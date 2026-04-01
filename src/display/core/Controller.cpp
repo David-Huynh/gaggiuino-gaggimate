@@ -202,6 +202,7 @@ void Controller::setupWifi() {
     if (settings.getWifiSsid() != "" && settings.getWifiPassword() != "") {
         WiFi.setHostname(settings.getMdnsName().c_str());
         WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
         WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
         WiFi.begin(settings.getWifiSsid(), settings.getWifiPassword());
         WiFi.setTxPower(WIFI_POWER_19_5dBm);
@@ -222,10 +223,6 @@ void Controller::setupWifi() {
                 [this](WiFiEvent_t, WiFiEventInfo_t info) {
                     ESP_LOGI(LOG_TAG, "Lost WiFi connection. Reason: %s", WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(info.wifi_sta_disconnected.reason)));
                     pluginManager->trigger("controller:wifi:disconnect");
-                    if (!isApConnection) {
-                        ESP_LOGI(LOG_TAG, "Trying reconnect to WiFi...");
-                        WiFi.reconnect();
-                    }
                 },
                 WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
             configTzTime(resolve_timezone(settings.getTimezone()), NTP_SERVER);
@@ -262,18 +259,20 @@ void Controller::loop() {
         connect();
     }
 
+    unsigned long now = millis();
+
     // If BLE scanning has been running for a while without finding the controller,
     // notify the UI so it can update the startup label accordingly.
     if (!waitingForController && initialized && !clientController.isConnected() &&
-        (millis() - connectStartTime) > CONTROLLER_WAITING_TIMEOUT_MS) {
+        (now - connectStartTime) > CONTROLLER_WAITING_TIMEOUT_MS) {
         waitingForController = true;
         pluginManager->trigger("controller:bluetooth:waiting");
     }
 
     // Periodically restart BLE scan while waiting for the controller to appear.
     if (initialized && !clientController.isConnected() &&
-        (millis() - lastScanTime) > (NimBLEClientController::BLE_SCAN_DURATION_SECONDS * 1000UL + 500UL)) {
-        lastScanTime = millis();
+        (now - lastScanTime) > (NimBLEClientController::BLE_SCAN_DURATION_SECONDS * 1000UL + 500UL)) {
+        lastScanTime = now;
         clientController.scan();
     }
 
@@ -295,14 +294,6 @@ void Controller::loop() {
             pluginManager->trigger("controller:ready");
         }
     }
-
-    unsigned long now = millis();
-
-    // Disable ping as we send output control frequently
-    // if (now - lastPing > PING_INTERVAL) {
-    //     lastPing = now;
-    //     clientController.sendPing();
-    // }
 
     if (isErrorState()) {
         return;
