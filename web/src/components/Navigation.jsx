@@ -5,6 +5,7 @@ import { faList } from '@fortawesome/free-solid-svg-icons/faList';
 import { faTimeline } from '@fortawesome/free-solid-svg-icons/faTimeline';
 import { faTemperatureHalf } from '@fortawesome/free-solid-svg-icons/faTemperatureHalf';
 import { faBluetoothB } from '@fortawesome/free-brands-svg-icons/faBluetoothB';
+import { faWeightScale } from '@fortawesome/free-solid-svg-icons/faWeightScale';
 import { faCog } from '@fortawesome/free-solid-svg-icons/faCog';
 import { faRotate } from '@fortawesome/free-solid-svg-icons/faRotate';
 import { faMagnifyingGlassChart } from '@fortawesome/free-solid-svg-icons/faMagnifyingGlassChart';
@@ -46,6 +47,7 @@ export function Navigation(props) {
       <div className='space-y-1.5'>
         <MenuItem label='PID Autotune' link='/pidtune' icon={faTemperatureHalf} />
         <MenuItem label='Bluetooth Devices' link='/scales' icon={faBluetoothB} />
+        <MenuItem label='Scale Calibration' link='/scale-calibration' icon={faWeightScale} />
         <MenuItem label='Settings' link='/settings' icon={faCog} />
       </div>
       <hr className='h-5 border-0' />

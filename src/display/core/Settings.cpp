@@ -105,6 +105,13 @@ Settings::Settings() {
     fullTankDistance = preferences.getInt("sr_fd", 50);
     altRelayFunction = preferences.getInt("alt_relay", ALT_RELAY_GRIND);
 
+    // Scale settings
+    scaleSource = preferences.getInt("sc_src", 0);
+    scaleCalibration1 = preferences.getFloat("sc_cal1", 1.0f);
+    scaleCalibration2 = preferences.getFloat("sc_cal2", 1.0f);
+    scaleOffset1 = preferences.getLong("sc_ofs1", 0);
+    scaleOffset2 = preferences.getLong("sc_ofs2", 0);
+
     preferences.end();
 
     xTaskCreate(loopTask, "Settings::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle);
@@ -421,6 +428,47 @@ void Settings::setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &sch
     save();
 }
 
+int Settings::getScaleSource() const {
+    return scaleSource;
+}
+
+void Settings::setScaleSource(int scale_source) {
+    scaleSource = scale_source;
+    save();
+}
+
+float Settings::getScaleCalibration1() const {
+    return scaleCalibration1;
+}
+
+void Settings::setScaleCalibration1(float calibration1) {
+    scaleCalibration1 = calibration1;
+    save();
+}
+
+float Settings::getScaleCalibration2() const {
+    return scaleCalibration2;
+}
+
+void Settings::setScaleCalibration2(float calibration2) {
+    scaleCalibration2 = calibration2;
+    save();
+}
+
+long Settings::getScaleOffset1() const { return scaleOffset1; }
+
+void Settings::setScaleOffset1(long offset1) {
+    scaleOffset1 = offset1;
+    save();
+}
+
+long Settings::getScaleOffset2() const { return scaleOffset2; }
+
+void Settings::setScaleOffset2(long offset2) {
+    scaleOffset2 = offset2;
+    save();
+}
+
 void Settings::doSave() {
     if (!dirty) {
         return;
@@ -502,6 +550,13 @@ void Settings::doSave() {
     preferences.putInt("sr_ed", emptyTankDistance);
     preferences.putInt("sr_fd", fullTankDistance);
     preferences.putInt("alt_relay", altRelayFunction);
+
+    // Scale settings
+    preferences.putInt("sc_src", scaleSource);
+    preferences.putFloat("sc_cal1", scaleCalibration1);
+    preferences.putFloat("sc_cal2", scaleCalibration2);
+    preferences.putLong("sc_ofs1", scaleOffset1);
+    preferences.putLong("sc_ofs2", scaleOffset2);
 
     preferences.end();
 }

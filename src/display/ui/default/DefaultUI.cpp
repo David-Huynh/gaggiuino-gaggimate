@@ -220,10 +220,17 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
+    pluginManager->on("controller:weight:change", [=](Event const &event) {
+        double newWeight = event.getFloat("value");
+        if (round(newWeight * 10.0) != round(hardwareWeight * 10.0)) {
+            hardwareWeight = newWeight;
+            rerender = true;
+        }
+    });
     setupState();
     setupReactive();
     xTaskCreatePinnedToCore(loopTask, "DefaultUI::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 1);
-    xTaskCreatePinnedToCore(profileLoopTask, "DefaultUI::loopProfiles", configMINIMAL_STACK_SIZE * 4, this, 1, &profileTaskHandle,
+    xTaskCreatePinnedToCore(profileLoopTask, "DefaultUI::loopProfiles", configMINIMAL_STACK_SIZE * 8, this, 1, &profileTaskHandle,
                             0);
 }
 
@@ -248,6 +255,7 @@ void DefaultUI::loop() {
         const Settings &settings = controller->getSettings();
         volumetricAvailable = controller->isVolumetricAvailable();
         bluetoothScales = controller->isBluetoothScaleHealthy();
+        hardwareScalePresent = controller->isHardwareScalePresent();
         volumetricMode = volumetricAvailable && settings.isVolumetricTarget();
         brewVolumetric = volumetricAvailable && profileVolumetric;
         grindActive = controller->isGrindActive();
@@ -638,22 +646,26 @@ void DefaultUI::setupReactive() {
                           &grindAvailable);
     effect_mgr.use_effect([=] { return currentScreen == ui_BrewScreen; },
                           [=]() {
-                              if (volumetricAvailable && bluetoothScales) {
+                              if (volumetricAvailable && hardwareScalePresent) {
+                                  lv_label_set_text_fmt(ui_BrewScreen_weightLabel, "%.1fg", hardwareWeight);
+                              } else if (volumetricAvailable && bluetoothScales) {
                                   lv_label_set_text_fmt(ui_BrewScreen_weightLabel, "%.1fg", bluetoothWeight);
                               } else {
                                   lv_label_set_text(ui_BrewScreen_weightLabel, "-");
                               }
                           },
-                          &bluetoothWeight, &volumetricAvailable, &bluetoothScales);
+                          &bluetoothWeight, &hardwareWeight, &volumetricAvailable, &bluetoothScales, &hardwareScalePresent);
     effect_mgr.use_effect([=] { return currentScreen == ui_GrindScreen; },
                           [=]() {
-                              if (volumetricAvailable && bluetoothScales) {
+                              if (volumetricAvailable && hardwareScalePresent) {
+                                  lv_label_set_text_fmt(ui_GrindScreen_weightLabel, "%.1fg", hardwareWeight);
+                              } else if (volumetricAvailable && bluetoothScales) {
                                   lv_label_set_text_fmt(ui_GrindScreen_weightLabel, "%.1fg", bluetoothWeight);
                               } else {
                                   lv_label_set_text(ui_GrindScreen_weightLabel, "-");
                               }
                           },
-                          &bluetoothWeight, &volumetricAvailable, &bluetoothScales);
+                          &bluetoothWeight, &hardwareWeight, &volumetricAvailable, &bluetoothScales, &hardwareScalePresent);
     effect_mgr.use_effect(
         [=] { return currentScreen == ui_BrewScreen; },
         [=]() {

@@ -1,3 +1,6 @@
+#ifdef ARDUINO_ARCH_STM32
+  #include <STM32FreeRTOS.h>
+#endif
 #include "SimplePump.h"
 
 SimplePump::SimplePump(int pin, uint8_t pumpOn, float windowSize)

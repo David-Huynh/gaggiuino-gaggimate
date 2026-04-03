@@ -23,32 +23,47 @@
 static std::unordered_map<uint32_t, std::string> rxBuffers;
 static WebUIPlugin *g_webUIPlugin = nullptr;
 
+#if defined(GAGGIMATE_DISABLE_OTA)
+static constexpr bool OTA_ENABLED = false;
+#else
+static constexpr bool OTA_ENABLED = true;
+#endif
+
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
 void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) {
     this->controller = _controller;
     this->profileManager = _controller->getProfileManager();
     this->pluginManager = _pluginManager;
-    this->ota = new GitHubOTA(
-        BUILD_GIT_VERSION, controller->getSystemInfo().version,
-        RELEASE_URL + (controller->getSettings().getOTAChannel() == "latest" ? "latest" : "tag/nightly"),
-        [this](uint8_t phase) {
-            pluginManager->trigger("ota:update:phase", "phase", phase);
-            updateOTAProgress(phase, 0);
-        },
-        [this](uint8_t phase, int progress) {
-            pluginManager->trigger("ota:update:progress", "progress", progress);
-            updateOTAProgress(phase, progress);
-        },
-        "display-firmware.bin", "display-filesystem.bin", "board-firmware.bin");
+    if (OTA_ENABLED) {
+        this->ota = new GitHubOTA(
+            BUILD_GIT_VERSION, controller->getSystemInfo().version,
+            RELEASE_URL + (controller->getSettings().getOTAChannel() == "latest" ? "latest" : "tag/nightly"),
+            [this](uint8_t phase) {
+                pluginManager->trigger("ota:update:phase", "phase", phase);
+                updateOTAProgress(phase, 0);
+            },
+            [this](uint8_t phase, int progress) {
+                pluginManager->trigger("ota:update:progress", "progress", progress);
+                updateOTAProgress(phase, progress);
+            },
+            "display-firmware.bin", "display-filesystem.bin", "board-firmware.bin");
+    }
     pluginManager->on("controller:wifi:connect", [this](Event const &event) {
         apMode = event.getInt("AP");
         start();
     });
     pluginManager->on("controller:wifi:disconnect", [this](Event const &) { stop(); });
     pluginManager->on("controller:ready", [this](Event const &) {
+        if (!OTA_ENABLED || ota == nullptr) {
+            return;
+        }
         ota->setControllerVersion(controller->getSystemInfo().version);
-        ota->init(controller->getClientController()->getClient());
+#ifdef GAGGIMATE_UART_COMMS
+        ota->init(nullptr);
+#else
+        ota->init(static_cast<NimBLEClientController *>(controller->getClientController())->getClient());
+#endif
     });
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
 
@@ -66,10 +81,18 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     pluginManager->on("controller:volumetric-measurement:bluetooth:change",
                       [this](Event const &event) { this->currentBluetoothWeight = event.getFloat("value"); });
 
+    // Subscribe to hardware scale weight updates
+    pluginManager->on("controller:weight:change",
+                      [this](Event const &event) { this->currentHardwareWeight = event.getFloat("value"); });
+
     setupServer();
 }
 
 void WebUIPlugin::loop() {
+    if (!OTA_ENABLED) {
+        updating = false;
+    }
+
     if (updating) {
         pluginManager->trigger("ota:update:start");
         ota->update(updateComponent != "display", updateComponent != "controller");
@@ -81,10 +104,14 @@ void WebUIPlugin::loop() {
     }
     const long now = millis();
     if ((lastUpdateCheck == 0 || now > lastUpdateCheck + UPDATE_CHECK_INTERVAL)) {
-        ota->checkForUpdates();
-        pluginManager->trigger("ota:update:status", "value", ota->isUpdateAvailable());
+        if (OTA_ENABLED && ota != nullptr) {
+            ota->checkForUpdates();
+            pluginManager->trigger("ota:update:status", "value", ota->isUpdateAvailable());
+        } else {
+            pluginManager->trigger("ota:update:status", "value", false);
+        }
         lastUpdateCheck = now;
-        updateOTAStatus(ota->getCurrentVersion());
+        updateOTAStatus(OTA_ENABLED && ota != nullptr ? ota->getCurrentVersion() : "disabled");
     }
     if (now > lastStatus + STATUS_PERIOD && !ws.getClients().empty()) {
         lastStatus = now;
@@ -111,15 +138,22 @@ void WebUIPlugin::loop() {
         doc["gt"] = controller->isVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
         doc["gact"] = controller->isGrindActive() ? 1 : 0;
         doc["rssi"] = 0;
-        if (controller->getClientController()->getClient()->isConnected()) {
-            doc["rssi"] = controller->getClientController()->getClient()->getRssi();
+#ifndef GAGGIMATE_UART_COMMS
+        if (static_cast<NimBLEClientController *>(controller->getClientController())->getClient()->isConnected()) {
+            doc["rssi"] = static_cast<NimBLEClientController *>(controller->getClientController())->getClient()->getRssi();
         }
+#endif
 
         bool bleConnected = BLEScales.isConnected();
         // Add Bluetooth scale weight information
         doc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // current bluetooth weight
         doc["cw"] = bleConnected ? this->currentBluetoothWeight : 0; // Use 'currentWeight' for forward compatbility
         doc["bc"] = bleConnected;                                    // bluetooth scale connected status
+
+        // Add hardware scale weight information
+        bool hwScalePresent = controller->isHardwareScalePresent();
+        doc["hw"] = hwScalePresent ? this->currentHardwareWeight : 0; // hardware scale weight
+        doc["hwc"] = hwScalePresent;                                  // hardware scale present
 
         Process *process = controller->getProcess();
         if (process == nullptr) {
@@ -355,6 +389,20 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     client->text(buffer);
                 } else if (msgType == "req:flush:start") {
                     handleFlushStart(client->id(), doc);
+                } else if (msgType == "req:scale:tare") {
+                    controller->scaleTare();
+                } else if (msgType == "req:scale:calibrate") {
+                    if (doc["c1"].is<float>() && doc["c2"].is<float>()) {
+                        auto c1 = doc["c1"].as<float>();
+                        auto c2 = doc["c2"].as<float>();
+                        controller->sendScaleCalibration(c1, c2);
+                    }
+                } else if (msgType == "req:scale:cal:start") {
+                    if (doc["channel"].is<uint8_t>() && doc["refWeight"].is<float>()) {
+                        auto channel = doc["channel"].as<uint8_t>();
+                        auto refWeight = doc["refWeight"].as<float>();
+                        controller->getClientController()->startScaleCalibration(channel, refWeight);
+                    }
                 }
             }
         }
@@ -364,6 +412,12 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
 }
 
 void WebUIPlugin::handleOTASettings(uint32_t clientId, JsonDocument &request) {
+    if (!OTA_ENABLED || ota == nullptr) {
+        (void)clientId;
+        updateOTAStatus("disabled");
+        return;
+    }
+
     if (request["update"].as<bool>()) {
         if (!request["channel"].isNull()) {
             controller->getSettings().setOTAChannel(request["channel"].as<String>() == "latest" ? "latest" : "nightly");
@@ -375,6 +429,18 @@ void WebUIPlugin::handleOTASettings(uint32_t clientId, JsonDocument &request) {
 }
 
 void WebUIPlugin::handleOTAStart(uint32_t clientId, JsonDocument &request) {
+    if (!OTA_ENABLED || ota == nullptr) {
+        JsonDocument response;
+        response["tp"] = "res:ota-start";
+        response["rid"] = request["rid"];
+        response["success"] = false;
+        response["error"] = "OTA disabled by firmware";
+        String msg;
+        serializeJson(response, msg);
+        ws.text(clientId, msg);
+        return;
+    }
+
     updating = true;
     if (request["cp"].is<String>()) {
         updateComponent = request["cp"].as<String>();
@@ -542,6 +608,16 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setFullTankDistance(request->arg("fullTankDistance").toInt());
             if (request->hasArg("altRelayFunction"))
                 settings->setAltRelayFunction(request->arg("altRelayFunction").toInt());
+            if (request->hasArg("scaleSource"))
+                settings->setScaleSource(request->arg("scaleSource").toInt());
+            if (request->hasArg("scaleCalibration1"))
+                settings->setScaleCalibration1(request->arg("scaleCalibration1").toFloat());
+            if (request->hasArg("scaleCalibration2"))
+                settings->setScaleCalibration2(request->arg("scaleCalibration2").toFloat());
+            if (request->hasArg("scaleOffset1"))
+                settings->setScaleOffset1(request->arg("scaleOffset1").toInt());
+            if (request->hasArg("scaleOffset2"))
+                settings->setScaleOffset2(request->arg("scaleOffset2").toInt());
             settings->setAutoWakeupEnabled(request->hasArg("autowakeupEnabled"));
             if (request->hasArg("autowakeupSchedules")) {
                 // Handle schedule format with days
@@ -639,6 +715,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["emptyTankDistance"] = settings.getEmptyTankDistance();
     doc["fullTankDistance"] = settings.getFullTankDistance();
     doc["altRelayFunction"] = settings.getAltRelayFunction();
+    doc["scaleSource"] = settings.getScaleSource();
+    doc["scaleCalibration1"] = settings.getScaleCalibration1();
+    doc["scaleCalibration2"] = settings.getScaleCalibration2();
+    doc["scaleOffset1"] = settings.getScaleOffset1();
+    doc["scaleOffset2"] = settings.getScaleOffset2();
     // Add auto-wakeup settings to response
     doc["autowakeupEnabled"] = settings.isAutoWakeupEnabled();
 
@@ -722,16 +803,17 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
     }
     Settings const &settings = controller->getSettings();
     JsonDocument doc;
-    doc["latestVersion"] = ota->getCurrentVersion();
+    doc["latestVersion"] = OTA_ENABLED && ota != nullptr ? ota->getCurrentVersion() : version;
     doc["tp"] = "res:ota-settings";
-    doc["displayUpdateAvailable"] = ota->isUpdateAvailable(false);
-    doc["controllerUpdateAvailable"] = ota->isUpdateAvailable(true);
+    doc["displayUpdateAvailable"] = OTA_ENABLED && ota != nullptr ? ota->isUpdateAvailable(false) : false;
+    doc["controllerUpdateAvailable"] = OTA_ENABLED && ota != nullptr ? ota->isUpdateAvailable(true) : false;
     doc["displayVersion"] = BUILD_GIT_VERSION;
     doc["controllerVersion"] = controller->getSystemInfo().version;
     doc["hardware"] = controller->getSystemInfo().hardware;
-    doc["latestVersion"] = ota->getCurrentVersion();
+    doc["latestVersion"] = OTA_ENABLED && ota != nullptr ? ota->getCurrentVersion() : version;
     doc["channel"] = settings.getOTAChannel();
     doc["updating"] = updating;
+    doc["otaEnabled"] = OTA_ENABLED;
     // SPIFFS usage metrics
     {
         size_t total = SPIFFS.totalBytes();

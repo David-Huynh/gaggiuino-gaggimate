@@ -1,8 +1,14 @@
 #ifndef CONTROLLER_H
 #define CONTROLLER_H
 
+#include "ClientCommunicationHandler.h"
+#ifdef GAGGIMATE_UART_COMMS
+#include "UARTClientController.h"
+#else
 #include "NimBLEClientController.h"
 #include "NimBLEComm.h"
+#endif
+
 #include "PluginManager.h"
 #include "Settings.h"
 #include <WiFi.h>
@@ -16,7 +22,7 @@
 const IPAddress WIFI_AP_IP(4, 4, 4, 1); // the IP address the web server, Samsung requires the IP to be in public space
 const IPAddress WIFI_SUBNET_MASK(255, 255, 255, 0); // no need to change: https://avinetworks.com/glossary/subnet-mask/
 
-enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH };
+enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH, HARDWARE_SCALE };
 
 class Controller {
   public:
@@ -89,6 +95,10 @@ class Controller {
     void onProfileSaveAsNew();
     void onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source);
     void setVolumetricOverride(bool override) { volumetricOverride = override; }
+    void setHardwareScalePresent(bool present) { hardwareScalePresent = present; }
+    bool isHardwareScalePresent() const { return hardwareScalePresent; }
+    void scaleTare();
+    void sendScaleCalibration(float c1, float c2);
     bool isBluetoothScaleHealthy() const;
     void onFlush();
     int getWaterLevel() const {
@@ -103,7 +113,7 @@ class Controller {
 
     SystemInfo getSystemInfo() const { return systemInfo; }
 
-    NimBLEClientController *getClientController() { return &clientController; }
+    ClientCommunicationHandler *getClientController() { return &clientController; }
 
   private:
     // Initialization methods
@@ -132,7 +142,11 @@ class Controller {
     DefaultUI *ui = nullptr;
     Driver *driver = nullptr;
 #endif
+#ifdef GAGGIMATE_UART_COMMS
+    UARTClientController clientController;
+#else
     NimBLEClientController clientController;
+#endif
     hw_timer_t *timer = nullptr;
     Settings settings;
     PluginManager *pluginManager{};
@@ -165,6 +179,7 @@ class Controller {
     bool waitingForController = false;
     unsigned long connectStartTime = 0;
     bool volumetricOverride = false;
+    bool hardwareScalePresent = false;
     bool processCompleted = false;
     bool steamReady = false;
     bool sdcard = false;

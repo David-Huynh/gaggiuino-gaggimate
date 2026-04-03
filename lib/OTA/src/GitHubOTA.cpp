@@ -1,5 +1,6 @@
 #include "GitHubOTA.h"
 #include "common.h"
+#include "logging.h"
 #include "semver_extensions.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>

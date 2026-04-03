@@ -1,11 +1,17 @@
 #ifndef GAGGIMATECONTROLLER_H
 #define GAGGIMATECONTROLLER_H
+#include "CommunicationHandler.h"
 #include "ControllerConfig.h"
-#include "NimBLEServerController.h"
+#include <memory>
 #include <peripherals/DigitalInput.h>
 #include <peripherals/DistanceSensor.h>
 #include <peripherals/Heater.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <peripherals/LedController2.h>
+#else
 #include <peripherals/LedController.h>
+#endif
+#include <peripherals/HX711Scale.h>
 #include <peripherals/Max31855Thermocouple.h>
 #include <peripherals/PressureSensor.h>
 #include <peripherals/Pump.h>
@@ -19,7 +25,12 @@ constexpr int DETECT_VALUE_PIN = 11;
 
 class GaggiMateController {
   public:
-    GaggiMateController(String version);
+    /**
+     * @brief Construct GaggiMateController with optional custom communication handler
+     * @param version Firmware version string
+     * @param commHandler Optional communication handler (BLE, UART, etc). If nullptr, defaults to NimBLEServerController
+     */
+    GaggiMateController(String version, CommunicationHandler *commHandler = nullptr);
     void setup(void);
     void loop(void);
 
@@ -36,7 +47,8 @@ class GaggiMateController {
     void sendSensorData(void);
 
     ControllerConfig _config = ControllerConfig{};
-    NimBLEServerController _ble;
+    CommunicationHandler *_comm = nullptr;
+    bool _comm_owned = false; // Track if we allocated _comm and should delete it
 
     Max31855Thermocouple *thermocouple = nullptr;
     Heater *heater = nullptr;
@@ -46,6 +58,7 @@ class GaggiMateController {
     DigitalInput *brewBtn = nullptr;
     DigitalInput *steamBtn = nullptr;
     PressureSensor *pressureSensor = nullptr;
+    HX711Scale *scale = nullptr;
     LedController *ledController = nullptr;
     DistanceSensor *distanceSensor = nullptr;
 

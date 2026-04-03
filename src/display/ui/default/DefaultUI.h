@@ -98,6 +98,7 @@ class DefaultUI {
     int waitingForController = false;
     int volumetricAvailable = false;
     int bluetoothScales = false;
+    int hardwareScalePresent = false;
     int volumetricMode = false;
     int brewVolumetric = false;
     int profileVolumetric = false;
@@ -125,6 +126,7 @@ class DefaultUI {
     int pressureScaling = DEFAULT_PRESSURE_SCALING;
     int heatingFlash = 0;
     double bluetoothWeight = 0.0;
+    double hardwareWeight = 0.0;
     BrewScreenState brewScreenState = BrewScreenState::Brew;
 
     int profileDirty = 0;

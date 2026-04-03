@@ -443,6 +443,32 @@ export function Settings() {
             </div>
           </Card>
 
+          {/* Scale Settings */}
+          <Card sm={10} lg={5} title='Scale Settings'>
+            <div className='form-control mb-4'>
+              <label htmlFor='scaleSource' className='mb-2 block text-sm font-medium'>
+                Scale Source
+              </label>
+              <select
+                id='scaleSource'
+                name='scaleSource'
+                className='select select-bordered w-full'
+                value={formData.scaleSource ?? 0}
+                onChange={onChange('scaleSource')}
+              >
+                <option value={0}>Auto (Hardware preferred)</option>
+                <option value={1}>Bluetooth only</option>
+                <option value={2}>Hardware only</option>
+              </select>
+              <p className='text-base-content/60 mt-1 text-xs'>
+                Auto uses the hardware HX711 scale when present, otherwise falls back to Bluetooth.
+              </p>
+            </div>
+            <a href='/scale-calibration' className='btn btn-outline btn-sm w-full'>
+              Configure Hardware Scale Calibration
+            </a>
+          </Card>
+
           {/* Web Settings */}
           <Card sm={10} lg={5} title='Web Settings'>
             <div className='form-control mb-4'>

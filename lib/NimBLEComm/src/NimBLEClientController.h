@@ -2,9 +2,10 @@
 #define NIMBLECLIENTCONTROLLER_H
 
 #include "NimBLEComm.h"
+#include "ClientCommunicationHandler.h"
 #include "cstring"
 
-class NimBLEClientController : public NimBLEAdvertisedDeviceCallbacks, NimBLEClientCallbacks {
+class NimBLEClientController : public ClientCommunicationHandler, NimBLEAdvertisedDeviceCallbacks, NimBLEClientCallbacks {
   public:
     NimBLEClientController();
     void initClient();
@@ -22,7 +23,7 @@ class NimBLEClientController : public NimBLEAdvertisedDeviceCallbacks, NimBLECli
     void setPressureScale(float scale);
     void sendLedControl(uint8_t channel, uint8_t brightness);
     bool isReadyForConnection() const;
-    bool isConnected();
+    bool isConnected() const;
     void scan();
     void tare();
     void registerRemoteErrorCallback(const remote_err_callback_t &callback);
@@ -33,6 +34,12 @@ class NimBLEClientController : public NimBLEAdvertisedDeviceCallbacks, NimBLECli
     void registerVolumetricMeasurementCallback(const float_callback_t &callback);
     void registerTofMeasurementCallback(const int_callback_t &callback);
     void registerDisconnectCallback(const void_callback_t &callback);
+    void registerWeightMeasurementCallback(const float_callback_t &callback);
+    void scaleTare();
+    void sendScaleCalibration(float c1, float c2, long offset1, long offset2);
+    void startScaleCalibration(uint8_t channel, float refWeight);
+    void registerScaleOffsetsCallback(const scale_offsets_callback_t &callback);
+    void registerScaleCalResultCallback(const scale_cal_result_callback_t &callback);
     std::string readInfo() const;
     NimBLEClient *getClient() const { return client; };
 
@@ -61,6 +68,12 @@ class NimBLEClientController : public NimBLEAdvertisedDeviceCallbacks, NimBLECli
     NimBLERemoteCharacteristic *volumetricTareChar = nullptr;
     NimBLERemoteCharacteristic *ledControlChar = nullptr;
     NimBLERemoteCharacteristic *tofMeasurementChar = nullptr;
+    NimBLERemoteCharacteristic *weightMeasurementChar = nullptr;
+    NimBLERemoteCharacteristic *scaleTareChar = nullptr;
+    NimBLERemoteCharacteristic *scaleCalibrationChar = nullptr;
+    NimBLERemoteCharacteristic *scaleOffsetsChar = nullptr;
+    NimBLERemoteCharacteristic *scaleCalStartChar = nullptr;
+    NimBLERemoteCharacteristic *scaleCalResultChar = nullptr;
     NimBLEAdvertisedDevice *serverDevice = nullptr;
     bool readyForConnection = false;
     xTaskHandle taskHandle;
@@ -73,6 +86,9 @@ class NimBLEClientController : public NimBLEAdvertisedDeviceCallbacks, NimBLECli
     float_callback_t volumetricMeasurementCallback = nullptr;
     int_callback_t tofMeasurementCallback = nullptr;
     void_callback_t disconnectCallback = nullptr;
+    float_callback_t weightMeasurementCallback = nullptr;
+    scale_offsets_callback_t scaleOffsetsCallback = nullptr;
+    scale_cal_result_callback_t scaleCalResultCallback = nullptr;
 
     String _lastOutputControl = "";
     char advancedOutputBuffer[80]{};

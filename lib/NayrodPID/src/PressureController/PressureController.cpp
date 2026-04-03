@@ -1,5 +1,6 @@
 #include "PressureController.h"
 #include "SimpleKalmanFilter/SimpleKalmanFilter.h"
+#include "logging.h"
 #include <algorithm>
 #include <math.h>
 

@@ -21,6 +21,7 @@ import { Autotune } from './pages/Autotune/index.jsx';
 import { ShotHistory } from './pages/ShotHistory/index.jsx';
 import { ShotAnalyzer } from './pages/ShotAnalyzer/index.jsx';
 import { StatisticsPage } from './pages/Statistics/index.jsx';
+import { ScaleCalibration } from './pages/ScaleCalibration/index.jsx';
 
 const apiService = new ApiService();
 
@@ -45,6 +46,7 @@ export function App() {
                         <Route path='/settings' component={Settings} />
                         <Route path='/ota' component={OTA} />
                         <Route path='/scales' component={Scales} />
+                        <Route path='/scale-calibration' component={ScaleCalibration} />
                         <Route path='/pidtune' component={Autotune} />
                         <Route path='/history' component={ShotHistory} />
                         <Route path='/analyzer' component={ShotAnalyzer} />

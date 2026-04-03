@@ -1,6 +1,7 @@
 #ifndef NIMBLECOMM_H
 #define NIMBLECOMM_H
 
+#include "CommonTypes.h"
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
@@ -23,47 +24,13 @@
 #define VOLUMETRIC_MEASUREMENT_UUID "b0080557-3865-4a9c-be37-492d77ee5951"
 #define VOLUMETRIC_TARE_UUID "a8bd52e0-77c3-412c-847c-4e802c3982f9"
 #define TOF_MEASUREMENT_UUID "7282c525-21a0-416a-880d-21fe98602533"
+#define WEIGHT_MEASUREMENT_UUID "9e7c9e60-1c7a-4c3e-b2f1-8a3d5e7f1234"
+#define SCALE_TARE_UUID "9e7c9e61-1c7a-4c3e-b2f1-8a3d5e7f1234"
+#define SCALE_CALIBRATION_UUID "9e7c9e62-1c7a-4c3e-b2f1-8a3d5e7f1234"
+#define SCALE_OFFSETS_UUID "9e7c9e63-1c7a-4c3e-b2f1-8a3d5e7f1234"
+#define SCALE_CAL_START_UUID "9e7c9e64-1c7a-4c3e-b2f1-8a3d5e7f1234"
+#define SCALE_CAL_RESULT_UUID "9e7c9e65-1c7a-4c3e-b2f1-8a3d5e7f1234"
 #define LED_CONTROL_UUID "37804a2b-49ab-4500-8582-db4279fc8573"
-
-constexpr size_t ERROR_CODE_NONE = 0;
-constexpr size_t ERROR_CODE_COMM_SEND = 1;
-constexpr size_t ERROR_CODE_COMM_RCV = 2;
-constexpr size_t ERROR_CODE_PROTO_ERR = 3;
-constexpr size_t ERROR_CODE_RUNAWAY = 4;
-constexpr size_t ERROR_CODE_TIMEOUT = 5;
-
-using pin_control_callback_t = std::function<void(bool isActive)>;
-using pid_control_callback_t = std::function<void(float Kp, float Ki, float Kd, float Kf)>;
-using pump_model_coeffs_callback_t = std::function<void(float a, float b, float c, float d)>;
-using ping_callback_t = std::function<void()>;
-using remote_err_callback_t = std::function<void(int errorCode)>;
-using autotune_callback_t = std::function<void(int testTime, int samples)>;
-using brew_callback_t = std::function<void(bool brewButtonStatus)>;
-using steam_callback_t = std::function<void(bool steamButtonStatus)>;
-using void_callback_t = std::function<void()>;
-
-// New combined callbacks
-using float_callback_t = std::function<void(float val)>;
-using int_callback_t = std::function<void(int val)>;
-using simple_output_callback_t = std::function<void(bool valve, float pumpSetpoint, float boilerSetpoint)>;
-using advanced_output_callback_t =
-    std::function<void(bool valve, float boilerSetpoint, bool pressureTarget, float pumpPressure, float pumpFlow)>;
-using sensor_read_callback_t =
-    std::function<void(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance)>;
-using led_control_callback_t = std::function<void(uint8_t channel, uint8_t brightness)>;
-
-struct SystemCapabilities {
-    bool dimming;
-    bool pressure;
-    bool ledControl;
-    bool tof;
-};
-
-struct SystemInfo {
-    String hardware;
-    String version;
-    SystemCapabilities capabilities;
-};
 
 String get_token(const String &from, uint8_t index, char separator, String default_value = "");
 

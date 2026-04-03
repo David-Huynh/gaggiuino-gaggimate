@@ -1,6 +1,7 @@
 #ifndef SIMPLE_PID_H
 #define SIMPLE_PID_H
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <vector>
 // #define PI 3.14159265358979323846

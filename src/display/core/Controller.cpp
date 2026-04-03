@@ -14,6 +14,8 @@
 #include <display/core/zones.h>
 #include <display/plugins/AutoWakeupPlugin.h>
 #include <display/plugins/BLEScalePlugin.h>
+#include <display/plugins/HWScalePlugin.h>
+
 #include <display/plugins/BoilerFillPlugin.h>
 #include <display/plugins/HomekitPlugin.h>
 #include <display/plugins/LedControlPlugin.h>
@@ -72,6 +74,9 @@ void Controller::setup() {
     pluginManager->registerPlugin(new WebUIPlugin());
     pluginManager->registerPlugin(&ShotHistory);
     pluginManager->registerPlugin(&BLEScales);
+#ifdef GAGGIMATE_UART_COMMS
+    pluginManager->registerPlugin(&HWScale);
+#endif
     pluginManager->registerPlugin(new LedControlPlugin());
     pluginManager->registerPlugin(new AutoWakeupPlugin());
     pluginManager->setup(this);
@@ -134,7 +139,25 @@ void Controller::setupPanel() {
 #endif
 
 void Controller::setupBluetooth() {
+#ifdef GAGGIMATE_UART_COMMS
+// Initialize Serial2 for UART communication to STM32F4 controller
+#ifndef GAGGIMATE_UART_BAUD
+#define GAGGIMATE_UART_BAUD 460800
+#endif
+#ifndef GAGGIMATE_UART_RX_PIN
+#define GAGGIMATE_UART_RX_PIN 44
+#endif
+#ifndef GAGGIMATE_UART_TX_PIN
+#define GAGGIMATE_UART_TX_PIN 43
+#endif
+
+    Serial2.begin(GAGGIMATE_UART_BAUD, SERIAL_8N1, GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
+    delay(500); // Wait for serial to stabilize
+    ESP_LOGI(LOG_TAG, "UART initialized at %d baud (RX=%d, TX=%d)", GAGGIMATE_UART_BAUD, GAGGIMATE_UART_RX_PIN,
+             GAGGIMATE_UART_TX_PIN);
+#endif
     clientController.initClient();
+#ifndef GAGGIMATE_UART_COMMS
     clientController.registerDisconnectCallback([this]() {
         if (initialized) {
             pluginManager->trigger("controller:bluetooth:disconnect");
@@ -142,6 +165,7 @@ void Controller::setupBluetooth() {
             setMode(MODE_STANDBY);
         }
     });
+#endif
     clientController.registerSensorCallback(
         [this](const float temp, const float pressure, const float puckFlow, const float pumpFlow, const float puckResistance) {
             onTempRead(temp);
@@ -180,7 +204,32 @@ void Controller::setupBluetooth() {
         ESP_LOGV(LOG_TAG, "Received new TOF distance: %d", value);
         pluginManager->trigger("controller:tof:change", "value", value);
     });
+    clientController.registerWeightMeasurementCallback(
+        [this](const float weight) { pluginManager->trigger("controller:weight:change", "value", weight); });
+    clientController.registerScaleOffsetsCallback([this](long offset1, long offset2) {
+        settings.setScaleOffset1(offset1);
+        settings.setScaleOffset2(offset2);
+        ESP_LOGI(LOG_TAG, "Scale offsets received and saved: %ld, %ld", offset1, offset2);
+    });
+    clientController.registerScaleCalResultCallback([this](uint8_t channel, float calibration) {
+        if (channel == 1)
+            settings.setScaleCalibration1(calibration);
+        else if (channel == 2)
+            settings.setScaleCalibration2(calibration);
+        pluginManager->trigger("controller:scale:calibrated", "channel", static_cast<int>(channel));
+        ESP_LOGI(LOG_TAG, "Scale ch%d calibration result: %.6f", channel, calibration);
+    });
+    pluginManager->on("settings:changed", [this](Event const &) {
+        if (clientController.isConnected()) {
+            clientController.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(),
+                                                  settings.getScaleOffset1(), settings.getScaleOffset2());
+        }
+    });
+#ifdef GAGGIMATE_UART_COMMS
+    pluginManager->trigger("controller:uart:init");
+#else
     pluginManager->trigger("controller:bluetooth:init");
+#endif
 }
 
 void Controller::setupInfos() {
@@ -260,6 +309,9 @@ void Controller::setupWifi() {
 }
 
 void Controller::loop() {
+#ifdef GAGGIMATE_UART_COMMS
+    clientController.poll();
+#endif
     pluginManager->loop();
 
     if (screenReady) {
@@ -268,6 +320,8 @@ void Controller::loop() {
 
     unsigned long now = millis();
 
+#ifndef GAGGIMATE_UART_COMMS
+    // BLE-specific connection management
     // If BLE scanning has been running for a while without finding the controller,
     // notify the UI so it can update the startup label accordingly.
     if (!waitingForController && initialized && !clientController.isConnected() &&
@@ -275,6 +329,7 @@ void Controller::loop() {
         waitingForController = true;
         pluginManager->trigger("controller:bluetooth:waiting");
     }
+#endif
 
     if (clientController.isReadyForConnection() && clientController.connectToServer()) {
         waitingForController = false;
@@ -283,6 +338,8 @@ void Controller::loop() {
         setPressureScale();
         clientController.sendPidSettings(settings.getPid());
         clientController.sendPumpModelCoeffs(settings.getPumpModelCoeffs());
+        clientController.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(),
+                                              settings.getScaleOffset1(), settings.getScaleOffset2());
         if (!loaded) {
             loaded = true;
             if (settings.getStartupMode() == MODE_STANDBY)
@@ -364,6 +421,19 @@ bool Controller::isAutotuning() const { return autotuning; }
 bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !isAutotuning(); }
 
 bool Controller::isVolumetricAvailable() const {
+    int src = settings.getScaleSource();
+    if (src == 2) // HW only
+        return hardwareScalePresent;
+    if (src == 1) { // BLE only
+#ifdef NIGHTLY_BUILD
+        return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
+#else
+        return isBluetoothScaleHealthy();
+#endif
+    }
+    // AUTO: prefer HW, fall back to BLE
+    if (hardwareScalePresent)
+        return true;
 #ifdef NIGHTLY_BUILD
     return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
 #else
@@ -567,12 +637,28 @@ void Controller::activate() {
     clear();
     clientController.tare();
     if (isVolumetricAvailable()) {
+        int src = settings.getScaleSource();
+        if (src == 2 && hardwareScalePresent) {
+            currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+        } else if (src == 1) {
 #ifdef NIGHTLY_BUILD
-        currentVolumetricSource =
-            isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
+            currentVolumetricSource =
+                isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
 #else
-        currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+            currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
 #endif
+        } else { // AUTO
+            if (hardwareScalePresent) {
+                currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+            } else {
+#ifdef NIGHTLY_BUILD
+                currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
+                                                                    : VolumetricMeasurementSource::FLOW_ESTIMATION;
+#else
+                currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+#endif
+            }
+        }
         if (mode == MODE_BREW) {
             pluginManager->trigger("controller:brew:prestart");
         }
@@ -700,10 +786,14 @@ void Controller::onProfileSaveAsNew() {
 }
 
 void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source) {
-    pluginManager->trigger(source == VolumetricMeasurementSource::FLOW_ESTIMATION
-                               ? F("controller:volumetric-measurement:estimation:change")
-                               : F("controller:volumetric-measurement:bluetooth:change"),
-                           "value", static_cast<float>(measurement));
+    if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
+        pluginManager->trigger(F("controller:volumetric-measurement:estimation:change"), "value",
+                               static_cast<float>(measurement));
+    } else if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        pluginManager->trigger(F("controller:volumetric-measurement:hardware:change"), "value", static_cast<float>(measurement));
+    } else {
+        pluginManager->trigger(F("controller:volumetric-measurement:bluetooth:change"), "value", static_cast<float>(measurement));
+    }
     if (source == VolumetricMeasurementSource::BLUETOOTH) {
         lastBluetoothMeasurement = millis();
     }
@@ -718,6 +808,12 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
     if (lastProcess != nullptr && !lastProcess->isComplete()) {
         lastProcess->updateVolume(measurement);
     }
+}
+
+void Controller::scaleTare() { clientController.scaleTare(); }
+
+void Controller::sendScaleCalibration(float c1, float c2) {
+    clientController.sendScaleCalibration(c1, c2, settings.getScaleOffset1(), settings.getScaleOffset2());
 }
 
 bool Controller::isBluetoothScaleHealthy() const {

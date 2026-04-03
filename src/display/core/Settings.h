@@ -168,6 +168,16 @@ class Settings {
     void setAltRelayFunction(int alt_relay_function);
     void setAutoWakeupEnabled(bool enabled);
     void setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules);
+    int getScaleSource() const;
+    void setScaleSource(int scale_source);
+    float getScaleCalibration1() const;
+    void setScaleCalibration1(float calibration1);
+    float getScaleCalibration2() const;
+    void setScaleCalibration2(float calibration2);
+    long getScaleOffset1() const;
+    void setScaleOffset1(long offset1);
+    long getScaleOffset2() const;
+    void setScaleOffset2(long offset2);
 
   private:
     Preferences preferences;
@@ -234,6 +244,13 @@ class Settings {
     int emptyTankDistance = 200;
     int fullTankDistance = 50;
     int altRelayFunction = ALT_RELAY_GRIND; // Default to grind
+
+    // Scale settings
+    int scaleSource = 0; // 0=AUTO, 1=BLE only, 2=HW only
+    float scaleCalibration1 = 1.0f;
+    float scaleCalibration2 = 1.0f;
+    long scaleOffset1 = 0;
+    long scaleOffset2 = 0;
 
     void doSave();
     xTaskHandle taskHandle;

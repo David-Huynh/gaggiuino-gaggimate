@@ -1,6 +1,8 @@
 #ifndef DISTANCESENSOR_H
 #define DISTANCESENSOR_H
-
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include <Arduino.h>
 #include <VL53L0X.h>
 #include <Wire.h>

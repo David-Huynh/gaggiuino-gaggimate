@@ -1,4 +1,5 @@
 #include "SimplePID.h"
+#include "logging.h"
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>

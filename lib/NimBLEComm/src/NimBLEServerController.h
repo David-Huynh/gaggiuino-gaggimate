@@ -1,11 +1,12 @@
 #ifndef NIMBLESERVERCONTROLLER_H
 #define NIMBLESERVERCONTROLLER_H
 
+#include "CommunicationHandler.h"
 #include "NimBLEComm.h"
 #include "cstring"
 #include <ble_ota_dfu.hpp>
 
-class NimBLEServerController : public NimBLEServerCallbacks, public NimBLECharacteristicCallbacks {
+class NimBLEServerController : public CommunicationHandler, public NimBLEServerCallbacks, public NimBLECharacteristicCallbacks {
   public:
     NimBLEServerController();
     void initServer(String infoString);
@@ -18,6 +19,9 @@ class NimBLEServerController : public NimBLEServerCallbacks, public NimBLECharac
     void sendAutotuneResult(float Kp, float Ki, float Kd);
     void sendVolumetricMeasurement(float value);
     void sendTofMeasurement(int value);
+    void sendWeightMeasurement(float weight);
+    void sendScaleOffsets(long offset1, long offset2) override;
+    void sendScaleCalResult(uint8_t channel, float calibration) override;
     void registerOutputControlCallback(const simple_output_callback_t &callback);
     void registerAdvancedOutputControlCallback(const advanced_output_callback_t &callback);
     void registerAltControlCallback(const pin_control_callback_t &callback);
@@ -25,9 +29,12 @@ class NimBLEServerController : public NimBLEServerCallbacks, public NimBLECharac
     void registerPumpModelCoeffsCallback(const pump_model_coeffs_callback_t &callback);
     void registerPingCallback(const ping_callback_t &callback);
     void registerAutotuneCallback(const autotune_callback_t &callback);
-    void registerPressureScaleCallback(const float_callback_t &callback);
-    void registerTareCallback(const void_callback_t &callback);
-    void registerLedControlCallback(const led_control_callback_t &callback);
+    void registerPressureScaleCallback(const float_callback_t &callback) override;
+    void registerTareCallback(const void_callback_t &callback) override;
+    void registerScaleTareCallback(const void_callback_t &callback) override;
+    void registerScaleCalibrationCallback(const scale_calibration_callback_t &callback) override;
+    void registerScaleCalStartCallback(const scale_cal_start_callback_t &callback) override;
+    void registerLedControlCallback(const led_control_callback_t &callback) override;
     void setInfo(String infoString);
 
   private:
@@ -51,7 +58,13 @@ class NimBLEServerController : public NimBLEServerCallbacks, public NimBLECharac
     NimBLECharacteristic *sensorChar = nullptr;
     NimBLECharacteristic *volumetricMeasurementChar = nullptr;
     NimBLECharacteristic *volumetricTareChar = nullptr;
+    NimBLECharacteristic *scaleTareChar = nullptr;
+    NimBLECharacteristic *scaleCalibrationChar = nullptr;
+    NimBLECharacteristic *scaleOffsetsChar = nullptr;
+    NimBLECharacteristic *scaleCalStartChar = nullptr;
+    NimBLECharacteristic *scaleCalResultChar = nullptr;
     NimBLECharacteristic *tofMeasurementChar = nullptr;
+    NimBLECharacteristic *weightMeasurementChar = nullptr;
     NimBLECharacteristic *ledControlChar = nullptr;
 
     simple_output_callback_t outputControlCallback = nullptr;
@@ -63,6 +76,9 @@ class NimBLEServerController : public NimBLEServerCallbacks, public NimBLECharac
     autotune_callback_t autotuneCallback = nullptr;
     float_callback_t pressureScaleCallback = nullptr;
     void_callback_t tareCallback = nullptr;
+    void_callback_t scaleTareCallback = nullptr;
+    scale_calibration_callback_t scaleCalibrationCallback = nullptr;
+    scale_cal_start_callback_t scaleCalStartCallback = nullptr;
     led_control_callback_t ledControlCallback = nullptr;
     char sensorDataBuffer[80]{};
     char errorBuffer[12]{};
