@@ -1,22 +1,45 @@
 #include "GaggiMateServer.h"
 #include <cstdio>
 #include <cstring>
+#if defined(ARDUINO_ARCH_STM32)
+#define ESP_LOGE(tag, fmt, ...)                                                                                                  \
+    do {                                                                                                                         \
+        Serial.printf("[E][%s] " fmt "\n", tag, ##__VA_ARGS__);                                                                 \
+    } while (0)
+#else
 #include <esp_log.h>
+#endif
 
-GaggiMateServer::GaggiMateServer() : _endpoint(_transport) {}
+GaggiMateServer::GaggiMateServer()
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+    : _transport(Serial2), _endpoint(_transport) {
+}
+#else
+    : _endpoint(_transport) {
+}
+#endif
 
 void GaggiMateServer::init(const String &deviceName, const String &hardware, const String &version, bool dimming, bool pressure,
-                           bool ledControl, bool tof) {
-    setSystemInfo(hardware, version, dimming, pressure, ledControl, tof);
+                           bool ledControl, bool tof, bool scale) {
+    setSystemInfo(hardware, version, dimming, pressure, ledControl, tof, scale);
     registerHandlers();
     _endpoint.onConnection([this](bool connected) {
         if (connected)
             pushSystemInfo();
     });
     _endpoint.begin();
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+    (void)deviceName;
+    _transport.begin();
+#else
     _transport.init(deviceName);
+#endif
 
+#if defined(ARDUINO_ARCH_STM32)
+    if (xTaskCreate(pumpTask, "GaggiMateServer", 4096, this, 1, &_taskHandle) != pdPASS) {
+#else
     if (xTaskCreatePinnedToCore(pumpTask, "GaggiMateServer", 4096, this, 1, &_taskHandle, 0) != pdPASS) {
+#endif
         _taskHandle = nullptr;
         ESP_LOGE("GaggiMateServer", "Failed to create pump task; ACK/retransmit will not run");
     }
@@ -26,13 +49,20 @@ void GaggiMateServer::pumpTask(void *arg) {
     auto *self = static_cast<GaggiMateServer *>(arg);
     TickType_t lastWake = xTaskGetTickCount();
     for (;;) {
-        self->_endpoint.loop();
+        self->loop();
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(15));
     }
 }
 
+void GaggiMateServer::loop() {
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+    _transport.loop();
+#endif
+    _endpoint.loop();
+}
+
 void GaggiMateServer::setSystemInfo(const String &hardware, const String &version, bool dimming, bool pressure, bool ledControl,
-                                    bool tof) {
+                                    bool tof, bool scale) {
     memset(&_systemInfo, 0, sizeof(_systemInfo));
     strlcpy(_systemInfo.hardware, hardware.c_str(), sizeof(_systemInfo.hardware));
     strlcpy(_systemInfo.version, version.c_str(), sizeof(_systemInfo.version));
@@ -42,14 +72,20 @@ void GaggiMateServer::setSystemInfo(const String &hardware, const String &versio
     _systemInfo.capabilities.pressure = pressure;
     _systemInfo.capabilities.led_control = ledControl;
     _systemInfo.capabilities.tof = tof;
+    _systemInfo.capabilities.scale = scale;
 
     // Mirror system info onto the legacy read-only characteristic in the old
     // JSON shape (plus "pv"), so pre-framing tools can still read it.
     char json[224];
-    snprintf(json, sizeof(json), "{\"hw\":\"%s\",\"v\":\"%s\",\"pv\":%u,\"cp\":{\"ps\":%s,\"dm\":%s,\"led\":%s,\"tof\":%s}}",
+    snprintf(json, sizeof(json),
+             "{\"hw\":\"%s\",\"v\":\"%s\",\"pv\":%u,\"cp\":{\"ps\":%s,\"dm\":%s,\"led\":%s,\"tof\":%s,\"sc\":%s}}",
              hardware.c_str(), version.c_str(), static_cast<unsigned>(gm_proto::PROTOCOL_VERSION), pressure ? "true" : "false",
-             dimming ? "true" : "false", ledControl ? "true" : "false", tof ? "true" : "false");
+             dimming ? "true" : "false", ledControl ? "true" : "false", tof ? "true" : "false", scale ? "true" : "false");
+#if !defined(GAGGIMATE_UART_COMMS) && !defined(ARDUINO_ARCH_STM32)
     _transport.setInfo(json);
+#else
+    (void)json;
+#endif
 }
 
 void GaggiMateServer::pushSystemInfo() {
@@ -112,6 +148,29 @@ gm::Payload GaggiMateServer::buildError(int code) {
     return p;
 }
 
+gm::Payload GaggiMateServer::buildWeightMeasurement(float weight) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_weight_tag;
+    p.content.weight.weight = weight;
+    return p;
+}
+
+gm::Payload GaggiMateServer::buildScaleOffsets(long offset1, long offset2) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_scale_offsets_tag;
+    p.content.scale_offsets.offset1 = static_cast<int32_t>(offset1);
+    p.content.scale_offsets.offset2 = static_cast<int32_t>(offset2);
+    return p;
+}
+
+gm::Payload GaggiMateServer::buildScaleCalibrationResult(uint8_t channel, float calibration) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_scale_calibration_result_tag;
+    p.content.scale_calibration_result.channel = channel;
+    p.content.scale_calibration_result.calibration = calibration;
+    return p;
+}
+
 // Telemetry (sensor / volumetric / ToF) is sent fire-and-forget: it is
 // high-rate and self-refreshing, so a dropped sample is replaced by the next
 // one. This avoids the constant ACK chatter on the high-rate path. Button /
@@ -131,6 +190,14 @@ void GaggiMateServer::sendVolumetricMeasurement(float volume) { _endpoint.sendUn
 void GaggiMateServer::sendTofMeasurement(uint32_t distance) { _endpoint.sendUnreliable(buildTofMeasurement(distance)); }
 
 void GaggiMateServer::sendError(int code) { _endpoint.send(buildError(code)); }
+
+void GaggiMateServer::sendWeightMeasurement(float weight) { _endpoint.sendUnreliable(buildWeightMeasurement(weight)); }
+
+void GaggiMateServer::sendScaleOffsets(long offset1, long offset2) { _endpoint.send(buildScaleOffsets(offset1, offset2)); }
+
+void GaggiMateServer::sendScaleCalibrationResult(uint8_t channel, float calibration) {
+    _endpoint.send(buildScaleCalibrationResult(channel, calibration));
+}
 
 void GaggiMateServer::registerHandlers() {
     _endpoint.on(gaggimate_Payload_ping_tag, [this](const gm::Payload &) {
@@ -178,5 +245,19 @@ void GaggiMateServer::registerHandlers() {
         for (pb_size_t i = 0; i < p.content.led.channels_count; i++)
             _ledCb(static_cast<uint8_t>(p.content.led.channels[i].channel),
                    static_cast<uint8_t>(p.content.led.channels[i].brightness));
+    });
+    _endpoint.on(gaggimate_Payload_scale_tare_tag, [this](const gm::Payload &) {
+        if (_scaleTareCb)
+            _scaleTareCb();
+    });
+    _endpoint.on(gaggimate_Payload_scale_calibration_tag, [this](const gm::Payload &p) {
+        if (_scaleCalibrationCb)
+            _scaleCalibrationCb(p.content.scale_calibration.calibration1, p.content.scale_calibration.calibration2,
+                                p.content.scale_calibration.offset1, p.content.scale_calibration.offset2);
+    });
+    _endpoint.on(gaggimate_Payload_scale_calibration_start_tag, [this](const gm::Payload &p) {
+        if (_scaleCalibrationStartCb)
+            _scaleCalibrationStartCb(static_cast<uint8_t>(p.content.scale_calibration_start.channel),
+                                     p.content.scale_calibration_start.reference_weight);
     });
 }

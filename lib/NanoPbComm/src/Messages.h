@@ -28,6 +28,9 @@ using PressureScale = gaggimate_PressureScale;
 using Tare = gaggimate_Tare;
 using LedChannel = gaggimate_LedChannel;
 using LedControl = gaggimate_LedControl;
+using ScaleTare = gaggimate_ScaleTare;
+using ScaleCalibration = gaggimate_ScaleCalibration;
+using ScaleCalibrationStart = gaggimate_ScaleCalibrationStart;
 
 using DeviceCapabilities = gaggimate_Capabilities;
 using SystemInfo = gaggimate_SystemInfo;
@@ -38,6 +41,9 @@ using AutotuneResult = gaggimate_AutotuneResult;
 using VolumetricMeasurement = gaggimate_VolumetricMeasurement;
 using TofMeasurement = gaggimate_TofMeasurement;
 using Error = gaggimate_Error;
+using WeightMeasurement = gaggimate_WeightMeasurement;
+using ScaleOffsets = gaggimate_ScaleOffsets;
+using ScaleCalibrationResult = gaggimate_ScaleCalibrationResult;
 
 using PumpMode = gaggimate_PumpMode;
 using BoilerMode = gaggimate_BoilerMode;

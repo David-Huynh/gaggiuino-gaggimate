@@ -1,4 +1,8 @@
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include "LedController.h"
+#include "logging.h"
 
 LedController::LedController(TwoWire *i2c) { this->pca9634 = new PCA9634(0x00, i2c); }
 

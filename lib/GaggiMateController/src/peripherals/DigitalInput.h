@@ -1,6 +1,8 @@
 #ifndef DIGITALINPUT_H
 #define DIGITALINPUT_H
-
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include <Arduino.h>
 
 constexpr int INPUT_CHECK_INTERVAL_MS = 100;

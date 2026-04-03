@@ -3,7 +3,12 @@
 
 #include "Endpoint.h"
 #include "GaggiMateComm.h"
+#ifdef GAGGIMATE_UART_COMMS
+#include "uart/UartTransport.h"
+class NimBLEClient;
+#else
 #include "ble/BleClientTransport.h"
+#endif
 #include <Arduino.h>
 #include <functional>
 
@@ -22,7 +27,7 @@ class GaggiMateClient {
     // Argument is the raw legacy INFO characteristic (JSON), if readable.
     using IncompatibleCallback = std::function<void(const String &info)>;
     using SystemInfoCallback = std::function<void(const char *hardware, const char *version, uint32_t protocolVersion,
-                                                  bool dimming, bool pressure, bool ledControl, bool tof)>;
+                                                  bool dimming, bool pressure, bool ledControl, bool tof, bool scale)>;
     using SensorCallback =
         std::function<void(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance)>;
     using ButtonCallback = std::function<void(uint8_t index, bool pressed)>;
@@ -30,6 +35,9 @@ class GaggiMateClient {
     using VolumetricCallback = std::function<void(float volume)>;
     using TofCallback = std::function<void(uint32_t distance)>;
     using ErrorCallback = std::function<void(int code)>;
+    using WeightCallback = std::function<void(float weight)>;
+    using ScaleOffsetsCallback = std::function<void(long offset1, long offset2)>;
+    using ScaleCalibrationResultCallback = std::function<void(uint8_t channel, float calibration)>;
 
     GaggiMateClient();
 
@@ -37,10 +45,26 @@ class GaggiMateClient {
     void loop();
 
     // Connection lifecycle (driven from the display's main loop).
-    bool isReadyForConnection() const { return _transport.isReadyForConnection(); }
-    bool connectToServer() { return _transport.connectToServer(); }
+    bool isReadyForConnection() const {
+#ifdef GAGGIMATE_UART_COMMS
+        return false;
+#else
+        return _transport.isReadyForConnection();
+#endif
+    }
+    bool connectToServer() {
+#ifdef GAGGIMATE_UART_COMMS
+        return false;
+#else
+        return _transport.connectToServer();
+#endif
+    }
     bool isConnected() const { return _endpoint.isConnected(); }
+#ifdef GAGGIMATE_UART_COMMS
+    void disconnect() {}
+#else
     void disconnect() { _transport.disconnect(); }
+#endif
 
     // BLE round-trip latency (ms) measured by the reliability layer (send -> ACK).
     // EWMA-smoothed; refreshed at least every ~2s by the keep-alive ping plus on
@@ -51,11 +75,21 @@ class GaggiMateClient {
 
     // Tight connection interval (responsive control) while active; relaxed when
     // idle to give the shared radio back to Wi-Fi.
-    void setLowLatency(bool active) { _transport.setLowLatency(active); }
+    void setLowLatency(bool active) {
+#ifndef GAGGIMATE_UART_COMMS
+        _transport.setLowLatency(active);
+#else
+        (void)active;
+#endif
+    }
 
+#ifdef GAGGIMATE_UART_COMMS
+    NimBLEClient *getClient() const { return nullptr; }
+#else
     // Native NimBLE client handle, used by ControllerOTA / status RSSI (OTA uses
     // its own BLE service, independent of this protocol).
     NimBLEClient *getClient() const { return _transport.getNativeClient(); }
+#endif
 
     // Build a payload without sending (compose your own batch, then send()).
     gm::Payload buildPing();
@@ -67,6 +101,9 @@ class GaggiMateClient {
     gm::Payload buildAutotune(uint32_t testTime, uint32_t samples, uint32_t heaterWattage);
     gm::Payload buildPressureScale(float scale);
     gm::Payload buildTare();
+    gm::Payload buildScaleTare();
+    gm::Payload buildScaleCalibration(float calibration1, float calibration2, long offset1, long offset2);
+    gm::Payload buildScaleCalibrationStart(uint8_t channel, float referenceWeight);
     // Pack channel/brightness pairs into one LedControl payload; entries beyond
     // the schema's per-message cap (LedControl.channels max_count) are dropped.
     gm::Payload buildLedControl(const LedChannelCommand *channels, size_t count);
@@ -81,6 +118,9 @@ class GaggiMateClient {
     void sendAutotune(uint32_t testTime, uint32_t samples, uint32_t heaterWattage);
     void sendPressureScale(float scale);
     void tare();
+    void scaleTare();
+    void sendScaleCalibration(float calibration1, float calibration2, long offset1, long offset2);
+    void startScaleCalibration(uint8_t channel, float referenceWeight);
     // Drive several LED channels in one message (avoids per-channel sends that
     // the outbound queue would coalesce down to a single channel).
     void sendLedControl(const LedChannelCommand *channels, size_t count);
@@ -103,9 +143,16 @@ class GaggiMateClient {
     void onVolumetricMeasurement(VolumetricCallback cb) { _volumetricCb = std::move(cb); }
     void onTofMeasurement(TofCallback cb) { _tofCb = std::move(cb); }
     void onError(ErrorCallback cb) { _errorCb = std::move(cb); }
+    void onWeightMeasurement(WeightCallback cb) { _weightCb = std::move(cb); }
+    void onScaleOffsets(ScaleOffsetsCallback cb) { _scaleOffsetsCb = std::move(cb); }
+    void onScaleCalibrationResult(ScaleCalibrationResultCallback cb) { _scaleCalibrationResultCb = std::move(cb); }
 
   private:
+#ifdef GAGGIMATE_UART_COMMS
+    UartTransport _transport;
+#else
     BleClientTransport _transport;
+#endif
     Endpoint _endpoint;
 
     ConnectionCallback _connCb;
@@ -117,6 +164,9 @@ class GaggiMateClient {
     VolumetricCallback _volumetricCb;
     TofCallback _tofCb;
     ErrorCallback _errorCb;
+    WeightCallback _weightCb;
+    ScaleOffsetsCallback _scaleOffsetsCb;
+    ScaleCalibrationResultCallback _scaleCalibrationResultCb;
 
     void registerHandlers();
 };

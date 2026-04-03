@@ -1,8 +1,16 @@
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
+#include <freertos/FreeRTOS.h>
+#endif
 #include "Max31855Thermocouple.h"
+#include "logging.h"
 #include <Arduino.h>
 #include <SPI.h>
-#include <freertos/FreeRTOS.h>
-
+#ifdef ARDUINO_ARCH_STM32
+// On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
+#define xTaskDelayUntil vTaskDelayUntil
+#endif
 Max31855Thermocouple::Max31855Thermocouple(const int csPin, const int misoPin, const int sckPin,
                                            const temperature_callback_t &callback,
                                            const temperature_error_callback_t &error_callback)
@@ -23,7 +31,7 @@ void Max31855Thermocouple::setup() {
     max31855->begin();
     max31855->setSPIspeed(1000000);
 
-    xTaskCreate(monitorTask, "Max31855Thermocouple::monitor", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle);
+    xTaskCreate(monitorTask, "Max31855Thermocouple::monitor", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
 }
 
 void Max31855Thermocouple::loop() {

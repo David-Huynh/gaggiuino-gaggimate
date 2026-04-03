@@ -25,6 +25,9 @@ const NotFound = lazy(() => import('./pages/_404.jsx').then(m => m.NotFound));
 const Settings = lazy(() => import('./pages/Settings/index.jsx').then(m => m.Settings));
 const OTA = lazy(() => import('./pages/OTA/index.jsx').then(m => m.OTA));
 const Scales = lazy(() => import('./pages/Scales/index.jsx').then(m => m.Scales));
+const ScaleCalibration = lazy(() =>
+  import('./pages/ScaleCalibration/index.jsx').then(m => m.ScaleCalibration),
+);
 const ProfileList = lazy(() => import('./pages/ProfileList/index.jsx').then(m => m.ProfileList));
 const ProfileEdit = lazy(() => import('./pages/ProfileEdit/index.jsx').then(m => m.ProfileEdit));
 const Autotune = lazy(() => import('./pages/Autotune/index.jsx').then(m => m.Autotune));
@@ -90,6 +93,7 @@ export function App() {
                       <Route path='/settings' component={Settings} />
                       <Route path='/ota' component={OTA} />
                       <Route path='/scales' component={Scales} />
+                      <Route path='/scale-calibration' component={ScaleCalibration} />
                       <Route path='/pidtune' component={Autotune} />
                       <Route path='/history' component={ShotHistory} />
                       <Route path='/analyzer' component={ShotAnalyzer} />

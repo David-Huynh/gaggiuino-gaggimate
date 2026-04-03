@@ -1,11 +1,15 @@
 #ifndef HEATER_H
 #define HEATER_H
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 #include "Autotune/Autotune.h"
 #include "Max31855Thermocouple.h"
 #include "TemperatureSensor.h"
 #include <SimplePID/SimplePID.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 
 enum class PIDLibrary { Legacy, Nimrod };
 

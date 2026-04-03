@@ -5,7 +5,12 @@
 #include <peripherals/DigitalInput.h>
 #include <peripherals/DistanceSensor.h>
 #include <peripherals/Heater.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <peripherals/LedController2.h>
+#else
 #include <peripherals/LedController.h>
+#endif
+#include <peripherals/HX711Scale.h>
 #include <peripherals/Max31855Thermocouple.h>
 #include <peripherals/PressureSensor.h>
 #include <peripherals/Pump.h>
@@ -47,6 +52,7 @@ class GaggiMateController {
     DigitalInput *brewBtn = nullptr;
     DigitalInput *steamBtn = nullptr;
     PressureSensor *pressureSensor = nullptr;
+    HX711Scale *scale = nullptr;
     LedController *ledController = nullptr;
     DistanceSensor *distanceSensor = nullptr;
 

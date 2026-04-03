@@ -1,10 +1,13 @@
 #ifndef MAX31855THERMOCOUPLE_H
 #define MAX31855THERMOCOUPLE_H
-
-#include "TemperatureSensor.h"
-#include <MAX31855.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#endif
+#include "TemperatureSensor.h"
+#include <MAX31855.h>
 
 constexpr int MAX31855_UPDATE_INTERVAL = 250;
 constexpr int MAX31855_ERROR_WINDOW = 20;
@@ -44,7 +47,7 @@ class Max31855Thermocouple : public TemperatureSensor {
     temperature_error_callback_t error_callback;
 
     const char *LOG_TAG = "Max31855Thermocouple";
-    static void monitorTask(void *arg);
+    [[noreturn]] static void monitorTask(void *arg);
 };
 
 #endif // MAX31855THERMOCOUPLE_H

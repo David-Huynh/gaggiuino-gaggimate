@@ -1,4 +1,5 @@
 #include "SimpleRelay.h"
+#include "logging.h"
 
 SimpleRelay::SimpleRelay(int pin, uint8_t onState) : state(false) {
     this->_pin = pin;

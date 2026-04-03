@@ -114,6 +114,11 @@ Settings::Settings() {
 
     String buttonBehaviorStr = preferences.getString("btnb", "brew,steam,water");
     buttonBehavior = explode(buttonBehaviorStr, ',');
+    scaleSource = preferences.getInt("sc_src", 0);
+    scaleCalibration1 = preferences.getFloat("sc_c1", 1.0f);
+    scaleCalibration2 = preferences.getFloat("sc_c2", 1.0f);
+    scaleOffset1 = preferences.getLong("sc_o1", 0);
+    scaleOffset2 = preferences.getLong("sc_o2", 0);
 
     preferences.end();
 
@@ -469,6 +474,31 @@ void Settings::setButtonBehaviorList(const std::vector<String> &behavior_list) {
     save();
 }
 
+void Settings::setScaleSource(int scale_source) {
+    scaleSource = scale_source;
+    save();
+}
+
+void Settings::setScaleCalibration1(float calibration1) {
+    scaleCalibration1 = calibration1;
+    save();
+}
+
+void Settings::setScaleCalibration2(float calibration2) {
+    scaleCalibration2 = calibration2;
+    save();
+}
+
+void Settings::setScaleOffset1(long offset1) {
+    scaleOffset1 = offset1;
+    save();
+}
+
+void Settings::setScaleOffset2(long offset2) {
+    scaleOffset2 = offset2;
+    save();
+}
+
 void Settings::doSave() {
     if (!dirty) {
         return;
@@ -552,6 +582,11 @@ void Settings::doSave() {
     preferences.putInt("sr_fd", fullTankDistance);
     preferences.putInt("alt_relay", altRelayFunction);
     preferences.putString("btnb", implode(buttonBehavior, ","));
+    preferences.putInt("sc_src", scaleSource);
+    preferences.putFloat("sc_c1", scaleCalibration1);
+    preferences.putFloat("sc_c2", scaleCalibration2);
+    preferences.putLong("sc_o1", scaleOffset1);
+    preferences.putLong("sc_o2", scaleOffset2);
 
     preferences.end();
 }

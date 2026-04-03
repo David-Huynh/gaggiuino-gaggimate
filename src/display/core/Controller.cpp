@@ -165,6 +165,20 @@ static void parseFloatCsv(const String &csv, float *out, size_t count, float def
 }
 
 void Controller::setupBluetooth() {
+#ifdef GAGGIMATE_UART_COMMS
+#ifndef GAGGIMATE_UART_BAUD
+#define GAGGIMATE_UART_BAUD 115200
+#endif
+#ifndef GAGGIMATE_UART_RX_PIN
+#define GAGGIMATE_UART_RX_PIN 44
+#endif
+#ifndef GAGGIMATE_UART_TX_PIN
+#define GAGGIMATE_UART_TX_PIN 43
+#endif
+    Serial2.begin(GAGGIMATE_UART_BAUD, SERIAL_8N1, GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
+    ESP_LOGI(LOG_TAG, "UART controller link initialized at %d baud (RX=%d, TX=%d)", GAGGIMATE_UART_BAUD,
+             GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
+#endif
     comms.init("GPBLC");
     comms.onConnectionChanged([this](bool connected) {
         // Force a full control resend after any (re)connect -- the controller
@@ -182,7 +196,7 @@ void Controller::setupBluetooth() {
     });
     comms.onSystemInfo(
         [this](const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure, bool ledControl,
-               bool tof) { onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof); });
+               bool tof, bool scale) { onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof, scale); });
     comms.onIncompatibleController([this](const String &info) { onIncompatibleController(info); });
     // A controller OTA streams the firmware over this BLE link; the relaxed idle
     // interval makes that crawl. Force a low-latency interval for the duration of
@@ -294,16 +308,34 @@ void Controller::setupBluetooth() {
     });
     comms.onVolumetricMeasurement(
         [this](float value) { onVolumetricMeasurement(value, VolumetricMeasurementSource::FLOW_ESTIMATION); });
+    comms.onWeightMeasurement([this](float weight) { pluginManager->trigger("controller:weight:change", "value", weight); });
+    comms.onScaleOffsets([this](long offset1, long offset2) {
+        settings.setScaleOffset1(offset1);
+        settings.setScaleOffset2(offset2);
+        ESP_LOGI(LOG_TAG, "Scale offsets received and saved: %ld, %ld", offset1, offset2);
+    });
+    comms.onScaleCalibrationResult([this](uint8_t channel, float calibration) {
+        if (channel == 1)
+            settings.setScaleCalibration1(calibration);
+        else if (channel == 2)
+            settings.setScaleCalibration2(calibration);
+        pluginManager->trigger("controller:scale:calibrated", "channel", static_cast<int>(channel));
+        ESP_LOGI(LOG_TAG, "Scale ch%d calibration result: %.6f", channel, calibration);
+    });
     comms.onTofMeasurement([this](uint32_t value) {
         tofDistance = static_cast<int>(value);
         ESP_LOGV(LOG_TAG, "Received new TOF distance: %d", tofDistance);
         pluginManager->trigger("controller:tof:change", "value", tofDistance);
     });
+#ifdef GAGGIMATE_UART_COMMS
+    pluginManager->trigger("controller:uart:init");
+#else
     pluginManager->trigger("controller:bluetooth:init");
+#endif
 }
 
 void Controller::onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
-                              bool ledControl, bool tof) {
+                              bool ledControl, bool tof, bool scale) {
     const bool mismatch = protocolVersion != gm_proto::PROTOCOL_VERSION;
     systemInfo = SystemInfo{.hardware = String(hardware),
                             .version = String(version),
@@ -313,11 +345,12 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
                                     .pressure = pressure,
                                     .ledControl = ledControl,
                                     .tof = tof,
+                                    .scale = scale,
                                 },
                             .protocolVersion = protocolVersion,
                             .protocolMismatch = mismatch};
-    ESP_LOGI(LOG_TAG, "System info: %s %s (proto=%u local=%u dm=%d ps=%d led=%d tof=%d)", hardware, version, protocolVersion,
-             gm_proto::PROTOCOL_VERSION, dimming, pressure, ledControl, tof);
+    ESP_LOGI(LOG_TAG, "System info: %s %s (proto=%u local=%u dm=%d ps=%d led=%d tof=%d scale=%d)", hardware, version,
+             protocolVersion, gm_proto::PROTOCOL_VERSION, dimming, pressure, ledControl, tof, scale);
     if (mismatch) {
         // Mixed-firmware links are not wire-compatible, so don't push config and
         // don't drive control (updateControl() also bails on protocolMismatch).
@@ -334,6 +367,10 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
         parseFloatCsv(settings.getPid(), pid, 4, 0.0f);
         comms.sendPidSettings(pid[0], pid[1], pid[2], pid[3]);
         setPumpModelCoeffs();
+        if (scale) {
+            comms.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(), settings.getScaleOffset1(),
+                                       settings.getScaleOffset2());
+        }
     }
 
     if (!loaded) {
@@ -358,7 +395,7 @@ void Controller::onIncompatibleController(const String &infoJson) {
     DeserializationError err = deserializeJson(doc, infoJson);
     if (err) {
         ESP_LOGW(LOG_TAG, "Incompatible controller, no readable info (%s)", err.c_str());
-        onSystemInfo("Legacy controller", "0.0.0", 0, false, false, false, false);
+        onSystemInfo("Legacy controller", "0.0.0", 0, false, false, false, false, false);
         return;
     }
     String hardware = doc["hw"].as<String>();
@@ -368,7 +405,7 @@ void Controller::onIncompatibleController(const String &infoJson) {
     if (version.isEmpty())
         version = "0.0.0";
     onSystemInfo(hardware.c_str(), version.c_str(), 0, doc["cp"]["dm"].as<bool>(), doc["cp"]["ps"].as<bool>(),
-                 doc["cp"]["led"].as<bool>(), doc["cp"]["tof"].as<bool>());
+                 doc["cp"]["led"].as<bool>(), doc["cp"]["tof"].as<bool>(), doc["cp"]["sc"].as<bool>());
 }
 
 void Controller::setupWifi() {
@@ -545,6 +582,18 @@ bool Controller::isAutotuning() const { return autotuning; }
 bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !isAutotuning(); }
 
 bool Controller::isVolumetricAvailable() const {
+    int src = settings.getScaleSource();
+    if (src == 2)
+        return hardwareScalePresent;
+    if (src == 1) {
+#ifdef NIGHTLY_BUILD
+        return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
+#else
+        return isBluetoothScaleHealthy();
+#endif
+    }
+    if (hardwareScalePresent)
+        return true;
 #ifdef NIGHTLY_BUILD
     return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
 #else
@@ -591,7 +640,9 @@ void Controller::applyConnectionPriority(bool force) {
         // the chronic coex failure mode is WiFi getting starved and the whole
         // IP stack wedging. Default coex preference is BALANCE; nobody set this
         // before. Best-effort: ignore the return (no-op if coex inactive). [GM-90]
+#ifndef GAGGIMATE_UART_COMMS
         esp_coex_preference_set(lowLatency ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_WIFI);
+#endif
     }
 }
 
@@ -823,12 +874,26 @@ void Controller::activate() {
     clear();
     comms.tare();
     if (isVolumetricAvailable()) {
+        int src = settings.getScaleSource();
+        if (src == 2 && hardwareScalePresent) {
+            currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+        } else if (src == 1) {
 #ifdef NIGHTLY_BUILD
-        currentVolumetricSource =
-            isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
+            currentVolumetricSource =
+                isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
 #else
-        currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+            currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
 #endif
+        } else if (hardwareScalePresent) {
+            currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+        } else {
+#ifdef NIGHTLY_BUILD
+            currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
+                                                                : VolumetricMeasurementSource::FLOW_ESTIMATION;
+#else
+            currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+#endif
+        }
         if (mode == MODE_BREW) {
             pluginManager->trigger("controller:brew:prestart");
         }
@@ -957,10 +1022,13 @@ void Controller::onProfileSaveAsNew() {
 }
 
 void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source) {
-    pluginManager->trigger(source == VolumetricMeasurementSource::FLOW_ESTIMATION
-                               ? F("controller:volumetric-measurement:estimation:change")
-                               : F("controller:volumetric-measurement:bluetooth:change"),
-                           "value", static_cast<float>(measurement));
+    const __FlashStringHelper *eventName = F("controller:volumetric-measurement:bluetooth:change");
+    if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
+        eventName = F("controller:volumetric-measurement:estimation:change");
+    } else if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        eventName = F("controller:volumetric-measurement:hardware:change");
+    }
+    pluginManager->trigger(eventName, "value", static_cast<float>(measurement));
     if (source == VolumetricMeasurementSource::BLUETOOTH) {
         lastBluetoothMeasurement = millis();
     }
@@ -983,6 +1051,12 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
     if (last != nullptr && !last->isComplete()) {
         last->updateVolume(measurement);
     }
+}
+
+void Controller::scaleTare() { comms.scaleTare(); }
+
+void Controller::sendScaleCalibration(float c1, float c2) {
+    comms.sendScaleCalibration(c1, c2, settings.getScaleOffset1(), settings.getScaleOffset2());
 }
 
 bool Controller::isBluetoothScaleHealthy() const {

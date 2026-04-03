@@ -1,6 +1,14 @@
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include "PressureSensor.h"
 #include "Wire.h"
-
+#include "logging.h"
+#include "wire_compatibility.h"
+#ifdef ARDUINO_ARCH_STM32
+// On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
+#define xTaskDelayUntil vTaskDelayUntil
+#endif
 PressureSensor::PressureSensor(uint8_t sda_pin, uint8_t scl_pin, const pressure_callback_t &callback, float pressure_scale,
                                float voltage_floor, float voltage_ceil)
     : _sda_pin(sda_pin), _scl_pin(scl_pin), _pressure_scale(pressure_scale), _callback(callback), taskHandle(nullptr) {
@@ -10,7 +18,10 @@ PressureSensor::PressureSensor(uint8_t sda_pin, uint8_t scl_pin, const pressure_
 }
 
 void PressureSensor::setup() {
-    Wire1.begin(_sda_pin, _scl_pin);
+    // Initialize I2C with platform-aware handling
+    if (!initI2CBus(Wire1, _sda_pin, _scl_pin, 400000)) {
+        ESP_LOGE(LOG_TAG, "Failed to initialize I2C bus for pressure sensor");
+    }
     ESP_LOGV(LOG_TAG, "Initializing pressure sensor on SDA: %d, SCL: %d", _sda_pin, _scl_pin);
     delay(100);
     ads = new ADS1115(0x48, &Wire1);
@@ -21,7 +32,7 @@ void PressureSensor::setup() {
     ads->setDataRate(4);
     ads->setMode(0);
     ads->readADC(0);
-    xTaskCreate(loopTask, "PressureSensor::loop", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle);
+    xTaskCreate(loopTask, "PressureSensor::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
 }
 
 void PressureSensor::loop() {

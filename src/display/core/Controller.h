@@ -16,7 +16,7 @@
 const IPAddress WIFI_AP_IP(4, 4, 4, 1); // the IP address the web server, Samsung requires the IP to be in public space
 const IPAddress WIFI_SUBNET_MASK(255, 255, 255, 0); // no need to change: https://avinetworks.com/glossary/subnet-mask/
 
-enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH };
+enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH, HARDWARE_SCALE };
 
 class Controller {
   public:
@@ -90,6 +90,10 @@ class Controller {
     void onProfileSaveAsNew();
     void onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source);
     void setVolumetricOverride(bool override) { volumetricOverride = override; }
+    void setHardwareScalePresent(bool present) { hardwareScalePresent = present; }
+    bool isHardwareScalePresent() const { return hardwareScalePresent; }
+    void scaleTare();
+    void sendScaleCalibration(float c1, float c2);
     bool isBluetoothScaleHealthy() const;
     void onFlush();
     int getWaterLevel() const {
@@ -114,7 +118,7 @@ class Controller {
 #endif
     void setupBluetooth();
     void onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
-                      bool ledControl, bool tof);
+                      bool ledControl, bool tof, bool scale);
     // Connected to a controller too old to speak the framed protocol: drive the
     // same path as a protocol-version mismatch (OTA recovery only). infoJson is
     // the legacy INFO characteristic contents (hardware/version/capabilities).
@@ -192,6 +196,7 @@ class Controller {
     bool waitingForController = false;
     unsigned long connectStartTime = 0;
     bool volumetricOverride = false;
+    bool hardwareScalePresent = false;
     bool processCompleted = false;
     bool steamReady = false;
     bool sdcard = false;

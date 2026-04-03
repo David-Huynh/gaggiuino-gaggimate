@@ -3,7 +3,11 @@
 
 #include "Endpoint.h"
 #include "GaggiMateComm.h"
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+#include "uart/UartTransport.h"
+#else
 #include "ble/BleServerTransport.h"
+#endif
 #include <Arduino.h>
 #include <functional>
 
@@ -26,14 +30,19 @@ class GaggiMateServer {
     using PressureScaleCallback = std::function<void(float scale)>;
     using TareCallback = std::function<void()>;
     using LedCallback = std::function<void(uint8_t channel, uint8_t brightness)>;
+    using ScaleTareCallback = std::function<void()>;
+    using ScaleCalibrationCallback = std::function<void(float calibration1, float calibration2, long offset1, long offset2)>;
+    using ScaleCalibrationStartCallback = std::function<void(uint8_t channel, float referenceWeight)>;
 
     GaggiMateServer();
 
     void init(const String &deviceName, const String &hardware, const String &version, bool dimming, bool pressure,
-              bool ledControl, bool tof);
+              bool ledControl, bool tof, bool scale);
+    void loop();
     bool isConnected() const { return _endpoint.isConnected(); }
 
-    void setSystemInfo(const String &hardware, const String &version, bool dimming, bool pressure, bool ledControl, bool tof);
+    void setSystemInfo(const String &hardware, const String &version, bool dimming, bool pressure, bool ledControl, bool tof,
+                       bool scale);
 
     // Build a payload without sending (compose your own batch, then send()).
     // sendSensorData reports boiler 0; the wire format supports several boilers.
@@ -43,6 +52,9 @@ class GaggiMateServer {
     gm::Payload buildVolumetricMeasurement(float volume);
     gm::Payload buildTofMeasurement(uint32_t distance);
     gm::Payload buildError(int code);
+    gm::Payload buildWeightMeasurement(float weight);
+    gm::Payload buildScaleOffsets(long offset1, long offset2);
+    gm::Payload buildScaleCalibrationResult(uint8_t channel, float calibration);
 
     // Responses (controller -> display)
     void sendSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance);
@@ -51,6 +63,9 @@ class GaggiMateServer {
     void sendVolumetricMeasurement(float volume);
     void sendTofMeasurement(uint32_t distance);
     void sendError(int code);
+    void sendWeightMeasurement(float weight);
+    void sendScaleOffsets(long offset1, long offset2);
+    void sendScaleCalibrationResult(uint8_t channel, float calibration);
 
     // Send a pre-built payload / batch of payloads (one frame).
     void send(const gm::Payload &payload) { _endpoint.send(payload); }
@@ -71,9 +86,16 @@ class GaggiMateServer {
     void onPressureScale(PressureScaleCallback cb) { _pressureScaleCb = std::move(cb); }
     void onTare(TareCallback cb) { _tareCb = std::move(cb); }
     void onLedControl(LedCallback cb) { _ledCb = std::move(cb); }
+    void onScaleTare(ScaleTareCallback cb) { _scaleTareCb = std::move(cb); }
+    void onScaleCalibration(ScaleCalibrationCallback cb) { _scaleCalibrationCb = std::move(cb); }
+    void onScaleCalibrationStart(ScaleCalibrationStartCallback cb) { _scaleCalibrationStartCb = std::move(cb); }
 
   private:
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+    UartTransport _transport;
+#else
     BleServerTransport _transport;
+#endif
     Endpoint _endpoint;
     gm::SystemInfo _systemInfo = gaggimate_SystemInfo_init_zero;
 
@@ -87,6 +109,9 @@ class GaggiMateServer {
     PressureScaleCallback _pressureScaleCb;
     TareCallback _tareCb;
     LedCallback _ledCb;
+    ScaleTareCallback _scaleTareCb;
+    ScaleCalibrationCallback _scaleCalibrationCb;
+    ScaleCalibrationStartCallback _scaleCalibrationStartCb;
 
     void registerHandlers();
     void pushSystemInfo();

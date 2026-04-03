@@ -1,5 +1,13 @@
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include "DimmedPump.h"
-
+#include "logging.h"
+#include <algorithm>
+#ifdef ARDUINO_ARCH_STM32
+// On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
+#define xTaskDelayUntil vTaskDelayUntil
+#endif
 #include <GaggiMateController.h>
 
 DimmedPump::DimmedPump(uint8_t ssr_pin, uint8_t sense_pin, PressureSensor *pressure_sensor)
@@ -13,7 +21,7 @@ void DimmedPump::setup() {
     if (_cps > 70) {
         _cps = _cps / 2;
     }
-    xTaskCreate(loopTask, "DimmedPump::loop", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle);
+    xTaskCreate(loopTask, "DimmedPump::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
 }
 
 void DimmedPump::loop() {

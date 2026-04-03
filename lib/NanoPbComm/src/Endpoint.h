@@ -6,9 +6,15 @@
 #include "Protocol.h"
 #include "Transport.h"
 #include <array>
+#if defined(ARDUINO_ARCH_STM32)
+#include <STM32FreeRTOS.h>
+#include <queue.h>
+#include <semphr.h>
+#else
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
+#endif
 #include <functional>
 
 /**

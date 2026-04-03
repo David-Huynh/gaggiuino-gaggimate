@@ -59,7 +59,9 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
     pluginManager->on("controller:ready", [this](Event const &) {
         ota->setControllerVersion(controller->getSystemInfo().version);
+#ifndef GAGGIMATE_UART_COMMS
         ota->init(controller->getClientController()->getClient());
+#endif
     });
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
@@ -77,6 +79,8 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     // Subscribe to Bluetooth scale weight updates
     pluginManager->on("controller:volumetric-measurement:bluetooth:change",
                       [this](Event const &event) { this->currentBluetoothWeight = event.getFloat("value"); });
+    pluginManager->on("controller:volumetric-measurement:hardware:change",
+                      [this](Event const &event) { this->currentHardwareWeight = event.getFloat("value"); });
 
     setupServer();
 }
@@ -130,9 +134,11 @@ void WebUIPlugin::loop() {
         statusDoc["rssi"] = 0;
         statusDoc["lat"] = -1; // BLE round-trip latency (ms); -1 = not yet measured
 
-        if (controller->getClientController()->getClient()->isConnected()) {
+#ifndef GAGGIMATE_UART_COMMS
+        if (controller->getClientController()->getClient() != nullptr && controller->getClientController()->getClient()->isConnected()) {
             statusDoc["rssi"] = controller->getClientController()->getClient()->getRssi();
         }
+#endif
         if (controller->getClientController()->hasLatency()) {
             statusDoc["lat"] = controller->getClientController()->getLatencyMs();
         }
@@ -140,7 +146,11 @@ void WebUIPlugin::loop() {
         bool bleConnected = BLEScales.isConnected();
         // Add Bluetooth scale weight information
         statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // current bluetooth weight
-        statusDoc["cw"] = bleConnected ? this->currentBluetoothWeight : 0; // Use 'currentWeight' for forward compatbility
+        statusDoc["hw"] = controller->isHardwareScalePresent() ? this->currentHardwareWeight : 0;
+        statusDoc["hwc"] = controller->isHardwareScalePresent();
+        statusDoc["cw"] = controller->isHardwareScalePresent() ? this->currentHardwareWeight
+                           : bleConnected                       ? this->currentBluetoothWeight
+                                                                : 0; // Use 'currentWeight' for forward compatbility
         statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
         // Scale battery — only surfaced when the driver reports one and the
         // value isn't the UNKNOWN sentinel (255). UI omits the battery pill
@@ -408,6 +418,14 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     client->text(buffer);
                 } else if (msgType == "req:flush:start") {
                     handleFlushStart(client->id(), doc);
+                } else if (msgType == "req:scale:tare") {
+                    controller->scaleTare();
+                } else if (msgType == "req:scale:cal:start") {
+                    uint8_t channel = doc["channel"] | 0;
+                    float refWeight = doc["refWeight"] | 0.0f;
+                    if ((channel == 1 || channel == 2) && refWeight > 0.0f) {
+                        controller->getClientController()->startScaleCalibration(channel, refWeight);
+                    }
                 }
             }
         }
@@ -618,6 +636,16 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setAltRelayFunction(request->arg("altRelayFunction").toInt());
             if (request->hasArg("buttonBehavior"))
                 settings->setButtonBehaviorList(explode(request->arg("buttonBehavior"), ','));
+            if (request->hasArg("scaleSource"))
+                settings->setScaleSource(request->arg("scaleSource").toInt());
+            if (request->hasArg("scaleCalibration1"))
+                settings->setScaleCalibration1(request->arg("scaleCalibration1").toFloat());
+            if (request->hasArg("scaleCalibration2"))
+                settings->setScaleCalibration2(request->arg("scaleCalibration2").toFloat());
+            if (request->hasArg("scaleOffset1"))
+                settings->setScaleOffset1(request->arg("scaleOffset1").toInt());
+            if (request->hasArg("scaleOffset2"))
+                settings->setScaleOffset2(request->arg("scaleOffset2").toInt());
             settings->setAutoWakeupEnabled(request->hasArg("autowakeupEnabled"));
             if (request->hasArg("autowakeupSchedules")) {
                 // Handle schedule format with days
@@ -716,6 +744,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["emptyTankDistance"] = settings.getEmptyTankDistance();
     doc["fullTankDistance"] = settings.getFullTankDistance();
     doc["altRelayFunction"] = settings.getAltRelayFunction();
+    doc["scaleSource"] = settings.getScaleSource();
+    doc["scaleCalibration1"] = settings.getScaleCalibration1();
+    doc["scaleCalibration2"] = settings.getScaleCalibration2();
+    doc["scaleOffset1"] = settings.getScaleOffset1();
+    doc["scaleOffset2"] = settings.getScaleOffset2();
     // Add auto-wakeup settings to response
     doc["autowakeupEnabled"] = settings.isAutoWakeupEnabled();
     doc["buttonBehavior"] = implode(settings.getButtonBehaviorList(), ",");

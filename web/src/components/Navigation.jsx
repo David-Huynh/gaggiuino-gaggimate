@@ -9,6 +9,7 @@ import { faCog } from '@fortawesome/free-solid-svg-icons/faCog';
 import { faRotate } from '@fortawesome/free-solid-svg-icons/faRotate';
 import { faMagnifyingGlassChart } from '@fortawesome/free-solid-svg-icons/faMagnifyingGlassChart';
 import { faChartSimple } from '@fortawesome/free-solid-svg-icons/faChartSimple';
+import { faWeightScale } from '@fortawesome/free-solid-svg-icons/faWeightScale';
 import { faCircleChevronLeft } from '@fortawesome/free-solid-svg-icons/faCircleChevronLeft';
 import { faCircleChevronRight } from '@fortawesome/free-solid-svg-icons/faCircleChevronRight';
 import { GmLogoIcon } from '../pages/ShotAnalyzer/components/SourceMarker.jsx';
@@ -62,6 +63,7 @@ const NAVIGATION_SECTIONS = [
     items: [
       { label: 'PID Autotune', link: '/pidtune', icon: faTemperatureHalf },
       { label: 'Bluetooth Devices', link: '/scales', icon: faBluetoothB },
+      { label: 'Scale Calibration', link: '/scale-calibration', icon: faWeightScale },
       { label: 'Settings', link: '/settings', icon: faCog },
     ],
   },

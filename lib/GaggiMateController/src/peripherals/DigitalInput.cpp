@@ -1,3 +1,6 @@
+#ifdef ARDUINO_ARCH_STM32
+  #include <STM32FreeRTOS.h>
+#endif
 #include "DigitalInput.h"
 
 DigitalInput::DigitalInput(uint8_t pin, const input_callback_t &callback, const int debounce_count)
@@ -5,7 +8,7 @@ DigitalInput::DigitalInput(uint8_t pin, const input_callback_t &callback, const 
 
 void DigitalInput::setup() {
     pinMode(_pin, INPUT_PULLUP);
-    xTaskCreate(loopTask, "DigitalInput::loop", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle);
+    xTaskCreate(loopTask, "DigitalInput::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
 }
 
 void DigitalInput::loop() {

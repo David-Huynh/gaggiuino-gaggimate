@@ -126,6 +126,11 @@ class Settings {
         return "";
     };
     std::vector<String> getButtonBehaviorList() const { return buttonBehavior; }
+    int getScaleSource() const { return scaleSource; }
+    float getScaleCalibration1() const { return scaleCalibration1; }
+    float getScaleCalibration2() const { return scaleCalibration2; }
+    long getScaleOffset1() const { return scaleOffset1; }
+    long getScaleOffset2() const { return scaleOffset2; }
     void setTargetSteamTemp(int target_steam_temp);
     void setTargetWaterTemp(int target_water_temp);
     void setTemperatureOffset(int temperature_offset);
@@ -195,6 +200,11 @@ class Settings {
     void setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules);
     void setButtonBehavior(int index, String behavior);
     void setButtonBehaviorList(const std::vector<String> &behavior_list);
+    void setScaleSource(int scale_source);
+    void setScaleCalibration1(float calibration1);
+    void setScaleCalibration2(float calibration2);
+    void setScaleOffset1(long offset1);
+    void setScaleOffset2(long offset2);
 
   private:
     Preferences preferences;
@@ -267,6 +277,11 @@ class Settings {
     int fullTankDistance = 50;
     int altRelayFunction = ALT_RELAY_GRIND; // Default to grind
     std::vector<String> buttonBehavior;
+    int scaleSource = 0; // 0 auto, 1 BLE, 2 hardware
+    float scaleCalibration1 = 1.0f;
+    float scaleCalibration2 = 1.0f;
+    long scaleOffset1 = 0;
+    long scaleOffset2 = 0;
 
     void doSave();
     xTaskHandle taskHandle;

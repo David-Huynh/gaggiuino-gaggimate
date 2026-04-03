@@ -5,12 +5,13 @@
 
 // Controller capabilities + identity as the display tracks them. Populated from
 // the SystemInfo message the controller pushes on connect. (Previously lived in
-// the NimBLEComm library.)
+// the NanoPbComm SystemInfo payload.)
 struct SystemCapabilities {
     bool dimming;
     bool pressure;
     bool ledControl;
     bool tof;
+    bool scale;
 };
 
 struct SystemInfo {

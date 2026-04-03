@@ -1,12 +1,26 @@
 #include "GaggiMateController.h"
-#include "utilities.h"
-#include <Arduino.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#endif
+#include "logging.h"
+#include "utilities.h"
+#include <Arduino.h>
 #include <peripherals/DimmedPump.h>
 #include <peripherals/SimplePump.h>
 
 #include <utility>
+
+#ifdef ARDUINO_ARCH_STM32
+extern "C" void ControllerLoopTask(void *pvParameters) {
+    auto *controller = static_cast<GaggiMateController *>(pvParameters);
+    for (;;) {
+        controller->loop();
+    }
+}
+#endif
 
 GaggiMateController::GaggiMateController(String version) : _version(std::move(version)) {
     configs.push_back(GM_STANDARD_REV_1X);
@@ -15,6 +29,7 @@ GaggiMateController::GaggiMateController(String version) : _version(std::move(ve
     configs.push_back(GM_PRO_REV_1x);
     configs.push_back(GM_PRO_LEGO);
     configs.push_back(GM_PRO_REV_11);
+    configs.push_back(GM_STM32F4_V1);
 }
 
 void GaggiMateController::setup() {
@@ -34,6 +49,10 @@ void GaggiMateController::setup() {
     if (_config.capabilites.pressure) {
         pressureSensor = new PressureSensor(_config.pressureSda, _config.pressureScl, [this](float pressure) { /* noop */ });
     }
+    if (_config.capabilites.scale) {
+        scale = new HX711Scale(_config.scaleSdaPin, _config.scaleSda1Pin, _config.scaleSclPin,
+                               [this](float weight) { _comms.sendWeightMeasurement(weight); });
+    }
     if (_config.capabilites.dimming) {
         pump = new DimmedPump(_config.pumpPin, _config.pumpSensePin, pressureSensor);
     } else {
@@ -43,9 +62,14 @@ void GaggiMateController::setup() {
     this->steamBtn = new DigitalInput(_config.steamButtonPin, [this](const bool state) { _comms.sendButtonState(1, state); });
 
     // 4-Pin peripheral port
+#ifdef ARDUINO_ARCH_STM32
+    Wire.begin(_config.sunriseSdaPin, _config.sunriseSclPin);
+    Wire.setClock(400000);
+#else
     if (!Wire.begin(_config.sunriseSdaPin, _config.sunriseSclPin, 400000)) {
         ESP_LOGE(LOG_TAG, "Failed to initialize I2C bus");
     }
+#endif
     this->ledController = new LedController(&Wire);
     this->distanceSensor = new DistanceSensor(&Wire, [this](int distance) { _comms.sendTofMeasurement(distance); });
     if (this->ledController->isAvailable()) {
@@ -55,7 +79,7 @@ void GaggiMateController::setup() {
     }
 
     _comms.init("GPBLS", _config.name.c_str(), _version, _config.capabilites.dimming, _config.capabilites.pressure,
-                _config.capabilites.ledControls, _config.capabilites.tof);
+                _config.capabilites.ledControls, _config.capabilites.tof, _config.capabilites.scale);
 
     if (_config.capabilites.ledControls) {
         this->ledController->setup();
@@ -74,6 +98,23 @@ void GaggiMateController::setup() {
     if (_config.capabilites.pressure) {
         pressureSensor->setup();
         _comms.onPressureScale([this](float scale) { this->pressureSensor->setScale(scale); });
+    }
+    if (_config.capabilites.scale && scale != nullptr) {
+        scale->setup();
+        scale->setTareResultCallback([this](long o1, long o2) { _comms.sendScaleOffsets(o1, o2); });
+        _comms.onScaleTare([this]() { scale->tare(); });
+        _comms.onScaleCalibration([this](float c1, float c2, long offset1, long offset2) {
+            scale->setCalibration(c1, c2);
+            if (offset1 != 0 || offset2 != 0) {
+                scale->setOffset(offset1, offset2);
+            }
+        });
+        _comms.onScaleCalibrationStart([this](uint8_t channel, float refWeight) {
+            float newFactor = scale->calibrateChannel(channel, refWeight);
+            if (newFactor != 0.0f) {
+                _comms.sendScaleCalibrationResult(channel, newFactor);
+            }
+        });
     }
     // Set up thermal feedforward for main heater if pressure/dimming capability exists
     if (heater && _config.capabilites.dimming && _config.capabilites.pressure) {
@@ -183,6 +224,10 @@ void GaggiMateController::setup() {
         dimmedPump->tare();
     });
     ESP_LOGI(LOG_TAG, "Initialization done");
+#ifdef ARDUINO_ARCH_STM32
+    xTaskCreate(ControllerLoopTask, "MainLoop", configMINIMAL_STACK_SIZE * 8, this, configMAX_PRIORITIES - 1, nullptr);
+    vTaskStartScheduler();
+#endif
 }
 
 void GaggiMateController::loop() {
@@ -206,6 +251,11 @@ void GaggiMateController::loop() {
 void GaggiMateController::registerBoardConfig(ControllerConfig config) { configs.push_back(config); }
 
 void GaggiMateController::detectBoard() {
+#ifdef ARDUINO_ARCH_STM32
+    _config = GM_STM32F4_V1;
+    ESP_LOGI(LOG_TAG, "Using Board: %s", _config.name.c_str());
+    return;
+#else
     constexpr int MAX_DETECT_RETRIES = 3;
     pinMode(DETECT_EN_PIN, OUTPUT);
     pinMode(DETECT_VALUE_PIN, INPUT_PULLDOWN);
@@ -230,6 +280,7 @@ void GaggiMateController::detectBoard() {
     ESP_LOGE(LOG_TAG, "No compatible board detected after %d attempts. Restarting...", MAX_DETECT_RETRIES);
     delay(5000);
     ESP.restart();
+#endif
 }
 
 void GaggiMateController::detectAddon() {
@@ -322,6 +373,7 @@ void GaggiMateController::handleSerialCommand(char c) {
         ESP_LOGI("Controller", "║  └─ Temperature: %.2f", heater->getSetpoint());
         ESP_LOGI("Controller", "║");
 
+#ifndef ARDUINO_ARCH_STM32
         size_t free = heap_caps_get_free_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
         size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
         size_t total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL);
@@ -329,6 +381,7 @@ void GaggiMateController::handleSerialCommand(char c) {
         ESP_LOGI("Controller", "╠═ Memory");
         ESP_LOGI("Controller", "║  ├─ Heap: %d / %d (%.2f%%)", (total - free), total, (100.0f * (total - free)) / total);
         ESP_LOGI("Controller", "║  └─ Fragmentation: %.2f%%", fragmentation);
+#endif
         ESP_LOGI("Controller", "");
     } else {
         ESP_LOGI("Controller", "Unrecognized Input! Available commands: S (Status)");

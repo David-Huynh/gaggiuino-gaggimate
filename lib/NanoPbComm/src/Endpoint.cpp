@@ -1,6 +1,17 @@
 #include "Endpoint.h"
 #include <cstring>
+#if defined(ARDUINO_ARCH_STM32)
+#define ESP_LOGE(tag, fmt, ...)                                                                                                  \
+    do {                                                                                                                         \
+        Serial.printf("[E][%s] " fmt "\n", tag, ##__VA_ARGS__);                                                                 \
+    } while (0)
+#define ESP_LOGW(tag, fmt, ...)                                                                                                  \
+    do {                                                                                                                         \
+        Serial.printf("[W][%s] " fmt "\n", tag, ##__VA_ARGS__);                                                                 \
+    } while (0)
+#else
 #include <esp_log.h>
+#endif
 #include <pb_decode.h>
 #include <pb_encode.h>
 

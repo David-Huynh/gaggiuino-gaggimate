@@ -1,7 +1,6 @@
 #include "main.h"
 #include "ControllerConfig.h"
 #include "GaggiMateController.h"
-
 GaggiMateController controller(BUILD_GIT_VERSION);
 
 void setup() {

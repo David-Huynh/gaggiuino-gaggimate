@@ -8,10 +8,9 @@
     "url": "https://github.com/gaggimate/gaggimate"
   },
   "frameworks": "arduino",
-  "platforms": ["espressif32"],
+  "platforms": ["espressif32", "ststm32"],
   "dependencies": {
-    "nanopb/Nanopb": "^0.4.9",
-    "h2zero/NimBLE-Arduino": "^1.4.0"
+    "nanopb/Nanopb": "^0.4.9"
   },
   "build": {
     "flags": ["-I src"]

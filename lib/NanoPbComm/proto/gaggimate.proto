@@ -44,6 +44,9 @@ message Payload {
         PressureScale pressure_scale = 9;
         Tare tare = 10;
         LedControl led = 11;
+        ScaleTare scale_tare = 12;
+        ScaleCalibration scale_calibration = 13;
+        ScaleCalibrationStart scale_calibration_start = 14;
 
         // Responses: controller -> display
         SystemInfo system_info = 20;
@@ -53,6 +56,9 @@ message Payload {
         VolumetricMeasurement volumetric = 24;
         TofMeasurement tof = 25;
         Error error = 26;
+        WeightMeasurement weight = 27;
+        ScaleOffsets scale_offsets = 28;
+        ScaleCalibrationResult scale_calibration_result = 29;
     }
 }
 
@@ -141,6 +147,20 @@ message LedControl {
     repeated LedChannel channels = 1;
 }
 
+message ScaleTare {}
+
+message ScaleCalibration {
+    float calibration1 = 1;
+    float calibration2 = 2;
+    int32 offset1 = 3;
+    int32 offset2 = 4;
+}
+
+message ScaleCalibrationStart {
+    uint32 channel = 1;
+    float reference_weight = 2;
+}
+
 // ---------------------------------------------------------------------------
 // Responses (controller -> display)
 // ---------------------------------------------------------------------------
@@ -150,6 +170,7 @@ message Capabilities {
     bool pressure = 2;
     bool led_control = 3;
     bool tof = 4;
+    bool scale = 5;
 }
 
 message SystemInfo {
@@ -206,4 +227,18 @@ enum ErrorCode {
 
 message Error {
     ErrorCode code = 1;
+}
+
+message WeightMeasurement {
+    float weight = 1;
+}
+
+message ScaleOffsets {
+    int32 offset1 = 1;
+    int32 offset2 = 2;
+}
+
+message ScaleCalibrationResult {
+    uint32 channel = 1;
+    float calibration = 2;
 }
