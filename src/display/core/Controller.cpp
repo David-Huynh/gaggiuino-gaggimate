@@ -583,7 +583,11 @@ bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !i
 
 bool Controller::isVolumetricAvailable() const {
     int src = settings.getScaleSource();
-    if (src == 2)
+    if (src == 4)
+        return false; // OFF
+    if (src == 3)
+        return true; // Predictive (flow estimation always available)
+    if (src == 2)    // HW only
         return hardwareScalePresent;
     if (src == 1) {
 #ifdef NIGHTLY_BUILD
@@ -875,7 +879,9 @@ void Controller::activate() {
     comms.tare();
     if (isVolumetricAvailable()) {
         int src = settings.getScaleSource();
-        if (src == 2 && hardwareScalePresent) {
+        if (src == 3) { // Predictive
+            currentVolumetricSource = VolumetricMeasurementSource::FLOW_ESTIMATION;
+        } else if (src == 2 && hardwareScalePresent) {
             currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
         } else if (src == 1) {
 #ifdef NIGHTLY_BUILD

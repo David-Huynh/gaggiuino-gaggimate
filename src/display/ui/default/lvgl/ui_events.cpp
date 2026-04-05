@@ -91,7 +91,16 @@ void onGrindScreen(lv_event_t *e) {
     controller.setMode(MODE_GRIND);
 }
 
-void onVolumetricClick(lv_event_t *e) {}
+void onVolumetricClick(lv_event_t *e) {
+    if (volumetricHoldTriggered) {
+        volumetricHoldTriggered = false;
+        return;
+    }
+    // Cycle: 1 (BLE) → 2 (HW) → 3 (Predictive) → 4 (OFF) → 1
+    int src = controller.getSettings().getScaleSource();
+    int next = (src >= 1 && src <= 3) ? src + 1 : 1;
+    controller.getSettings().setScaleSource(next);
+}
 
 void onPreviousProfile(lv_event_t *e) { controller.getUI()->onPreviousProfile(); }
 
