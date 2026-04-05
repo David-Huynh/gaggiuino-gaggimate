@@ -99,6 +99,7 @@ class DefaultUI {
     int volumetricAvailable = false;
     int bluetoothScales = false;
     int hardwareScalePresent = false;
+    int scaleSource = 0;
     int volumetricMode = false;
     int brewVolumetric = false;
     int profileVolumetric = false;

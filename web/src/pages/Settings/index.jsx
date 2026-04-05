@@ -446,22 +446,27 @@ export function Settings() {
           {/* Scale Settings */}
           <Card sm={10} lg={5} title='Scale Settings'>
             <div className='form-control mb-4'>
-              <label htmlFor='scaleSource' className='mb-2 block text-sm font-medium'>
-                Scale Source
-              </label>
-              <select
-                id='scaleSource'
-                name='scaleSource'
-                className='select select-bordered w-full'
-                value={formData.scaleSource ?? 0}
-                onChange={onChange('scaleSource')}
-              >
-                <option value={0}>Auto (Hardware preferred)</option>
-                <option value={1}>Bluetooth only</option>
-                <option value={2}>Hardware only</option>
-              </select>
+              <label className='mb-2 block text-sm font-medium'>Scale Source</label>
+              <input type='hidden' name='scaleSource' value={formData.scaleSource ?? 1} />
+              <div className='join w-full'>
+                {[
+                  { value: 1, label: 'Bluetooth' },
+                  { value: 2, label: 'Hardware' },
+                  { value: 3, label: 'Predictive' },
+                  { value: 4, label: 'Off' },
+                ].map(({ value, label }) => (
+                  <button
+                    key={value}
+                    type='button'
+                    className={`join-item btn btn-sm flex-1 ${parseInt(formData.scaleSource) === value ? 'btn-primary' : 'btn-outline'}`}
+                    onClick={() => setFormData({ ...formData, scaleSource: value })}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
               <p className='text-base-content/60 mt-1 text-xs'>
-                Auto uses the hardware HX711 scale when present, otherwise falls back to Bluetooth.
+                Bluetooth and Hardware use an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.
               </p>
             </div>
             <a href='/scale-calibration' className='btn btn-outline btn-sm w-full'>

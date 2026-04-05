@@ -422,7 +422,11 @@ bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !i
 
 bool Controller::isVolumetricAvailable() const {
     int src = settings.getScaleSource();
-    if (src == 2) // HW only
+    if (src == 4)
+        return false; // OFF
+    if (src == 3)
+        return true; // Predictive (flow estimation always available)
+    if (src == 2)    // HW only
         return hardwareScalePresent;
     if (src == 1) { // BLE only
 #ifdef NIGHTLY_BUILD
@@ -431,14 +435,7 @@ bool Controller::isVolumetricAvailable() const {
         return isBluetoothScaleHealthy();
 #endif
     }
-    // AUTO: prefer HW, fall back to BLE
-    if (hardwareScalePresent)
-        return true;
-#ifdef NIGHTLY_BUILD
-    return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
-#else
-    return isBluetoothScaleHealthy();
-#endif
+    return false;
 }
 
 void Controller::autotune(int testTime, int samples) {
@@ -638,26 +635,13 @@ void Controller::activate() {
     clientController.tare();
     if (isVolumetricAvailable()) {
         int src = settings.getScaleSource();
-        if (src == 2 && hardwareScalePresent) {
+        if (src == 3) { // Predictive
+            currentVolumetricSource = VolumetricMeasurementSource::FLOW_ESTIMATION;
+        } else if (src == 2 && hardwareScalePresent) {
             currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
         } else if (src == 1) {
-#ifdef NIGHTLY_BUILD
             currentVolumetricSource =
                 isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
-#else
-            currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
-#endif
-        } else { // AUTO
-            if (hardwareScalePresent) {
-                currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
-            } else {
-#ifdef NIGHTLY_BUILD
-                currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
-                                                                    : VolumetricMeasurementSource::FLOW_ESTIMATION;
-#else
-                currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
-#endif
-            }
         }
         if (mode == MODE_BREW) {
             pluginManager->trigger("controller:brew:prestart");

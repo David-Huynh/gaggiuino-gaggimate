@@ -256,6 +256,7 @@ void DefaultUI::loop() {
         volumetricAvailable = controller->isVolumetricAvailable();
         bluetoothScales = controller->isBluetoothScaleHealthy();
         hardwareScalePresent = controller->isHardwareScalePresent();
+        scaleSource = settings.getScaleSource();
         volumetricMode = volumetricAvailable && settings.isVolumetricTarget();
         brewVolumetric = volumetricAvailable && profileVolumetric;
         grindActive = controller->isGrindActive();
@@ -575,8 +576,16 @@ void DefaultUI::setupReactive() {
         },
         &volumetricMode);
     effect_mgr.use_effect([=] { return currentScreen == ui_GrindScreen; },
-                          [=]() { _ui_flag_modify(ui_GrindScreen_modeSwitch, LV_OBJ_FLAG_HIDDEN, volumetricAvailable); },
-                          &volumetricAvailable);
+                          [=]() {
+                              _ui_flag_modify(ui_GrindScreen_modeSwitch, LV_OBJ_FLAG_HIDDEN, volumetricAvailable || scaleSource > 0);
+                              const lv_img_dsc_t *icon = (scaleSource == 1) ? &ui_img_1424216268 :
+                                                         (scaleSource == 2) ? &ui_img_flowmeter_png :
+                                                         (scaleSource == 3) ? &ui_img_2074354459 :
+                                                         (scaleSource == 4) ? &ui_img_2044104741 :
+                                                         &ui_img_1424216268;
+                              lv_img_set_src(ui_GrindScreen_volumetricButton, icon);
+                          },
+                          &volumetricAvailable, &scaleSource);
     effect_mgr.use_effect([=] { return currentScreen == ui_SimpleProcessScreen; },
                           [=]() {
                               if (mode == MODE_STEAM) {
@@ -676,12 +685,17 @@ void DefaultUI::setupReactive() {
             _ui_flag_modify(ui_BrewScreen_startButton, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Brew);
             _ui_flag_modify(ui_BrewScreen_profileInfo, LV_OBJ_FLAG_HIDDEN, brewScreenState == BrewScreenState::Brew);
             _ui_flag_modify(ui_BrewScreen_modeSwitch, LV_OBJ_FLAG_HIDDEN,
-                            brewScreenState == BrewScreenState::Brew && volumetricAvailable);
-            if (volumetricAvailable) {
-                lv_img_set_src(ui_BrewScreen_volumetricButton, bluetoothScales ? &ui_img_1424216268 : &ui_img_flowmeter_png);
+                            brewScreenState == BrewScreenState::Brew && (volumetricAvailable || scaleSource > 0));
+            {
+                const lv_img_dsc_t *icon = (scaleSource == 1)   ? &ui_img_1424216268
+                                           : (scaleSource == 2) ? &ui_img_flowmeter_png
+                                           : (scaleSource == 3) ? &ui_img_2074354459
+                                           : (scaleSource == 4) ? &ui_img_2044104741
+                                                                : (bluetoothScales ? &ui_img_1424216268 : &ui_img_flowmeter_png);
+                lv_img_set_src(ui_BrewScreen_volumetricButton, icon);
             }
         },
-        &brewScreenState, &volumetricAvailable, &bluetoothScales);
+        &brewScreenState, &volumetricAvailable, &bluetoothScales, &scaleSource);
     effect_mgr.use_effect(
         [=] { return currentScreen == ui_BrewScreen; },
         [=]() {

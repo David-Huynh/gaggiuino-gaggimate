@@ -1,22 +1,15 @@
 {
     "name": "UARTComm",
-    "version": "0.1.0",
-    "description": "UART communication handler for GaggiMate using line-v1 protocol",
-    "homepage": "https://github.com/jniebuhr/gaggimate",
+    "keywords": "GaggiMate UART Lib",
+    "description": "GaggiMate UART Lib",
     "repository": {
-        "type": "git",
-        "url": "https://github.com/jniebuhr/gaggimate.git"
+        "type": "email",
+        "url": "huynh.david.work@gmail.com"
     },
-    "authors": [
-        {
-            "name": "GaggiMate Contributors"
-        }
-    ],
+    "version": "1.0.0",
     "frameworks": "arduino",
-    "platforms": "*",
-    "dependencies": [
-        {
-            "name": "GaggiMateController"
-        }
+    "platforms": [
+        "esp32",
+        "ststm32"
     ]
 }
