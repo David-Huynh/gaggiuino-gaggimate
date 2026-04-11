@@ -18,8 +18,11 @@ void UARTClientController::initClient() {
 }
 
 bool UARTClientController::connectToServer() {
-    // For UART, we're always "connected" if we get here
-    // In a real implementation, we might wait for the first EVT,PING
+    // Wait until we've received the INFO message from the STM32,
+    // which means it has finished setup and is ready to receive commands.
+    if (systemInfo.empty()) {
+        return false;
+    }
     connected = true;
     return true;
 }

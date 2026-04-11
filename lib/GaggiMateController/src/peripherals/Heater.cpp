@@ -30,6 +30,9 @@ void Heater::setupPid() {
     simplePid->setCtrlOutputLimits(0.0f, TUNER_OUTPUT_SPAN);
     simplePid->activateSetPointFilter(false);
     simplePid->activateFeedForward(false);
+    // Initialize with default gains so heater works even before CMD,PID arrives.
+    // The ESP32 will override these with user-configured values once connected.
+    simplePid->setControllerPIDGains(Kp, Ki, Kd, 0.0f);
     simplePid->reset();
 }
 

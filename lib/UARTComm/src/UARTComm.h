@@ -52,7 +52,7 @@ class UARTComm : public CommunicationHandler {
      * @param uartPort HardwareSerial port to use (e.g., Serial2)
      * @param baudRate Baud rate (default 460800)
      */
-    UARTComm(HardwareSerial *uartPort, uint32_t baudRate = UART_DEFAULT_BAUD);
+    UARTComm(HardwareSerial *uartPort, uint32_t baudRate = UART_DEFAULT_BAUD, bool alreadyInitialized = false);
 
     /**
      * @brief Initialize communication (required by CommunicationHandler)
@@ -154,7 +154,9 @@ class UARTComm : public CommunicationHandler {
     };
     HardwareSerial *_uart = nullptr;
     uint32_t _baudRate = UART_DEFAULT_BAUD;
+    bool _initialized = false;
     TaskHandle_t _uartTaskHandle = nullptr;
+    SemaphoreHandle_t _txMutex = nullptr;
     static void uartTaskFunction(void *param);
     void uartTaskLoop();
 

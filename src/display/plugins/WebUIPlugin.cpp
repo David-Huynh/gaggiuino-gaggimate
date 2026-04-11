@@ -138,7 +138,9 @@ void WebUIPlugin::loop() {
         doc["gt"] = controller->isVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
         doc["gact"] = controller->isGrindActive() ? 1 : 0;
         doc["rssi"] = 0;
-#ifndef GAGGIMATE_UART_COMMS
+#ifdef GAGGIMATE_UART_COMMS
+        // UART mode — no RSSI
+#else
         if (static_cast<NimBLEClientController *>(controller->getClientController())->getClient()->isConnected()) {
             doc["rssi"] = static_cast<NimBLEClientController *>(controller->getClientController())->getClient()->getRssi();
         }
@@ -221,6 +223,8 @@ void WebUIPlugin::setupServer() {
               [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // android captive portal redirect
     server.on("/redirect", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); });            // microsoft redirect
     server.on("/hotspot-detect.html", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // apple call home
+    server.on("/library/test/success.html",
+              [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // apple call home (newer iOS)
     server.on("/canonical.html",
               [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); });       // firefox captive portal call home
     server.on("/success.txt", [](AsyncWebServerRequest *request) { request->send(200); }); // firefox captive portal call home
@@ -253,7 +257,13 @@ void WebUIPlugin::setupServer() {
         }
     });
     server.on("/api/core-dump", HTTP_GET, [this](AsyncWebServerRequest *request) { handleCoreDumpDownload(request); });
-    server.onNotFound([](AsyncWebServerRequest *request) { request->send(SPIFFS, "/w/index.html"); });
+    server.onNotFound([this](AsyncWebServerRequest *request) {
+        if (apMode && request->url() != "/") {
+            request->redirect(LOCAL_URL);
+        } else {
+            request->send(SPIFFS, "/w/index.html");
+        }
+    });
     server.serveStatic("/", SPIFFS, "/w").setDefaultFile("index.html").setCacheControl("max-age=0");
     ws.onEvent(
         [this](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {

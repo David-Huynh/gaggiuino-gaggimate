@@ -1,11 +1,12 @@
 #include "main.h"
 #include "ControllerConfig.h"
 #include "GaggiMateController.h"
-GaggiMateController controller(BUILD_GIT_VERSION);
+#include "UARTComm.h"
 
-void setup() {
-    Serial.begin(115200);
-    controller.setup();
-}
+// Serial1 = USART_LCD: PA9(TX) → ESP32 RX, PA10(RX) ← ESP32 TX
+UARTComm comm(&Serial1, 460800);
+GaggiMateController controller(BUILD_GIT_VERSION, &comm);
+
+void setup() { controller.setup(); }
 
 void loop() { controller.loop(); }

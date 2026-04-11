@@ -7,18 +7,30 @@
 #include <cstdio>
 #include <cstdlib>
 
-UARTComm::UARTComm(HardwareSerial *uartPort, uint32_t baudRate) : _uart(uartPort), _baudRate(baudRate) {
-    if (_uart) {
-        _uart->begin(baudRate);
-    }
+UARTComm::UARTComm(HardwareSerial *uartPort, uint32_t baudRate, bool alreadyInitialized)
+    : _uart(uartPort), _baudRate(baudRate), _initialized(alreadyInitialized) {
+    // Do not call _uart->begin() or create FreeRTOS objects here —
+    // global constructors run before the HAL and scheduler are ready.
 }
 void UARTComm::initServer(String infoString) {
-    _sendLine("INFO,%s", infoString.c_str());
-
-    // Create queue (holds up to 10 commands)
-    if (!_cmdQueue) {
-        _cmdQueue = xQueueCreate(10, sizeof(UARTCommand));
+    // Skip begin() if already initialized (e.g. stm32_main.cpp calls begin() early)
+    if (_uart && !_initialized) {
+        _uart->begin(_baudRate);
+        _initialized = true;
     }
+
+    // Create TX mutex for thread-safe UART writes
+    if (!_txMutex) {
+        _txMutex = xSemaphoreCreateMutex();
+    }
+
+    // Create queue (holds up to 32 commands to absorb bursts)
+    if (!_cmdQueue) {
+        _cmdQueue = xQueueCreate(32, sizeof(UARTCommand));
+    }
+
+    // Send INFO after mutex is ready — this tells the remote side we're initialized
+    _sendLine("INFO,%s", infoString.c_str());
 
     // Create UART receive task if not already running
     if (_uart && !_uartTaskHandle) {
@@ -159,7 +171,7 @@ void UARTComm::_processCommand(const char *line) {
             cmd.data.out.valve = atoi(valve_str) != 0;
             cmd.data.out.pump = strtof(pump_str, nullptr);
             cmd.data.out.heater = strtof(heater_str, nullptr);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else if (strcmp(token, "ADV") == 0) {
         if (!args)
@@ -177,14 +189,14 @@ void UARTComm::_processCommand(const char *line) {
             cmd.data.adv.pressureTarget = atoi(pres_target_str) != 0;
             cmd.data.adv.pressure = strtof(pressure_str, nullptr);
             cmd.data.adv.flow = strtof(flow_str, nullptr);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else if (strcmp(token, "ALT") == 0) {
         if (!args)
             return;
         cmd.type = UARTCommand::CMD_ALT;
         cmd.data.alt.state = atoi(args) != 0;
-        xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+        xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
     } else if (strcmp(token, "PID") == 0) {
         if (!args)
             return;
@@ -199,7 +211,7 @@ void UARTComm::_processCommand(const char *line) {
             cmd.data.pid.ki = strtof(ki_str, nullptr);
             cmd.data.pid.kd = strtof(kd_str, nullptr);
             cmd.data.pid.kf = strtof(kf_str, nullptr);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else if (strcmp(token, "PUMP_COEFFS") == 0) {
         if (!args)
@@ -215,7 +227,7 @@ void UARTComm::_processCommand(const char *line) {
             cmd.data.pumpCoeffs.b = strtof(b_str, nullptr);
             cmd.data.pumpCoeffs.c = strtof(c_str, nullptr);
             cmd.data.pumpCoeffs.d = strtof(d_str, nullptr);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else if (strcmp(token, "AUTOTUNE") == 0) {
         if (!args)
@@ -227,14 +239,14 @@ void UARTComm::_processCommand(const char *line) {
             cmd.type = UARTCommand::CMD_AUTOTUNE;
             cmd.data.autotune.goal = atoi(goal_str);
             cmd.data.autotune.window = atoi(window_str);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else if (strcmp(token, "PRESSURE_SCALE") == 0) {
         if (!args)
             return;
         cmd.type = UARTCommand::CMD_PRESSURE_SCALE;
         cmd.data.pressureScale.scale = strtof(args, nullptr);
-        xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+        xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
     } else if (strcmp(token, "LED") == 0) {
         if (!args)
             return;
@@ -245,18 +257,18 @@ void UARTComm::_processCommand(const char *line) {
             cmd.type = UARTCommand::CMD_LED;
             cmd.data.led.channel = atoi(channel_str);
             cmd.data.led.brightness = atoi(brightness_str);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
             // Note: EVT,LED,OK will be sent from processQueue after execution
         }
     } else if (strcmp(token, "PING") == 0) {
         cmd.type = UARTCommand::CMD_PING;
-        xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+        xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
     } else if (strcmp(token, "TARE") == 0) {
         cmd.type = UARTCommand::CMD_TARE;
-        xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+        xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
     } else if (strcmp(token, "SCALE_TARE") == 0) {
         cmd.type = UARTCommand::CMD_SCALE_TARE;
-        xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+        xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
     } else if (strcmp(token, "SCALE_CAL") == 0) {
         if (!args)
             return;
@@ -271,7 +283,7 @@ void UARTComm::_processCommand(const char *line) {
             char *o2_str = strtok_r(nullptr, ",", &argsptr);
             cmd.data.scaleCal.offset1 = o1_str ? atol(o1_str) : 0;
             cmd.data.scaleCal.offset2 = o2_str ? atol(o2_str) : 0;
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else if (strcmp(token, "SCALE_CAL_START") == 0) {
         if (!args)
@@ -283,7 +295,7 @@ void UARTComm::_processCommand(const char *line) {
             cmd.type = UARTCommand::CMD_SCALE_CAL_START;
             cmd.data.scaleCalStart.channel = static_cast<uint8_t>(atoi(ch_str));
             cmd.data.scaleCalStart.refWeight = strtof(ref_str, nullptr);
-            xQueueSend(_cmdQueue, &cmd, portMAX_DELAY);
+            xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
     } else {
         _sendLine("EVT,ERR,%d", ERROR_CODE_UNKNOWN_CMD);
@@ -382,7 +394,10 @@ void UARTComm::_sendLine(const char *format, ...) {
     vsnprintf(buffer, UART_TX_BUFFER_SIZE, format, args);
     va_end(args);
 
-    _uart->println(buffer);
+    if (_txMutex && xSemaphoreTake(_txMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        _uart->println(buffer);
+        xSemaphoreGive(_txMutex);
+    }
 }
 
 char *UARTComm::_getToken(char *input, uint8_t index, char separator) {

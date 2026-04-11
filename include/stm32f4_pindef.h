@@ -19,18 +19,11 @@
 #include <Arduino.h>
 
 // ===== UART Communication (to ESP32) =====
-// Serial2: TX=PA2, RX=PA3 (can be remapped)
-// Reserved for main communication with ESP32
+// Serial2: TX=PA2, RX=PA3 (USART2) — connected to ESP32 via Nextion connector wires
 #define UART_COMM Serial2
-#define UART_COMM_BAUD 460800
-#define UART_TX_PIN PA2
-#define UART_RX_PIN PA3
+#define UART_COMM_BAUD 115200 // 460800 caused signal issues — keep at 115200
 
-// Debug serial over USB-CDC (takes PA8, PA9, PA10, PA11)
-#define UART_DEBUG Serial
-#define UART_DEBUG_BAUD 115200
-#define UART_DEBUG_TX_PIN PA9
-#define UART_DEBUG_RX_PIN PA10
+// Debug logging is disabled (no-op) to avoid interfering with UART communication
 
 // ===== Thermocouple (MAX31855) - SPI =====
 // SPI1: MOSI=PA7, MISO=PB4, SCK=PA5
@@ -41,7 +34,7 @@
 // SPI interface will be configured via stm32duino SPI1
 
 // ===== Heater Control =====
-#define HEATER_PIN PB1        // PWM via TIM3_CH4 or TIM8_CH3N
+#define HEATER_PIN PA15       // SSR relay output (relayPin in Gaggiuino pindef)
 #define HEATER_PWM_FREQ 40000 // 40 kHz PWM frequency
 
 // ===== Pump Control =====
@@ -56,9 +49,8 @@
 // ===== Water Sensor =====
 #define WATER_PIN PB15
 
-// ===== Auxiliary Relay (for auxiliary solenoid) =====
-#define ALT_PIN PA15 // GPIO output
-#define ALT_ON_STATE HIGH
+// ===== Auxiliary Relay (not available on standard Gaggiuino PCB) =====
+// #define ALT_PIN — no dedicated alt relay pin on this board
 
 // ===== Brew & Steam Button Inputs =====
 #define BREW_BTN_PIN PC14  // GPIO input with pull-down
@@ -104,11 +96,10 @@
 // ===== Pin Validation =====
 // Verify no conflicts:
 // - SPI1: PA5(CLK), PA6(CS), PA7(MOSI), PB4(MISO) - Thermocouple
-// - UART2: PA2(TX), PA3(RX) - ESP32 communication
-// - UART1: PA9(TX), PA10(RX) - Optional debug
+// - USART2: PA2(TX), PA3(RX) - ESP32 communication (Nextion LCD connector wires)
 // - I2C1: PB6(SCL), PB7(SDA) - Pressure/LED/TOF/Scales
-// - PWM: PA1(pump), PB1(heater) - Control outputs
-// - GPIO: PA0(ADC), PA15(alt), PC13(valve), PC14(brew), PC15(steam)
+// - PWM: PA1(pump) - Pump dimmer output
+// - GPIO: PA0(ADC), PA15(heater SSR), PC13(valve), PC14(brew), PC15(steam)
 // - HX711: PB0(sck), PB8(dout1), PB9(dout2)
 
 #endif // STM32F4_PINDEF_H
