@@ -229,6 +229,8 @@ void WebUIPlugin::setupServer() {
               [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // android captive portal redirect
     server.on("/redirect", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); });            // microsoft redirect
     server.on("/hotspot-detect.html", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // apple call home
+    server.on("/library/test/success.html",
+              [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // apple call home (newer iOS)
     server.on("/canonical.html",
               [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); });       // firefox captive portal call home
     server.on("/success.txt", [](AsyncWebServerRequest *request) { request->send(200); }); // firefox captive portal call home

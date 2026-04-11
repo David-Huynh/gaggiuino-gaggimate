@@ -1,7 +1,7 @@
 import { useState, useCallback, useContext } from 'preact/hooks';
 import { useQuery } from 'preact-fetching';
 import Card from '../../components/Card.jsx';
-import { ApiServiceContext } from '../../services/ApiService.js';
+import { ApiServiceContext, machine } from '../../services/ApiService.js';
 
 export function ScaleCalibration() {
   const [calKey, setCalKey] = useState(0);
@@ -9,6 +9,7 @@ export function ScaleCalibration() {
   const [refWeight2, setRefWeight2] = useState(100);
   const [calStatus, setCalStatus] = useState('');
   const apiService = useContext(ApiServiceContext);
+  const currentWeight = machine.value.status.currentWeight;
 
   const { data: scaleSettings = {} } = useQuery(`scale-settings-${calKey}`, async () => {
     const response = await fetch(`/api/settings`);
@@ -55,6 +56,13 @@ export function ScaleCalibration() {
       <div className='grid grid-cols-1 gap-4 lg:grid-cols-12'>
         <Card sm={12} lg={6} title='Current Values'>
           <div className='grid grid-cols-2 gap-3'>
+            <div className='bg-primary/10 rounded-lg p-4 col-span-2'>
+              <div className='text-base-content/60 text-xs uppercase tracking-wide'>Current Weight</div>
+              <div className='mt-1 font-mono text-2xl font-semibold'>
+                {Number.isFinite(currentWeight) ? `${currentWeight.toFixed(2)} g` : '—'}
+              </div>
+              <div className='text-base-content/50 mt-1 text-xs'>Live reading from the hardware scale</div>
+            </div>
             <div className='bg-base-200 rounded-lg p-4'>
               <div className='text-base-content/60 text-xs uppercase tracking-wide'>
                 Ch1 Calibration Factor

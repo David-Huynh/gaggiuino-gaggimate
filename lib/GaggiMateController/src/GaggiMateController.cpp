@@ -33,7 +33,6 @@ GaggiMateController::GaggiMateController(String version) : _version(std::move(ve
 }
 
 void GaggiMateController::setup() {
-    delay(5000);
     detectBoard();
     detectAddon();
 
@@ -46,9 +45,11 @@ void GaggiMateController::setup() {
         [this]() { _comms.sendError(ERROR_CODE_AUTOTUNE_TIMEOUT); });
     this->valve = new SimpleRelay(_config.valvePin, _config.valveOn);
     this->alt = new SimpleRelay(_config.altPin, _config.altOn);
+
     if (_config.capabilites.pressure) {
         pressureSensor = new PressureSensor(_config.pressureSda, _config.pressureScl, [this](float pressure) { /* noop */ });
     }
+
     if (_config.capabilites.scale) {
         scale = new HX711Scale(_config.scaleSdaPin, _config.scaleSda1Pin, _config.scaleSclPin,
                                [this](float weight) { _comms.sendWeightMeasurement(weight); });
@@ -63,13 +64,16 @@ void GaggiMateController::setup() {
 
     // 4-Pin peripheral port
 #ifdef ARDUINO_ARCH_STM32
-    Wire.begin(_config.sunriseSdaPin, _config.sunriseSclPin);
+    Wire.setSDA(_config.sunriseSdaPin);
+    Wire.setSCL(_config.sunriseSclPin);
+    Wire.begin();
     Wire.setClock(400000);
 #else
     if (!Wire.begin(_config.sunriseSdaPin, _config.sunriseSclPin, 400000)) {
         ESP_LOGE(LOG_TAG, "Failed to initialize I2C bus");
     }
 #endif
+
     this->ledController = new LedController(&Wire);
     this->distanceSensor = new DistanceSensor(&Wire, [this](int distance) { _comms.sendTofMeasurement(distance); });
     if (this->ledController->isAvailable()) {
@@ -77,9 +81,6 @@ void GaggiMateController::setup() {
         _config.capabilites.tof = true;
         _comms.onLedControl([this](uint8_t channel, uint8_t brightness) { ledController->setChannel(channel, brightness); });
     }
-
-    _comms.init("GPBLS", _config.name.c_str(), _version, _config.capabilites.dimming, _config.capabilites.pressure,
-                _config.capabilites.ledControls, _config.capabilites.tof, _config.capabilites.scale);
 
     if (_config.capabilites.ledControls) {
         this->ledController->setup();
@@ -223,6 +224,11 @@ void GaggiMateController::setup() {
         auto dimmedPump = static_cast<DimmedPump *>(pump);
         dimmedPump->tare();
     });
+    // Send INFO last: this tells the ESP32 the STM32 is ready to receive commands.
+    // All callbacks and hardware must be initialized before this point.
+    _comms.init("GPBLS", _config.name.c_str(), _version, _config.capabilites.dimming, _config.capabilites.pressure,
+                _config.capabilites.ledControls, _config.capabilites.tof, _config.capabilites.scale);
+
     ESP_LOGI(LOG_TAG, "Initialization done");
 #ifdef ARDUINO_ARCH_STM32
     xTaskCreate(ControllerLoopTask, "MainLoop", configMINIMAL_STACK_SIZE * 8, this, configMAX_PRIORITIES - 1, nullptr);
@@ -252,6 +258,8 @@ void GaggiMateController::registerBoardConfig(ControllerConfig config) { configs
 
 void GaggiMateController::detectBoard() {
 #ifdef ARDUINO_ARCH_STM32
+    // STM32 has no voltage-divider auto-detect hardware.
+    // Use the STM32F4 config directly.
     _config = GM_STM32F4_V1;
     ESP_LOGI(LOG_TAG, "Using Board: %s", _config.name.c_str());
     return;

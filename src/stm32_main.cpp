@@ -19,9 +19,10 @@
 #include <Arduino.h>
 #include <GaggiMateController.h>
 
-#if defined(UART_TX_PIN) && defined(UART_RX_PIN)
-HardwareSerial Serial2(UART_TX_PIN, UART_RX_PIN);
-#endif
+// STM32duino HardwareSerial constructor is (RX, TX)
+// Gaggiuino pindef: PA2=TX, PA3=RX, so constructor is (PA3, PA2).
+HardwareSerial Serial2(PA3, PA2);
+
 // Global controller and communication handler
 GaggiMateController *controller = nullptr;
 
@@ -35,62 +36,17 @@ GaggiMateController *controller = nullptr;
  * 4. Board detection and peripheral initialization
  */
 void setup() {
-    // Small delay for stable power-up
     delay(100);
-
-    // Initialize debug serial (optional, connect PA9/PA10 to USB-UART adapter)
-    // This allows remote debugging via USB serial
-    UART_DEBUG.begin(UART_DEBUG_BAUD);
-    delay(50);
-
-    // Print startup message
-    Serial.print("GaggiMate STM32F4 Controller v");
-    Serial.println(FIRMWARE_VERSION);
-    Serial.println("Initializing UART communication with ESP32...");
 
     // Initialize main UART communication with ESP32.
     // This MUST be initialized before GaggiMateServer starts its UART transport.
     UART_COMM.begin(UART_COMM_BAUD);
-    delay(100);
 
-    Serial.println("UART communication initialized.");
-
-    // Create GaggiMateController with NanoPb UART transport
-    // GaggiMateController is the core controller logic
     controller = new GaggiMateController(FIRMWARE_VERSION);
 
-    Serial.println("GaggiMateController instantiated.");
-    Serial.println("Starting GaggiMateController setup...");
-
-    // Initialize the controller (board detection, peripheral setup, etc.)
-    // This is a blocking call that may take several seconds
-    controller->setup();
-
-    Serial.println("Setup complete. Ready for commands from ESP32.");
-    Serial.println("Waiting for PING...");
+    controller->setup(); // this calls vTaskStartScheduler() and never returns
 }
 
-/**
- * @brief Main loop
- *
- * Handles:
- * 1. Processing incoming UART frames from ESP32
- * 2. Reading sensors and sending data
- * 3. Updating peripherals (heater PID, pump control, etc.)
- *
- * This runs continuously with GaggiMateController handling timing.
- */
-void loop() { // Should be blocked by spinning up vTaskStartScheduler();
-    // if (!controller) {
-    //     // Controller not initialized, spin
-    //     delay(100);
-    //     return;
-    // }
-
-    // // Run main controller loop
-    // // Handles sensor reads, PID updates, safety checks, sends periodic sensor data
-    // controller->loop();
-
-    // // Minimal delay to allow other tasks (if using FreeRTOS)
-    // // GaggiMateController::loop() already includes a delay(250)
+void loop() {
+    // Dead code: vTaskStartScheduler() in controller->setup() never returns.
 }

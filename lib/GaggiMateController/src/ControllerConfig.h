@@ -227,25 +227,26 @@ const ControllerConfig GM_PRO_REV_11 = {.name = "GaggiMate Pro Rev 1.1",
 
 // STM32F4 Controller - replaces peripheral ESP32, communicates via UART
 // Source of truth: gaggiuino/src/pindef.h
-// Arduino STM32 mapping: PA0-PA15=0-15, PB0-PB15=16-31, PC13-PC15=45-47
+// Arduino STM32 mapping (BlackPill F411CE variant):
+// PA0-PA15=0-15, PB0-PB10=16-26, PB12-PB15=27-30, PC13-PC15=31-33
 const ControllerConfig GM_STM32F4_V1 = {.name = "GaggiMate STM32F4 Controller v1.0",
                                         .autodetectValue = 99, // Not used in STM32 (no voltage divider), unique ID for reference
 
-                                        // Heater PWM output: PB1
-                                        .heaterPin = 17, // Arduino pin for PB1 on STM32F4
+                                        // Heater SSR relay: PA15 (relayPin in Gaggiuino pindef)
+                                        .heaterPin = 15, // Arduino pin for PA15 on STM32F4
 
                                         // Pump PWM output: PA1
                                         .pumpPin = 1,      // Arduino pin for PA1 on STM32F4
                                         .pumpSensePin = 0, // Not used on this board (kept for backward compatibility)
                                         .pumpOn = 1,       // Active high
 
-                                        // Valve relay: PC13
-                                        .valvePin = 45, // Arduino pin for PC13 on STM32F4
+                                        // Valve relay: PC13 (also onboard LED on BlackPill)
+                                        .valvePin = 31, // Arduino pin for PC13 on BlackPill F411CE
                                         .valveOn = 1,   // Active high
 
-                                        // Auxiliary relay: PA15
-                                        .altPin = 15, // Arduino pin for PA15 on STM32F4
-                                        .altOn = 1,   // Active high
+                                        // Auxiliary relay: not available on standard Gaggiuino PCB
+                                        .altPin = 0,
+                                        .altOn = 1,
 
                                         // I2C1 for pressure sensor (PB6=SCL, PB7=SDA)
                                         .pressureScl = 22, // Arduino pin for PB6
@@ -257,10 +258,10 @@ const ControllerConfig GM_STM32F4_V1 = {.name = "GaggiMate STM32F4 Controller v1
                                         .maxMisoPin = 20, // Arduino pin for PB4
 
                                         // Brew button: PC14
-                                        .brewButtonPin = 46, // Arduino pin for PC14
+                                        .brewButtonPin = 32, // Arduino pin for PC14 on BlackPill F411CE
 
                                         // Steam button: PC15
-                                        .steamButtonPin = 47, // Arduino pin for PC15
+                                        .steamButtonPin = 33, // Arduino pin for PC15 on BlackPill F411CE
 
                                         // HX711: SCK=PB0, DOUT1=PB8, DOUT2=PB9
                                         .scaleSclPin = 16,  // Arduino pin for PB0
