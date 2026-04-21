@@ -156,6 +156,9 @@ void GaggiMateController::loop() {
         handlePingTimeout();
     }
     sendSensorData();
+    if (errorState != ERROR_CODE_NONE) {
+        ESP_LOGW("GaggiMateController", "Error state: %d", errorState);
+    }
     delay(250);
 }
 
