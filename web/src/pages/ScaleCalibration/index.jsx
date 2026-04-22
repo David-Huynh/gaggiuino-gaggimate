@@ -9,7 +9,8 @@ export function ScaleCalibration() {
   const [refWeight2, setRefWeight2] = useState(100);
   const [calStatus, setCalStatus] = useState('');
   const apiService = useContext(ApiServiceContext);
-  const currentWeight = machine.value.status.currentWeight;
+  const currentWeight = machine.value.status.hardwareWeight;
+  const scaleDetected = machine.value.status.hardwareScalePresent;
 
   const { data: scaleSettings = {} } = useQuery(`scale-settings-${calKey}`, async () => {
     const response = await fetch(`/api/settings`);
@@ -61,7 +62,10 @@ export function ScaleCalibration() {
               <div className='mt-1 font-mono text-2xl font-semibold'>
                 {Number.isFinite(currentWeight) ? `${currentWeight.toFixed(2)} g` : '—'}
               </div>
-              <div className='text-base-content/50 mt-1 text-xs'>Live reading from the hardware scale</div>
+              <div className='mt-2 flex items-center gap-2'>
+                <span className={`inline-block h-2 w-2 rounded-full ${scaleDetected ? 'bg-green-500' : 'bg-red-500'}`} />
+                <span className='text-base-content/50 text-xs'>{scaleDetected ? 'Scale detected' : 'Scale not detected'}</span>
+              </div>
             </div>
             <div className='bg-base-200 rounded-lg p-4'>
               <div className='text-base-content/60 text-xs uppercase tracking-wide'>

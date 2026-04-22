@@ -22,6 +22,7 @@
  *   CMD,OUT,valve,pumpSetpoint,heaterSetpoint
  *   CMD,ADV,valve,heaterSetpoint,pressureTarget,pressure,flow
  *   CMD,PING
+ *   CMD,INFO_REQ
  *   CMD,TARE
  *   CMD,SCALE_TARE
  *   CMD,SCALE_CAL,c1,c2,offset1,offset2
@@ -64,6 +65,7 @@ class UARTClientController : public ClientCommunicationHandler {
     void sendOutputControl(bool valve, float pumpSetpoint, float boilerSetpoint);
     void sendAltControl(bool pinState);
     void sendPing();
+    void requestInfo();
     void sendAutotune(int testTime, int samples);
     void sendPidSettings(const String &pid);
     void sendPumpModelCoeffs(const String &pumpModelCoeffs);

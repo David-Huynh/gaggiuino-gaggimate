@@ -29,6 +29,8 @@ void UARTComm::initServer(String infoString) {
         _cmdQueue = xQueueCreate(32, sizeof(UARTCommand));
     }
 
+    _infoString = infoString;
+
     // Send INFO after mutex is ready — this tells the remote side we're initialized
     _sendLine("INFO,%s", infoString.c_str());
 
@@ -56,7 +58,13 @@ void UARTComm::sendVolumetricMeasurement(float value) { _sendLine("EVT,VOLUMETRI
 
 void UARTComm::sendTofMeasurement(int value) { _sendLine("EVT,TOF,%d", value); }
 
-void UARTComm::sendWeightMeasurement(float weight) { _sendLine("EVT,WEIGHT,%.2f", weight); }
+void UARTComm::sendWeightMeasurement(float weight) { _sendLine("EVT,WEIGHT,%.4f", weight); }
+
+void UARTComm::sendInfo() {
+    if (_infoString.length() > 0) {
+        _sendLine("INFO,%s", _infoString.c_str());
+    }
+}
 
 void UARTComm::registerOutputControlCallback(const simple_output_callback_t &callback) { _outputControlCallback = callback; }
 
@@ -82,13 +90,17 @@ void UARTComm::registerTareCallback(const void_callback_t &callback) { _tareCall
 
 void UARTComm::registerScaleTareCallback(const void_callback_t &callback) { _scaleTareCallback = callback; }
 
-void UARTComm::registerScaleCalibrationCallback(const scale_calibration_callback_t &callback) { _scaleCalibrationCallback = callback; }
+void UARTComm::registerScaleCalibrationCallback(const scale_calibration_callback_t &callback) {
+    _scaleCalibrationCallback = callback;
+}
 
 void UARTComm::registerScaleCalStartCallback(const scale_cal_start_callback_t &callback) { _scaleCalStartCallback = callback; }
 
 void UARTComm::sendScaleOffsets(long offset1, long offset2) { _sendLine("EVT,SCALE_OFFSETS,%ld,%ld", offset1, offset2); }
 
-void UARTComm::sendScaleCalResult(uint8_t channel, float calibration) { _sendLine("EVT,SCALE_CAL_RESULT,%d,%.6f", channel, calibration); }
+void UARTComm::sendScaleCalResult(uint8_t channel, float calibration) {
+    _sendLine("EVT,SCALE_CAL_RESULT,%d,%.6f", channel, calibration);
+}
 
 void UARTComm::registerLedControlCallback(const led_control_callback_t &callback) { _ledControlCallback = callback; }
 
@@ -297,6 +309,8 @@ void UARTComm::_processCommand(const char *line) {
             cmd.data.scaleCalStart.refWeight = strtof(ref_str, nullptr);
             xQueueSend(_cmdQueue, &cmd, pdMS_TO_TICKS(50));
         }
+    } else if (strcmp(token, "INFO_REQ") == 0) {
+        sendInfo(); // Respond immediately — no queue needed
     } else {
         _sendLine("EVT,ERR,%d", ERROR_CODE_UNKNOWN_CMD);
     }
@@ -370,8 +384,8 @@ void UARTComm::processQueue() {
             break;
         case UARTCommand::CMD_SCALE_CAL:
             if (_scaleCalibrationCallback) {
-                _scaleCalibrationCallback(cmd.data.scaleCal.c1, cmd.data.scaleCal.c2,
-                                          cmd.data.scaleCal.offset1, cmd.data.scaleCal.offset2);
+                _scaleCalibrationCallback(cmd.data.scaleCal.c1, cmd.data.scaleCal.c2, cmd.data.scaleCal.offset1,
+                                          cmd.data.scaleCal.offset2);
             }
             break;
         case UARTCommand::CMD_SCALE_CAL_START:

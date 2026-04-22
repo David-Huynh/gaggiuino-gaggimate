@@ -247,8 +247,8 @@ class Settings {
 
     // Scale settings
     int scaleSource = 0; // 0=AUTO, 1=BLE only, 2=HW only, 3=Predictive, 4=OFF
-    float scaleCalibration1 = 1.0f;
-    float scaleCalibration2 = 1.0f;
+    float scaleCalibration1 = 2000.0f;
+    float scaleCalibration2 = 2000.0f;
     long scaleOffset1 = 0;
     long scaleOffset2 = 0;
 

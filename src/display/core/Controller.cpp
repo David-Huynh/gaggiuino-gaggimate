@@ -311,6 +311,13 @@ void Controller::setupWifi() {
 void Controller::loop() {
 #ifdef GAGGIMATE_UART_COMMS
     clientController.poll();
+    if (initialized && !clientController.isConnected()) {
+        unsigned long nowMs = millis();
+        if (nowMs - lastInfoRequest > 1000) {
+            lastInfoRequest = nowMs;
+            clientController.requestInfo();
+        }
+    }
 #endif
     pluginManager->loop();
 

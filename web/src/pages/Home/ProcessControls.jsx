@@ -129,6 +129,7 @@ const BrewProgress = props => {
 const ProcessControls = props => {
   // brew is true when mode equals 1 (Brew mode), false otherwise
   const { brew, mode, changeMode } = props;
+  const waterLevel = Math.max(0, Math.min(100, status.value.waterLevel ?? 0));
   // Coerce brewTarget to strict boolean
   const brewTarget = !!status.value.brewTarget;
   const processInfo = status.value.process;
@@ -298,7 +299,17 @@ const ProcessControls = props => {
 
   return (
     <div className={`flex min-h-[250px] flex-col justify-between lg:min-h-[350px]`}>
-      <div className='mb-2 flex justify-center'>
+      <div className='mb-2 flex items-center justify-center gap-3'>
+        <div className='flex shrink-0 flex-col items-center gap-0.5' title={`Water: ${waterLevel}%`}>
+          <FontAwesomeIcon icon={faTint} className='text-xs text-base-content/40' />
+          <div className='relative h-12 w-3 overflow-hidden rounded-full bg-base-300'>
+            <div
+              className='absolute bottom-0 w-full rounded-full bg-blue-400 transition-all duration-700'
+              style={{ height: `${waterLevel}%` }}
+            />
+          </div>
+          <span className='text-[10px] leading-none text-base-content/50'>{waterLevel}%</span>
+        </div>
         <div className='bg-base-300 flex w-full max-w-md rounded-full p-1'>
           {[
             { id: 0, label: 'Standby' },

@@ -1,29 +1,18 @@
 #ifndef HX711SCALE_H
 #define HX711SCALE_H
-
+#ifdef ARDUINO_ARCH_STM32
 #include <Arduino.h>
+#include <STM32FreeRTOS.h>
 #include <functional>
 
-#ifdef ARDUINO_ARCH_STM32
-#include <STM32FreeRTOS.h>
-#else
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#endif
-
-#include <HX711_2.h>
+#include "HX711Dual.h"
 
 constexpr int SCALE_READ_INTERVAL_MS = 50;
 constexpr int SCALE_TARE_READINGS = 4;
-constexpr int SCALE_INIT_TIMEOUT_MS = 1000;
+constexpr int SCALE_INIT_TIMEOUT_MS = 5000;
 constexpr int SCALE_READY_DELAY_MS = 10;
-
-// Adaptive GCV window config
-static constexpr int SG_WINDOW_MAX = 20; // largest candidate, size of buffer
-static constexpr int SG_CANDIDATES[] = {5, 7, 10, 15, 20};
-static constexpr int SG_NUM_CANDIDATES = 5;
-static constexpr float K_SIGMA = 3.0f;
-static constexpr float MAD_NOISE_FLOOR = 0.1f; // g — below this the scale is still; skip outlier rejection
+constexpr int SCALE_INIT_RETRIES = 3;
+constexpr int SCALE_INIT_RETRY_DELAY_MS = 250;
 
 using weight_callback_t = std::function<void(float)>;
 using tare_result_callback_t = std::function<void(long offset1, long offset2)>;
@@ -67,14 +56,7 @@ class HX711Scale {
     float _weight = 0.0f;
     bool _present = false;
 
-    HX711_2 *_loadCells = nullptr;
-
-    // SG filter state
-    float _sgBuffer[SG_WINDOW_MAX] = {};
-    int _sgIndex = 0;
-    int _sgCount = 0;
-    int _sgActive = 10;
-    float _lastMAD = 0.1f;
+    HX711Dual *_loadCells = nullptr;
 
     weight_callback_t _callback;
     tare_result_callback_t _tareResultCallback = nullptr;
@@ -82,11 +64,6 @@ class HX711Scale {
 
     const char *LOG_TAG = "HX711Scale";
     [[noreturn]] static void loopTask(void *arg);
-    // Private methods
-    void computeFit(float &a, float &b, float &c, int n);
-    float computeGCV(int h);
-    int selectWindow();
-    bool sgFilter(float rawValue, float &smoothed, float &slopeGPerSec);
 };
-
+#endif
 #endif // HX711SCALE_H

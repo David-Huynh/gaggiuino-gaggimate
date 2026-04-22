@@ -107,8 +107,8 @@ Settings::Settings() {
 
     // Scale settings
     scaleSource = preferences.getInt("sc_src", 0);
-    scaleCalibration1 = preferences.getFloat("sc_cal1", 1.0f);
-    scaleCalibration2 = preferences.getFloat("sc_cal2", 1.0f);
+    scaleCalibration1 = preferences.getFloat("sc_cal1", 2000.0f);
+    scaleCalibration2 = preferences.getFloat("sc_cal2", 2000.0f);
     scaleOffset1 = preferences.getLong("sc_ofs1", 0);
     scaleOffset2 = preferences.getLong("sc_ofs2", 0);
 

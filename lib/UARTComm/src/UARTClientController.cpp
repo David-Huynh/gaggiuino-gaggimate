@@ -77,6 +77,8 @@ void UARTClientController::sendAltControl(bool pinState) { _sendCommand("CMD,ALT
 
 void UARTClientController::sendPing() { _sendCommand("CMD,PING"); }
 
+void UARTClientController::requestInfo() { _sendCommand("CMD,INFO_REQ"); }
+
 void UARTClientController::sendAutotune(int testTime, int samples) { _sendCommand("CMD,AUTOTUNE,%d,%d", testTime, samples); }
 
 void UARTClientController::sendPidSettings(const String &pid) {

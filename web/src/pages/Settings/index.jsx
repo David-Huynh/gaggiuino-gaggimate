@@ -41,6 +41,8 @@ export function Settings() {
       // but preserve it if it already exists in the fetched data
       const settingsWithToggle = {
         ...fetchedSettings,
+        scaleCalibration1: fetchedSettings.scaleCalibration1 ?? 2000,
+        scaleCalibration2: fetchedSettings.scaleCalibration2 ?? 2000,
         standbyDisplayEnabled:
           fetchedSettings.standbyDisplayEnabled !== undefined
             ? fetchedSettings.standbyDisplayEnabled
@@ -469,6 +471,41 @@ export function Settings() {
                 Bluetooth and Hardware use an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.
               </p>
             </div>
+            <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
+              <div className='form-control'>
+                <label htmlFor='scaleCalibration1' className='mb-2 block text-sm font-medium'>
+                  Hardware Calibration Ch1
+                </label>
+                <input
+                  id='scaleCalibration1'
+                  name='scaleCalibration1'
+                  type='number'
+                  step='any'
+                  className='input input-bordered w-full'
+                  placeholder='2000'
+                  value={formData.scaleCalibration1 ?? 2000}
+                  onChange={onChange('scaleCalibration1')}
+                />
+              </div>
+              <div className='form-control'>
+                <label htmlFor='scaleCalibration2' className='mb-2 block text-sm font-medium'>
+                  Hardware Calibration Ch2
+                </label>
+                <input
+                  id='scaleCalibration2'
+                  name='scaleCalibration2'
+                  type='number'
+                  step='any'
+                  className='input input-bordered w-full'
+                  placeholder='2000'
+                  value={formData.scaleCalibration2 ?? 2000}
+                  onChange={onChange('scaleCalibration2')}
+                />
+              </div>
+            </div>
+            <p className='text-base-content/60 mt-2 text-xs'>
+              These values are saved to device memory when you save settings.
+            </p>
             <a href='/scale-calibration' className='btn btn-outline btn-sm w-full'>
               Configure Hardware Scale Calibration
             </a>

@@ -24,6 +24,7 @@ constexpr int ERROR_CODE_UNKNOWN_CMD = 4;
  *   CMD,OUT,valve,pumpSetpoint,heaterSetpoint
  *   CMD,ADV,valve,heaterSetpoint,pressureTarget,pressure,flow
  *   CMD,PING
+ *   CMD,INFO_REQ
  *   CMD,TARE
  *   CMD,SCALE_TARE
  *   CMD,SCALE_CAL,c1,c2
@@ -59,6 +60,11 @@ class UARTComm : public CommunicationHandler {
      * @param infoString System information string
      */
     void initServer(String infoString) override;
+
+    /**
+     * @brief Re-send the INFO string (called in response to CMD,INFO_REQ)
+     */
+    void sendInfo();
 
     // ===== Outbound methods (send data to remote) =====
     void sendSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance) override;
@@ -155,6 +161,7 @@ class UARTComm : public CommunicationHandler {
     HardwareSerial *_uart = nullptr;
     uint32_t _baudRate = UART_DEFAULT_BAUD;
     bool _initialized = false;
+    String _infoString;
     TaskHandle_t _uartTaskHandle = nullptr;
     SemaphoreHandle_t _txMutex = nullptr;
     static void uartTaskFunction(void *param);

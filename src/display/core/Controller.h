@@ -102,10 +102,14 @@ class Controller {
     bool isBluetoothScaleHealthy() const;
     void onFlush();
     int getWaterLevel() const {
-        float reversedLevel = static_cast<float>(settings.getEmptyTankDistance()) -
-                              static_cast<float>(std::min(settings.getEmptyTankDistance(), tofDistance));
-        return static_cast<int>((reversedLevel - settings.getFullTankDistance()) /
-                                static_cast<float>(settings.getEmptyTankDistance() - settings.getFullTankDistance()) * 100.0f);
+        int emptyDist = settings.getEmptyTankDistance();
+        int fullDist  = settings.getFullTankDistance();
+        if (emptyDist <= fullDist) return 0;
+        float reversedLevel = static_cast<float>(emptyDist) -
+                              static_cast<float>(std::min(emptyDist, tofDistance));
+        int level = static_cast<int>((reversedLevel - fullDist) /
+                                     static_cast<float>(emptyDist - fullDist) * 100.0f);
+        return std::max(0, std::min(100, level));
     };
 
     void onVolumetricDelete();
@@ -169,6 +173,7 @@ class Controller {
     unsigned long grindActiveUntil = 0;
     unsigned long lastPing = 0;
     unsigned long lastProgress = 0;
+    unsigned long lastInfoRequest = 0;
     unsigned long lastAction = 0;
     bool loaded = false;
     bool updating = false;

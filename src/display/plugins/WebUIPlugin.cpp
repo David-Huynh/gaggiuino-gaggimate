@@ -154,8 +154,10 @@ void WebUIPlugin::loop() {
 
         // Add hardware scale weight information
         bool hwScalePresent = controller->isHardwareScalePresent();
-        doc["hw"] = hwScalePresent ? this->currentHardwareWeight : 0; // hardware scale weight
-        doc["hwc"] = hwScalePresent;                                  // hardware scale present
+        // Always report raw hardware weight for debugging/calibration, even before presence is latched.
+        doc["hw"] = this->currentHardwareWeight;
+        doc["hwc"] = hwScalePresent;             // hardware scale present
+        doc["wl"] = controller->getWaterLevel(); // water level %
 
         Process *process = controller->getProcess();
         if (process == nullptr) {

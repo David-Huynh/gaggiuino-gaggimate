@@ -181,6 +181,9 @@ export default class ApiService {
       grindTarget: message.gt || 0,
       grindActive: message.gact || false,
       currentWeight: message.cw || 0,
+      hardwareWeight: message.hw || 0,
+      hardwareScalePresent: message.hwc || false,
+      waterLevel: message.wl ?? 0,
       bluetoothConnected: message.bc || false,
       process: message.process || null,
       timestamp: new Date(),
@@ -224,6 +227,7 @@ export const machine = signal({
     grindTargetVolume: 0,
     grindTarget: 0,
     grindActive: false,
+    waterLevel: 0,
     process: null,
   },
   capabilities: {

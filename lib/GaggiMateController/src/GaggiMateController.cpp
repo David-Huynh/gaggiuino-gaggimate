@@ -62,16 +62,19 @@ void GaggiMateController::setup() {
         this->thermocouple, _config.heaterPin, [this]() { thermalRunawayShutdown(); },
         [this](float Kp, float Ki, float Kd) { _comm->sendAutotuneResult(Kp, Ki, Kd); });
     this->valve = new SimpleRelay(_config.valvePin, _config.valveOn);
-    this->alt = new SimpleRelay(_config.altPin, _config.altOn);
+    if (_config.altPin > 0) {
+        this->alt = new SimpleRelay(_config.altPin, _config.altOn);
+    }
 
     if (_config.capabilites.pressure) {
         pressureSensor = new PressureSensor(_config.pressureSda, _config.pressureScl, [this](float pressure) { /* noop */ });
     }
-
+#ifdef ARDUINO_ARCH_STM32
     if (_config.capabilites.scale) {
         scale = new HX711Scale(_config.scaleSdaPin, _config.scaleSda1Pin, _config.scaleSclPin,
                                [this](float weight) { _comm->sendWeightMeasurement(weight); });
     }
+#endif
     if (_config.capabilites.dimming) {
         pump = new DimmedPump(_config.pumpPin, _config.pumpSensePin, pressureSensor);
     } else {
@@ -112,7 +115,9 @@ void GaggiMateController::setup() {
     this->thermocouple->setup();
     this->heater->setup();
     this->valve->setup();
-    this->alt->setup();
+    if (this->alt) {
+        this->alt->setup();
+    }
     this->pump->setup();
     this->brewBtn->setup();
     this->steamBtn->setup();
@@ -120,6 +125,7 @@ void GaggiMateController::setup() {
         pressureSensor->setup();
         _comm->registerPressureScaleCallback([this](float scale) { this->pressureSensor->setScale(scale); });
     }
+#ifdef ARDUINO_ARCH_STM32
     if (_config.capabilites.scale) {
         scale->setup();
         scale->setTareResultCallback([this](long o1, long o2) { _comm->sendScaleOffsets(o1, o2); });
@@ -137,6 +143,7 @@ void GaggiMateController::setup() {
             }
         });
     }
+#endif
     // Set up thermal feedforward for main heater if pressure/dimming capability exists
     if (heater && _config.capabilites.dimming && _config.capabilites.pressure) {
         auto dimmedPump = static_cast<DimmedPump *>(pump);
@@ -182,7 +189,10 @@ void GaggiMateController::setup() {
             }
             dimmedPump->setValveState(valve);
         });
-    _comm->registerAltControlCallback([this](bool state) { this->alt->set(state); });
+    _comm->registerAltControlCallback([this](bool state) {
+        if (this->alt)
+            this->alt->set(state);
+    });
     _comm->registerPidControlCallback([this](float Kp, float Ki, float Kd, float Kf) {
         this->heater->setTunings(Kp, Ki, Kd);
 
@@ -310,7 +320,8 @@ void GaggiMateController::handlePingTimeout() {
     this->heater->setSetpoint(0);
     this->pump->setPower(0);
     this->valve->set(false);
-    this->alt->set(false);
+    if (this->alt)
+        this->alt->set(false);
     errorState = ERROR_CODE_TIMEOUT;
 }
 
@@ -320,7 +331,8 @@ void GaggiMateController::thermalRunawayShutdown() {
     this->heater->setSetpoint(0);
     this->pump->setPower(0);
     this->valve->set(false);
-    this->alt->set(false);
+    if (this->alt)
+        this->alt->set(false);
     errorState = ERROR_CODE_RUNAWAY;
     _comm->sendError(ERROR_CODE_RUNAWAY);
 }
