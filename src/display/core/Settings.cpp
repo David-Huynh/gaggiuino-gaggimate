@@ -115,8 +115,8 @@ Settings::Settings() {
     String buttonBehaviorStr = preferences.getString("btnb", "brew,steam,water");
     buttonBehavior = explode(buttonBehaviorStr, ',');
     scaleSource = preferences.getInt("sc_src", 0);
-    scaleCalibration1 = preferences.getFloat("sc_c1", 1.0f);
-    scaleCalibration2 = preferences.getFloat("sc_c2", 1.0f);
+    scaleCalibration1 = preferences.getFloat("sc_c1", 2000.0f);
+    scaleCalibration2 = preferences.getFloat("sc_c2", 2000.0f);
     scaleOffset1 = preferences.getLong("sc_o1", 0);
     scaleOffset2 = preferences.getLong("sc_o2", 0);
 
