@@ -15,9 +15,10 @@ void HX711Scale::setup() {
     _loadCells = new HX711Dual();
     _present = false;
 
-    // Some boards expect open-drain SCK, others require push-pull.
-    // Try both modes to match legacy behavior across hardware variants.
-    const uint32_t sckModes[] = {OUTPUT_OPEN_DRAIN, OUTPUT};
+    // The original HX711_2 timer-ISR library used push-pull timer output.
+    // Try push-pull first (works with or without PCB pull-ups).
+    // Fall back to open-drain only if push-pull fails to detect the HX711.
+    const uint32_t sckModes[] = {OUTPUT, OUTPUT_OPEN_DRAIN};
 
     for (size_t modeIdx = 0; modeIdx < (sizeof(sckModes) / sizeof(sckModes[0])) && !_present; modeIdx++) {
         const uint32_t sckMode = sckModes[modeIdx];
@@ -69,19 +70,33 @@ void HX711Scale::loop() {
         float values[2];
         _loadCells->get_units(values, 2);
 
-        float signedSum = values[0] + values[1];
-        const float absSum = fabsf(values[0]) + fabsf(values[1]);
-
-        // If channels are opposite polarity, signed sum can collapse to ~0.
-        // In that case, use magnitude sum so readings remain usable.
-        if (fabsf(signedSum) < 0.05f && absSum > 1.0f) {
-            signedSum = absSum;
-            ESP_LOGW(LOG_TAG, "Channel cancellation detected, using abs sum: ch1=%.2f ch2=%.2f abs=%.2f", values[0], values[1],
-                     absSum);
+        if (!_emaInitialized) {
+            _emaCh1 = values[0];
+            _emaCh2 = values[1];
+            _emaInitialized = true;
+        } else {
+            _emaCh1 += SCALE_EMA_ALPHA * (values[0] - _emaCh1);
+            _emaCh2 += SCALE_EMA_ALPHA * (values[1] - _emaCh2);
         }
 
-        _weight = signedSum;
-        ESP_LOGV(LOG_TAG, "RAW: ch1=%.2f ch2=%.2f sum=%.2f abs=%.2f", values[0], values[1], signedSum, absSum);
+        const float signedSum = _emaCh1 + _emaCh2;
+
+        // Reject implausible values and sudden spikes caused by vibration/EMI.
+        if (fabsf(signedSum) > SCALE_MAX_ABS_WEIGHT_G) {
+            ESP_LOGW(LOG_TAG, "Scale outlier rejected: %.2f g (ema1=%.2f ema2=%.2f)", signedSum, _emaCh1, _emaCh2);
+            return;
+        }
+
+        float filteredSum = signedSum;
+        const float delta = signedSum - _weight;
+        if (fabsf(delta) > SCALE_MAX_DELTA_PER_SAMPLE_G) {
+            filteredSum = _weight + (delta > 0.0f ? SCALE_MAX_DELTA_PER_SAMPLE_G : -SCALE_MAX_DELTA_PER_SAMPLE_G);
+            ESP_LOGV(LOG_TAG, "Scale slew-limited: prev=%.2f raw=%.2f out=%.2f", _weight, signedSum, filteredSum);
+        }
+
+        _weight = filteredSum;
+        ESP_LOGV(LOG_TAG, "SCALE: raw1=%.2f raw2=%.2f ema1=%.2f ema2=%.2f sum=%.2f", values[0], values[1], _emaCh1, _emaCh2,
+                 _weight);
         _callback(_weight);
     }
 }
@@ -93,6 +108,9 @@ void HX711Scale::tare() {
     if (_loadCells->wait_ready_timeout(150, SCALE_READY_DELAY_MS)) {
         _loadCells->tare(SCALE_TARE_READINGS);
         _weight = 0.0f;
+        _emaInitialized = false;
+        _emaCh1 = 0.0f;
+        _emaCh2 = 0.0f;
         long offsets[2] = {0, 0};
         _loadCells->get_offset(offsets);
         _offset1 = offsets[0];
@@ -145,7 +163,7 @@ float HX711Scale::calibrateChannel(uint8_t channel, float refWeight) {
         return 0.0f;
 
     long values[2] = {0, 0};
-    _loadCells->get_value(values, 5);
+    _loadCells->get_value(values, SCALE_CALIBRATION_READINGS);
 
     float newFactor = 0.0f;
     if (channel == 1 && values[0] != 0) {
