@@ -22,6 +22,9 @@ void HX711Dual::begin(uint8_t dout1, uint8_t dout2, uint8_t sck, uint8_t gain, u
     pinMode(_dout1, INPUT_PULLUP);
     pinMode(_dout2, INPUT_PULLUP);
     pinMode(_sck, sckMode);
+    if (_mutex == nullptr) {
+        _mutex = xSemaphoreCreateMutex();
+    }
     power_up();
 }
 
@@ -51,6 +54,30 @@ bool HX711Dual::wait_ready_timeout(unsigned long timeout_ms, unsigned long delay
 }
 
 void HX711Dual::read_raw(long values[2]) {
+    // Serialise concurrent callers (loop task vs calibrateChannel). We take the mutex
+    // BEFORE waiting for the HX711 ready signal so no concurrent caller can steal the
+    // sample between our ready-check and the clock sequence.
+    if (!_mutex || xSemaphoreTake(_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        values[0] = _offset1;
+        values[1] = _offset2;
+        return;
+    }
+
+    // Wait for HX711 to signal data ready while holding the mutex.
+    // Any previous conversion must complete (~100 ms at 10 SPS) before we clock.
+    {
+        unsigned long start = millis();
+        while (!is_ready()) {
+            if (millis() - start > 600) {
+                values[0] = _offset1;
+                values[1] = _offset2;
+                xSemaphoreGive(_mutex);
+                return;
+            }
+            delay(1);
+        }
+    }
+
     // Protect the clock sequence: preemption with SCK high >60µs triggers HX711 power-down.
     // The critical section lasts ~50µs (25 clocks × 2µs). delayMicroseconds() uses
     // DWT->CYCCNT which works without interrupts.
@@ -84,17 +111,15 @@ void HX711Dual::read_raw(long values[2]) {
     // yields ~0 for that channel rather than phantom constants.
     values[0] = ready1 ? ((buf0 & 0x800000UL) ? (long)(buf0 | 0xFF000000UL) : (long)buf0) : _offset1;
     values[1] = ready2 ? ((buf1 & 0x800000UL) ? (long)(buf1 | 0xFF000000UL) : (long)buf1) : _offset2;
+
+    xSemaphoreGive(_mutex);
 }
 
 void HX711Dual::read_average(long values[2], uint8_t times) {
     long sum0 = 0, sum1 = 0;
     long raw[2];
     for (uint8_t i = 0; i < times; i++) {
-        if (!wait_ready_timeout(500, 1)) {
-            raw[0] = raw[1] = 0;
-        } else {
-            read_raw(raw);
-        }
+        read_raw(raw); // read_raw blocks until the HX711 is ready (or times out)
         sum0 += raw[0];
         sum1 += raw[1];
     }

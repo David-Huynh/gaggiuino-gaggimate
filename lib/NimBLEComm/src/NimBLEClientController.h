@@ -68,12 +68,6 @@ class NimBLEClientController : public ClientCommunicationHandler, NimBLEAdvertis
     NimBLERemoteCharacteristic *volumetricTareChar = nullptr;
     NimBLERemoteCharacteristic *ledControlChar = nullptr;
     NimBLERemoteCharacteristic *tofMeasurementChar = nullptr;
-    NimBLERemoteCharacteristic *weightMeasurementChar = nullptr;
-    NimBLERemoteCharacteristic *scaleTareChar = nullptr;
-    NimBLERemoteCharacteristic *scaleCalibrationChar = nullptr;
-    NimBLERemoteCharacteristic *scaleOffsetsChar = nullptr;
-    NimBLERemoteCharacteristic *scaleCalStartChar = nullptr;
-    NimBLERemoteCharacteristic *scaleCalResultChar = nullptr;
     NimBLEAdvertisedDevice *serverDevice = nullptr;
     bool readyForConnection = false;
     xTaskHandle taskHandle;
@@ -87,8 +81,6 @@ class NimBLEClientController : public ClientCommunicationHandler, NimBLEAdvertis
     int_callback_t tofMeasurementCallback = nullptr;
     void_callback_t disconnectCallback = nullptr;
     float_callback_t weightMeasurementCallback = nullptr;
-    scale_offsets_callback_t scaleOffsetsCallback = nullptr;
-    scale_cal_result_callback_t scaleCalResultCallback = nullptr;
 
     String _lastOutputControl = "";
     char advancedOutputBuffer[80]{};

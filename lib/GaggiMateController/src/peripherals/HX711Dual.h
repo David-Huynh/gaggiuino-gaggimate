@@ -27,6 +27,7 @@ class HX711Dual {
     uint8_t _gainPulses = 1; // extra clocks after data: 128→1, 32→2, 64→3
     float _scale1 = 1.0f, _scale2 = 1.0f;
     long _offset1 = 0, _offset2 = 0;
+    SemaphoreHandle_t _mutex = nullptr;
 
     bool is_ready() const;
     void read_raw(long values[2]);

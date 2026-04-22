@@ -65,15 +65,6 @@ void NimBLEServerController::initServer(const String infoString) {
     volumetricTareChar->setCallbacks(this);
 
     tofMeasurementChar = pService->createCharacteristic(TOF_MEASUREMENT_UUID, NIMBLE_PROPERTY::NOTIFY);
-    weightMeasurementChar = pService->createCharacteristic(WEIGHT_MEASUREMENT_UUID, NIMBLE_PROPERTY::NOTIFY);
-    scaleTareChar = pService->createCharacteristic(SCALE_TARE_UUID, NIMBLE_PROPERTY::WRITE);
-    scaleTareChar->setCallbacks(this);
-    scaleCalibrationChar = pService->createCharacteristic(SCALE_CALIBRATION_UUID, NIMBLE_PROPERTY::WRITE);
-    scaleCalibrationChar->setCallbacks(this);
-    scaleOffsetsChar = pService->createCharacteristic(SCALE_OFFSETS_UUID, NIMBLE_PROPERTY::NOTIFY);
-    scaleCalStartChar = pService->createCharacteristic(SCALE_CAL_START_UUID, NIMBLE_PROPERTY::WRITE);
-    scaleCalStartChar->setCallbacks(this);
-    scaleCalResultChar = pService->createCharacteristic(SCALE_CAL_RESULT_UUID, NIMBLE_PROPERTY::NOTIFY);
     ledControlChar = pService->createCharacteristic(LED_CONTROL_UUID, NIMBLE_PROPERTY::WRITE);
     ledControlChar->setCallbacks(this);
 
@@ -158,12 +149,7 @@ void NimBLEServerController::sendTofMeasurement(int value) {
     }
 }
 
-void NimBLEServerController::sendWeightMeasurement(float weight) {
-    if (deviceConnected) {
-        weightMeasurementChar->setValue(float_to_string(weight));
-        weightMeasurementChar->notify();
-    }
-}
+void NimBLEServerController::sendWeightMeasurement(float /*weight*/) {}
 
 void NimBLEServerController::registerOutputControlCallback(const simple_output_callback_t &callback) {
     outputControlCallback = callback;
@@ -180,31 +166,11 @@ void NimBLEServerController::registerPressureScaleCallback(const float_callback_
 
 void NimBLEServerController::registerTareCallback(const void_callback_t &callback) { tareCallback = callback; }
 
-void NimBLEServerController::registerScaleTareCallback(const void_callback_t &callback) { scaleTareCallback = callback; }
-
-void NimBLEServerController::registerScaleCalibrationCallback(const scale_calibration_callback_t &callback) {
-    scaleCalibrationCallback = callback;
-}
-
-void NimBLEServerController::registerScaleCalStartCallback(const scale_cal_start_callback_t &callback) {
-    scaleCalStartCallback = callback;
-}
-
-void NimBLEServerController::sendScaleOffsets(long offset1, long offset2) {
-    if (deviceConnected && scaleOffsetsChar != nullptr) {
-        std::string value = std::to_string(offset1) + "," + std::to_string(offset2);
-        scaleOffsetsChar->setValue(value);
-        scaleOffsetsChar->notify();
-    }
-}
-
-void NimBLEServerController::sendScaleCalResult(uint8_t channel, float calibration) {
-    if (deviceConnected && scaleCalResultChar != nullptr) {
-        std::string value = std::to_string(channel) + "," + float_to_string(calibration);
-        scaleCalResultChar->setValue(value);
-        scaleCalResultChar->notify();
-    }
-}
+void NimBLEServerController::registerScaleTareCallback(const void_callback_t &) {}
+void NimBLEServerController::registerScaleCalibrationCallback(const scale_calibration_callback_t &) {}
+void NimBLEServerController::registerScaleCalStartCallback(const scale_cal_start_callback_t &) {}
+void NimBLEServerController::sendScaleOffsets(long, long) {}
+void NimBLEServerController::sendScaleCalResult(uint8_t, float) {}
 
 void NimBLEServerController::registerLedControlCallback(const led_control_callback_t &callback) { ledControlCallback = callback; }
 
@@ -318,29 +284,6 @@ void NimBLEServerController::onWrite(NimBLECharacteristic *pCharacteristic) {
         ESP_LOGV(LOG_TAG, "Received tare");
         if (tareCallback != nullptr) {
             tareCallback();
-        }
-    } else if (pCharacteristic->getUUID().equals(NimBLEUUID(SCALE_TARE_UUID))) {
-        ESP_LOGV(LOG_TAG, "Received scale tare");
-        if (scaleTareCallback != nullptr) {
-            scaleTareCallback();
-        }
-    } else if (pCharacteristic->getUUID().equals(NimBLEUUID(SCALE_CALIBRATION_UUID))) {
-        String calibData = String(pCharacteristic->getValue().c_str());
-        float c1 = get_token(calibData, 0, ',').toFloat();
-        float c2 = get_token(calibData, 1, ',').toFloat();
-        long offset1 = get_token(calibData, 2, ',').toInt();
-        long offset2 = get_token(calibData, 3, ',').toInt();
-        ESP_LOGV(LOG_TAG, "Received scale calibration: c1=%.6f, c2=%.6f, o1=%ld, o2=%ld", c1, c2, offset1, offset2);
-        if (scaleCalibrationCallback != nullptr) {
-            scaleCalibrationCallback(c1, c2, offset1, offset2);
-        }
-    } else if (pCharacteristic->getUUID().equals(NimBLEUUID(SCALE_CAL_START_UUID))) {
-        String calData = String(pCharacteristic->getValue().c_str());
-        uint8_t channel = static_cast<uint8_t>(get_token(calData, 0, ',').toInt());
-        float refWeight = get_token(calData, 1, ',').toFloat();
-        ESP_LOGV(LOG_TAG, "Received scale cal start: ch=%d, ref=%.1f", channel, refWeight);
-        if (scaleCalStartCallback != nullptr) {
-            scaleCalStartCallback(channel, refWeight);
         }
     } else if (pCharacteristic->getUUID().equals(NimBLEUUID(LED_CONTROL_UUID))) {
         if (ledControlCallback != nullptr) {

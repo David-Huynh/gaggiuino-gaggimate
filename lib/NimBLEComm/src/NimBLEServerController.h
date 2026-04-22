@@ -58,13 +58,7 @@ class NimBLEServerController : public CommunicationHandler, public NimBLEServerC
     NimBLECharacteristic *sensorChar = nullptr;
     NimBLECharacteristic *volumetricMeasurementChar = nullptr;
     NimBLECharacteristic *volumetricTareChar = nullptr;
-    NimBLECharacteristic *scaleTareChar = nullptr;
-    NimBLECharacteristic *scaleCalibrationChar = nullptr;
-    NimBLECharacteristic *scaleOffsetsChar = nullptr;
-    NimBLECharacteristic *scaleCalStartChar = nullptr;
-    NimBLECharacteristic *scaleCalResultChar = nullptr;
     NimBLECharacteristic *tofMeasurementChar = nullptr;
-    NimBLECharacteristic *weightMeasurementChar = nullptr;
     NimBLECharacteristic *ledControlChar = nullptr;
 
     simple_output_callback_t outputControlCallback = nullptr;
@@ -76,9 +70,6 @@ class NimBLEServerController : public CommunicationHandler, public NimBLEServerC
     autotune_callback_t autotuneCallback = nullptr;
     float_callback_t pressureScaleCallback = nullptr;
     void_callback_t tareCallback = nullptr;
-    void_callback_t scaleTareCallback = nullptr;
-    scale_calibration_callback_t scaleCalibrationCallback = nullptr;
-    scale_cal_start_callback_t scaleCalStartCallback = nullptr;
     led_control_callback_t ledControlCallback = nullptr;
     char sensorDataBuffer[80]{};
     char errorBuffer[12]{};

@@ -40,34 +40,11 @@ void NimBLEClientController::tare() {
     }
 }
 
-void NimBLEClientController::scaleTare() {
-    if (scaleTareChar != nullptr && client->isConnected()) {
-        scaleTareChar->writeValue("1");
-    }
-}
-
-void NimBLEClientController::sendScaleCalibration(float c1, float c2, long offset1, long offset2) {
-    if (scaleCalibrationChar != nullptr && client->isConnected()) {
-        std::string calibData = float_to_string(c1) + "," + float_to_string(c2) + "," +
-                                std::to_string(offset1) + "," + std::to_string(offset2);
-        scaleCalibrationChar->writeValue(calibData);
-    }
-}
-
-void NimBLEClientController::startScaleCalibration(uint8_t channel, float refWeight) {
-    if (scaleCalStartChar != nullptr && client->isConnected()) {
-        std::string calData = std::to_string(channel) + "," + float_to_string(refWeight);
-        scaleCalStartChar->writeValue(calData);
-    }
-}
-
-void NimBLEClientController::registerScaleOffsetsCallback(const scale_offsets_callback_t &callback) {
-    scaleOffsetsCallback = callback;
-}
-
-void NimBLEClientController::registerScaleCalResultCallback(const scale_cal_result_callback_t &callback) {
-    scaleCalResultCallback = callback;
-}
+void NimBLEClientController::scaleTare() {}
+void NimBLEClientController::sendScaleCalibration(float, float, long, long) {}
+void NimBLEClientController::startScaleCalibration(uint8_t, float) {}
+void NimBLEClientController::registerScaleOffsetsCallback(const scale_offsets_callback_t &) {}
+void NimBLEClientController::registerScaleCalResultCallback(const scale_cal_result_callback_t &) {}
 
 void NimBLEClientController::registerRemoteErrorCallback(const remote_err_callback_t &callback) {
     remoteErrorCallback = callback;
@@ -141,9 +118,6 @@ bool NimBLEClientController::connectToServer() {
     pressureScaleChar = pRemoteService->getCharacteristic(NimBLEUUID(PRESSURE_SCALE_UUID));
     volumetricTareChar = pRemoteService->getCharacteristic(NimBLEUUID(VOLUMETRIC_TARE_UUID));
     ledControlChar = pRemoteService->getCharacteristic(NimBLEUUID(LED_CONTROL_UUID));
-    scaleTareChar = pRemoteService->getCharacteristic(NimBLEUUID(SCALE_TARE_UUID));
-    scaleCalibrationChar = pRemoteService->getCharacteristic(NimBLEUUID(SCALE_CALIBRATION_UUID));
-    weightMeasurementChar = pRemoteService->getCharacteristic(NimBLEUUID(WEIGHT_MEASUREMENT_UUID));
 
     // Obtain the remote notify characteristic and subscribe to it
 
@@ -189,26 +163,6 @@ bool NimBLEClientController::connectToServer() {
         tofMeasurementChar->subscribe(true, std::bind(&NimBLEClientController::notifyCallback, this, std::placeholders::_1,
                                                       std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
     }
-
-    weightMeasurementChar = pRemoteService->getCharacteristic(NimBLEUUID(WEIGHT_MEASUREMENT_UUID));
-    if (weightMeasurementChar != nullptr && weightMeasurementChar->canNotify()) {
-        weightMeasurementChar->subscribe(true, std::bind(&NimBLEClientController::notifyCallback, this, std::placeholders::_1,
-                                                         std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
-    }
-
-    scaleOffsetsChar = pRemoteService->getCharacteristic(NimBLEUUID(SCALE_OFFSETS_UUID));
-    if (scaleOffsetsChar != nullptr && scaleOffsetsChar->canNotify()) {
-        scaleOffsetsChar->subscribe(true, std::bind(&NimBLEClientController::notifyCallback, this, std::placeholders::_1,
-                                                    std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
-    }
-
-    scaleCalResultChar = pRemoteService->getCharacteristic(NimBLEUUID(SCALE_CAL_RESULT_UUID));
-    if (scaleCalResultChar != nullptr && scaleCalResultChar->canNotify()) {
-        scaleCalResultChar->subscribe(true, std::bind(&NimBLEClientController::notifyCallback, this, std::placeholders::_1,
-                                                      std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
-    }
-
-    scaleCalStartChar = pRemoteService->getCharacteristic(NimBLEUUID(SCALE_CAL_START_UUID));
 
     delay(500);
 
@@ -414,28 +368,10 @@ void NimBLEClientController::notifyCallback(NimBLERemoteCharacteristic *pRemoteC
         }
     }
     if (pRemoteCharacteristic->getUUID().equals(NimBLEUUID(WEIGHT_MEASUREMENT_UUID))) {
-        float value = atof(rawData.c_str());
+        float value = atof(rawData);
         ESP_LOGV(LOG_TAG, "Weight measurement: %.2f", value);
         if (weightMeasurementCallback != nullptr) {
             weightMeasurementCallback(value);
-        }
-    }
-    if (pRemoteCharacteristic->getUUID().equals(NimBLEUUID(SCALE_OFFSETS_UUID))) {
-        String data = String(rawData.c_str());
-        long offset1 = get_token(data, 0, ',').toInt();
-        long offset2 = get_token(data, 1, ',').toInt();
-        ESP_LOGV(LOG_TAG, "Scale offsets: %ld, %ld", offset1, offset2);
-        if (scaleOffsetsCallback != nullptr) {
-            scaleOffsetsCallback(offset1, offset2);
-        }
-    }
-    if (pRemoteCharacteristic->getUUID().equals(NimBLEUUID(SCALE_CAL_RESULT_UUID))) {
-        String data = String(rawData.c_str());
-        uint8_t channel = static_cast<uint8_t>(get_token(data, 0, ',').toInt());
-        float calibration = get_token(data, 1, ',').toFloat();
-        ESP_LOGV(LOG_TAG, "Scale cal result: ch=%d, factor=%.6f", channel, calibration);
-        if (scaleCalResultCallback != nullptr) {
-            scaleCalResultCallback(channel, calibration);
         }
     }
 }

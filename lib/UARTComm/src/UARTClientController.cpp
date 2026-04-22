@@ -361,7 +361,6 @@ void UARTClientController::_sendCommand(const char *format, ...) {
 
     if (xSemaphoreTake(_txMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         Serial2.println(buffer);
-        Serial2.flush();
         xSemaphoreGive(_txMutex);
     }
 }

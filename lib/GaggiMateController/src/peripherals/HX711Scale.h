@@ -13,6 +13,10 @@ constexpr int SCALE_INIT_TIMEOUT_MS = 5000;
 constexpr int SCALE_READY_DELAY_MS = 10;
 constexpr int SCALE_INIT_RETRIES = 3;
 constexpr int SCALE_INIT_RETRY_DELAY_MS = 250;
+constexpr uint8_t SCALE_CALIBRATION_READINGS = 15;
+constexpr float SCALE_EMA_ALPHA = 0.12f;
+constexpr float SCALE_MAX_ABS_WEIGHT_G = 5000.0f;
+constexpr float SCALE_MAX_DELTA_PER_SAMPLE_G = 60.0f;
 
 using weight_callback_t = std::function<void(float)>;
 using tare_result_callback_t = std::function<void(long offset1, long offset2)>;
@@ -55,6 +59,9 @@ class HX711Scale {
     long _offset2 = 0;
     float _weight = 0.0f;
     bool _present = false;
+    bool _emaInitialized = false;
+    float _emaCh1 = 0.0f;
+    float _emaCh2 = 0.0f;
 
     HX711Dual *_loadCells = nullptr;
 
