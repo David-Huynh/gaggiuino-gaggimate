@@ -84,6 +84,10 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
            [this](Event const &event) { currentEstimatedWeight = event.getFloat("value"); });
     pm->on("controller:volumetric-measurement:bluetooth:change",
            [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
+    pm->on("controller:volumetric-measurement:hardware:change",
+           [this](Event const &event) { currentHardwareWeight = event.getFloat("value"); });
+    pm->on("controller:volumetric-measurement:hardware-shot:change",
+           [this](Event const &event) { currentHardwareShotWeight = event.getFloat("value"); });
     pm->on("boiler:currentTemperature:change", [this](Event const &event) { currentTemperature = event.getFloat("value"); });
     pm->on("pump:puck-resistance:change", [this](Event const &event) { currentPuckResistance = event.getFloat("value"); });
     // Initialize rebuild state
@@ -92,6 +96,13 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
 }
 
 void ShotHistoryPlugin::record() {
+    // Pick the scale source's weight for this tick. Mirrors what the brew
+    // controller is acting on (Controller::activate sets currentVolumetricSource
+    // from settings.getScaleSource()), so logged sample.v matches the value the
+    // shot actually stopped on instead of always being BLE.
+    const bool useHwScale = controller && controller->getSettings().getScaleSource() == 2;
+    const float scaleWeight = useHwScale ? currentHardwareShotWeight : currentBluetoothWeight;
+
     bool shouldRecord = recording || extendedRecording;
 
     if (shouldRecord && (controller->getMode() == MODE_BREW || extendedRecording)) {
@@ -121,10 +132,10 @@ void ShotHistoryPlugin::record() {
                 currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
             }
         }
-        float btDiff = currentBluetoothWeight - lastBluetoothWeight;
-        float btFlow = btDiff / 0.25f;
-        currentBluetoothFlow = currentBluetoothFlow * 0.75f + btFlow * 0.25f;
-        lastBluetoothWeight = currentBluetoothWeight;
+        float scaleDiff = scaleWeight - lastScaleWeight;
+        float scaleFlow = scaleDiff / 0.25f;
+        currentScaleFlow = currentScaleFlow * 0.75f + scaleFlow * 0.25f;
+        lastScaleWeight = scaleWeight;
 
         ShotLogSample sample{};
         uint32_t tick = sampleCount <= 0xFFFF ? sampleCount : 0xFFFF;
@@ -136,8 +147,8 @@ void ShotHistoryPlugin::record() {
         sample.fl = encodeSigned(controller->getCurrentPumpFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.tf = encodeSigned(controller->getTargetFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.pf = encodeSigned(controller->getCurrentPuckFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
-        sample.vf = encodeSigned(currentBluetoothFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
-        sample.v = encodeUnsigned(currentBluetoothWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+        sample.vf = encodeSigned(currentScaleFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+        sample.v = encodeUnsigned(scaleWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.ev = encodeUnsigned(currentEstimatedWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.pr = encodeUnsigned(currentPuckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
         sample.si = getSystemInfo(); // Pack system state information
@@ -186,7 +197,7 @@ void ShotHistoryPlugin::record() {
                 return;
             }
 
-            const float weightDiff = abs(currentBluetoothWeight - lastStableWeight);
+            const float weightDiff = abs(scaleWeight - lastStableWeight);
 
             if (weightDiff < WEIGHT_STABILIZATION_THRESHOLD) {
                 if (lastWeightChangeTime == 0) {
@@ -199,7 +210,7 @@ void ShotHistoryPlugin::record() {
             } else {
                 // Weight changed, reset stabilization timer
                 lastWeightChangeTime = 0;
-                lastStableWeight = currentBluetoothWeight;
+                lastStableWeight = scaleWeight;
             }
 
             // Also stop extended recording after maximum duration
@@ -213,7 +224,7 @@ void ShotHistoryPlugin::record() {
         // Patch header with sampleCount and duration
         header.sampleCount = sampleCount;
         header.durationMs = millis() - shotStart;
-        float finalWeight = currentBluetoothWeight;
+        float finalWeight = scaleWeight;
         header.finalWeight = finalWeight > 0.0f ? encodeUnsigned(finalWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE) : 0;
         currentFile.seek(0, SeekSet);
         currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
@@ -268,9 +279,12 @@ void ShotHistoryPlugin::startRecording() {
     lastWeightChangeTime = 0;
     extendedRecordingStart = 0;
     currentBluetoothWeight = 0.0f;
+    currentHardwareWeight = 0.0f;
+    currentHardwareShotWeight = 0.0f;
     lastStableWeight = 0.0f;
+    lastScaleWeight = 0.0f;
     currentEstimatedWeight = 0.0f;
-    currentBluetoothFlow = 0.0f;
+    currentScaleFlow = 0.0f;
     currentProfileName = controller->getProfileManager()->getSelectedProfile().label;
     recording = true;
     extendedRecording = false;
@@ -289,12 +303,16 @@ unsigned long ShotHistoryPlugin::getTime() {
 }
 
 void ShotHistoryPlugin::endRecording() {
-    if (recording && controller && controller->isVolumetricAvailable() && currentBluetoothWeight > 0) {
-        // Start extended recording for any shot with active weight data
-        extendedRecording = true;
-        extendedRecordingStart = millis();
-        lastStableWeight = currentBluetoothWeight;
-        lastWeightChangeTime = 0;
+    if (recording && controller && controller->isVolumetricAvailable()) {
+        const bool useHwScale = controller->getSettings().getScaleSource() == 2;
+        const float scaleWeight = useHwScale ? currentHardwareShotWeight : currentBluetoothWeight;
+        if (scaleWeight > 0) {
+            // Start extended recording for any shot with active weight data
+            extendedRecording = true;
+            extendedRecordingStart = millis();
+            lastStableWeight = scaleWeight;
+            lastWeightChangeTime = 0;
+        }
     }
 
     recording = false;

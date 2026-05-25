@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
+#include <functional>
 #include <vector>
 
 #define PREFERENCES_KEY "controller"
@@ -201,10 +202,25 @@ class Settings {
     void setButtonBehavior(int index, String behavior);
     void setButtonBehaviorList(const std::vector<String> &behavior_list);
     void setScaleSource(int scale_source);
+    // Invoked AFTER the new value is stored and the save flag is set. Fires on
+    // every setScaleSource() call, even when the value is unchanged, so the
+    // Controller can resync its volumetric state machine when the user cycles
+    // sources from the UI or WebUI.
+    void setOnScaleSourceChange(std::function<void(int)> cb) { onScaleSourceChange = std::move(cb); }
     void setScaleCalibration1(float calibration1);
     void setScaleCalibration2(float calibration2);
     void setScaleOffset1(long offset1);
     void setScaleOffset2(long offset2);
+    // Unix epoch seconds at which each channel was last calibrated (0 = never).
+    long getScaleCalTimestamp1() const { return scaleCalTimestamp1; }
+    void setScaleCalTimestamp1(long ts);
+    long getScaleCalTimestamp2() const { return scaleCalTimestamp2; }
+    void setScaleCalTimestamp2(long ts);
+    // Noise floor (g) observed at the time of each channel's last calibration.
+    float getScaleCalStddev1() const { return scaleCalStddev1; }
+    void setScaleCalStddev1(float v);
+    float getScaleCalStddev2() const { return scaleCalStddev2; }
+    void setScaleCalStddev2(float v);
 
   private:
     Preferences preferences;
@@ -280,10 +296,19 @@ class Settings {
 
     // Scale settings
     int scaleSource = 0; // 0=AUTO, 1=BLE only, 2=HW only, 3=Predictive, 4=OFF
-    float scaleCalibration1 = 2000.0f;
-    float scaleCalibration2 = 2000.0f;
+    // 0.0f is the NOT_CALIBRATED sentinel — HX711Scale treats it as uncalibrated
+    // and emits NaN for that channel. The brew controller then suppresses
+    // volumetric stop based on hardware weight.
+    float scaleCalibration1 = 0.0f;
+    float scaleCalibration2 = 0.0f;
     long scaleOffset1 = 0;
     long scaleOffset2 = 0;
+    long scaleCalTimestamp1 = 0;
+    long scaleCalTimestamp2 = 0;
+    float scaleCalStddev1 = 0.0f;
+    float scaleCalStddev2 = 0.0f;
+
+    std::function<void(int)> onScaleSourceChange;
 
     void doSave();
     xTaskHandle taskHandle;

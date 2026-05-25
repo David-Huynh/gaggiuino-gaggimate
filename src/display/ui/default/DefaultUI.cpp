@@ -233,7 +233,7 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
-    pluginManager->on("controller:weight:change", [=](Event const &event) {
+    pluginManager->on("controller:scale:sample", [=](Event const &event) {
         double newWeight = event.getFloat("value");
         if (round(newWeight * 10.0) != round(hardwareWeight * 10.0)) {
             hardwareWeight = newWeight;

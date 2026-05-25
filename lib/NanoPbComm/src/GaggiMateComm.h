@@ -46,6 +46,30 @@ struct RelayCommand {
     bool operator==(const RelayCommand &o) const { return index == o.index && open == o.open; }
     bool operator!=(const RelayCommand &o) const { return !(*this == o); }
 };
+
+// Hardware scale snapshot shared by the controller and display. This is plain
+// protocol vocabulary, not a transport-specific payload.
+struct ScaleSample {
+    float weightG = 0.0f;
+    float stddevG = 0.0f;
+    float ch1G = 0.0f;
+    float ch2G = 0.0f;
+    float ch1StdG = 0.0f;
+    float ch2StdG = 0.0f;
+    uint16_t healthBits = 0;
+    uint32_t sampleSeq = 0;
+};
+
+constexpr uint16_t SCALE_HEALTH_OK = 0;
+constexpr uint16_t SCALE_HEALTH_NOT_CALIBRATED = 1u << 0;
+constexpr uint16_t SCALE_HEALTH_SAT_CH1 = 1u << 1;
+constexpr uint16_t SCALE_HEALTH_SAT_CH2 = 1u << 2;
+constexpr uint16_t SCALE_HEALTH_STALE = 1u << 3;
+constexpr uint16_t SCALE_HEALTH_TARE_FAILED = 1u << 4;
+constexpr uint16_t SCALE_HEALTH_TARE_NOISY = 1u << 5;
+constexpr uint16_t SCALE_HEALTH_TARING = 1u << 6;
+constexpr uint16_t SCALE_HEALTH_CALIBRATING = 1u << 7;
+
 // One LED output's target brightness. Several are packed into a single
 // LedControl message so a multi-channel update can't be split (and coalesced)
 // into separate frames.

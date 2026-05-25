@@ -8,13 +8,16 @@
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
 #include <display/models/profile.h>
+#include <cmath>
 #include <display/plugins/BLEScalePlugin.h>
+#include <display/plugins/HWScalePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/util/PsramStlAllocator.h>
 #include <esp_core_dump.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_partition.h>
+#include <esp_system.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -26,6 +29,8 @@
 // themselves stay on the default heap (tiny: an id + a string handle).
 using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>>;
 static std::unordered_map<uint32_t, PsramString> rxBuffers;
+static std::unordered_map<uint32_t, unsigned long> rxBufferLastActivity;
+static constexpr unsigned long RXBUFFER_IDLE_EVICT_MS = 5UL * 60UL * 1000UL;
 static WebUIPlugin *g_webUIPlugin = nullptr;
 
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
@@ -79,8 +84,57 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     // Subscribe to Bluetooth scale weight updates
     pluginManager->on("controller:volumetric-measurement:bluetooth:change",
                       [this](Event const &event) { this->currentBluetoothWeight = event.getFloat("value"); });
+    // Hardware scale and predictive flow estimate are tracked alongside BLE so
+    // the WebUI 'cw' field can mirror whichever source the user has selected.
     pluginManager->on("controller:volumetric-measurement:hardware:change",
                       [this](Event const &event) { this->currentHardwareWeight = event.getFloat("value"); });
+    pluginManager->on("controller:volumetric-measurement:estimation:change",
+                      [this](Event const &event) { this->currentEstimatedWeight = event.getFloat("value"); });
+
+    // Forward async scale events as WebSocket messages so the calibration page can
+    // drive its live progress bars and result toasts directly.
+    pluginManager->on("controller:scale:tare:progress", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:tare:progress";
+        doc["samples"] = ev.getInt("samples");
+        doc["stddevG"] = ev.getFloat("stddevG");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:tare:done", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:tare:done";
+        doc["success"] = ev.getInt("success");
+        doc["offset1"] = ev.getFloat("offset1");
+        doc["offset2"] = ev.getFloat("offset2");
+        doc["std1"] = ev.getFloat("std1");
+        doc["std2"] = ev.getFloat("std2");
+        doc["healthBits"] = ev.getInt("healthBits");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:cal:progress", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:cal:progress";
+        doc["channel"] = ev.getInt("channel");
+        doc["samples"] = ev.getInt("samples");
+        doc["stddevG"] = ev.getFloat("stddevG");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:cal:done", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:cal:done";
+        doc["channel"] = ev.getInt("channel");
+        doc["factor"] = ev.getFloat("factor");
+        doc["stddevG"] = ev.getFloat("stddevG");
+        doc["success"] = ev.getInt("success");
+        doc["errorCode"] = ev.getInt("errorCode");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:not-ready", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:not-ready";
+        doc["source"] = ev.getInt("source");
+        ws.textAll(doc.as<String>());
+    });
 
     setupServer();
 }
@@ -143,15 +197,62 @@ void WebUIPlugin::loop() {
             statusDoc["lat"] = controller->getClientController()->getLatencyMs();
         }
 
-        bool bleConnected = BLEScales.isConnected();
-        // Add Bluetooth scale weight information
-        statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // current bluetooth weight
-        statusDoc["hw"] = controller->isHardwareScalePresent() ? this->currentHardwareWeight : 0;
-        statusDoc["hwc"] = controller->isHardwareScalePresent();
-        statusDoc["cw"] = controller->isHardwareScalePresent() ? this->currentHardwareWeight
-                           : bleConnected                       ? this->currentBluetoothWeight
-                                                                : 0; // Use 'currentWeight' for forward compatbility
+        const bool bleConnected = BLEScales.isConnected();
+        const ScaleSample sc = controller->getScaleSample();
+        const bool hwScalePresent = controller->isHardwareScalePresent();
+        const bool hwHealthy = hwScalePresent && std::isfinite(sc.weightG) &&
+                               (sc.healthBits & HWScalePlugin::BREW_BLOCKING_HEALTH) == 0;
+
+        // During a HW-scale brew, present the shot-relative weight (current −
+        // captured baseline) so the WebUI matches the value the brew controller
+        // is targeting against. Outside a brew the raw absolute reading is shown.
+        const bool useShotRelative = controller->isHardwareScaleShotBaselineActive();
+        const float baseline = controller->getHardwareScaleShotBaseline();
+        const float displayHwG = (useShotRelative && std::isfinite(sc.weightG))
+                                     ? std::max(0.0f, sc.weightG - baseline)
+                                     : sc.weightG;
+
+        // 'cw' (currentWeight) mirrors the selected scale source so the WebUI
+        // chart and Process Controls card show the same weight the brew
+        // controller is acting on. 'bw' keeps its raw BLE-only meaning.
+        float cw = 0.0f;
+        switch (controller->getSettings().getScaleSource()) {
+        case 2: // HW only
+            cw = hwHealthy ? displayHwG : 0.0f;
+            break;
+        case 1: // BLE only
+            cw = bleConnected ? this->currentBluetoothWeight : 0.0f;
+            break;
+        case 3: // Predictive (flow estimation)
+            cw = this->currentEstimatedWeight;
+            break;
+        case 4: // Off
+            cw = 0.0f;
+            break;
+        case 0: // Auto: prefer HW if healthy, else BLE
+        default:
+            cw = hwHealthy ? displayHwG : (bleConnected ? this->currentBluetoothWeight : 0.0f);
+            break;
+        }
+
+        statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // raw BLE weight
+        statusDoc["hw"] = hwHealthy ? displayHwG : 0.0f;
+        statusDoc["hwc"] = hwScalePresent;
+        statusDoc["cw"] = cw;                                              // active-source weight
         statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
+
+        // Hardware scale: structured snapshot. Flat hw/hwc stay for existing UI.
+        auto sObj = statusDoc["scale"].to<JsonObject>();
+        sObj["w"] = displayHwG;
+        sObj["sd"] = sc.stddevG;
+        sObj["c1"] = sc.ch1G;
+        sObj["c2"] = sc.ch2G;
+        sObj["sd1"] = sc.ch1StdG;
+        sObj["sd2"] = sc.ch2StdG;
+        sObj["h"] = sc.healthBits;
+        sObj["seq"] = sc.sampleSeq;
+        sObj["pr"] = hwScalePresent;
+        sObj["bl"] = baseline; // captured shot baseline (0 when no brew active)
         // Scale battery — only surfaced when the driver reports one and the
         // value isn't the UNKNOWN sentinel (255). UI omits the battery pill
         // entirely when `sbat` is absent, so disconnected/unknown scales don't
@@ -205,11 +306,36 @@ void WebUIPlugin::loop() {
             }
         }
 
+        // Diagnostics for hang triage: heap usage, largest free block, historical
+        // minimum, uptime in seconds. Watch for hl falling while hf stays high
+        // (fragmentation) vs steady hf decline (leak).
+        statusDoc["hf"] = ESP.getFreeHeap();
+        statusDoc["hl"] = ESP.getMaxAllocHeap();
+        statusDoc["hm"] = ESP.getMinFreeHeap();
+        statusDoc["up"] = millis() / 1000;
+
         broadcastJson(statusDoc);
     }
     if (now > lastCleanup + CLEANUP_PERIOD) {
         lastCleanup = now;
         ws.cleanupClients();
+        // Evict rxBuffers from clients that dropped TCP without a clean WS close
+        // (mobile screen-lock, OS killing background tab). Otherwise these leak
+        // until reboot.
+        const unsigned long nowMs = millis();
+        size_t evicted = 0;
+        for (auto it = rxBufferLastActivity.begin(); it != rxBufferLastActivity.end();) {
+            if (nowMs - it->second > RXBUFFER_IDLE_EVICT_MS) {
+                rxBuffers.erase(it->first);
+                it = rxBufferLastActivity.erase(it);
+                ++evicted;
+            } else {
+                ++it;
+            }
+        }
+        if (evicted > 0) {
+            ESP_LOGI("WebUIPlugin", "Evicted %u idle rxBuffers", static_cast<unsigned>(evicted));
+        }
     }
     if (now > lastDns + DNS_PERIOD && dnsServer != nullptr) {
         lastDns = now;
@@ -334,6 +460,8 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
     auto *info = static_cast<AwsFrameInfo *>(arg);
     const uint32_t cid = client->id();
 
+    rxBufferLastActivity[cid] = millis();
+
     if (info->index == 0) {
         auto &buf = rxBuffers[cid];
         buf.clear();
@@ -363,35 +491,35 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                 } else if (msgType == "req:autotune-start") {
                     handleAutotuneStart(client->id(), doc);
                 } else if (msgType == "req:process:activate") {
-                    controller->activate();
+                    controller->postCommand(CtrlCmd::ACTIVATE);
                 } else if (msgType == "req:process:deactivate") {
-                    controller->deactivate();
-                    controller->clear();
+                    controller->postCommand(CtrlCmd::DEACTIVATE);
+                    controller->postCommand(CtrlCmd::CLEAR);
                 } else if (msgType == "req:process:clear") {
-                    controller->clear();
+                    controller->postCommand(CtrlCmd::CLEAR);
                 } else if (msgType == "req:grind:activate") {
-                    controller->activateGrind();
+                    controller->postCommand(CtrlCmd::ACTIVATE_GRIND);
                 } else if (msgType == "req:grind:deactivate") {
-                    controller->deactivateGrind();
+                    controller->postCommand(CtrlCmd::DEACTIVATE_GRIND);
                 } else if (msgType == "req:change-grind-target") {
                     if (doc["target"].is<uint8_t>()) {
                         auto target = doc["target"].as<uint8_t>();
                         controller->getSettings().setVolumetricTarget(target);
                     }
                 } else if (msgType == "req:raise-temp") {
-                    controller->raiseTemp();
+                    controller->postCommand(CtrlCmd::RAISE_TEMP);
                 } else if (msgType == "req:lower-temp") {
-                    controller->lowerTemp();
+                    controller->postCommand(CtrlCmd::LOWER_TEMP);
                 } else if (msgType == "req:raise-grind-target") {
-                    controller->raiseGrindTarget();
+                    controller->postCommand(CtrlCmd::RAISE_GRIND_TARGET);
                 } else if (msgType == "req:lower-grind-target") {
-                    controller->lowerGrindTarget();
+                    controller->postCommand(CtrlCmd::LOWER_GRIND_TARGET);
                 } else if (msgType == "req:change-mode") {
                     if (doc["mode"].is<uint8_t>()) {
                         auto mode = doc["mode"].as<uint8_t>();
-                        controller->deactivate();
-                        controller->clear();
-                        controller->setMode(mode);
+                        controller->postCommand(CtrlCmd::DEACTIVATE);
+                        controller->postCommand(CtrlCmd::CLEAR);
+                        controller->postCommand(CtrlCmd::SET_MODE, mode);
                     }
                 } else if (msgType == "req:change-brew-target") {
                     if (doc["target"].is<uint8_t>()) {
@@ -433,6 +561,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
         }
         // Done with this message
         rxBuffers.erase(cid);
+        rxBufferLastActivity.erase(cid);
     }
 }
 
@@ -751,6 +880,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["scaleCalibration2"] = settings.getScaleCalibration2();
     doc["scaleOffset1"] = settings.getScaleOffset1();
     doc["scaleOffset2"] = settings.getScaleOffset2();
+    doc["scaleCalTimestamp1"] = settings.getScaleCalTimestamp1();
+    doc["scaleCalTimestamp2"] = settings.getScaleCalTimestamp2();
+    doc["scaleCalStddev1"] = settings.getScaleCalStddev1();
+    doc["scaleCalStddev2"] = settings.getScaleCalStddev2();
     // Add auto-wakeup settings to response
     doc["autowakeupEnabled"] = settings.isAutoWakeupEnabled();
     doc["buttonBehavior"] = implode(settings.getButtonBehaviorList(), ",");

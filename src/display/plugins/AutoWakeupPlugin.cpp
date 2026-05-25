@@ -61,7 +61,7 @@ void AutoWakeupPlugin::checkAutoWakeup() {
             ESP_LOGI(LOG_TAG.c_str(), "Auto-wakeup schedule matched (time: %s, day: %d), switching to brew mode",
                      schedule.time.c_str(), currentDayOfWeek);
 
-            controller->setMode(MODE_BREW);
+            controller->postCommand(CtrlCmd::SET_MODE, MODE_BREW);
 
             // Trigger plugin events
             pluginManager->trigger("autowakeup:activated", "time", schedule.time);

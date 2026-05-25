@@ -2,6 +2,7 @@
 #define HWSCALEPLUGIN_H
 
 #include "../core/Plugin.h"
+#include "GaggiMateComm.h"
 
 class HWScalePlugin : public Plugin {
   public:
@@ -11,22 +12,24 @@ class HWScalePlugin : public Plugin {
     void loop() override {}
 
     bool isPresent() const { return present; }
-    float getWeight() const { return currentWeight; }
+    float getWeight() const { return lastSample.weightG; }
+    const ScaleSample &lastReading() const { return lastSample; }
     void tare();
 
+    // Health bits that disqualify the sample from feeding the brew controller.
+    static constexpr uint16_t BREW_BLOCKING_HEALTH = SCALE_HEALTH_NOT_CALIBRATED | SCALE_HEALTH_STALE | SCALE_HEALTH_TARE_FAILED |
+                                                     SCALE_HEALTH_SAT_CH1 | SCALE_HEALTH_SAT_CH2 | SCALE_HEALTH_TARING |
+                                                     SCALE_HEALTH_CALIBRATING;
+
   private:
-    void onMeasurement(float weight);
+    void onSample(const ScaleSample &s);
     void onProcessStart();
 
     Controller *controller = nullptr;
     PluginManager *pluginManager = nullptr;
     bool present = false;
-    float currentWeight = 0.0f;
     bool active = false;
-
-    // Rate limiting
-    mutable unsigned long lastMeasurementTime = 0;
-    static constexpr unsigned long MIN_MEASUREMENT_INTERVAL_MS = 10;
+    ScaleSample lastSample{};
 };
 
 extern HWScalePlugin HWScale;

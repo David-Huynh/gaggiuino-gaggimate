@@ -2,6 +2,9 @@
 #define CONTROLLER_H
 
 #include "GaggiMateClient.h"
+
+#include <atomic>
+#include <cstdint>
 #include "PluginManager.h"
 #include "Settings.h"
 #include "SystemInfo.h"
@@ -18,9 +21,31 @@ const IPAddress WIFI_SUBNET_MASK(255, 255, 255, 0); // no need to change: https:
 
 enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH, HARDWARE_SCALE };
 
+// Commands posted from any task; drained on the Arduino loop task at the top of
+// Controller::loop(). External callers (WebUI, LVGL, plugins) MUST use
+// postCommand() rather than calling the corresponding mutator directly so that
+// process-state mutation only happens on a single task.
+enum class CtrlCmd : uint8_t {
+    ACTIVATE,
+    DEACTIVATE,
+    CLEAR,
+    ACTIVATE_GRIND,
+    DEACTIVATE_GRIND,
+    ACTIVATE_STANDBY,
+    DEACTIVATE_STANDBY,
+    SET_MODE,
+    RAISE_TEMP,
+    LOWER_TEMP,
+    RAISE_GRIND_TARGET,
+    LOWER_GRIND_TARGET,
+};
+
 class Controller {
   public:
     Controller() = default;
+
+    // Thread-safe: enqueue a command from any task. Non-blocking.
+    void postCommand(CtrlCmd cmd, int32_t arg = 0);
 
     void setup();
     void connect();
@@ -39,7 +64,7 @@ class Controller {
 
     float getTargetTemp() const;
     int getTargetGrindDuration() const;
-    virtual float getCurrentTemp() const { return currentTemp; }
+    virtual float getCurrentTemp() const { return currentTemp.load(std::memory_order_relaxed); }
     bool isActive() const;
     bool isGrindActive() const;
     bool isUpdating() const;
@@ -49,9 +74,9 @@ class Controller {
     bool isSDCard() const { return sdcard; }
     virtual float getTargetPressure() const { return targetPressure; }
     virtual float getTargetFlow() const { return targetFlow; }
-    virtual float getCurrentPressure() const { return pressure; }
+    virtual float getCurrentPressure() const { return pressure.load(std::memory_order_relaxed); }
     virtual float getCurrentPuckFlow() const { return currentPuckFlow; }
-    virtual float getCurrentPumpFlow() const { return currentPumpFlow; }
+    virtual float getCurrentPumpFlow() const { return currentPumpFlow.load(std::memory_order_relaxed); }
 
     bool isTaskHealthy() const { return is_task_healthy(eTaskGetState(taskHandle)); }
 
@@ -92,9 +117,13 @@ class Controller {
     void setVolumetricOverride(bool override) { volumetricOverride = override; }
     void setHardwareScalePresent(bool present) { hardwareScalePresent = present; }
     bool isHardwareScalePresent() const { return hardwareScalePresent; }
+    bool isHardwareScaleShotBaselineActive() const { return hardwareScaleShotBaselineActive; }
+    float getHardwareScaleShotBaseline() const { return hardwareScaleShotBaseline; }
     void scaleTare();
     void sendScaleCalibration(float c1, float c2);
     bool isBluetoothScaleHealthy() const;
+    // Most-recent ScaleSample snapshot (rich health/stddev info), copied under mutex.
+    ScaleSample getScaleSample() const;
     void onFlush();
     int getWaterLevel() const {
         int emptyDist = settings.getEmptyTankDistance();
@@ -134,6 +163,11 @@ class Controller {
     // Switch the BLE connection interval based on whether a process is running.
     // force re-applies even if the desired state is unchanged (use on connect).
     void applyConnectionPriority(bool force = false);
+    void drainCommandQueue();
+    bool captureHardwareScaleShotBaseline();
+    void resetHardwareScaleShotBaseline();
+    void recordHardwareScaleBaselineSample(const ScaleSample &sample);
+    bool isHardwareScaleSampleHealthy(const ScaleSample &sample) const;
 
     // Event handlers
     void onTempRead(float temperature);
@@ -156,11 +190,14 @@ class Controller {
     ProfileManager *profileManager{};
 
     int mode = MODE_BREW;
-    float currentTemp = 0;
-    float pressure = 0.0f;
+    // Sensor scalars written from the UART poll callback (Arduino loop task) and
+    // read from loopTask on Core 1; atomic to avoid torn reads / race-y glitches
+    // in the brew control loop.
+    std::atomic<float> currentTemp{0.0f};
+    std::atomic<float> pressure{0.0f};
     float targetPressure = 0.0f;
     float currentPuckFlow = 0.0f;
-    float currentPumpFlow = 0.0f;
+    std::atomic<float> currentPumpFlow{0.0f};
     float targetFlow = 0.0f;
     int tofDistance = 0;
 
@@ -181,6 +218,23 @@ class Controller {
 
     Process *currentProcess = nullptr;
     Process *lastProcess = nullptr;
+    // Serializes mutation and dereference of currentProcess / lastProcess across
+    // tasks (Arduino loop, Core 1 loopTask, AsyncTCP, LVGL). Recursive so that
+    // activate() can call clear()/startProcess() while already holding it.
+    SemaphoreHandle_t processMutex = nullptr;
+
+    // External-mutation queue, drained on the Arduino loop task.
+    QueueHandle_t cmdQueue = nullptr;
+
+    // Most-recent ScaleSample, written from UART poll callback, read by getters.
+    mutable SemaphoreHandle_t scaleSampleMutex = nullptr;
+    ScaleSample lastScaleSample{};
+    static constexpr uint8_t HARDWARE_SCALE_BASELINE_SAMPLE_COUNT = 8;
+    float hardwareScaleBaselineSamples[HARDWARE_SCALE_BASELINE_SAMPLE_COUNT]{};
+    uint8_t hardwareScaleBaselineSampleIndex = 0;
+    uint8_t hardwareScaleBaselineSampleCount = 0;
+    bool hardwareScaleShotBaselineActive = false;
+    float hardwareScaleShotBaseline = 0.0f;
 
     unsigned long grindActiveUntil = 0;
     unsigned long lastPing = 0;

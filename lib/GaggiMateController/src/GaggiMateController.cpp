@@ -54,7 +54,7 @@ void GaggiMateController::setup() {
 #ifdef ARDUINO_ARCH_STM32
     if (_config.capabilites.scale) {
         scale = new HX711Scale(_config.scaleSdaPin, _config.scaleSda1Pin, _config.scaleSclPin,
-                               [this](float weight) { _comms.sendWeightMeasurement(weight); });
+                               [this](const ScaleSnapshot &snap) { _comms.sendWeightMeasurement(snap.weightG); });
     }
 #endif
     if (_config.capabilites.dimming) {
@@ -108,20 +108,22 @@ void GaggiMateController::setup() {
 #ifdef ARDUINO_ARCH_STM32
     if (_config.capabilites.scale && scale != nullptr) {
         scale->setup();
-        scale->setTareResultCallback([this](long o1, long o2) { _comms.sendScaleOffsets(o1, o2); });
-        _comms.onScaleTare([this]() { scale->tare(); });
+        scale->setTareDoneCallback([this](long o1, long o2, float, float, bool success, uint16_t) {
+            if (success) {
+                _comms.sendScaleOffsets(o1, o2);
+            }
+        });
+        scale->setCalDoneCallback([this](uint8_t channel, float factor, float, bool success, uint8_t) {
+            if (success) {
+                _comms.sendScaleCalibrationResult(channel, factor);
+            }
+        });
+        _comms.onScaleTare([this]() { scale->requestTare(); });
         _comms.onScaleCalibration([this](float c1, float c2, long offset1, long offset2) {
             scale->setCalibration(c1, c2);
-            if (offset1 != 0 || offset2 != 0) {
-                scale->setOffset(offset1, offset2);
-            }
+            scale->setOffset(offset1, offset2);
         });
-        _comms.onScaleCalibrationStart([this](uint8_t channel, float refWeight) {
-            float newFactor = scale->calibrateChannel(channel, refWeight);
-            if (newFactor != 0.0f) {
-                _comms.sendScaleCalibrationResult(channel, newFactor);
-            }
-        });
+        _comms.onScaleCalibrationStart([this](uint8_t channel, float refWeight) { scale->requestCalibration(channel, refWeight); });
     }
 #endif
     // Set up thermal feedforward for main heater if pressure/dimming capability exists

@@ -3,34 +3,63 @@
 #include <Arduino.h>
 #include <STM32FreeRTOS.h>
 
+// Outcome of a single read attempt. Values are filled only on OK.
+enum class HxResult : uint8_t {
+    OK = 0,
+    NOT_READY = 1,
+    MUTEX_TIMEOUT = 2,
+};
+
+struct HxStatus {
+    uint32_t okCount = 0;
+    uint32_t notReadyCount = 0;
+    uint32_t mutexTimeoutCount = 0;
+    uint32_t saturationCount = 0; // any channel saturated on a successful read
+    uint16_t nativeHz = 0;        // 10 or 80 once detected, 0 otherwise
+};
+
 // FreeRTOS-compatible dual-channel HX711 driver using software bit-bang.
-// Drop-in replacement for the banoz HX711_2 timer-ISR library.
-// No hardware timer used — SCK is clocked directly in the reading task,
-// protected by a brief critical section to prevent preemption mid-frame.
+// Returns raw 24-bit signed counts only; calibration math lives in HX711Scale.
 class HX711Dual {
   public:
-    void begin(uint8_t dout1, uint8_t dout2, uint8_t sck,
-               uint8_t gain = 128, uint32_t sckMode = OUTPUT);
-    void set_scale(float scale1 = 1.0f, float scale2 = 1.0f);
+    // Saturation threshold: ~1% from full-scale rails of the 24-bit signed range.
+    static constexpr long SATURATION_THRESHOLD = 0x7E0000;
+
+    void begin(uint8_t dout1, uint8_t dout2, uint8_t sck, uint8_t gain = 128, uint32_t sckMode = OUTPUT);
     void power_up();
     void power_down();
-    bool wait_ready_timeout(unsigned long timeout_ms, unsigned long delay_ms = 0,
-                            unsigned long fromCounter = 0);
-    void tare(uint8_t times = 10);
-    void get_units(float *values, uint8_t times = 1);
-    void get_value(long *values, uint8_t times = 1);
-    void set_offset(long offset1 = 0, long offset2 = 0);
-    void get_offset(long *offsets);
+
+    // Block until at least one DOUT line goes low (data ready) or timeout elapses.
+    bool wait_ready_timeout(unsigned long timeout_ms, unsigned long delay_ms = 0);
+
+    // Fast probe — returns true if data is currently ready without blocking.
+    bool is_ready() const;
+
+    // Single-shot read attempt. On OK fills `values` with raw signed 24-bit counts,
+    // `valid` with per-channel readiness, and `saturated` with per-channel saturation
+    // flags. NOT_READY if both DOUT lines are high (no fresh data); MUTEX_TIMEOUT if
+    // another caller holds the bus longer than 50 ms.
+    HxResult try_read(long values[2], bool valid[2], bool saturated[2]);
+
+    // Set gain factor (32, 64, or 128). The setting takes effect on the next read.
+    void set_gain(uint8_t gain);
+
+    // True if |raw| exceeds SATURATION_THRESHOLD.
+    static bool is_saturated(long raw) { return raw > SATURATION_THRESHOLD || raw < -SATURATION_THRESHOLD; }
+
+    // Time consecutive ready cycles to classify the HX711 as 10 Hz or 80 Hz native.
+    // Caller must have a powered-up driver with the data line responding.
+    // Returns the cached value if already detected; safe default 10 Hz on failure.
+    uint16_t detect_rate();
+    uint16_t getNativeHz() const { return _nativeHz; }
+
+    HxStatus read_status() const { return _status; }
 
   private:
     uint8_t _dout1 = 0, _dout2 = 0, _sck = 0;
     uint8_t _gainPulses = 1; // extra clocks after data: 128→1, 32→2, 64→3
-    float _scale1 = 1.0f, _scale2 = 1.0f;
-    long _offset1 = 0, _offset2 = 0;
     SemaphoreHandle_t _mutex = nullptr;
-
-    bool is_ready() const;
-    void read_raw(long values[2]);
-    void read_average(long values[2], uint8_t times);
+    uint16_t _nativeHz = 0;
+    HxStatus _status{};
 };
 #endif

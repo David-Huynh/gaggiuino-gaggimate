@@ -12,20 +12,20 @@
 static bool volumetricHoldTriggered = false;
 
 void onBrewCancel(lv_event_t *e) {
-    controller.deactivate();
-    controller.clear();
+    controller.postCommand(CtrlCmd::DEACTIVATE);
+    controller.postCommand(CtrlCmd::CLEAR);
 }
 
-void onBrewStart(lv_event_t *e) { controller.activate(); }
+void onBrewStart(lv_event_t *e) { controller.postCommand(CtrlCmd::ACTIVATE); }
 
 void onBrewTempLower(lv_event_t *e) {
     controller.getUI()->markProfileDirty();
-    controller.lowerTemp();
+    controller.postCommand(CtrlCmd::LOWER_TEMP);
 }
 
 void onBrewTempRaise(lv_event_t *e) {
     controller.getUI()->markProfileDirty();
-    controller.raiseTemp();
+    controller.postCommand(CtrlCmd::RAISE_TEMP);
 }
 
 void onBrewTimeLower(lv_event_t *e) {
@@ -38,26 +38,26 @@ void onBrewTimeRaise(lv_event_t *e) {
     controller.raiseBrewTarget();
 }
 
-void onSteamTempLower(lv_event_t *e) { controller.lowerTemp(); }
+void onSteamTempLower(lv_event_t *e) { controller.postCommand(CtrlCmd::LOWER_TEMP); }
 
-void onSteamTempRaise(lv_event_t *e) { controller.raiseTemp(); }
+void onSteamTempRaise(lv_event_t *e) { controller.postCommand(CtrlCmd::RAISE_TEMP); }
 
 void onBrewScreen(lv_event_t *e) {
     controller.getUI()->changeScreen(&ui_BrewScreen, &ui_BrewScreen_screen_init);
-    controller.deactivate();
-    controller.setMode(MODE_BREW);
+    controller.postCommand(CtrlCmd::DEACTIVATE);
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_BREW);
 }
 
 void onWaterScreen(lv_event_t *e) {
     controller.getUI()->changeScreen(&ui_SimpleProcessScreen, &ui_SimpleProcessScreen_screen_init);
-    controller.setMode(MODE_WATER);
-    controller.deactivate();
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_WATER);
+    controller.postCommand(CtrlCmd::DEACTIVATE);
 }
 
 void onSteamScreen(lv_event_t *e) {
     controller.getUI()->changeScreen(&ui_SimpleProcessScreen, &ui_SimpleProcessScreen_screen_init);
-    controller.setMode(MODE_STEAM);
-    controller.deactivate();
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_STEAM);
+    controller.postCommand(CtrlCmd::DEACTIVATE);
 }
 
 void onWakeup(lv_event_t *e) {
@@ -66,29 +66,31 @@ void onWakeup(lv_event_t *e) {
         return;
     }
     controller.getUI()->changeScreen(&ui_BrewScreen, &ui_BrewScreen_screen_init);
-    controller.deactivate();
-    controller.setMode(MODE_BREW);
+    controller.postCommand(CtrlCmd::DEACTIVATE);
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_BREW);
 }
 
 void onLoadStarted(lv_event_t *e) {}
 
-void onStandby(lv_event_t *e) { controller.activateStandby(); }
+void onStandby(lv_event_t *e) { controller.postCommand(CtrlCmd::ACTIVATE_STANDBY); }
 
-void onGrindToggle(lv_event_t *e) { controller.isGrindActive() ? controller.deactivateGrind() : controller.activateGrind(); }
+void onGrindToggle(lv_event_t *e) {
+    controller.postCommand(controller.isGrindActive() ? CtrlCmd::DEACTIVATE_GRIND : CtrlCmd::ACTIVATE_GRIND);
+}
 
-void onGrindTimeLower(lv_event_t *e) { controller.lowerGrindTarget(); }
+void onGrindTimeLower(lv_event_t *e) { controller.postCommand(CtrlCmd::LOWER_GRIND_TARGET); }
 
-void onGrindTimeRaise(lv_event_t *e) { controller.raiseGrindTarget(); }
+void onGrindTimeRaise(lv_event_t *e) { controller.postCommand(CtrlCmd::RAISE_GRIND_TARGET); }
 
 void onMenuClick(lv_event_t *e) {
-    controller.deactivate();
-    controller.setMode(MODE_BREW);
+    controller.postCommand(CtrlCmd::DEACTIVATE);
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_BREW);
     controller.getUI()->changeScreen(&ui_MenuScreen, &ui_MenuScreen_screen_init);
 }
 
 void onGrindScreen(lv_event_t *e) {
     controller.getUI()->changeScreen(&ui_GrindScreen, &ui_GrindScreen_screen_init);
-    controller.setMode(MODE_GRIND);
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_GRIND);
 }
 
 void onVolumetricClick(lv_event_t *e) {
@@ -114,7 +116,7 @@ void onFlush(lv_event_t *e) { controller.onFlush(); }
 
 void onSimpleProcessToggle(lv_event_t *e) {
     if (controller.getMode() != MODE_STEAM) {
-        controller.isActive() ? controller.deactivate() : controller.activate();
+        controller.postCommand(controller.isActive() ? CtrlCmd::DEACTIVATE : CtrlCmd::ACTIVATE);
     }
 }
 

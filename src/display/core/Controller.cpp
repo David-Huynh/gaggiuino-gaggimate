@@ -2,8 +2,10 @@
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
 #include "esp_sntp.h"
+#include "esp_task_wdt.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <display/config.h>
@@ -34,8 +36,92 @@
 
 const String LOG_TAG = F("Controller");
 
+namespace {
+// RAII guard for the process mutex. Recursive take, give on scope exit.
+struct ProcessLock {
+    SemaphoreHandle_t m;
+    explicit ProcessLock(SemaphoreHandle_t mtx) : m(mtx) {
+        if (m != nullptr) {
+            xSemaphoreTakeRecursive(m, portMAX_DELAY);
+        }
+    }
+    ~ProcessLock() {
+        if (m != nullptr) {
+            xSemaphoreGiveRecursive(m);
+        }
+    }
+    ProcessLock(const ProcessLock &) = delete;
+    ProcessLock &operator=(const ProcessLock &) = delete;
+};
+} // namespace
+
+struct CtrlCmdMsg {
+    CtrlCmd type;
+    int32_t arg;
+};
+
+void Controller::postCommand(CtrlCmd cmd, int32_t arg) {
+    if (cmdQueue == nullptr) {
+        return;
+    }
+    CtrlCmdMsg msg{cmd, arg};
+    if (xQueueSend(cmdQueue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(LOG_TAG.c_str(), "Controller cmdQueue full, dropped cmd=%u", static_cast<unsigned>(cmd));
+    }
+}
+
+void Controller::drainCommandQueue() {
+    if (cmdQueue == nullptr) {
+        return;
+    }
+    CtrlCmdMsg msg;
+    while (xQueueReceive(cmdQueue, &msg, 0) == pdTRUE) {
+        switch (msg.type) {
+        case CtrlCmd::ACTIVATE:
+            activate();
+            break;
+        case CtrlCmd::DEACTIVATE:
+            deactivate();
+            break;
+        case CtrlCmd::CLEAR:
+            clear();
+            break;
+        case CtrlCmd::ACTIVATE_GRIND:
+            activateGrind();
+            break;
+        case CtrlCmd::DEACTIVATE_GRIND:
+            deactivateGrind();
+            break;
+        case CtrlCmd::ACTIVATE_STANDBY:
+            activateStandby();
+            break;
+        case CtrlCmd::DEACTIVATE_STANDBY:
+            deactivateStandby();
+            break;
+        case CtrlCmd::SET_MODE:
+            setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::RAISE_TEMP:
+            raiseTemp();
+            break;
+        case CtrlCmd::LOWER_TEMP:
+            lowerTemp();
+            break;
+        case CtrlCmd::RAISE_GRIND_TARGET:
+            raiseGrindTarget();
+            break;
+        case CtrlCmd::LOWER_GRIND_TARGET:
+            lowerGrindTarget();
+            break;
+        }
+    }
+}
+
 void Controller::setup() {
     mode = settings.getStartupMode();
+    processMutex = xSemaphoreCreateRecursiveMutex();
+    scaleSampleMutex = xSemaphoreCreateMutex();
+    cmdQueue = xQueueCreate(16, sizeof(CtrlCmdMsg));
 
     // Web assets are served from this partition. LittleFS (not SPIFFS): SPIFFS
     // has no directory tree, so stat()/exists() is O(whole filesystem) and a
@@ -96,6 +182,18 @@ void Controller::setup() {
 
     pluginManager->on("profiles:profile:select", [this](Event const &event) { this->handleProfileUpdate(); });
 
+    // When the user cycles scale source from the UI/WebUI we tear down any
+    // in-flight process so the next brew press starts from a known state.
+    // Without this, plugin-side flags (volumetricOverride, hardwareScalePresent)
+    // and Controller::currentVolumetricSource can hold values that no longer
+    // match the active source, which manifested as "brew button does nothing"
+    // after cycling away from Predictive.
+    settings.setOnScaleSourceChange([this](int) {
+        postCommand(CtrlCmd::DEACTIVATE);
+        postCommand(CtrlCmd::CLEAR);
+        volumetricOverride = false;
+    });
+
 #ifndef GAGGIMATE_HEADLESS
     ui->init();
 #endif
@@ -104,6 +202,7 @@ void Controller::setup() {
     updateLastAction();
     xTaskCreatePinnedToCore(loopTask, "Controller::loopControl", configMINIMAL_STACK_SIZE * 6, this, 2, &taskHandle, 0);
     xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", configMINIMAL_STACK_SIZE * 6, this, 3, &logicTaskHandle, 0);
+    esp_task_wdt_add(taskHandle);
 }
 
 void Controller::onScreenReady() { screenReady = true; }
@@ -216,9 +315,9 @@ void Controller::setupBluetooth() {
     pluginManager->on("ota:update:end", [this](Event const &) { applyConnectionPriority(true); });
     comms.onSensorData([this](float temp, float pressure, float puckFlow, float pumpFlow, float puckResistance) {
         onTempRead(temp);
-        this->pressure = pressure;
+        this->pressure.store(pressure, std::memory_order_relaxed);
         this->currentPuckFlow = puckFlow;
-        this->currentPumpFlow = pumpFlow;
+        this->currentPumpFlow.store(pumpFlow, std::memory_order_relaxed);
         pluginManager->trigger("boiler:pressure:change", "value", pressure);
         pluginManager->trigger("pump:puck-flow:change", "value", puckFlow);
         pluginManager->trigger("pump:flow:change", "value", pumpFlow);
@@ -308,24 +407,68 @@ void Controller::setupBluetooth() {
     });
     comms.onVolumetricMeasurement(
         [this](float value) { onVolumetricMeasurement(value, VolumetricMeasurementSource::FLOW_ESTIMATION); });
-    comms.onWeightMeasurement([this](float weight) { pluginManager->trigger("controller:weight:change", "value", weight); });
+    comms.onWeightMeasurement([this](float weight) {
+        ScaleSample sample{};
+        sample.weightG = weight;
+        sample.stddevG = 0.0f;
+        sample.ch1G = weight;
+        sample.ch2G = 0.0f;
+        sample.ch1StdG = 0.0f;
+        sample.ch2StdG = 0.0f;
+        sample.healthBits = SCALE_HEALTH_OK;
+        if (scaleSampleMutex && xSemaphoreTake(scaleSampleMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+            sample.sampleSeq = lastScaleSample.sampleSeq + 1;
+            lastScaleSample = sample;
+            xSemaphoreGive(scaleSampleMutex);
+        }
+        recordHardwareScaleBaselineSample(sample);
+        pluginManager->trigger("controller:scale:sample", "value", weight);
+        pluginManager->trigger("controller:weight:change", "value", weight);
+    });
     comms.onScaleOffsets([this](long offset1, long offset2) {
         settings.setScaleOffset1(offset1);
         settings.setScaleOffset2(offset2);
         ESP_LOGI(LOG_TAG, "Scale offsets received and saved: %ld, %ld", offset1, offset2);
+        Event ev{"controller:scale:tare:done"};
+        ev.setInt("success", 1);
+        ev.setFloat("offset1", static_cast<float>(offset1));
+        ev.setFloat("offset2", static_cast<float>(offset2));
+        ev.setFloat("std1", 0.0f);
+        ev.setFloat("std2", 0.0f);
+        ev.setInt("healthBits", SCALE_HEALTH_OK);
+        pluginManager->trigger(ev);
     });
     comms.onScaleCalibrationResult([this](uint8_t channel, float calibration) {
-        if (channel == 1)
+        const long now = static_cast<long>(time(nullptr));
+        if (channel == 1) {
             settings.setScaleCalibration1(calibration);
-        else if (channel == 2)
+            settings.setScaleCalTimestamp1(now);
+            settings.setScaleCalStddev1(0.0f);
+        } else if (channel == 2) {
             settings.setScaleCalibration2(calibration);
+            settings.setScaleCalTimestamp2(now);
+            settings.setScaleCalStddev2(0.0f);
+        }
         pluginManager->trigger("controller:scale:calibrated", "channel", static_cast<int>(channel));
+        Event ev{"controller:scale:cal:done"};
+        ev.setInt("channel", static_cast<int>(channel));
+        ev.setFloat("factor", calibration);
+        ev.setFloat("stddevG", 0.0f);
+        ev.setInt("success", 1);
+        ev.setInt("errorCode", 0);
+        pluginManager->trigger(ev);
         ESP_LOGI(LOG_TAG, "Scale ch%d calibration result: %.6f", channel, calibration);
     });
     comms.onTofMeasurement([this](uint32_t value) {
         tofDistance = static_cast<int>(value);
         ESP_LOGV(LOG_TAG, "Received new TOF distance: %d", tofDistance);
         pluginManager->trigger("controller:tof:change", "value", tofDistance);
+    });
+    pluginManager->on("settings:changed", [this](Event const &) {
+        if (comms.isConnected() && systemInfo.capabilities.scale) {
+            comms.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(), settings.getScaleOffset1(),
+                                       settings.getScaleOffset2());
+        }
     });
 #ifdef GAGGIMATE_UART_COMMS
     pluginManager->trigger("controller:uart:init");
@@ -467,6 +610,10 @@ void Controller::setupWifi() {
 }
 
 void Controller::loop() {
+    // Drain external commands first so any pending activate/deactivate/setMode
+    // from WebUI / LVGL / plugins runs on this task, not on AsyncTCP or LVGL.
+    drainCommandQueue();
+
     // Act on WiFi link-state changes flagged by the (small-stack) event task here
     // on the main loop. Disconnect before connect so a flap is ordered correctly.
     if (wifiDisconnectedPending) {
@@ -517,51 +664,62 @@ void Controller::loopLogic() {
         return;
     }
 
-    // Check if steam is ready
-    if (mode == MODE_STEAM && !steamReady && currentTemp + 5.f > getTargetTemp()) {
-        activate();
-        steamReady = true;
-    }
+    unsigned long now = millis();
 
-    // Handle current process
-    if (currentProcess != nullptr) {
-        updateLastAction();
-        if (currentProcess->getType() == MODE_BREW) {
-            auto brewProcess = static_cast<BrewProcess *>(currentProcess);
-            brewProcess->updatePressure(pressure);
-            brewProcess->updateFlow(currentPumpFlow);
+    if (now - lastProgress > PROGRESS_INTERVAL) {
+        // Check if steam is ready
+        if (mode == MODE_STEAM && !steamReady && currentTemp.load(std::memory_order_relaxed) + 5.f > getTargetTemp()) {
+            activate();
+            steamReady = true;
         }
-        currentProcess->progress();
-        if (!isActive()) {
+
+        // Handle current and last process under the process mutex so a concurrent
+        // deactivate()/clear() from AsyncTCP or LVGL cannot delete the object
+        // we're dereferencing here.
+        bool needDeactivate = false;
+        {
+            ProcessLock lock(processMutex);
+            Process *proc = currentProcess;
+            if (proc != nullptr) {
+                updateLastAction();
+                if (proc->getType() == MODE_BREW) {
+                    auto brewProcess = static_cast<BrewProcess *>(proc);
+                    brewProcess->updatePressure(pressure.load(std::memory_order_relaxed));
+                    brewProcess->updateFlow(currentPumpFlow.load(std::memory_order_relaxed));
+                }
+                proc->progress();
+                needDeactivate = !proc->isActive();
+            }
+
+            Process *last = lastProcess;
+            if (last != nullptr && !last->isComplete()) {
+                last->progress();
+            }
+            if (last != nullptr && last->isComplete() && !processCompleted && settings.isDelayAdjust()) {
+                processCompleted = true;
+                if (last->getType() == MODE_BREW) {
+                    if (auto *brewProcess = static_cast<BrewProcess *>(last); brewProcess->target == ProcessTarget::VOLUMETRIC) {
+                        double newDelay = brewProcess->getNewDelayTime();
+                        if (newDelay >= 0) {
+                            settings.setBrewDelay(newDelay);
+                        }
+                    }
+                } else if (last->getType() == MODE_GRIND) {
+                    if (auto *grindProcess = static_cast<GrindProcess *>(last);
+                        grindProcess->target == ProcessTarget::VOLUMETRIC) {
+                        double newDelay = grindProcess->getNewDelayTime();
+                        if (newDelay >= 0) {
+                            settings.setGrindDelay(newDelay);
+                        }
+                    }
+                }
+            }
+        }
+        if (needDeactivate) {
             deactivate();
         }
+        lastProgress = now;
     }
-
-    // Handle last process - Calculate auto delay
-    if (lastProcess != nullptr && !lastProcess->isComplete()) {
-        lastProcess->progress();
-    }
-    if (lastProcess != nullptr && lastProcess->isComplete() && !processCompleted && settings.isDelayAdjust()) {
-        processCompleted = true;
-        if (lastProcess->getType() == MODE_BREW) {
-            if (auto *brewProcess = static_cast<BrewProcess *>(lastProcess); brewProcess->target == ProcessTarget::VOLUMETRIC) {
-                double newDelay = brewProcess->getNewDelayTime();
-                if (newDelay >= 0) {
-                    settings.setBrewDelay(newDelay);
-                }
-            }
-        } else if (lastProcess->getType() == MODE_GRIND) {
-            if (auto *grindProcess = static_cast<GrindProcess *>(lastProcess);
-                grindProcess->target == ProcessTarget::VOLUMETRIC) {
-                double newDelay = grindProcess->getNewDelayTime();
-                if (newDelay >= 0) {
-                    settings.setGrindDelay(newDelay);
-                }
-            }
-        }
-    }
-
-    unsigned long now = millis();
 
     if (grindActiveUntil != 0 && now > grindActiveUntil)
         deactivateGrind();
@@ -605,6 +763,57 @@ bool Controller::isVolumetricAvailable() const {
 #endif
 }
 
+bool Controller::isHardwareScaleSampleHealthy(const ScaleSample &sample) const {
+    static constexpr uint16_t BLOCKING_HEALTH =
+        SCALE_HEALTH_NOT_CALIBRATED | SCALE_HEALTH_STALE | SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_SAT_CH1 |
+        SCALE_HEALTH_SAT_CH2 | SCALE_HEALTH_TARING | SCALE_HEALTH_CALIBRATING;
+    return hardwareScalePresent && std::isfinite(sample.weightG) && (sample.healthBits & BLOCKING_HEALTH) == 0;
+}
+
+void Controller::recordHardwareScaleBaselineSample(const ScaleSample &sample) {
+    if (!isHardwareScaleSampleHealthy(sample)) {
+        return;
+    }
+    hardwareScaleBaselineSamples[hardwareScaleBaselineSampleIndex] = sample.weightG;
+    hardwareScaleBaselineSampleIndex =
+        static_cast<uint8_t>((hardwareScaleBaselineSampleIndex + 1) % HARDWARE_SCALE_BASELINE_SAMPLE_COUNT);
+    if (hardwareScaleBaselineSampleCount < HARDWARE_SCALE_BASELINE_SAMPLE_COUNT) {
+        ++hardwareScaleBaselineSampleCount;
+    }
+}
+
+bool Controller::captureHardwareScaleShotBaseline() {
+    resetHardwareScaleShotBaseline();
+    const ScaleSample latest = getScaleSample();
+    if (!isHardwareScaleSampleHealthy(latest)) {
+        ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unavailable; falling back to timed brew");
+        return false;
+    }
+
+    float sum = 0.0f;
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < hardwareScaleBaselineSampleCount; i++) {
+        const float sample = hardwareScaleBaselineSamples[i];
+        if (std::isfinite(sample)) {
+            sum += sample;
+            ++count;
+        }
+    }
+    if (count == 0) {
+        sum = latest.weightG;
+        count = 1;
+    }
+    hardwareScaleShotBaseline = sum / static_cast<float>(count);
+    hardwareScaleShotBaselineActive = true;
+    ESP_LOGI(LOG_TAG, "Hardware scale shot baseline captured: %.3f g (%u samples)", hardwareScaleShotBaseline, count);
+    return true;
+}
+
+void Controller::resetHardwareScaleShotBaseline() {
+    hardwareScaleShotBaselineActive = false;
+    hardwareScaleShotBaseline = 0.0f;
+}
+
 void Controller::autotune(int testTime, int samples, int heaterWattage) {
     if (isActive() || !isReady()) {
         return;
@@ -622,8 +831,11 @@ void Controller::startProcess(Process *process) {
         delete process;
         return;
     }
-    processCompleted = false;
-    this->currentProcess = process;
+    {
+        ProcessLock lock(processMutex);
+        processCompleted = false;
+        this->currentProcess = process;
+    }
     applyConnectionPriority(); // shot started -> tight BLE interval
     pluginManager->trigger("controller:process:start");
     updateLastAction();
@@ -786,19 +998,54 @@ void Controller::updateControl() {
         return;
     }
 
-    // Local capture to avoid race condition with deactivate() running on another core
-    Process *proc = currentProcess;
-    bool active = isActive();
-
-    float targetTemp = getTargetTemp();
-    if (targetTemp > .0f) {
-        targetTemp = targetTemp + static_cast<float>(settings.getTemperatureOffset());
-    }
-
     bool altRelayActive = false;
-    if (active && proc->isAltRelayActive()) {
-        if (proc->getType() == MODE_GRIND && settings.getAltRelayFunction() == ALT_RELAY_GRIND) {
-            altRelayActive = true;
+    bool useAdvancedOutput = false;
+    bool outputValve = false;
+    bool pressureTarget = false;
+    float pumpSetpoint = 0.0f;
+    float advancedPressure = 0.0f;
+    float advancedFlow = 0.0f;
+    float targetTemp = 0.0f;
+
+    // Snapshot everything that needs currentProcess while the mutex is held.
+    // UART writes happen after the lock is released, so process start/stop is
+    // not blocked behind a potentially slow serial send.
+    {
+        ProcessLock lock(processMutex);
+        Process *proc = currentProcess;
+        const bool active = (proc != nullptr) && proc->isActive();
+
+        targetTemp = getTargetTemp();
+        if (targetTemp > .0f) {
+            targetTemp = targetTemp + static_cast<float>(settings.getTemperatureOffset());
+        }
+
+        if (active && proc->isAltRelayActive()) {
+            if (proc->getType() == MODE_GRIND && settings.getAltRelayFunction() == ALT_RELAY_GRIND) {
+                altRelayActive = true;
+            }
+        }
+
+        if (active && systemInfo.capabilities.pressure) {
+            if (proc->getType() == MODE_STEAM) {
+                useAdvancedOutput = true;
+                advancedPressure = settings.getSteamPumpCutoff();
+                advancedFlow = proc->getPumpValue() * 0.1f;
+            } else if (proc->getType() == MODE_BREW) {
+                auto *brewProcess = static_cast<BrewProcess *>(proc);
+                if (brewProcess->isAdvancedPump()) {
+                    useAdvancedOutput = true;
+                    outputValve = brewProcess->isRelayActive();
+                    pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
+                    advancedPressure = brewProcess->getPumpPressure();
+                    advancedFlow = brewProcess->getPumpFlow();
+                }
+            }
+        }
+
+        if (!useAdvancedOutput) {
+            outputValve = active && proc->isRelayActive();
+            pumpSetpoint = active ? proc->getPumpValue() : 0.0f;
         }
     }
 
@@ -808,42 +1055,25 @@ void Controller::updateControl() {
     BoilerCommand boiler;
     boiler.index = 0;
     boiler.setpoint = targetTemp;
+
     PumpCommand pump;
     pump.index = 0;
-    RelayCommand relay; // index 0 = brew valve
-    relay.index = 0;
 
-    bool handled = false;
-    if (active && systemInfo.capabilities.pressure) {
-        if (proc->getType() == MODE_STEAM) {
-            targetPressure = settings.getSteamPumpCutoff();
-            targetFlow = proc->getPumpValue() * 0.1f;
-            relay.open = false;
-            pump.mode = PumpControlMode::Flow; // flow target, pressure as the limit
-            pump.flow = targetFlow;
-            pump.pressure = targetPressure;
-            handled = true;
-        } else if (proc->getType() == MODE_BREW) {
-            auto *brewProcess = static_cast<BrewProcess *>(proc);
-            if (brewProcess->isAdvancedPump()) {
-                const bool pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
-                relay.open = brewProcess->isRelayActive();
-                pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
-                pump.pressure = brewProcess->getPumpPressure();
-                pump.flow = brewProcess->getPumpFlow();
-                targetPressure = brewProcess->getPumpPressure();
-                targetFlow = brewProcess->getPumpFlow();
-                handled = true;
-            }
-        }
-    }
+    RelayCommand relay;
+    relay.index = 0; // brew valve
+    relay.open = outputValve;
 
-    if (!handled) {
+    if (useAdvancedOutput) {
+        targetPressure = advancedPressure;
+        targetFlow = advancedFlow;
+        pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
+        pump.pressure = advancedPressure;
+        pump.flow = advancedFlow;
+    } else {
         targetPressure = 0.0f;
         targetFlow = 0.0f;
-        relay.open = active && proc->isRelayActive();
         pump.mode = PumpControlMode::Power;
-        pump.power = active ? proc->getPumpValue() : 0;
+        pump.power = pumpSetpoint;
     }
 
     // Only send components that changed since the last update. The controller is
@@ -873,16 +1103,36 @@ void Controller::updateControl() {
 }
 
 void Controller::activate() {
-    if (isActive())
+    const bool wasActive = isActive();
+    ESP_LOGI(LOG_TAG, "activate entry: mode=%d isActive=%d src=%d volumetricAvailable=%d hwScalePresent=%d", mode, wasActive,
+             settings.getScaleSource(), isVolumetricAvailable(), hardwareScalePresent);
+    if (wasActive)
         return;
     clear();
-    comms.tare();
+    // clear() already resets this under the process lock, but state in activate()
+    // is the operative invariant for the rest of this function — keep it explicit.
+    currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+    // HW-scale brews use an ESP32-side software shot baseline (see
+    // captureHardwareScaleShotBaseline below). Issuing a hardware tare here races
+    // the baseline capture: post-tare samples read ≈ 0 g while the baseline still
+    // holds the pre-tare cup weight, so (weight − baseline) clamps to 0 for the
+    // whole shot and weight-target stages never advance.
+    const int activateSrc = settings.getScaleSource();
+    if (activateSrc == 2) {
+        ESP_LOGI(LOG_TAG, "activate: skipping comms.tare() (HW scale uses software shot baseline) src=%d", activateSrc);
+    } else {
+        ESP_LOGI(LOG_TAG, "activate: comms.tare() src=%d", activateSrc);
+        comms.tare();
+    }
+    bool hardwareScaleBaselineReady = false;
     if (isVolumetricAvailable()) {
         int src = settings.getScaleSource();
         if (src == 3) { // Predictive
             currentVolumetricSource = VolumetricMeasurementSource::FLOW_ESTIMATION;
-        } else if (src == 2 && hardwareScalePresent) {
-            currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+        } else if (src == 2 && mode == MODE_BREW && hardwareScalePresent) {
+            hardwareScaleBaselineReady = captureHardwareScaleShotBaseline();
+            currentVolumetricSource =
+                hardwareScaleBaselineReady ? VolumetricMeasurementSource::HARDWARE_SCALE : VolumetricMeasurementSource::INACTIVE;
         } else if (src == 1) {
 #ifdef NIGHTLY_BUILD
             currentVolumetricSource =
@@ -890,8 +1140,18 @@ void Controller::activate() {
 #else
             currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
 #endif
-        } else if (hardwareScalePresent) {
-            currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+        } else if (hardwareScalePresent && mode == MODE_BREW) {
+            hardwareScaleBaselineReady = captureHardwareScaleShotBaseline();
+            if (hardwareScaleBaselineReady) {
+                currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
+            } else {
+#ifdef NIGHTLY_BUILD
+                currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
+                                                                    : VolumetricMeasurementSource::FLOW_ESTIMATION;
+#else
+                currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+#endif
+            }
         } else {
 #ifdef NIGHTLY_BUILD
             currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
@@ -900,15 +1160,29 @@ void Controller::activate() {
             currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
 #endif
         }
-        if (mode == MODE_BREW) {
-            pluginManager->trigger("controller:brew:prestart");
-        }
+    }
+    // HW-only refuses to silently fall back to TIME — that produces a stalled-
+    // looking brew whose phases only time out on BREW_SAFETY_DURATION_MS when the
+    // profile's stages progress on weight. Better UX is a clear rejection.
+    if (activateSrc == 2 && mode == MODE_BREW &&
+        currentVolumetricSource != VolumetricMeasurementSource::HARDWARE_SCALE) {
+        ESP_LOGW(LOG_TAG, "Hardware scale selected but no healthy sample is available yet; brew start rejected");
+        Event ev{"controller:scale:not-ready"};
+        ev.setInt("source", activateSrc);
+        pluginManager->trigger(ev);
+        return;
+    }
+    if (mode == MODE_BREW) {
+        // Fire unconditionally so plugins that pre-arm on brew start (e.g.
+        // BLE scale auto-tare) run regardless of volumetric availability.
+        pluginManager->trigger("controller:brew:prestart");
     }
     delay(200);
     switch (mode) {
     case MODE_BREW:
         startProcess(new BrewProcess(profileManager->getSelectedProfile(),
-                                     profileManager->getSelectedProfile().isVolumetric() && isVolumetricAvailable()
+                                     profileManager->getSelectedProfile().isVolumetric() && isVolumetricAvailable() &&
+                                             currentVolumetricSource != VolumetricMeasurementSource::INACTIVE
                                          ? ProcessTarget::VOLUMETRIC
                                          : ProcessTarget::TIME,
                                      settings.getBrewDelay()));
@@ -921,22 +1195,38 @@ void Controller::activate() {
         break;
     default:;
     }
-    if (currentProcess != nullptr && currentProcess->getType() == MODE_BREW) {
+    bool startedBrew = false;
+    int procType = -1;
+    {
+        ProcessLock lock(processMutex);
+        Process *proc = currentProcess;
+        startedBrew = proc != nullptr && proc->getType() == MODE_BREW;
+        procType = proc != nullptr ? proc->getType() : -1;
+    }
+    ESP_LOGI(LOG_TAG, "activate after startProcess: procType=%d startedBrew=%d", procType, startedBrew);
+    if (startedBrew) {
         pluginManager->trigger("controller:brew:start");
     }
 }
 
 void Controller::deactivate() {
-    if (currentProcess == nullptr) {
-        return;
+    int swappedType = -1;
+    {
+        ProcessLock lock(processMutex);
+        if (currentProcess == nullptr) {
+            return;
+        }
+        delete lastProcess;
+        lastProcess = currentProcess;
+        currentProcess = nullptr;
+        swappedType = lastProcess->getType();
     }
-    delete lastProcess;
-    lastProcess = currentProcess;
-    currentProcess = nullptr;
     applyConnectionPriority(); // shot ended -> relaxed BLE interval
-    if (lastProcess->getType() == MODE_BREW) {
+    if (swappedType == MODE_BREW) {
+        currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+        resetHardwareScaleShotBaseline();
         pluginManager->trigger("controller:brew:end");
-    } else if (lastProcess->getType() == MODE_GRIND) {
+    } else if (swappedType == MODE_GRIND) {
         pluginManager->trigger("controller:grind:end");
     }
     pluginManager->trigger("controller:process:end");
@@ -944,13 +1234,21 @@ void Controller::deactivate() {
 }
 
 void Controller::clear() {
-    processCompleted = true;
-    if (lastProcess != nullptr && lastProcess->getType() == MODE_BREW) {
+    bool wasBrew = false;
+    {
+        ProcessLock lock(processMutex);
+        processCompleted = true;
+        if (lastProcess != nullptr && lastProcess->getType() == MODE_BREW) {
+            wasBrew = true;
+        }
+        delete lastProcess;
+        lastProcess = nullptr;
+        currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+        resetHardwareScaleShotBaseline();
+    }
+    if (wasBrew) {
         pluginManager->trigger("controller:brew:clear");
     }
-    delete lastProcess;
-    lastProcess = nullptr;
-    currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
 }
 
 void Controller::activateGrind() {
@@ -983,11 +1281,13 @@ void Controller::deactivateStandby() {
 }
 
 bool Controller::isActive() const {
+    ProcessLock lock(processMutex);
     Process *proc = currentProcess;
     return proc != nullptr && proc->isActive();
 }
 
 bool Controller::isGrindActive() const {
+    ProcessLock lock(processMutex);
     Process *proc = currentProcess;
     return proc != nullptr && proc->isActive() && proc->getType() == MODE_GRIND;
 }
@@ -998,6 +1298,9 @@ void Controller::setMode(int newMode) {
     Event modeEvent = pluginManager->trigger("controller:mode:change", "value", newMode);
     mode = modeEvent.getInt("value");
     steamReady = false;
+    if (mode != MODE_BREW) {
+        resetHardwareScaleShotBaseline();
+    }
 
     updateLastAction();
     setTargetTemp(getTargetTemp());
@@ -1006,7 +1309,7 @@ void Controller::setMode(int newMode) {
 void Controller::onTempRead(float temperature) {
     float temp = temperature - static_cast<float>(settings.getTemperatureOffset());
     Event event = pluginManager->trigger("boiler:currentTemperature:change", "value", temp);
-    currentTemp = event.getFloat("value");
+    currentTemp.store(event.getFloat("value"), std::memory_order_relaxed);
 }
 
 void Controller::updateLastAction() { lastAction = millis(); }
@@ -1043,19 +1346,24 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
         ESP_LOGD(LOG_TAG, "Ignoring volumetric measurement, source does not match");
         return;
     }
-    // Local capture to avoid use-after-free with deactivate() / clear() running
-    // on another core. This callback fires from the NimBLE task on core 0 each
-    // time the BLE scale reports weight; deactivate() / clear() run on core 1
-    // (AsyncTCP/LVGL) and can `delete lastProcess` between our nullptr check
-    // and the dereference. Mirrors the same capture pattern used in
-    // updateControl() above (see comment around line 560).
-    Process *curr = currentProcess;
+    double processMeasurement = measurement;
+    if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        if (!hardwareScaleShotBaselineActive) {
+            ESP_LOGD(LOG_TAG, "Ignoring hardware scale measurement without shot baseline");
+            return;
+        }
+        processMeasurement = std::max(0.0, measurement - static_cast<double>(hardwareScaleShotBaseline));
+        pluginManager->trigger(F("controller:volumetric-measurement:hardware-shot:change"), "value",
+                               static_cast<float>(processMeasurement));
+    }
+    ProcessLock lock(processMutex);
+    Process *proc = currentProcess;
     Process *last = lastProcess;
-    if (curr != nullptr) {
-        curr->updateVolume(measurement);
+    if (proc != nullptr) {
+        proc->updateVolume(processMeasurement);
     }
     if (last != nullptr && !last->isComplete()) {
-        last->updateVolume(measurement);
+        last->updateVolume(processMeasurement);
     }
 }
 
@@ -1063,6 +1371,15 @@ void Controller::scaleTare() { comms.scaleTare(); }
 
 void Controller::sendScaleCalibration(float c1, float c2) {
     comms.sendScaleCalibration(c1, c2, settings.getScaleOffset1(), settings.getScaleOffset2());
+}
+
+ScaleSample Controller::getScaleSample() const {
+    ScaleSample s{};
+    if (scaleSampleMutex && xSemaphoreTake(scaleSampleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        s = lastScaleSample;
+        xSemaphoreGive(scaleSampleMutex);
+    }
+    return s;
 }
 
 bool Controller::isBluetoothScaleHealthy() const {
@@ -1075,6 +1392,7 @@ void Controller::onFlush() {
         return;
     }
     clear();
+    resetHardwareScaleShotBaseline();
     startProcess(new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay()));
     pluginManager->trigger("controller:brew:start");
 }
@@ -1086,6 +1404,8 @@ void Controller::onVolumetricDelete() {
 }
 
 void Controller::handleBrewButton(int brewButtonStatus) {
+    ESP_LOGI(LOG_TAG, "handleBrewButton: mode=%d status=%d isActive=%d src=%d", getMode(), brewButtonStatus, isActive(),
+             settings.getScaleSource());
     if (brewButtonStatus) {
         switch (getMode()) {
         case MODE_STANDBY:
@@ -1188,6 +1508,7 @@ void Controller::loopTask(void *arg) {
     TickType_t lastWake = xTaskGetTickCount();
     auto *controller = static_cast<Controller *>(arg);
     while (true) {
+        esp_task_wdt_reset();
         controller->loopControl();
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
     }

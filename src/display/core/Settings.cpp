@@ -114,11 +114,16 @@ Settings::Settings() {
 
     String buttonBehaviorStr = preferences.getString("btnb", "brew,steam,water");
     buttonBehavior = explode(buttonBehaviorStr, ',');
+    // Scale settings. 0.0f calibration is the NOT_CALIBRATED sentinel.
     scaleSource = preferences.getInt("sc_src", 0);
-    scaleCalibration1 = preferences.getFloat("sc_c1", 2000.0f);
-    scaleCalibration2 = preferences.getFloat("sc_c2", 2000.0f);
+    scaleCalibration1 = preferences.getFloat("sc_c1", 0.0f);
+    scaleCalibration2 = preferences.getFloat("sc_c2", 0.0f);
     scaleOffset1 = preferences.getLong("sc_o1", 0);
     scaleOffset2 = preferences.getLong("sc_o2", 0);
+    scaleCalTimestamp1 = preferences.getLong("sc_cts1", 0);
+    scaleCalTimestamp2 = preferences.getLong("sc_cts2", 0);
+    scaleCalStddev1 = preferences.getFloat("sc_csd1", 0.0f);
+    scaleCalStddev2 = preferences.getFloat("sc_csd2", 0.0f);
 
     preferences.end();
 
@@ -477,6 +482,9 @@ void Settings::setButtonBehaviorList(const std::vector<String> &behavior_list) {
 void Settings::setScaleSource(int scale_source) {
     scaleSource = scale_source;
     save();
+    if (onScaleSourceChange) {
+        onScaleSourceChange(scale_source);
+    }
 }
 
 void Settings::setScaleCalibration1(float calibration1) {
@@ -496,6 +504,26 @@ void Settings::setScaleOffset1(long offset1) {
 
 void Settings::setScaleOffset2(long offset2) {
     scaleOffset2 = offset2;
+    save();
+}
+
+void Settings::setScaleCalTimestamp1(long ts) {
+    scaleCalTimestamp1 = ts;
+    save();
+}
+
+void Settings::setScaleCalTimestamp2(long ts) {
+    scaleCalTimestamp2 = ts;
+    save();
+}
+
+void Settings::setScaleCalStddev1(float v) {
+    scaleCalStddev1 = v;
+    save();
+}
+
+void Settings::setScaleCalStddev2(float v) {
+    scaleCalStddev2 = v;
     save();
 }
 
@@ -587,6 +615,10 @@ void Settings::doSave() {
     preferences.putFloat("sc_c2", scaleCalibration2);
     preferences.putLong("sc_o1", scaleOffset1);
     preferences.putLong("sc_o2", scaleOffset2);
+    preferences.putLong("sc_cts1", scaleCalTimestamp1);
+    preferences.putLong("sc_cts2", scaleCalTimestamp2);
+    preferences.putFloat("sc_csd1", scaleCalStddev1);
+    preferences.putFloat("sc_csd2", scaleCalStddev2);
 
     preferences.end();
 }
