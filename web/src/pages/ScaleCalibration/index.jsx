@@ -3,7 +3,7 @@ import { useQuery } from 'preact-fetching';
 import Card from '../../components/Card.jsx';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
 
-// Health bit constants — must mirror lib/common/src/CommonTypes.h.
+// Health bit constants — must mirror lib/NanoPbComm/src/GaggiMateComm.h.
 const H = {
   NOT_CALIBRATED: 1 << 0,
   SAT_CH1: 1 << 1,

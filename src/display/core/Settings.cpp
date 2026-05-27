@@ -479,7 +479,21 @@ void Settings::setButtonBehaviorList(const std::vector<String> &behavior_list) {
     save();
 }
 
+int Settings::getScaleSource() const {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (scaleSource == 2) {
+        return 3;
+    }
+#endif
+    return scaleSource;
+}
+
 void Settings::setScaleSource(int scale_source) {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (scale_source == 2) {
+        scale_source = 3;
+    }
+#endif
     scaleSource = scale_source;
     save();
     if (onScaleSourceChange) {

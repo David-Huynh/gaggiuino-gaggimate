@@ -1,4 +1,4 @@
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
 #include "HX711Dual.h"
 
 void HX711Dual::begin(uint8_t dout1, uint8_t dout2, uint8_t sck, uint8_t gain, uint32_t sckMode) {

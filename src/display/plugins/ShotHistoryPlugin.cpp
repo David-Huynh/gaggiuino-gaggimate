@@ -84,10 +84,12 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
            [this](Event const &event) { currentEstimatedWeight = event.getFloat("value"); });
     pm->on("controller:volumetric-measurement:bluetooth:change",
            [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     pm->on("controller:volumetric-measurement:hardware:change",
            [this](Event const &event) { currentHardwareWeight = event.getFloat("value"); });
     pm->on("controller:volumetric-measurement:hardware-shot:change",
            [this](Event const &event) { currentHardwareShotWeight = event.getFloat("value"); });
+#endif
     pm->on("boiler:currentTemperature:change", [this](Event const &event) { currentTemperature = event.getFloat("value"); });
     pm->on("pump:puck-resistance:change", [this](Event const &event) { currentPuckResistance = event.getFloat("value"); });
     // Initialize rebuild state
@@ -100,7 +102,11 @@ void ShotHistoryPlugin::record() {
     // controller is acting on (Controller::activate sets currentVolumetricSource
     // from settings.getScaleSource()), so logged sample.v matches the value the
     // shot actually stopped on instead of always being BLE.
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     const bool useHwScale = controller && controller->getSettings().getScaleSource() == 2;
+#else
+    const bool useHwScale = false;
+#endif
     const float scaleWeight = useHwScale ? currentHardwareShotWeight : currentBluetoothWeight;
 
     bool shouldRecord = recording || extendedRecording;
@@ -304,7 +310,11 @@ unsigned long ShotHistoryPlugin::getTime() {
 
 void ShotHistoryPlugin::endRecording() {
     if (recording && controller && controller->isVolumetricAvailable()) {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         const bool useHwScale = controller->getSettings().getScaleSource() == 2;
+#else
+        const bool useHwScale = false;
+#endif
         const float scaleWeight = useHwScale ? currentHardwareShotWeight : currentBluetoothWeight;
         if (scaleWeight > 0) {
             // Start extended recording for any shot with active weight data

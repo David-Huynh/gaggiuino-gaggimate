@@ -16,6 +16,7 @@ import { GmLogoIcon } from '../pages/ShotAnalyzer/components/SourceMarker.jsx';
 import { faGithub } from '@fortawesome/free-brands-svg-icons/faGithub';
 import { faDiscord } from '@fortawesome/free-brands-svg-icons/faDiscord';
 import { useCallback, useEffect, useMemo, useRef } from 'preact/hooks';
+import { hardwareScaleDisabled } from '../config/features.js';
 
 // List of random icons to display - add your icons here (SVG strings, text, or emojis)
 const RANDOM_ICONS = [
@@ -63,7 +64,9 @@ const NAVIGATION_SECTIONS = [
     items: [
       { label: 'PID Autotune', link: '/pidtune', icon: faTemperatureHalf },
       { label: 'Bluetooth Devices', link: '/scales', icon: faBluetoothB },
-      { label: 'Scale Calibration', link: '/scale-calibration', icon: faWeightScale },
+      ...(!hardwareScaleDisabled
+        ? [{ label: 'Scale Calibration', link: '/scale-calibration', icon: faWeightScale }]
+        : []),
       { label: 'Settings', link: '/settings', icon: faCog },
     ],
   },

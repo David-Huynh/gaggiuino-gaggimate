@@ -233,6 +233,7 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     pluginManager->on("controller:scale:sample", [=](Event const &event) {
         double newWeight = event.getFloat("value");
         if (round(newWeight * 10.0) != round(hardwareWeight * 10.0)) {
@@ -240,6 +241,7 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
+#endif
     setupState();
     setupReactive();
     xTaskCreatePinnedToCore(loopTask, "DefaultUI::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 1);

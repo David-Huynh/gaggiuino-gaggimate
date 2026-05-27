@@ -18,6 +18,9 @@
 #include <display/core/zones.h>
 #include <display/plugins/AutoWakeupPlugin.h>
 #include <display/plugins/BLEScalePlugin.h>
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+#include <display/plugins/HWScalePlugin.h>
+#endif
 #include <display/plugins/BoilerFillPlugin.h>
 #include <display/plugins/HomekitPlugin.h>
 #include <display/plugins/LedControlPlugin.h>
@@ -169,6 +172,9 @@ void Controller::setup() {
     pluginManager->registerPlugin(new NetworkWatchdogPlugin());
     pluginManager->registerPlugin(&ShotHistory);
     pluginManager->registerPlugin(&BLEScales);
+#if defined(GAGGIMATE_UART_COMMS) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+    pluginManager->registerPlugin(&HWScale);
+#endif
     pluginManager->registerPlugin(new LedControlPlugin());
     pluginManager->registerPlugin(new AutoWakeupPlugin());
     pluginManager->setup(this);
@@ -407,6 +413,7 @@ void Controller::setupBluetooth() {
     });
     comms.onVolumetricMeasurement(
         [this](float value) { onVolumetricMeasurement(value, VolumetricMeasurementSource::FLOW_ESTIMATION); });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     comms.onWeightMeasurement([this](float weight) {
         ScaleSample sample{};
         sample.weightG = weight;
@@ -459,16 +466,19 @@ void Controller::setupBluetooth() {
         pluginManager->trigger(ev);
         ESP_LOGI(LOG_TAG, "Scale ch%d calibration result: %.6f", channel, calibration);
     });
+#endif
     comms.onTofMeasurement([this](uint32_t value) {
         tofDistance = static_cast<int>(value);
         ESP_LOGV(LOG_TAG, "Received new TOF distance: %d", tofDistance);
         pluginManager->trigger("controller:tof:change", "value", tofDistance);
     });
     pluginManager->on("settings:changed", [this](Event const &) {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         if (comms.isConnected() && systemInfo.capabilities.scale) {
             comms.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(), settings.getScaleOffset1(),
                                        settings.getScaleOffset2());
         }
+#endif
     });
 #ifdef GAGGIMATE_UART_COMMS
     pluginManager->trigger("controller:uart:init");
@@ -510,11 +520,16 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
         parseFloatCsv(settings.getPid(), pid, 4, 0.0f);
         comms.sendPidSettings(pid[0], pid[1], pid[2], pid[3]);
         setPumpModelCoeffs();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         if (scale) {
             comms.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(), settings.getScaleOffset1(),
                                        settings.getScaleOffset2());
         }
+#endif
     }
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    systemInfo.capabilities.scale = false;
+#endif
 
     if (!loaded) {
         loaded = true;
@@ -764,13 +779,22 @@ bool Controller::isVolumetricAvailable() const {
 }
 
 bool Controller::isHardwareScaleSampleHealthy(const ScaleSample &sample) const {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    (void)sample;
+    return false;
+#else
     static constexpr uint16_t BLOCKING_HEALTH =
         SCALE_HEALTH_NOT_CALIBRATED | SCALE_HEALTH_STALE | SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_SAT_CH1 |
         SCALE_HEALTH_SAT_CH2 | SCALE_HEALTH_TARING | SCALE_HEALTH_CALIBRATING;
     return hardwareScalePresent && std::isfinite(sample.weightG) && (sample.healthBits & BLOCKING_HEALTH) == 0;
+#endif
 }
 
 void Controller::recordHardwareScaleBaselineSample(const ScaleSample &sample) {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    (void)sample;
+    return;
+#else
     if (!isHardwareScaleSampleHealthy(sample)) {
         return;
     }
@@ -780,9 +804,14 @@ void Controller::recordHardwareScaleBaselineSample(const ScaleSample &sample) {
     if (hardwareScaleBaselineSampleCount < HARDWARE_SCALE_BASELINE_SAMPLE_COUNT) {
         ++hardwareScaleBaselineSampleCount;
     }
+#endif
 }
 
 bool Controller::captureHardwareScaleShotBaseline() {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    resetHardwareScaleShotBaseline();
+    return false;
+#else
     resetHardwareScaleShotBaseline();
     const ScaleSample latest = getScaleSample();
     if (!isHardwareScaleSampleHealthy(latest)) {
@@ -807,6 +836,7 @@ bool Controller::captureHardwareScaleShotBaseline() {
     hardwareScaleShotBaselineActive = true;
     ESP_LOGI(LOG_TAG, "Hardware scale shot baseline captured: %.3f g (%u samples)", hardwareScaleShotBaseline, count);
     return true;
+#endif
 }
 
 void Controller::resetHardwareScaleShotBaseline() {
@@ -1331,6 +1361,11 @@ void Controller::onProfileSaveAsNew() {
 }
 
 void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source) {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        return;
+    }
+#endif
     const __FlashStringHelper *eventName = F("controller:volumetric-measurement:bluetooth:change");
     if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
         eventName = F("controller:volumetric-measurement:estimation:change");
@@ -1367,11 +1402,21 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
     }
 }
 
-void Controller::scaleTare() { comms.scaleTare(); }
+void Controller::scaleTare() {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    comms.scaleTare();
+#endif
+}
 
 void Controller::sendScaleCalibration(float c1, float c2) {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    (void)c1;
+    (void)c2;
+#else
     comms.sendScaleCalibration(c1, c2, settings.getScaleOffset1(), settings.getScaleOffset2());
+#endif
 }
+
 
 ScaleSample Controller::getScaleSample() const {
     ScaleSample s{};

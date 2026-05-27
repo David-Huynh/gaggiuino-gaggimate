@@ -1,5 +1,5 @@
 #pragma once
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
 #include <Arduino.h>
 
 #include "SimpleKalmanFilter/SimpleKalmanFilter.h"

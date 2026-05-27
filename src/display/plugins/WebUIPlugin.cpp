@@ -10,7 +10,9 @@
 #include <display/models/profile.h>
 #include <cmath>
 #include <display/plugins/BLEScalePlugin.h>
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 #include <display/plugins/HWScalePlugin.h>
+#endif
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/util/PsramStlAllocator.h>
 #include <esp_core_dump.h>
@@ -86,11 +88,14 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
                       [this](Event const &event) { this->currentBluetoothWeight = event.getFloat("value"); });
     // Hardware scale and predictive flow estimate are tracked alongside BLE so
     // the WebUI 'cw' field can mirror whichever source the user has selected.
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     pluginManager->on("controller:volumetric-measurement:hardware:change",
                       [this](Event const &event) { this->currentHardwareWeight = event.getFloat("value"); });
+#endif
     pluginManager->on("controller:volumetric-measurement:estimation:change",
                       [this](Event const &event) { this->currentEstimatedWeight = event.getFloat("value"); });
 
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     // Forward async scale events as WebSocket messages so the calibration page can
     // drive its live progress bars and result toasts directly.
     pluginManager->on("controller:scale:tare:progress", [this](Event const &ev) {
@@ -135,6 +140,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["source"] = ev.getInt("source");
         ws.textAll(doc.as<String>());
     });
+#endif
 
     setupServer();
 }
@@ -198,6 +204,7 @@ void WebUIPlugin::loop() {
         }
 
         const bool bleConnected = BLEScales.isConnected();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         const ScaleSample sc = controller->getScaleSample();
         const bool hwScalePresent = controller->isHardwareScalePresent();
         const bool hwHealthy = hwScalePresent && std::isfinite(sc.weightG) &&
@@ -253,6 +260,41 @@ void WebUIPlugin::loop() {
         sObj["seq"] = sc.sampleSeq;
         sObj["pr"] = hwScalePresent;
         sObj["bl"] = baseline; // captured shot baseline (0 when no brew active)
+#else
+        float cw = 0.0f;
+        switch (controller->getSettings().getScaleSource()) {
+        case 1: // BLE only
+            cw = bleConnected ? this->currentBluetoothWeight : 0.0f;
+            break;
+        case 3: // Predictive (flow estimation)
+            cw = this->currentEstimatedWeight;
+            break;
+        case 4: // Off
+            cw = 0.0f;
+            break;
+        case 0: // Auto: BLE if connected, otherwise predictive estimate
+        default:
+            cw = bleConnected ? this->currentBluetoothWeight : this->currentEstimatedWeight;
+            break;
+        }
+
+        statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // raw BLE weight
+        statusDoc["hw"] = 0.0f;
+        statusDoc["hwc"] = false;
+        statusDoc["cw"] = cw;                                              // active-source weight
+        statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
+        auto sObj = statusDoc["scale"].to<JsonObject>();
+        sObj["w"] = 0.0f;
+        sObj["sd"] = 0.0f;
+        sObj["c1"] = 0.0f;
+        sObj["c2"] = 0.0f;
+        sObj["sd1"] = 0.0f;
+        sObj["sd2"] = 0.0f;
+        sObj["h"] = 0;
+        sObj["seq"] = 0;
+        sObj["pr"] = false;
+        sObj["bl"] = 0.0f;
+#endif
         // Scale battery — only surfaced when the driver reports one and the
         // value isn't the UNKNOWN sentinel (255). UI omits the battery pill
         // entirely when `sbat` is absent, so disconnected/unknown scales don't
@@ -548,6 +590,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     client->text(buffer);
                 } else if (msgType == "req:flush:start") {
                     handleFlushStart(client->id(), doc);
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
                 } else if (msgType == "req:scale:tare") {
                     controller->scaleTare();
                 } else if (msgType == "req:scale:cal:start") {
@@ -556,6 +599,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     if ((channel == 1 || channel == 2) && refWeight > 0.0f) {
                         controller->getClientController()->startScaleCalibration(channel, refWeight);
                     }
+#endif
                 }
             }
         }
@@ -769,6 +813,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setButtonBehaviorList(explode(request->arg("buttonBehavior"), ','));
             if (request->hasArg("scaleSource"))
                 settings->setScaleSource(request->arg("scaleSource").toInt());
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
             if (request->hasArg("scaleCalibration1"))
                 settings->setScaleCalibration1(request->arg("scaleCalibration1").toFloat());
             if (request->hasArg("scaleCalibration2"))
@@ -777,6 +822,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setScaleOffset1(request->arg("scaleOffset1").toInt());
             if (request->hasArg("scaleOffset2"))
                 settings->setScaleOffset2(request->arg("scaleOffset2").toInt());
+#endif
             settings->setAutoWakeupEnabled(request->hasArg("autowakeupEnabled"));
             if (request->hasArg("autowakeupSchedules")) {
                 // Handle schedule format with days
@@ -884,6 +930,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["scaleCalTimestamp2"] = settings.getScaleCalTimestamp2();
     doc["scaleCalStddev1"] = settings.getScaleCalStddev1();
     doc["scaleCalStddev2"] = settings.getScaleCalStddev2();
+    doc["hardwareScaleDisabled"] =
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        true;
+#else
+        false;
+#endif
     // Add auto-wakeup settings to response
     doc["autowakeupEnabled"] = settings.isAutoWakeupEnabled();
     doc["buttonBehavior"] = implode(settings.getButtonBehaviorList(), ",");

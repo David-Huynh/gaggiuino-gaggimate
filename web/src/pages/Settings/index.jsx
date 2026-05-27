@@ -12,6 +12,7 @@ import {
   ToggleField,
 } from '../../components/SettingsFormField.jsx';
 import { timezones } from '../../config/zones.js';
+import { hardwareScaleDisabled } from '../../config/features.js';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
 import { DASHBOARD_LAYOUTS, setDashboardLayout } from '../../utils/dashboardManager.js';
 import { downloadJson } from '../../utils/download.js';
@@ -99,8 +100,12 @@ export function Settings() {
       const settingsWithToggle = {
         ...fetchedSettings,
         ...buttonFields,
-        scaleCalibration1: fetchedSettings.scaleCalibration1 ?? 2000,
-        scaleCalibration2: fetchedSettings.scaleCalibration2 ?? 2000,
+        scaleSource:
+          hardwareScaleDisabled && fetchedSettings.scaleSource === 2
+            ? 3
+            : fetchedSettings.scaleSource,
+        scaleCalibration1: fetchedSettings.scaleCalibration1 ?? 0,
+        scaleCalibration2: fetchedSettings.scaleCalibration2 ?? 0,
         standbyDisplayEnabled:
           fetchedSettings.standbyDisplayEnabled !== undefined
             ? fetchedSettings.standbyDisplayEnabled
@@ -400,7 +405,7 @@ export function Settings() {
               <div className='join w-full'>
                 {[
                   { value: 1, label: 'Bluetooth' },
-                  { value: 2, label: 'Hardware' },
+                  ...(!hardwareScaleDisabled ? [{ value: 2, label: 'Hardware' }] : []),
                   { value: 3, label: 'Predictive' },
                   { value: 4, label: 'Off' },
                 ].map(({ value, label }) => (
@@ -415,47 +420,53 @@ export function Settings() {
                 ))}
               </div>
               <p className='text-base-content/60 mt-1 text-xs'>
-                Bluetooth and Hardware use an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.
+                {hardwareScaleDisabled
+                  ? 'Bluetooth uses an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.'
+                  : 'Bluetooth and Hardware use an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.'}
               </p>
             </div>
-            <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
-              <div className='form-control'>
-                <label htmlFor='scaleCalibration1' className='mb-2 block text-sm font-medium'>
-                  Hardware Calibration Ch1
-                </label>
-                <input
-                  id='scaleCalibration1'
-                  name='scaleCalibration1'
-                  type='number'
-                  step='any'
-                  className='input input-bordered w-full'
-                  placeholder='2000'
-                  value={formData.scaleCalibration1 ?? 2000}
-                  onChange={onChange('scaleCalibration1')}
-                />
-              </div>
-              <div className='form-control'>
-                <label htmlFor='scaleCalibration2' className='mb-2 block text-sm font-medium'>
-                  Hardware Calibration Ch2
-                </label>
-                <input
-                  id='scaleCalibration2'
-                  name='scaleCalibration2'
-                  type='number'
-                  step='any'
-                  className='input input-bordered w-full'
-                  placeholder='2000'
-                  value={formData.scaleCalibration2 ?? 2000}
-                  onChange={onChange('scaleCalibration2')}
-                />
-              </div>
-            </div>
-            <p className='text-base-content/60 mt-2 text-xs'>
-              These values are saved to device memory when you save settings.
-            </p>
-            <a href='/scale-calibration' className='btn btn-outline btn-sm w-full'>
-              Configure Hardware Scale Calibration
-            </a>
+            {!hardwareScaleDisabled && (
+              <>
+                <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
+                  <div className='form-control'>
+                    <label htmlFor='scaleCalibration1' className='mb-2 block text-sm font-medium'>
+                      Hardware Calibration Ch1
+                    </label>
+                    <input
+                      id='scaleCalibration1'
+                      name='scaleCalibration1'
+                      type='number'
+                      step='any'
+                      className='input input-bordered w-full'
+                      placeholder='2000'
+                      value={formData.scaleCalibration1 ?? 2000}
+                      onChange={onChange('scaleCalibration1')}
+                    />
+                  </div>
+                  <div className='form-control'>
+                    <label htmlFor='scaleCalibration2' className='mb-2 block text-sm font-medium'>
+                      Hardware Calibration Ch2
+                    </label>
+                    <input
+                      id='scaleCalibration2'
+                      name='scaleCalibration2'
+                      type='number'
+                      step='any'
+                      className='input input-bordered w-full'
+                      placeholder='2000'
+                      value={formData.scaleCalibration2 ?? 2000}
+                      onChange={onChange('scaleCalibration2')}
+                    />
+                  </div>
+                </div>
+                <p className='text-base-content/60 mt-2 text-xs'>
+                  These values are saved to device memory when you save settings.
+                </p>
+                <a href='/scale-calibration' className='btn btn-outline btn-sm w-full'>
+                  Configure Hardware Scale Calibration
+                </a>
+              </>
+            )}
           </Card>
 
           {/* Web Settings */}

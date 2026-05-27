@@ -127,7 +127,7 @@ class Settings {
         return "";
     };
     std::vector<String> getButtonBehaviorList() const { return buttonBehavior; }
-    int getScaleSource() const { return scaleSource; }
+    int getScaleSource() const;
     float getScaleCalibration1() const { return scaleCalibration1; }
     float getScaleCalibration2() const { return scaleCalibration2; }
     long getScaleOffset1() const { return scaleOffset1; }

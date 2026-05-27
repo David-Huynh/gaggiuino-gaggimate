@@ -115,10 +115,20 @@ class Controller {
     void onProfileSaveAsNew();
     void onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source);
     void setVolumetricOverride(bool override) { volumetricOverride = override; }
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    void setHardwareScalePresent(bool present) {
+        (void)present;
+        hardwareScalePresent = false;
+    }
+    bool isHardwareScalePresent() const { return false; }
+    bool isHardwareScaleShotBaselineActive() const { return false; }
+    float getHardwareScaleShotBaseline() const { return 0.0f; }
+#else
     void setHardwareScalePresent(bool present) { hardwareScalePresent = present; }
     bool isHardwareScalePresent() const { return hardwareScalePresent; }
     bool isHardwareScaleShotBaselineActive() const { return hardwareScaleShotBaselineActive; }
     float getHardwareScaleShotBaseline() const { return hardwareScaleShotBaseline; }
+#endif
     void scaleTare();
     void sendScaleCalibration(float c1, float c2);
     bool isBluetoothScaleHealthy() const;

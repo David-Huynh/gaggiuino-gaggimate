@@ -51,7 +51,7 @@ void GaggiMateController::setup() {
     if (_config.capabilites.pressure) {
         pressureSensor = new PressureSensor(_config.pressureSda, _config.pressureScl, [this](float pressure) { /* noop */ });
     }
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
     if (_config.capabilites.scale) {
         scale = new HX711Scale(_config.scaleSdaPin, _config.scaleSda1Pin, _config.scaleSclPin,
                                [this](const ScaleSnapshot &snap) { _comms.sendWeightMeasurement(snap.weightG); });
@@ -105,7 +105,7 @@ void GaggiMateController::setup() {
         pressureSensor->setup();
         _comms.onPressureScale([this](float scale) { this->pressureSensor->setScale(scale); });
     }
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
     if (_config.capabilites.scale && scale != nullptr) {
         scale->setup();
         scale->setTareDoneCallback([this](long o1, long o2, float, float, bool success, uint16_t) {
@@ -235,8 +235,14 @@ void GaggiMateController::setup() {
     });
     // Send INFO last: this tells the ESP32 the STM32 is ready to receive commands.
     // All callbacks and hardware must be initialized before this point.
+    const bool scaleCapability =
+#if defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+        false;
+#else
+        _config.capabilites.scale;
+#endif
     _comms.init("GPBLS", _config.name.c_str(), _version, _config.capabilites.dimming, _config.capabilites.pressure,
-                _config.capabilites.ledControls, _config.capabilites.tof, _config.capabilites.scale);
+                _config.capabilites.ledControls, _config.capabilites.tof, scaleCapability);
 
     ESP_LOGI(LOG_TAG, "Initialization done");
 #ifdef ARDUINO_ARCH_STM32

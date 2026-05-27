@@ -8,7 +8,7 @@ mkdir -p data/p
 # Build web application
 cd web || exit
 npm ci
-npm run build
+VITE_DISABLE_HARDWARE_SCALE="${GAGGIMATE_DISABLE_HARDWARE_SCALE:-0}" npm run build
 
 cp -R dist/* ../data/w/
 gzip ../data/w/assets/*.js

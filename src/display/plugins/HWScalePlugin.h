@@ -1,6 +1,7 @@
 #ifndef HWSCALEPLUGIN_H
 #define HWSCALEPLUGIN_H
 
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 #include "../core/Plugin.h"
 #include "GaggiMateComm.h"
 
@@ -34,4 +35,5 @@ class HWScalePlugin : public Plugin {
 
 extern HWScalePlugin HWScale;
 
+#endif
 #endif // HWSCALEPLUGIN_H

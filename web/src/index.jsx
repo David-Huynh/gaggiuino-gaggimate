@@ -1,5 +1,6 @@
 import './style.css';
 import { initializeTheme } from './utils/themeManager.js';
+import { hardwareScaleDisabled } from './config/features.js';
 
 if (import.meta.env.DEV) {
   // Dev-only Preact warnings; stripped from production builds.
@@ -25,9 +26,9 @@ const NotFound = lazy(() => import('./pages/_404.jsx').then(m => m.NotFound));
 const Settings = lazy(() => import('./pages/Settings/index.jsx').then(m => m.Settings));
 const OTA = lazy(() => import('./pages/OTA/index.jsx').then(m => m.OTA));
 const Scales = lazy(() => import('./pages/Scales/index.jsx').then(m => m.Scales));
-const ScaleCalibration = lazy(() =>
-  import('./pages/ScaleCalibration/index.jsx').then(m => m.ScaleCalibration),
-);
+const ScaleCalibration = hardwareScaleDisabled
+  ? null
+  : lazy(() => import('./pages/ScaleCalibration/index.jsx').then(m => m.ScaleCalibration));
 const ProfileList = lazy(() => import('./pages/ProfileList/index.jsx').then(m => m.ProfileList));
 const ProfileEdit = lazy(() => import('./pages/ProfileEdit/index.jsx').then(m => m.ProfileEdit));
 const Autotune = lazy(() => import('./pages/Autotune/index.jsx').then(m => m.Autotune));
@@ -93,7 +94,9 @@ export function App() {
                       <Route path='/settings' component={Settings} />
                       <Route path='/ota' component={OTA} />
                       <Route path='/scales' component={Scales} />
-                      <Route path='/scale-calibration' component={ScaleCalibration} />
+                      {ScaleCalibration && (
+                        <Route path='/scale-calibration' component={ScaleCalibration} />
+                      )}
                       <Route path='/pidtune' component={Autotune} />
                       <Route path='/history' component={ShotHistory} />
                       <Route path='/analyzer' component={ShotAnalyzer} />
@@ -102,8 +105,7 @@ export function App() {
                         path='/statistics/:sourceAlias/:profileName'
                         component={StatisticsPage}
                       />
-                      <Route path='/analyzer/:source/:id' component={ShotAnalyzer} />{' '}
-                      {/*deep-link route (sorce & ID)*/}
+                      <Route path='/analyzer/:source/:id' component={ShotAnalyzer} />
                       <Route default component={NotFound} />
                     </Router>
                   </ErrorBoundary>

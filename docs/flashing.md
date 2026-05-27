@@ -18,6 +18,13 @@ The web UI must be built before the filesystem image can be created. Run this on
 scripts/build_spiffs.sh
 ```
 
+For the no-hardware-scale WebUI/filesystem build, pass the flag when running the SPIFFS build script:
+
+**Linux / macOS / Git Bash on Windows:**
+```bash
+GAGGIMATE_DISABLE_HARDWARE_SCALE=1 scripts/build_spiffs.sh
+```
+
 After this step, `data/w/` will contain the gzipped web app files.
 
 ---
@@ -30,6 +37,12 @@ In PlatformIO, select your environment (e.g. `display-headless-uart`) and click 
 pio run -e display-headless-uart -t upload
 ```
 
+For the no-hardware-scale UART display firmware:
+
+```bash
+pio run -e display-headless-uart-no-hwscale -t upload
+```
+
 ---
 
 ## Step 3 — Flash the filesystem (web UI)
@@ -38,6 +51,12 @@ This is a **separate upload** from the firmware. In PlatformIO, click **Upload F
 
 ```bash
 pio run -e display-headless-uart -t uploadfs
+```
+
+For the no-hardware-scale WebUI/filesystem image:
+
+```bash
+pio run -e display-headless-uart-no-hwscale -t uploadfs
 ```
 
 > **Important:** You must redo this step any time you rebuild the web UI (Step 1).
@@ -49,11 +68,13 @@ pio run -e display-headless-uart -t uploadfs
 | Environment | Board | Notes |
 |---|---|---|
 | `display-headless-uart` | ESP32-S3 DevKitC-1 | Headless, communicates with controller over UART |
+| `display-headless-uart-no-hwscale` | ESP32-S3 DevKitC-1 | Same as `display-headless-uart`, with hardware scale support disabled |
 | `display-headless` | LilyGo T-RGB | Headless with display board |
 | `display-headless-8m` | Seeed XIAO ESP32-S3 | 8MB flash variant |
 | `display-headless-4m` | ESP32-S3 SuperMini | 4MB flash variant |
 | `display` | LilyGo T-RGB | Full display build |
 | `controller` | GaggiMate Controller | Controller firmware (no web UI) |
+| `stm32f4-no-hwscale` | Black Pill STM32F411CE | STM32 controller build with hardware scale support disabled |
 
 ---
 

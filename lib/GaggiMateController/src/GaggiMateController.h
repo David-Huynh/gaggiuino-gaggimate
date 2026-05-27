@@ -6,7 +6,9 @@
 #include <peripherals/DistanceSensor.h>
 #include <peripherals/Heater.h>
 #ifdef ARDUINO_ARCH_STM32
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 #include <peripherals/HX711Scale.h>
+#endif
 #include <peripherals/LedController2.h>
 #else
 #include <peripherals/LedController.h>
@@ -52,7 +54,7 @@ class GaggiMateController {
     DigitalInput *brewBtn = nullptr;
     DigitalInput *steamBtn = nullptr;
     PressureSensor *pressureSensor = nullptr;
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
     HX711Scale *scale = nullptr;
 #endif
     LedController *ledController = nullptr;

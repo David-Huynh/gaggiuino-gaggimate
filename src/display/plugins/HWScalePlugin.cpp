@@ -1,3 +1,4 @@
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 #include "HWScalePlugin.h"
 #include <cmath>
 #include <display/core/Controller.h>
@@ -54,3 +55,4 @@ void HWScalePlugin::tare() {
         return;
     controller->scaleTare();
 }
+#endif

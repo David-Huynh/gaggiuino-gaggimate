@@ -100,7 +100,11 @@ void onVolumetricClick(lv_event_t *e) {
     }
     // Cycle: 1 (BLE) → 2 (HW) → 3 (Predictive) → 4 (OFF) → 1
     int src = controller.getSettings().getScaleSource();
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    int next = (src == 1) ? 3 : (src == 3) ? 4 : 1;
+#else
     int next = (src >= 1 && src <= 3) ? src + 1 : 1;
+#endif
     controller.getSettings().setScaleSource(next);
 }
 

@@ -2,6 +2,12 @@
 #define CONTROLLERCONFIG_H
 #include <string>
 
+#if defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+#define GAGGIMATE_HARDWARE_SCALE_ENABLED false
+#else
+#define GAGGIMATE_HARDWARE_SCALE_ENABLED true
+#endif
+
 struct Capabilities {
     bool dimming;
     bool pressure;
@@ -286,7 +292,7 @@ const ControllerConfig GM_STM32F4_V1 = {.name = "GaggiMate STM32F4 Controller v1
                                             .ssrPump = false,    // Uses dimmed pump, not SSR
                                             .ledControls = true, // Supports LED control
                                             .tof = true,         // Supports time-of-flight sensor
-                                            .scale = true,       // Supports HX711 hardware scale
+                                            .scale = GAGGIMATE_HARDWARE_SCALE_ENABLED, // Supports HX711 hardware scale
                                         }};
 
 const ControllerConfig GM_STANDARD_REV_3X = {.name = "GaggiMate Standard Rev 3.x",

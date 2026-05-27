@@ -1,6 +1,6 @@
 #ifndef HX711SCALE_H
 #define HX711SCALE_H
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
 #include <Arduino.h>
 #include <STM32FreeRTOS.h>
 #include <functional>

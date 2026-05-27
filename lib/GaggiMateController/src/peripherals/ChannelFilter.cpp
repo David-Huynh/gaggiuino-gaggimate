@@ -1,4 +1,4 @@
-#ifdef ARDUINO_ARCH_STM32
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
 #include "ChannelFilter.h"
 
 #include <math.h>
