@@ -295,7 +295,7 @@ class Settings {
     std::vector<String> buttonBehavior;
 
     // Scale settings
-    int scaleSource = 0; // 0=AUTO, 1=BLE only, 2=HW only, 3=Predictive, 4=OFF
+    int scaleSource = 0; // brew/general source: 0=AUTO, 1=BLE, 2=HW, 3=Predictive, 4=OFF
     // 0.0f is the NOT_CALIBRATED sentinel — HX711Scale treats it as uncalibrated
     // and emits NaN for that channel. The brew controller then suppresses
     // volumetric stop based on hardware weight.
@@ -309,7 +309,6 @@ class Settings {
     float scaleCalStddev2 = 0.0f;
 
     std::function<void(int)> onScaleSourceChange;
-
     void doSave();
     xTaskHandle taskHandle;
     static void loopTask(void *arg);

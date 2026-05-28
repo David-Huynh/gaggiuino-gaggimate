@@ -18,6 +18,10 @@ constexpr int SCALE_INIT_TIMEOUT_MS = 5000;
 constexpr int SCALE_READY_DELAY_MS = 10;
 constexpr int SCALE_INIT_RETRIES = 3;
 constexpr int SCALE_INIT_RETRY_DELAY_MS = 250;
+// Once the bus is alive, both HX711 convert in lockstep off the shared clock, so a
+// present second channel appears within ~1-2 sample periods. Bounds how long we
+// wait for the second channel before declaring it missing and retrying.
+constexpr int SCALE_BOTH_READY_TIMEOUT_MS = 1000;
 
 // Single immutable snapshot published every output tick. Trivially copyable so
 // callers can grab it under a brief mutex and read fields without further care.
@@ -104,6 +108,7 @@ class HX711Scale {
     uint16_t _nativeHz = 10;     // detected at setup; 10 or 80
     uint16_t _outputDivisor = 1; // 1 at 10 Hz native, 8 at 80 Hz native
     uint16_t _samplePeriodMs = SCALE_OUTPUT_PERIOD_MS; // 100 ms / 12 ms
+    uint32_t _lastInitAttemptMs = 0;
 
     // ----- calibration / offsets (set externally, read in scale loop) -----
     float _scale1 = 0.0f;
@@ -191,6 +196,7 @@ class HX711Scale {
 
     // ----- internals -----
     [[noreturn]] static void loopTask(void *arg);
+    bool initializeDriver();
     void loop();
     void processOneRawSample(long raw[2], bool valid[2], bool sat[2]);
     void emitOutputSample(long medRaw1, long medRaw2, bool ch1Valid, bool ch2Valid);

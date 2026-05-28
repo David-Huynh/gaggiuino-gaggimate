@@ -187,7 +187,7 @@ void WebUIPlugin::loop() {
         statusDoc["led"] = controller->getSystemInfo().capabilities.ledControl;
         statusDoc["gtd"] = controller->getTargetGrindDuration();
         statusDoc["gtv"] = controller->getSettings().getTargetGrindVolume();
-        statusDoc["gt"] = controller->isVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
+        statusDoc["gt"] = controller->isGrindVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
         statusDoc["gact"] = controller->isGrindActive() ? 1 : 0;
         statusDoc["wl"] = controller->getWaterLevel();
         statusDoc["tof"] = controller->getTofDistance();
@@ -207,8 +207,7 @@ void WebUIPlugin::loop() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         const ScaleSample sc = controller->getScaleSample();
         const bool hwScalePresent = controller->isHardwareScalePresent();
-        const bool hwHealthy = hwScalePresent && std::isfinite(sc.weightG) &&
-                               (sc.healthBits & HWScalePlugin::BREW_BLOCKING_HEALTH) == 0;
+        const bool hwHealthy = controller->isHardwareScaleSampleHealthy(sc);
 
         // During a HW-scale brew, present the shot-relative weight (current −
         // captured baseline) so the WebUI matches the value the brew controller
@@ -219,26 +218,25 @@ void WebUIPlugin::loop() {
                                      ? std::max(0.0f, sc.weightG - baseline)
                                      : sc.weightG;
 
-        // 'cw' (currentWeight) mirrors the selected scale source so the WebUI
-        // chart and Process Controls card show the same weight the brew
-        // controller is acting on. 'bw' keeps its raw BLE-only meaning.
+        // 'cw' (currentWeight) mirrors the source the brew controller is acting
+        // on (or would, when idle), so the WebUI chart and Process Controls card
+        // show the same weight the brew targets against. 'bw' keeps its raw
+        // BLE-only meaning.
+        const VolumetricMeasurementSource brewSource =
+            controller->isActive() ? controller->getCurrentVolumetricSource() : controller->getResolvedBrewSource();
         float cw = 0.0f;
-        switch (controller->getSettings().getScaleSource()) {
-        case 2: // HW only
+        switch (brewSource) {
+        case VolumetricMeasurementSource::HARDWARE_SCALE:
             cw = hwHealthy ? displayHwG : 0.0f;
             break;
-        case 1: // BLE only
+        case VolumetricMeasurementSource::BLUETOOTH:
             cw = bleConnected ? this->currentBluetoothWeight : 0.0f;
             break;
-        case 3: // Predictive (flow estimation)
+        case VolumetricMeasurementSource::FLOW_ESTIMATION:
             cw = this->currentEstimatedWeight;
             break;
-        case 4: // Off
-            cw = 0.0f;
-            break;
-        case 0: // Auto: prefer HW if healthy, else BLE
         default:
-            cw = hwHealthy ? displayHwG : (bleConnected ? this->currentBluetoothWeight : 0.0f);
+            cw = 0.0f;
             break;
         }
 
@@ -261,20 +259,18 @@ void WebUIPlugin::loop() {
         sObj["pr"] = hwScalePresent;
         sObj["bl"] = baseline; // captured shot baseline (0 when no brew active)
 #else
+        const VolumetricMeasurementSource brewSource =
+            controller->isActive() ? controller->getCurrentVolumetricSource() : controller->getResolvedBrewSource();
         float cw = 0.0f;
-        switch (controller->getSettings().getScaleSource()) {
-        case 1: // BLE only
+        switch (brewSource) {
+        case VolumetricMeasurementSource::BLUETOOTH:
             cw = bleConnected ? this->currentBluetoothWeight : 0.0f;
             break;
-        case 3: // Predictive (flow estimation)
+        case VolumetricMeasurementSource::FLOW_ESTIMATION:
             cw = this->currentEstimatedWeight;
             break;
-        case 4: // Off
-            cw = 0.0f;
-            break;
-        case 0: // Auto: BLE if connected, otherwise predictive estimate
         default:
-            cw = bleConnected ? this->currentBluetoothWeight : this->currentEstimatedWeight;
+            cw = 0.0f;
             break;
         }
 
@@ -306,6 +302,13 @@ void WebUIPlugin::loop() {
             }
         }
 
+        // Scale source routing, so the UI can show which source each role uses
+        // (enum: 0=none/INACTIVE, 1=predictive, 2=bluetooth, 3=hardware).
+        statusDoc["brewSource"] = static_cast<int>(controller->getResolvedBrewSource());
+        statusDoc["grindSource"] = static_cast<int>(controller->getResolvedGrindSource());
+        statusDoc["activeSource"] = static_cast<int>(controller->getCurrentVolumetricSource());
+        statusDoc["scaleCapable"] = controller->scaleAvailability().hardwareCapable;
+
         Process *process = controller->getProcess();
         if (process == nullptr) {
             process = controller->getLastProcess();
@@ -336,7 +339,7 @@ void WebUIPlugin::loop() {
                 pObj["s"] = "grind";
                 pObj["l"] = grind->isActive() ? "Grinding" : "Finished";
                 pObj["e"] = ts - grind->started;
-                const bool isVolumetric = grind->target == ProcessTarget::VOLUMETRIC && controller->isVolumetricAvailable();
+                const bool isVolumetric = grind->target == ProcessTarget::VOLUMETRIC && controller->isGrindVolumetricAvailable();
                 pObj["tt"] = isVolumetric ? "volumetric" : "time";
                 if (isVolumetric) {
                     pObj["pt"] = grind->grindVolume;
@@ -936,6 +939,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
 #else
         false;
 #endif
+    // Runtime truth for whether the connected controller actually has a hardware
+    // scale (STM32 + HX711 over UART). The web UI gates the "Hardware" source
+    // option on this rather than only the build-time hardwareScaleDisabled flag.
+    doc["scaleCapable"] = controller->scaleAvailability().hardwareCapable;
     // Add auto-wakeup settings to response
     doc["autowakeupEnabled"] = settings.isAutoWakeupEnabled();
     doc["buttonBehavior"] = implode(settings.getButtonBehaviorList(), ",");

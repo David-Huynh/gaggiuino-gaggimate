@@ -95,13 +95,23 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
         disconnect();
         scanner->stopAsyncScan();
     });
-    manager->on("controller:brew:prestart", [this](Event const &) { onProcessStart(); });
+    manager->on("controller:brew:prestart", [this](Event const &) {
+        if (this->controller != nullptr &&
+            this->controller->getCurrentVolumetricSource() == VolumetricMeasurementSource::BLUETOOTH) {
+            onProcessStart();
+        }
+    });
     manager->on("controller:brew:end", [this](Event const &) {
         if (scale != nullptr && scale->isConnected() && scale->hasTimerControl()) {
             scale->stopTimer();
         }
     });
-    manager->on("controller:grind:start", [this](Event const &) { onProcessStart(); });
+    manager->on("controller:grind:start", [this](Event const &) {
+        if (this->controller != nullptr &&
+            this->controller->getCurrentVolumetricSource() == VolumetricMeasurementSource::BLUETOOTH) {
+            onProcessStart();
+        }
+    });
     manager->on("controller:mode:change", [this](Event const &event) {
         if (event.getInt("value") != MODE_STANDBY) {
             ESP_LOGI("BLEScalePlugin", "Resuming scanning");
@@ -137,15 +147,11 @@ void BLEScalePlugin::update() {
         return;
     }
 
-    // Don't update volumetric override if scale access might fail
     bool hasConnectedScale = false;
     if (scale != nullptr) {
         // Check if scale pointer is valid before accessing
         hasConnectedScale = scale->isConnected();
     }
-
-    if (controller->isVolumetricAvailable())
-        controller->setVolumetricOverride(hasConnectedScale);
 
     if (!active)
         return;

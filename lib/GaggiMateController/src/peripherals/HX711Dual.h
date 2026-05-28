@@ -32,8 +32,14 @@ class HX711Dual {
     // Block until at least one DOUT line goes low (data ready) or timeout elapses.
     bool wait_ready_timeout(unsigned long timeout_ms, unsigned long delay_ms = 0);
 
-    // Fast probe — returns true if data is currently ready without blocking.
+    // Fast probe — returns true if a sample is ready on at least one channel
+    // (used by the read path). Initialization separately requires BOTH channels
+    // via is_ready_ch1()/is_ready_ch2(), since the scale sums two load cells.
     bool is_ready() const;
+
+    // Per-channel ready probes (DOUT low = a fresh sample is ready on that channel).
+    bool is_ready_ch1() const { return digitalRead(_dout1) == LOW; }
+    bool is_ready_ch2() const { return digitalRead(_dout2) == LOW; }
 
     // Single-shot read attempt. On OK fills `values` with raw signed 24-bit counts,
     // `valid` with per-channel readiness, and `saturated` with per-channel saturation

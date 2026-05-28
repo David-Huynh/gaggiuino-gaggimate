@@ -97,17 +97,23 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
 }
 
+float ShotHistoryPlugin::sourceWeight(VolumetricMeasurementSource source) const {
+    switch (source) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
+        return currentHardwareShotWeight;
+    case VolumetricMeasurementSource::FLOW_ESTIMATION:
+        return currentEstimatedWeight;
+    case VolumetricMeasurementSource::BLUETOOTH:
+    default:
+        return currentBluetoothWeight;
+    }
+}
+
 void ShotHistoryPlugin::record() {
-    // Pick the scale source's weight for this tick. Mirrors what the brew
-    // controller is acting on (Controller::activate sets currentVolumetricSource
-    // from settings.getScaleSource()), so logged sample.v matches the value the
-    // shot actually stopped on instead of always being BLE.
-#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    const bool useHwScale = controller && controller->getSettings().getScaleSource() == 2;
-#else
-    const bool useHwScale = false;
-#endif
-    const float scaleWeight = useHwScale ? currentHardwareShotWeight : currentBluetoothWeight;
+    // Log the weight from the source this shot is actually using (latched at
+    // brew start), so sample.v matches the value the brew controller stopped on
+    // instead of always being BLE.
+    const float scaleWeight = sourceWeight(shotSource);
 
     bool shouldRecord = recording || extendedRecording;
 
@@ -292,6 +298,9 @@ void ShotHistoryPlugin::startRecording() {
     currentEstimatedWeight = 0.0f;
     currentScaleFlow = 0.0f;
     currentProfileName = controller->getProfileManager()->getSelectedProfile().label;
+    // Latch the source the brew controller resolved for this shot (set in
+    // Controller::activate() before controller:brew:start fires).
+    shotSource = controller ? controller->getCurrentVolumetricSource() : VolumetricMeasurementSource::INACTIVE;
     recording = true;
     extendedRecording = false;
     indexEntryCreated = false; // Reset flag for new shot
@@ -310,12 +319,7 @@ unsigned long ShotHistoryPlugin::getTime() {
 
 void ShotHistoryPlugin::endRecording() {
     if (recording && controller && controller->isVolumetricAvailable()) {
-#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-        const bool useHwScale = controller->getSettings().getScaleSource() == 2;
-#else
-        const bool useHwScale = false;
-#endif
-        const float scaleWeight = useHwScale ? currentHardwareShotWeight : currentBluetoothWeight;
+        const float scaleWeight = sourceWeight(shotSource);
         if (scaleWeight > 0) {
             // Start extended recording for any shot with active weight data
             extendedRecording = true;

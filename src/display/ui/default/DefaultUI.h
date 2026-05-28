@@ -98,9 +98,13 @@ class DefaultUI {
     int autotuning = false;
     int waitingForController = false;
     int volumetricAvailable = false;
+    int grindVolumetricAvailable = false;
     int bluetoothScales = false;
     int hardwareScalePresent = false;
+    int hardwareShotBaselineActive = false;
     int scaleSource = 0;
+    int brewVolumetricSource = 0;
+    int grindVolumetricTarget = false;
     int volumetricMode = false;
     int brewVolumetric = false;
     int profileVolumetric = false;
@@ -129,6 +133,8 @@ class DefaultUI {
     int heatingFlash = 0;
     double bluetoothWeight = 0.0;
     double hardwareWeight = 0.0;
+    double hardwareShotWeight = 0.0;
+    double estimatedWeight = 0.0;
     BrewScreenState brewScreenState = BrewScreenState::Brew;
 
     int profileDirty = 0;

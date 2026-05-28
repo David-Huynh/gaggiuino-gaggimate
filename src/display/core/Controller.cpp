@@ -123,7 +123,9 @@ void Controller::drainCommandQueue() {
 void Controller::setup() {
     mode = settings.getStartupMode();
     processMutex = xSemaphoreCreateRecursiveMutex();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     scaleSampleMutex = xSemaphoreCreateMutex();
+#endif
     cmdQueue = xQueueCreate(16, sizeof(CtrlCmdMsg));
 
     // Web assets are served from this partition. LittleFS (not SPIFFS): SPIFFS
@@ -188,16 +190,14 @@ void Controller::setup() {
 
     pluginManager->on("profiles:profile:select", [this](Event const &event) { this->handleProfileUpdate(); });
 
-    // When the user cycles scale source from the UI/WebUI we tear down any
-    // in-flight process so the next brew press starts from a known state.
-    // Without this, plugin-side flags (volumetricOverride, hardwareScalePresent)
-    // and Controller::currentVolumetricSource can hold values that no longer
-    // match the active source, which manifested as "brew button does nothing"
-    // after cycling away from Predictive.
+    // When the user cycles the brew scale source from the UI/WebUI we tear down
+    // any in-flight process so the next start resolves the source cleanly.
+    // Without this, Controller::currentVolumetricSource can hold a value that no
+    // longer matches the selected source ("brew button does nothing" after
+    // cycling away from Predictive).
     settings.setOnScaleSourceChange([this](int) {
         postCommand(CtrlCmd::DEACTIVATE);
         postCommand(CtrlCmd::CLEAR);
-        volumetricOverride = false;
     });
 
 #ifndef GAGGIMATE_HEADLESS
@@ -426,6 +426,7 @@ void Controller::setupBluetooth() {
         if (scaleSampleMutex && xSemaphoreTake(scaleSampleMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
             sample.sampleSeq = lastScaleSample.sampleSeq + 1;
             lastScaleSample = sample;
+            lastHardwareScaleSampleMs = millis();
             xSemaphoreGive(scaleSampleMutex);
         }
         recordHardwareScaleBaselineSample(sample);
@@ -754,47 +755,40 @@ bool Controller::isAutotuning() const { return autotuning; }
 
 bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !isAutotuning(); }
 
-bool Controller::isVolumetricAvailable() const {
-    int src = settings.getScaleSource();
-    if (src == 4)
-        return false; // OFF
-    if (src == 3)
-        return true; // Predictive (flow estimation always available)
-    if (src == 2)    // HW only
-        return hardwareScalePresent;
-    if (src == 1) {
-#ifdef NIGHTLY_BUILD
-        return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
+ScaleAvailability Controller::scaleAvailability() const {
+    ScaleAvailability a;
+    a.bluetoothConnected = isBluetoothScaleHealthy();
+    a.hardwarePresent = hardwareScalePresent;
+    a.predictiveAvailable = true;
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    a.hardwareCapable = false;
 #else
-        return isBluetoothScaleHealthy();
+    // The hardware scale physically lives on the STM32 controller; capability is
+    // advertised in its INFO payload (false for BLE-connected controllers).
+    a.hardwareCapable = systemInfo.capabilities.scale;
 #endif
-    }
-    if (hardwareScalePresent)
-        return true;
-#ifdef NIGHTLY_BUILD
-    return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
-#else
-    return isBluetoothScaleHealthy();
-#endif
+    return a;
 }
 
+bool Controller::isVolumetricAvailable() const {
+    return ScaleSourceResolver::brewVolumetricAvailable(settings.getScaleSource(), scaleAvailability());
+}
+
+bool Controller::isGrindVolumetricAvailable() const {
+    return ScaleSourceResolver::grindVolumetricAvailable(scaleAvailability());
+}
+
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 bool Controller::isHardwareScaleSampleHealthy(const ScaleSample &sample) const {
-#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    (void)sample;
-    return false;
-#else
     static constexpr uint16_t BLOCKING_HEALTH =
         SCALE_HEALTH_NOT_CALIBRATED | SCALE_HEALTH_STALE | SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_SAT_CH1 |
         SCALE_HEALTH_SAT_CH2 | SCALE_HEALTH_TARING | SCALE_HEALTH_CALIBRATING;
-    return hardwareScalePresent && std::isfinite(sample.weightG) && (sample.healthBits & BLOCKING_HEALTH) == 0;
-#endif
+    return hardwareScalePresent && std::isfinite(sample.weightG) && std::isfinite(sample.stddevG) &&
+           std::fabs(sample.weightG) <= HARDWARE_SCALE_MAX_ABS_G && sample.stddevG <= HARDWARE_SCALE_MAX_STDDEV_G &&
+           (sample.healthBits & BLOCKING_HEALTH) == 0;
 }
 
 void Controller::recordHardwareScaleBaselineSample(const ScaleSample &sample) {
-#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    (void)sample;
-    return;
-#else
     if (!isHardwareScaleSampleHealthy(sample)) {
         return;
     }
@@ -804,18 +798,54 @@ void Controller::recordHardwareScaleBaselineSample(const ScaleSample &sample) {
     if (hardwareScaleBaselineSampleCount < HARDWARE_SCALE_BASELINE_SAMPLE_COUNT) {
         ++hardwareScaleBaselineSampleCount;
     }
-#endif
 }
 
 bool Controller::captureHardwareScaleShotBaseline() {
-#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
     resetHardwareScaleShotBaseline();
-    return false;
-#else
-    resetHardwareScaleShotBaseline();
+    hardwareScaleBaselineSampleIndex = 0;
+    hardwareScaleBaselineSampleCount = 0;
+    for (float &sample : hardwareScaleBaselineSamples) {
+        sample = NAN;
+    }
+
+    const uint32_t startMs = millis();
+    while (millis() - startMs <= HARDWARE_SCALE_PREBREW_STABILIZE_MS) {
+#ifdef GAGGIMATE_UART_COMMS
+        comms.loop();
+#endif
+        const ScaleSample latest = getScaleSample();
+        const uint32_t latestAgeMs = millis() - lastHardwareScaleSampleMs;
+        if (isHardwareScaleSampleHealthy(latest) && latestAgeMs <= HARDWARE_SCALE_SAMPLE_FRESH_MS &&
+            hardwareScaleBaselineSampleCount >= HARDWARE_SCALE_PREBREW_MIN_SAMPLES) {
+            float minSample = latest.weightG;
+            float maxSample = latest.weightG;
+            float sum = 0.0f;
+            uint8_t count = 0;
+            for (uint8_t i = 0; i < hardwareScaleBaselineSampleCount; i++) {
+                const float sample = hardwareScaleBaselineSamples[i];
+                if (std::isfinite(sample) && std::fabs(sample) <= HARDWARE_SCALE_MAX_ABS_G &&
+                    std::fabs(sample - latest.weightG) <= HARDWARE_SCALE_MAX_BASELINE_SPREAD_G) {
+                    minSample = std::min(minSample, sample);
+                    maxSample = std::max(maxSample, sample);
+                    sum += sample;
+                    ++count;
+                }
+            }
+            if (count >= HARDWARE_SCALE_PREBREW_MIN_SAMPLES &&
+                (maxSample - minSample) <= HARDWARE_SCALE_PREBREW_STABLE_SPREAD_G) {
+                hardwareScaleShotBaseline = sum / static_cast<float>(count);
+                hardwareScaleShotBaselineActive = true;
+                ESP_LOGI(LOG_TAG, "Hardware scale pre-brew baseline captured: %.3f g (%u samples, spread %.3f g)",
+                         hardwareScaleShotBaseline, count, maxSample - minSample);
+                return true;
+            }
+        }
+        delay(HARDWARE_SCALE_PREBREW_POLL_MS);
+    }
+
     const ScaleSample latest = getScaleSample();
     if (!isHardwareScaleSampleHealthy(latest)) {
-        ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unavailable; falling back to timed brew");
+        ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unavailable; no healthy fresh sample");
         return false;
     }
 
@@ -823,26 +853,21 @@ bool Controller::captureHardwareScaleShotBaseline() {
     uint8_t count = 0;
     for (uint8_t i = 0; i < hardwareScaleBaselineSampleCount; i++) {
         const float sample = hardwareScaleBaselineSamples[i];
-        if (std::isfinite(sample)) {
+        if (std::isfinite(sample) && std::fabs(sample) <= HARDWARE_SCALE_MAX_ABS_G &&
+            std::fabs(sample - latest.weightG) <= HARDWARE_SCALE_MAX_BASELINE_SPREAD_G) {
             sum += sample;
             ++count;
         }
     }
-    if (count == 0) {
-        sum = latest.weightG;
-        count = 1;
-    }
-    hardwareScaleShotBaseline = sum / static_cast<float>(count);
-    hardwareScaleShotBaselineActive = true;
-    ESP_LOGI(LOG_TAG, "Hardware scale shot baseline captured: %.3f g (%u samples)", hardwareScaleShotBaseline, count);
-    return true;
-#endif
+    ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unstable; samples=%u", count);
+    return false;
 }
 
 void Controller::resetHardwareScaleShotBaseline() {
     hardwareScaleShotBaselineActive = false;
     hardwareScaleShotBaseline = 0.0f;
 }
+#endif
 
 void Controller::autotune(int testTime, int samples, int heaterWattage) {
     if (isActive() || !isReady()) {
@@ -990,7 +1015,7 @@ void Controller::lowerBrewTarget() {
 }
 
 void Controller::raiseGrindTarget() {
-    if (settings.isVolumetricTarget() && isVolumetricAvailable()) {
+    if (settings.isVolumetricTarget() && isGrindVolumetricAvailable()) {
         double newTarget = settings.getTargetGrindVolume() + 0.5;
         if (newTarget > BREW_MAX_VOLUMETRIC) {
             newTarget = BREW_MAX_VOLUMETRIC;
@@ -1006,7 +1031,7 @@ void Controller::raiseGrindTarget() {
 }
 
 void Controller::lowerGrindTarget() {
-    if (settings.isVolumetricTarget() && isVolumetricAvailable()) {
+    if (settings.isVolumetricTarget() && isGrindVolumetricAvailable()) {
         double newTarget = settings.getTargetGrindVolume() - 0.5;
         if (newTarget < BREW_MIN_VOLUMETRIC) {
             newTarget = BREW_MIN_VOLUMETRIC;
@@ -1142,66 +1167,40 @@ void Controller::activate() {
     // clear() already resets this under the process lock, but state in activate()
     // is the operative invariant for the rest of this function — keep it explicit.
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
-    // HW-scale brews use an ESP32-side software shot baseline (see
-    // captureHardwareScaleShotBaseline below). Issuing a hardware tare here races
-    // the baseline capture: post-tare samples read ≈ 0 g while the baseline still
-    // holds the pre-tare cup weight, so (weight − baseline) clamps to 0 for the
-    // whole shot and weight-target stages never advance.
-    const int activateSrc = settings.getScaleSource();
-    if (activateSrc == 2) {
-        ESP_LOGI(LOG_TAG, "activate: skipping comms.tare() (HW scale uses software shot baseline) src=%d", activateSrc);
+
+    // Resolve which source this brew will use. Explicit selection wins when
+    // available; otherwise fall back predictably (selected → hardware →
+    // predictive) so a brew never blocks on an unavailable scale. Only an
+    // explicit OFF (or a non-brew mode) leaves the source INACTIVE → timed brew.
+    const int brewSrcSetting = settings.getScaleSource();
+    VolumetricMeasurementSource resolved = VolumetricMeasurementSource::INACTIVE;
+    if (mode == MODE_BREW) {
+        resolved = ScaleSourceResolver::resolveBrewSource(brewSrcSetting, scaleAvailability());
+        // A hardware-scale brew needs its software shot baseline (the pre-brew
+        // cup weight). If no healthy sample is available, fall back to predictive
+        // pump-flow rather than blocking the brew. Done before the tare decision
+        // below so the fallback still gets its pump-flow tare.
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        if (resolved == VolumetricMeasurementSource::HARDWARE_SCALE && !captureHardwareScaleShotBaseline()) {
+            ESP_LOGW(LOG_TAG, "HW scale baseline unavailable; falling back to predictive flow for this brew");
+            resolved = VolumetricMeasurementSource::FLOW_ESTIMATION;
+        }
+#endif
+    }
+
+    // Tare the pump-flow estimator for every source except the hardware scale.
+    // BLE/predictive brews want the estimator zeroed at the start; a HW brew uses
+    // the software baseline captured above, and a pump/hardware tare here would
+    // race it (post-tare samples read ≈ 0 g while the baseline still holds the
+    // cup weight, so weight − baseline clamps to 0 for the whole shot).
+    if (resolved == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        ESP_LOGI(LOG_TAG, "activate: skipping pump-flow tare (HW scale uses software shot baseline)");
     } else {
-        ESP_LOGI(LOG_TAG, "activate: comms.tare() src=%d", activateSrc);
         comms.tare();
     }
-    bool hardwareScaleBaselineReady = false;
-    if (isVolumetricAvailable()) {
-        int src = settings.getScaleSource();
-        if (src == 3) { // Predictive
-            currentVolumetricSource = VolumetricMeasurementSource::FLOW_ESTIMATION;
-        } else if (src == 2 && mode == MODE_BREW && hardwareScalePresent) {
-            hardwareScaleBaselineReady = captureHardwareScaleShotBaseline();
-            currentVolumetricSource =
-                hardwareScaleBaselineReady ? VolumetricMeasurementSource::HARDWARE_SCALE : VolumetricMeasurementSource::INACTIVE;
-        } else if (src == 1) {
-#ifdef NIGHTLY_BUILD
-            currentVolumetricSource =
-                isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
-#else
-            currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
-#endif
-        } else if (hardwareScalePresent && mode == MODE_BREW) {
-            hardwareScaleBaselineReady = captureHardwareScaleShotBaseline();
-            if (hardwareScaleBaselineReady) {
-                currentVolumetricSource = VolumetricMeasurementSource::HARDWARE_SCALE;
-            } else {
-#ifdef NIGHTLY_BUILD
-                currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
-                                                                    : VolumetricMeasurementSource::FLOW_ESTIMATION;
-#else
-                currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
-#endif
-            }
-        } else {
-#ifdef NIGHTLY_BUILD
-            currentVolumetricSource = isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH
-                                                                : VolumetricMeasurementSource::FLOW_ESTIMATION;
-#else
-            currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
-#endif
-        }
-    }
-    // HW-only refuses to silently fall back to TIME — that produces a stalled-
-    // looking brew whose phases only time out on BREW_SAFETY_DURATION_MS when the
-    // profile's stages progress on weight. Better UX is a clear rejection.
-    if (activateSrc == 2 && mode == MODE_BREW &&
-        currentVolumetricSource != VolumetricMeasurementSource::HARDWARE_SCALE) {
-        ESP_LOGW(LOG_TAG, "Hardware scale selected but no healthy sample is available yet; brew start rejected");
-        Event ev{"controller:scale:not-ready"};
-        ev.setInt("source", activateSrc);
-        pluginManager->trigger(ev);
-        return;
-    }
+    currentVolumetricSource = resolved;
+    ESP_LOGI(LOG_TAG, "activate: mode=%d brewSrcSetting=%d resolvedSource=%d", mode, brewSrcSetting, static_cast<int>(resolved));
+
     if (mode == MODE_BREW) {
         // Fire unconditionally so plugins that pre-arm on brew start (e.g.
         // BLE scale auto-tare) run regardless of volumetric availability.
@@ -1211,7 +1210,7 @@ void Controller::activate() {
     switch (mode) {
     case MODE_BREW:
         startProcess(new BrewProcess(profileManager->getSelectedProfile(),
-                                     profileManager->getSelectedProfile().isVolumetric() && isVolumetricAvailable() &&
+                                     profileManager->getSelectedProfile().isVolumetric() &&
                                              currentVolumetricSource != VolumetricMeasurementSource::INACTIVE
                                          ? ProcessTarget::VOLUMETRIC
                                          : ProcessTarget::TIME,
@@ -1254,7 +1253,9 @@ void Controller::deactivate() {
     applyConnectionPriority(); // shot ended -> relaxed BLE interval
     if (swappedType == MODE_BREW) {
         currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
-        resetHardwareScaleShotBaseline();
+        // Keep the hardware shot baseline alive after pump stop so UI and shot
+        // history can continue showing/recording settled shot-relative weight.
+        // clear(), mode change, flush, and next activate() reset it.
         pluginManager->trigger("controller:brew:end");
     } else if (swappedType == MODE_GRIND) {
         pluginManager->trigger("controller:grind:end");
@@ -1274,7 +1275,9 @@ void Controller::clear() {
         delete lastProcess;
         lastProcess = nullptr;
         currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         resetHardwareScaleShotBaseline();
+#endif
     }
     if (wasBrew) {
         pluginManager->trigger("controller:brew:clear");
@@ -1282,17 +1285,22 @@ void Controller::clear() {
 }
 
 void Controller::activateGrind() {
-    pluginManager->trigger("controller:grind:start");
     if (isGrindActive())
         return;
     clear();
-    if (settings.isVolumetricTarget() && isVolumetricAvailable()) {
-        currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+    // Grind-by-weight can only use a movable Bluetooth scale. The hardware scale
+    // is fixed in the brew path, and predictive pump-flow is meaningless while
+    // grinding.
+    VolumetricMeasurementSource resolved = ScaleSourceResolver::resolveGrindSource(scaleAvailability());
+    if (settings.isVolumetricTarget() && resolved != VolumetricMeasurementSource::INACTIVE) {
+        currentVolumetricSource = resolved;
         startProcess(new GrindProcess(ProcessTarget::VOLUMETRIC, 0, settings.getTargetGrindVolume(), settings.getGrindDelay()));
     } else {
+        currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
         startProcess(
             new GrindProcess(ProcessTarget::TIME, settings.getTargetGrindDuration(), settings.getTargetGrindVolume(), 0.0));
     }
+    pluginManager->trigger("controller:grind:start");
 }
 
 void Controller::deactivateGrind() {
@@ -1329,7 +1337,9 @@ void Controller::setMode(int newMode) {
     mode = modeEvent.getInt("value");
     steamReady = false;
     if (mode != MODE_BREW) {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         resetHardwareScaleShotBaseline();
+#endif
     }
 
     updateLastAction();
@@ -1367,29 +1377,40 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
     }
 #endif
     const __FlashStringHelper *eventName = F("controller:volumetric-measurement:bluetooth:change");
+    if (source == VolumetricMeasurementSource::BLUETOOTH) {
+        lastBluetoothMeasurement = millis();
+    }
     if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
         eventName = F("controller:volumetric-measurement:estimation:change");
     } else if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
         eventName = F("controller:volumetric-measurement:hardware:change");
     }
     pluginManager->trigger(eventName, "value", static_cast<float>(measurement));
-    if (source == VolumetricMeasurementSource::BLUETOOTH) {
-        lastBluetoothMeasurement = millis();
+    double processMeasurement = measurement;
+    if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        if (!hardwareScaleShotBaselineActive) {
+            if (currentVolumetricSource == source) {
+                ESP_LOGD(LOG_TAG, "Ignoring hardware scale measurement without shot baseline");
+                return;
+            }
+        } else {
+            processMeasurement = std::max(0.0, measurement - static_cast<double>(hardwareScaleShotBaseline));
+            if (processMeasurement > HARDWARE_SCALE_MAX_SHOT_G) {
+                ESP_LOGW(LOG_TAG, "Ignoring hardware scale shot outlier: raw=%.3f baseline=%.3f shot=%.3f",
+                         static_cast<float>(measurement), hardwareScaleShotBaseline, static_cast<float>(processMeasurement));
+                return;
+            }
+            pluginManager->trigger(F("controller:volumetric-measurement:hardware-shot:change"), "value",
+                                   static_cast<float>(processMeasurement));
+        }
+#else
+        return;
+#endif
     }
-
     if (currentVolumetricSource != source) {
         ESP_LOGD(LOG_TAG, "Ignoring volumetric measurement, source does not match");
         return;
-    }
-    double processMeasurement = measurement;
-    if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
-        if (!hardwareScaleShotBaselineActive) {
-            ESP_LOGD(LOG_TAG, "Ignoring hardware scale measurement without shot baseline");
-            return;
-        }
-        processMeasurement = std::max(0.0, measurement - static_cast<double>(hardwareScaleShotBaseline));
-        pluginManager->trigger(F("controller:volumetric-measurement:hardware-shot:change"), "value",
-                               static_cast<float>(processMeasurement));
     }
     ProcessLock lock(processMutex);
     Process *proc = currentProcess;
@@ -1426,10 +1447,14 @@ ScaleSample Controller::getScaleSample() const {
     }
     return s;
 }
+#endif
 
 bool Controller::isBluetoothScaleHealthy() const {
-    unsigned long timeSinceLastBluetooth = millis() - lastBluetoothMeasurement;
-    return (timeSinceLastBluetooth < BLUETOOTH_GRACE_PERIOD_MS) || volumetricOverride;
+    // BLE is usable for weight-based routines only while it is actively
+    // publishing measurements; a stale connected scale should fall back.
+    const unsigned long now = millis();
+    return BLEScales.isConnected() && lastBluetoothMeasurement != 0 &&
+           now - lastBluetoothMeasurement <= BLUETOOTH_MEASUREMENT_GRACE_MS;
 }
 
 void Controller::onFlush() {
@@ -1437,7 +1462,9 @@ void Controller::onFlush() {
         return;
     }
     clear();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     resetHardwareScaleShotBaseline();
+#endif
     startProcess(new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay()));
     pluginManager->trigger("controller:brew:start");
 }

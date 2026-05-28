@@ -98,14 +98,21 @@ void onVolumetricClick(lv_event_t *e) {
         volumetricHoldTriggered = false;
         return;
     }
-    // Cycle: 1 (BLE) → 2 (HW) → 3 (Predictive) → 4 (OFF) → 1
-    int src = controller.getSettings().getScaleSource();
-#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    int next = (src == 1) ? 3 : (src == 3) ? 4 : 1;
+    auto &settings = controller.getSettings();
+    if (controller.getMode() == MODE_GRIND) {
+        // Grind-by-weight is BLE-only. This toggles weight vs timed grind; the
+        // controller will use timed grind if no Bluetooth scale is connected.
+        settings.setVolumetricTarget(!settings.isVolumetricTarget());
+    } else {
+        // Brew role: BLE (1) → HW (2, UART only) → Predictive (3) → OFF (4) → BLE.
+        int src = settings.getScaleSource();
+#if defined(GAGGIMATE_UART_COMMS) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+        int next = (src >= 1 && src <= 3) ? src + 1 : 1;
 #else
-    int next = (src >= 1 && src <= 3) ? src + 1 : 1;
+        int next = (src == 1) ? 3 : (src == 3) ? 4 : 1;
 #endif
-    controller.getSettings().setScaleSource(next);
+        settings.setScaleSource(next);
+    }
 }
 
 void onPreviousProfile(lv_event_t *e) { controller.getUI()->onPreviousProfile(); }

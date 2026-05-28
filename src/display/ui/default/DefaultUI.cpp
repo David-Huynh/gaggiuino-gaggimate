@@ -233,11 +233,30 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
+    pluginManager->on("controller:volumetric-measurement:estimation:change", [=](Event const &event) {
+        double newWeight = event.getFloat("value");
+        if (round(newWeight * 10.0) != round(estimatedWeight * 10.0)) {
+            estimatedWeight = newWeight;
+            rerender = true;
+        }
+    });
+    pluginManager->on("controller:brew:prestart", [=](Event const &) {
+        estimatedWeight = 0.0;
+        hardwareShotWeight = 0.0;
+        rerender = true;
+    });
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     pluginManager->on("controller:scale:sample", [=](Event const &event) {
         double newWeight = event.getFloat("value");
         if (round(newWeight * 10.0) != round(hardwareWeight * 10.0)) {
             hardwareWeight = newWeight;
+            rerender = true;
+        }
+    });
+    pluginManager->on("controller:volumetric-measurement:hardware-shot:change", [=](Event const &event) {
+        double newWeight = event.getFloat("value");
+        if (round(newWeight * 10.0) != round(hardwareShotWeight * 10.0)) {
+            hardwareShotWeight = newWeight;
             rerender = true;
         }
     });
@@ -270,13 +289,18 @@ void DefaultUI::loop() {
         autotuning = controller->isAutotuning();
         const Settings &settings = controller->getSettings();
         volumetricAvailable = controller->isVolumetricAvailable();
+        grindVolumetricAvailable = controller->isGrindVolumetricAvailable();
         bluetoothScales = controller->isBluetoothScaleHealthy();
         hardwareScalePresent = controller->isHardwareScalePresent();
+        hardwareShotBaselineActive = controller->isHardwareScaleShotBaselineActive();
         scaleSource = settings.getScaleSource();
-        volumetricMode = volumetricAvailable && settings.isVolumetricTarget();
+        active = controller->isActive();
+        brewVolumetricSource = static_cast<int>(active ? controller->getCurrentVolumetricSource()
+                                                       : controller->getResolvedBrewSource());
+        grindVolumetricTarget = settings.isVolumetricTarget();
+        volumetricMode = grindVolumetricAvailable && grindVolumetricTarget;
         brewVolumetric = volumetricAvailable && profileVolumetric;
         grindActive = controller->isGrindActive();
-        active = controller->isActive();
         smartGrindActive = settings.isSmartGrindActive();
         grindAvailable = smartGrindActive || settings.getAltRelayFunction() == ALT_RELAY_GRIND;
         applyTheme();
@@ -378,9 +402,17 @@ void DefaultUI::setupState() {
     autotuning = controller->isAutotuning();
     const Settings &settings = controller->getSettings();
     volumetricAvailable = controller->isVolumetricAvailable();
-    volumetricMode = volumetricAvailable && settings.isVolumetricTarget();
-    grindActive = controller->isGrindActive();
+    grindVolumetricAvailable = controller->isGrindVolumetricAvailable();
+    bluetoothScales = controller->isBluetoothScaleHealthy();
+    hardwareScalePresent = controller->isHardwareScalePresent();
+    hardwareShotBaselineActive = controller->isHardwareScaleShotBaselineActive();
+    scaleSource = settings.getScaleSource();
     active = controller->isActive();
+    brewVolumetricSource = static_cast<int>(active ? controller->getCurrentVolumetricSource()
+                                                   : controller->getResolvedBrewSource());
+    grindVolumetricTarget = settings.isVolumetricTarget();
+    volumetricMode = grindVolumetricAvailable && grindVolumetricTarget;
+    grindActive = controller->isGrindActive();
     smartGrindActive = settings.isSmartGrindActive();
     grindAvailable = smartGrindActive || settings.getAltRelayFunction() == ALT_RELAY_GRIND;
     mode = controller->getMode();
@@ -600,15 +632,13 @@ void DefaultUI::setupReactive() {
         &volumetricMode);
     effect_mgr.use_effect([=] { return currentScreen == ui_GrindScreen; },
                           [=]() {
-                              _ui_flag_modify(ui_GrindScreen_modeSwitch, LV_OBJ_FLAG_HIDDEN, volumetricAvailable || scaleSource > 0);
-                              const lv_img_dsc_t *icon = (scaleSource == 1) ? &ui_img_1424216268 :
-                                                         (scaleSource == 2) ? &ui_img_flowmeter_png :
-                                                         (scaleSource == 3) ? &ui_img_2074354459 :
-                                                         (scaleSource == 4) ? &ui_img_2044104741 :
-                                                         &ui_img_1424216268;
+                              _ui_flag_modify(ui_GrindScreen_modeSwitch, LV_OBJ_FLAG_HIDDEN,
+                                              grindVolumetricAvailable || grindVolumetricTarget);
+                              const lv_img_dsc_t *icon =
+                                  grindVolumetricTarget ? &ui_img_1424216268 : &ui_img_2044104741;
                               lv_img_set_src(ui_GrindScreen_volumetricButton, icon);
                           },
-                          &volumetricAvailable, &scaleSource);
+                          &grindVolumetricAvailable, &grindVolumetricTarget);
     effect_mgr.use_effect([=] { return currentScreen == ui_SimpleProcessScreen; },
                           [=]() {
                               if (mode == MODE_STEAM) {
@@ -678,26 +708,29 @@ void DefaultUI::setupReactive() {
                           &grindAvailable);
     effect_mgr.use_effect([=] { return currentScreen == ui_BrewScreen; },
                           [=]() {
-                              if (volumetricAvailable && hardwareScalePresent) {
-                                  lv_label_set_text_fmt(ui_BrewScreen_weightLabel, "%.1fg", hardwareWeight);
-                              } else if (volumetricAvailable && bluetoothScales) {
+                              const auto source = static_cast<VolumetricMeasurementSource>(brewVolumetricSource);
+                              if (volumetricAvailable && source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+                                  lv_label_set_text_fmt(ui_BrewScreen_weightLabel, "%.1fg",
+                                                        hardwareShotBaselineActive ? hardwareShotWeight : hardwareWeight);
+                              } else if (volumetricAvailable && source == VolumetricMeasurementSource::BLUETOOTH) {
                                   lv_label_set_text_fmt(ui_BrewScreen_weightLabel, "%.1fg", bluetoothWeight);
+                              } else if (volumetricAvailable && source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
+                                  lv_label_set_text_fmt(ui_BrewScreen_weightLabel, "%.1fg", estimatedWeight);
                               } else {
                                   lv_label_set_text(ui_BrewScreen_weightLabel, "-");
                               }
                           },
-                          &bluetoothWeight, &hardwareWeight, &volumetricAvailable, &bluetoothScales, &hardwareScalePresent);
+                          &bluetoothWeight, &hardwareWeight, &hardwareShotWeight, &estimatedWeight, &volumetricAvailable,
+                          &brewVolumetricSource, &hardwareShotBaselineActive);
     effect_mgr.use_effect([=] { return currentScreen == ui_GrindScreen; },
                           [=]() {
-                              if (volumetricAvailable && hardwareScalePresent) {
-                                  lv_label_set_text_fmt(ui_GrindScreen_weightLabel, "%.1fg", hardwareWeight);
-                              } else if (volumetricAvailable && bluetoothScales) {
+                              if (grindVolumetricAvailable && bluetoothScales) {
                                   lv_label_set_text_fmt(ui_GrindScreen_weightLabel, "%.1fg", bluetoothWeight);
                               } else {
                                   lv_label_set_text(ui_GrindScreen_weightLabel, "-");
                               }
                           },
-                          &bluetoothWeight, &hardwareWeight, &volumetricAvailable, &bluetoothScales, &hardwareScalePresent);
+                          &bluetoothWeight, &grindVolumetricAvailable, &bluetoothScales);
     effect_mgr.use_effect(
         [=] { return currentScreen == ui_BrewScreen; },
         [=]() {

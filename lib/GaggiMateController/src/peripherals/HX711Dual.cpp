@@ -40,8 +40,9 @@ void HX711Dual::power_down() {
 }
 
 bool HX711Dual::is_ready() const {
-    // Only one HX711 channel may be populated; either DOUT going LOW means a sample
-    // is available.
+    // Read-path probe: either DOUT going LOW means a sample is available to clock.
+    // Detection separately requires BOTH channels (see HX711Scale::initializeDriver),
+    // because the scale sums two load cells.
     return digitalRead(_dout1) == LOW || digitalRead(_dout2) == LOW;
 }
 

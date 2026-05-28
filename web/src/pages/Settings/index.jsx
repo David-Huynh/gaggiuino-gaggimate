@@ -405,7 +405,9 @@ export function Settings() {
               <div className='join w-full'>
                 {[
                   { value: 1, label: 'Bluetooth' },
-                  ...(!hardwareScaleDisabled ? [{ value: 2, label: 'Hardware' }] : []),
+                  ...(!hardwareScaleDisabled && formData.scaleCapable
+                    ? [{ value: 2, label: 'Hardware' }]
+                    : []),
                   { value: 3, label: 'Predictive' },
                   { value: 4, label: 'Off' },
                 ].map(({ value, label }) => (
@@ -420,11 +422,12 @@ export function Settings() {
                 ))}
               </div>
               <p className='text-base-content/60 mt-1 text-xs'>
-                {hardwareScaleDisabled
-                  ? 'Bluetooth uses an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.'
-                  : 'Bluetooth and Hardware use an external scale. Predictive uses the pump flow meter. Off disables volumetric targeting.'}
+                Source used for brew weight and the general display. Selection wins when available;
+                otherwise it falls back to hardware (if present) and then predictive pump flow. Off
+                disables volumetric targeting.
               </p>
             </div>
+
             {!hardwareScaleDisabled && (
               <>
                 <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>

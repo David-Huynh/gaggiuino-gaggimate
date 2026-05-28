@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include "PluginManager.h"
+#include "ScaleSourceResolver.h"
 #include "Settings.h"
 #include "SystemInfo.h"
 #include <WiFi.h>
@@ -19,7 +20,9 @@
 const IPAddress WIFI_AP_IP(4, 4, 4, 1); // the IP address the web server, Samsung requires the IP to be in public space
 const IPAddress WIFI_SUBNET_MASK(255, 255, 255, 0); // no need to change: https://avinetworks.com/glossary/subnet-mask/
 
-enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH, HARDWARE_SCALE };
+// VolumetricMeasurementSource and the scale-source role resolver live in
+// ScaleSourceResolver.h (included above) so the routing logic stays a small,
+// Arduino-free unit.
 
 // Commands posted from any task; drained on the Arduino loop task at the top of
 // Controller::loop(). External callers (WebUI, LVGL, plugins) MUST use
@@ -114,7 +117,20 @@ class Controller {
     void onProfileSave() const;
     void onProfileSaveAsNew();
     void onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source);
-    void setVolumetricOverride(bool override) { volumetricOverride = override; }
+
+    // --- Scale source roles --------------------------------------------------
+    // Live snapshot of which sources are currently usable (BLE connected, HW
+    // present/capable, predictive). Cheap: no mutex, just flag reads.
+    ScaleAvailability scaleAvailability() const;
+    // Source the active process is currently consuming weight from.
+    VolumetricMeasurementSource getCurrentVolumetricSource() const { return currentVolumetricSource; }
+    // What the brew / grind roles would resolve to right now (for display).
+    VolumetricMeasurementSource getResolvedBrewSource() const {
+        return ScaleSourceResolver::resolveBrewSource(settings.getScaleSource(), scaleAvailability());
+    }
+    VolumetricMeasurementSource getResolvedGrindSource() const { return ScaleSourceResolver::resolveGrindSource(scaleAvailability()); }
+    // Volumetric availability for the grind-by-weight role (brew uses isVolumetricAvailable()).
+    bool isGrindVolumetricAvailable() const;
 #ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
     void setHardwareScalePresent(bool present) {
         (void)present;
@@ -128,12 +144,13 @@ class Controller {
     bool isHardwareScalePresent() const { return hardwareScalePresent; }
     bool isHardwareScaleShotBaselineActive() const { return hardwareScaleShotBaselineActive; }
     float getHardwareScaleShotBaseline() const { return hardwareScaleShotBaseline; }
-#endif
     void scaleTare();
     void sendScaleCalibration(float c1, float c2);
-    bool isBluetoothScaleHealthy() const;
     // Most-recent ScaleSample snapshot (rich health/stddev info), copied under mutex.
     ScaleSample getScaleSample() const;
+    bool isHardwareScaleSampleHealthy(const ScaleSample &sample) const;
+#endif
+    bool isBluetoothScaleHealthy() const;
     void onFlush();
     int getWaterLevel() const {
         int emptyDist = settings.getEmptyTankDistance();
@@ -174,10 +191,11 @@ class Controller {
     // force re-applies even if the desired state is unchanged (use on connect).
     void applyConnectionPriority(bool force = false);
     void drainCommandQueue();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     bool captureHardwareScaleShotBaseline();
     void resetHardwareScaleShotBaseline();
     void recordHardwareScaleBaselineSample(const ScaleSample &sample);
-    bool isHardwareScaleSampleHealthy(const ScaleSample &sample) const;
+#endif
 
     // Event handlers
     void onTempRead(float temperature);
@@ -236,17 +254,30 @@ class Controller {
     // External-mutation queue, drained on the Arduino loop task.
     QueueHandle_t cmdQueue = nullptr;
 
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     // Most-recent ScaleSample, written from UART poll callback, read by getters.
     mutable SemaphoreHandle_t scaleSampleMutex = nullptr;
     ScaleSample lastScaleSample{};
+    static constexpr float HARDWARE_SCALE_MAX_ABS_G = 5000.0f;
+    static constexpr float HARDWARE_SCALE_MAX_STDDEV_G = 5.0f;
+    static constexpr float HARDWARE_SCALE_MAX_BASELINE_SPREAD_G = 20.0f;
+    static constexpr float HARDWARE_SCALE_PREBREW_STABLE_SPREAD_G = 0.5f;
+    static constexpr float HARDWARE_SCALE_MAX_SHOT_G = BREW_MAX_VOLUMETRIC + 100.0f;
     static constexpr uint8_t HARDWARE_SCALE_BASELINE_SAMPLE_COUNT = 8;
+    static constexpr uint8_t HARDWARE_SCALE_PREBREW_MIN_SAMPLES = 4;
+    static constexpr uint32_t HARDWARE_SCALE_PREBREW_STABILIZE_MS = 800;
+    static constexpr uint32_t HARDWARE_SCALE_PREBREW_POLL_MS = 25;
+    static constexpr uint32_t HARDWARE_SCALE_SAMPLE_FRESH_MS = 350;
     float hardwareScaleBaselineSamples[HARDWARE_SCALE_BASELINE_SAMPLE_COUNT]{};
     uint8_t hardwareScaleBaselineSampleIndex = 0;
     uint8_t hardwareScaleBaselineSampleCount = 0;
     bool hardwareScaleShotBaselineActive = false;
     float hardwareScaleShotBaseline = 0.0f;
+    uint32_t lastHardwareScaleSampleMs = 0;
+#endif
 
     unsigned long grindActiveUntil = 0;
+    unsigned long lastBluetoothMeasurement = 0;
     unsigned long lastPing = 0;
     unsigned long lastProgress = 0;
     unsigned long lastInfoRequest = 0;
@@ -264,17 +295,22 @@ class Controller {
     bool screenReady = false;
     bool waitingForController = false;
     unsigned long connectStartTime = 0;
-    bool volumetricOverride = false;
     bool hardwareScalePresent = false;
+    // INFO/capability payload has been read and applied (capability latched,
+    // calibration sent, controller:ready fired). Decoupled from `connected` so a
+    // PING that latches the connection early can't skip capability detection.
+    bool infoApplied = false;
+    // controller:bluetooth:connect has been announced for this connection.
+    bool connectionAnnounced = false;
     bool processCompleted = false;
     bool steamReady = false;
     bool sdcard = false;
     int error = 0;
 
-    // Bluetooth scale connection monitoring
+    // Source the active process consumes weight from; set per-process in
+    // activate()/activateGrind() via the role resolver.
     VolumetricMeasurementSource currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
-    unsigned long lastBluetoothMeasurement = 0;
-    static const unsigned long BLUETOOTH_GRACE_PERIOD_MS = 1500; // 1.5 second grace period
+    static const unsigned long BLUETOOTH_MEASUREMENT_GRACE_MS = 2000;
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
 
     xTaskHandle taskHandle;

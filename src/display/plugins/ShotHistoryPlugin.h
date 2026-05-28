@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <display/core/Plugin.h>
+#include <display/core/ScaleSourceResolver.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
 
@@ -54,6 +55,9 @@ class ShotHistoryPlugin : public Plugin {
 
     void recordPhaseTransition(uint8_t phaseNumber, uint16_t sampleIndex); // Helper for phase transitions
 
+    // Live weight for a given source from the cached per-source values below.
+    float sourceWeight(VolumetricMeasurementSource source) const;
+
     Controller *controller = nullptr;
     PluginManager *pluginManager = nullptr;
     FS *fs = &LittleFS;
@@ -67,6 +71,10 @@ class ShotHistoryPlugin : public Plugin {
 
     bool recording = false;
     bool extendedRecording = false;
+    // Source the active shot is recording weight from, latched at brew start so
+    // the logged weight stays consistent through the post-shot settling window
+    // (Controller::currentVolumetricSource resets to INACTIVE on brew end).
+    VolumetricMeasurementSource shotSource = VolumetricMeasurementSource::INACTIVE;
     bool indexEntryCreated = false;     // Track if early index entry was created
     bool shotStartedVolumetric = false; // Track initial volumetric mode
     unsigned long shotStart = 0;

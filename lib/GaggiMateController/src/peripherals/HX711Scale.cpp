@@ -21,15 +21,36 @@ void HX711Scale::setup() {
     _drv = new HX711Dual();
     _present = false;
 
-    // The original library used push-pull SCK. Try push-pull first, fall back to
-    // open-drain for boards that need pull-up sharing.
-    const uint32_t sckModes[] = {OUTPUT, OUTPUT_OPEN_DRAIN};
+    if (!initializeDriver()) {
+        ESP_LOGW(LOG_TAG, "HX711 scale not detected at boot; retrying in background");
+    }
 
-    for (size_t modeIdx = 0; modeIdx < (sizeof(sckModes) / sizeof(sckModes[0])) && !_present; modeIdx++) {
+    xTaskCreate(loopTask, "HX711Scale::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &_taskHandle);
+}
+
+bool HX711Scale::initializeDriver() {
+    if (!_drv) {
+        return false;
+    }
+
+    _lastInitAttemptMs = millis();
+    _present = false;
+
+    // The two HX711 share one SCK pin (and therefore one SCK mode), so detection
+    // runs in two phases: (1) find an SCK mode where the bus comes alive at all,
+    // then (2) under that mode confirm BOTH channels. The scale sums two load
+    // cells, so a single live chip produces a NaN weight (see emitOutputSample)
+    // and is unusable. Re-clocking cannot conjure an absent chip, so phase 2 just
+    // polls the still-missing channel — leaving the live one untouched — and the
+    // 5 s loop() retry re-checks until the second chip is connected.
+    const uint32_t sckModes[] = {OUTPUT, OUTPUT_OPEN_DRAIN};
+    bool busAlive = false;
+
+    for (size_t modeIdx = 0; modeIdx < (sizeof(sckModes) / sizeof(sckModes[0])) && !busAlive; modeIdx++) {
         const uint32_t sckMode = sckModes[modeIdx];
         _drv->begin(_dout1_pin, _dout2_pin, _sck_pin, 128U, sckMode);
 
-        for (int attempt = 1; attempt <= SCALE_INIT_RETRIES; attempt++) {
+        for (int attempt = 1; attempt <= SCALE_INIT_RETRIES && !busAlive; attempt++) {
             _drv->power_up();
             const int dout1Before = digitalRead(_dout1_pin);
             const int dout2Before = digitalRead(_dout2_pin);
@@ -38,10 +59,9 @@ void HX711Scale::setup() {
                      dout2Before);
 
             if (_drv->wait_ready_timeout(SCALE_INIT_TIMEOUT_MS, SCALE_READY_DELAY_MS)) {
-                _present = true;
-                ESP_LOGI(LOG_TAG, "HX711 detected (SCK mode=%s) on attempt %d/%d (DOUT1=%d, DOUT2=%d, SCK=%d)",
-                         sckMode == OUTPUT_OPEN_DRAIN ? "open-drain" : "push-pull", attempt, SCALE_INIT_RETRIES, _dout1_pin,
-                         _dout2_pin, _sck_pin);
+                busAlive = true;
+                ESP_LOGI(LOG_TAG, "HX711 bus alive (SCK mode=%s) on attempt %d/%d (SCK=%d)",
+                         sckMode == OUTPUT_OPEN_DRAIN ? "open-drain" : "push-pull", attempt, SCALE_INIT_RETRIES, _sck_pin);
                 break;
             }
 
@@ -53,11 +73,36 @@ void HX711Scale::setup() {
         }
     }
 
-    if (!_present) {
+    if (!busAlive) {
         _drv->power_down();
-        ESP_LOGW(LOG_TAG, "HX711 scale not detected after %d attempts, disabling", SCALE_INIT_RETRIES);
-        return;
+        ESP_LOGW(LOG_TAG, "HX711 scale not detected after %d attempts", SCALE_INIT_RETRIES);
+        return false;
     }
+
+    // Phase 2: require BOTH channels. They convert in lockstep off the shared
+    // clock, so a present second chip appears within ~1-2 sample periods. Latch
+    // each channel as its DOUT is first seen ready and keep polling only the one
+    // still missing — without power-cycling, which would disturb the live channel.
+    bool ready1 = false;
+    bool ready2 = false;
+    const uint32_t bothStart = millis();
+    while (millis() - bothStart < static_cast<uint32_t>(SCALE_BOTH_READY_TIMEOUT_MS)) {
+        ready1 = ready1 || _drv->is_ready_ch1();
+        ready2 = ready2 || _drv->is_ready_ch2();
+        if (ready1 && ready2) {
+            break;
+        }
+        delay(SCALE_READY_DELAY_MS);
+    }
+
+    if (!ready1 || !ready2) {
+        _drv->power_down();
+        ESP_LOGW(LOG_TAG, "HX711 only one channel responding (ch1=%d ch2=%d); both required, will retry", ready1, ready2);
+        return false;
+    }
+
+    _present = true;
+    ESP_LOGI(LOG_TAG, "HX711 detected: both channels ready (DOUT1=%d, DOUT2=%d, SCK=%d)", _dout1_pin, _dout2_pin, _sck_pin);
 
     _nativeHz = _drv->detect_rate();
     if (_nativeHz == 80) {
@@ -79,8 +124,7 @@ void HX711Scale::setup() {
     }
     ESP_LOGI(LOG_TAG, "HX711 native rate: %u Hz (oversample x%u, sample period %u ms)", _nativeHz, _outputDivisor,
              _samplePeriodMs);
-
-    xTaskCreate(loopTask, "HX711Scale::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &_taskHandle);
+    return true;
 }
 
 void HX711Scale::recomputeNotCalibratedFlag() {
@@ -148,7 +192,14 @@ void HX711Scale::requestCalibration(uint8_t channel, float refWeight) {
 }
 
 void HX711Scale::loop() {
-    if (!_present || !_drv) {
+    if (!_drv) {
+        return;
+    }
+    if (!_present) {
+        const uint32_t now = millis();
+        if (_lastInitAttemptMs == 0 || (now - _lastInitAttemptMs) >= 5000) {
+            initializeDriver();
+        }
         return;
     }
 
@@ -601,9 +652,9 @@ float HX711Scale::stddevLong(const long *buf, size_t n) {
 [[noreturn]] void HX711Scale::loopTask(void *arg) {
     TickType_t lastWake = xTaskGetTickCount();
     auto *scale = static_cast<HX711Scale *>(arg);
-    const uint32_t period = scale->_samplePeriodMs > 0 ? scale->_samplePeriodMs : 100;
     while (true) {
         scale->loop();
+        const uint32_t period = scale->_samplePeriodMs > 0 ? scale->_samplePeriodMs : 100;
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(period));
     }
 }
