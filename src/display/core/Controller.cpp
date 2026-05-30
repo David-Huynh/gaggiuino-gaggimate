@@ -810,10 +810,49 @@ void Controller::recordHardwareScaleBaselineSample(const ScaleSample &sample) {
 
 bool Controller::captureHardwareScaleShotBaseline() {
     resetHardwareScaleShotBaseline();
-    hardwareScaleBaselineSampleIndex = 0;
-    hardwareScaleBaselineSampleCount = 0;
-    for (float &sample : hardwareScaleBaselineSamples) {
-        sample = NAN;
+
+    auto tryCaptureBaseline = [this](const ScaleSample &latest, bool allowLatestOnly) {
+        const uint32_t latestAgeMs = millis() - lastHardwareScaleSampleMs;
+        if (!isHardwareScaleSampleHealthy(latest) || latestAgeMs > HARDWARE_SCALE_SAMPLE_FRESH_MS) {
+            return false;
+        }
+
+        float minSample = latest.weightG;
+        float maxSample = latest.weightG;
+        float sum = 0.0f;
+        uint8_t count = 0;
+        for (uint8_t i = 0; i < hardwareScaleBaselineSampleCount; i++) {
+            const float sample = hardwareScaleBaselineSamples[i];
+            if (std::isfinite(sample) && std::fabs(sample) <= HARDWARE_SCALE_MAX_ABS_G &&
+                std::fabs(sample - latest.weightG) <= HARDWARE_SCALE_MAX_BASELINE_SPREAD_G) {
+                minSample = std::min(minSample, sample);
+                maxSample = std::max(maxSample, sample);
+                sum += sample;
+                ++count;
+            }
+        }
+        if (count >= HARDWARE_SCALE_PREBREW_MIN_SAMPLES &&
+            (maxSample - minSample) <= HARDWARE_SCALE_PREBREW_STABLE_SPREAD_G) {
+            hardwareScaleShotBaseline = sum / static_cast<float>(count);
+            hardwareScaleShotBaselineActive = true;
+            ESP_LOGI(LOG_TAG, "Hardware scale pre-brew baseline captured: %.3f g (%u samples, spread %.3f g)",
+                     hardwareScaleShotBaseline, count, maxSample - minSample);
+            return true;
+        }
+
+        if (allowLatestOnly) {
+            hardwareScaleShotBaseline = latest.weightG;
+            hardwareScaleShotBaselineActive = true;
+            ESP_LOGW(LOG_TAG, "Hardware scale baseline unstable; using latest sample %.3f g (%u samples)",
+                     hardwareScaleShotBaseline, count);
+            return true;
+        }
+
+        return false;
+    };
+
+    if (tryCaptureBaseline(getScaleSample(), false)) {
+        return true;
     }
 
     const uint32_t startMs = millis();
@@ -821,53 +860,22 @@ bool Controller::captureHardwareScaleShotBaseline() {
 #ifdef GAGGIMATE_UART_COMMS
         comms.loop();
 #endif
-        const ScaleSample latest = getScaleSample();
-        const uint32_t latestAgeMs = millis() - lastHardwareScaleSampleMs;
-        if (isHardwareScaleSampleHealthy(latest) && latestAgeMs <= HARDWARE_SCALE_SAMPLE_FRESH_MS &&
-            hardwareScaleBaselineSampleCount >= HARDWARE_SCALE_PREBREW_MIN_SAMPLES) {
-            float minSample = latest.weightG;
-            float maxSample = latest.weightG;
-            float sum = 0.0f;
-            uint8_t count = 0;
-            for (uint8_t i = 0; i < hardwareScaleBaselineSampleCount; i++) {
-                const float sample = hardwareScaleBaselineSamples[i];
-                if (std::isfinite(sample) && std::fabs(sample) <= HARDWARE_SCALE_MAX_ABS_G &&
-                    std::fabs(sample - latest.weightG) <= HARDWARE_SCALE_MAX_BASELINE_SPREAD_G) {
-                    minSample = std::min(minSample, sample);
-                    maxSample = std::max(maxSample, sample);
-                    sum += sample;
-                    ++count;
-                }
-            }
-            if (count >= HARDWARE_SCALE_PREBREW_MIN_SAMPLES &&
-                (maxSample - minSample) <= HARDWARE_SCALE_PREBREW_STABLE_SPREAD_G) {
-                hardwareScaleShotBaseline = sum / static_cast<float>(count);
-                hardwareScaleShotBaselineActive = true;
-                ESP_LOGI(LOG_TAG, "Hardware scale pre-brew baseline captured: %.3f g (%u samples, spread %.3f g)",
-                         hardwareScaleShotBaseline, count, maxSample - minSample);
-                return true;
-            }
+        if (tryCaptureBaseline(getScaleSample(), false)) {
+            return true;
         }
         delay(HARDWARE_SCALE_PREBREW_POLL_MS);
     }
 
-    const ScaleSample latest = getScaleSample();
-    if (!isHardwareScaleSampleHealthy(latest)) {
+    if (tryCaptureBaseline(getScaleSample(), true)) {
+        return true;
+    }
+
+    if (!isHardwareScaleSampleHealthy(getScaleSample())) {
         ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unavailable; no healthy fresh sample");
         return false;
     }
 
-    float sum = 0.0f;
-    uint8_t count = 0;
-    for (uint8_t i = 0; i < hardwareScaleBaselineSampleCount; i++) {
-        const float sample = hardwareScaleBaselineSamples[i];
-        if (std::isfinite(sample) && std::fabs(sample) <= HARDWARE_SCALE_MAX_ABS_G &&
-            std::fabs(sample - latest.weightG) <= HARDWARE_SCALE_MAX_BASELINE_SPREAD_G) {
-            sum += sample;
-            ++count;
-        }
-    }
-    ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unstable; samples=%u", count);
+    ESP_LOGW(LOG_TAG, "Hardware scale shot baseline unavailable; sample is stale");
     return false;
 }
 

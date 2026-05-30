@@ -1,3 +1,5 @@
+#ifndef GAGGIMATE_HEADLESS
+
 #include "RatingPlugin.h"
 #include "../core/Controller.h"
 #include "../core/Event.h"
@@ -294,3 +296,5 @@ static void later_btn_event_cb(lv_event_t *e) {
     auto *plugin = static_cast<RatingPlugin *>(lv_event_get_user_data(e));
     plugin->closeOverlay();
 }
+
+#endif // GAGGIMATE_HEADLESS

@@ -1,6 +1,8 @@
 #ifndef RATINGPLUGIN_H
 #define RATINGPLUGIN_H
 
+#ifndef GAGGIMATE_HEADLESS
+
 #include "../core/Event.h"
 #include "../core/Plugin.h"
 #include <lvgl.h>
@@ -45,4 +47,5 @@ class RatingPlugin : public Plugin {
     bool _hasPendingRecommendation = false;
 };
 
+#endif // GAGGIMATE_HEADLESS
 #endif // RATINGPLUGIN_H
