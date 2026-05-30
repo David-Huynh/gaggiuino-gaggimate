@@ -161,6 +161,30 @@ export function Settings() {
     setCurrentTheme(getStoredTheme());
   }, []);
 
+  useEffect(() => {
+    if (!apiService) {
+      return undefined;
+    }
+    const listenerId = apiService.on('evt:rl:status', message => {
+      setFormData(current => ({
+        ...current,
+        rlStatusSeen: message.rlStatusSeen,
+        rlAddonOnline: message.rlAddonOnline,
+        rlLastStatusAt: message.rlLastStatusAt,
+        rlLastShotId: message.rlLastShotId,
+        rlLastShotAt: message.rlLastShotAt,
+        rlLastRecommendationId: message.rlLastRecommendationId,
+        rlLastRecommendationAt: message.rlLastRecommendationAt,
+        rlRecommendationApplyStatus: message.rlRecommendationApplyStatus,
+        rlMode: message.rlMode,
+        rlLocalShotCount: message.rlLocalShotCount,
+        rlUploadQueueCount: message.rlUploadQueueCount,
+        rlCommunityUploadEnabled: message.rlCommunityUploadEnabled,
+      }));
+    });
+    return () => apiService.off('evt:rl:status', listenerId);
+  }, [apiService]);
+
   const onChange = key => {
     return e => {
       let value = e.currentTarget.value;
@@ -178,6 +202,15 @@ export function Settings() {
       }
       if (key === 'homeAssistant') {
         value = !formData.homeAssistant;
+        setFormData({
+          ...formData,
+          homeAssistant: value,
+          rlRatingEnabled: value ? formData.rlRatingEnabled : false,
+        });
+        return;
+      }
+      if (key === 'rlRatingEnabled') {
+        value = !formData.rlRatingEnabled;
       }
       if (key === 'momentaryButtons') {
         value = !formData.momentaryButtons;

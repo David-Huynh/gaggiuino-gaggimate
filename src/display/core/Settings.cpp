@@ -50,6 +50,7 @@ Settings::Settings() {
     steamPumpCutoff = preferences.getFloat("spc", DEFAULT_STEAM_PUMP_CUTOFF);
     historyIndex = preferences.getInt("hi", 0);
     autowakeupEnabled = preferences.getBool("ab_en", false);
+    rlRatingEnabled = preferences.getBool("rl_rate", false);
 
     // Load schedule format: "time1|days1;time2|days2" where days is 7-bit string (e.g., "1111100" for weekdays only)
     String schedulesStr = preferences.getString("ab_schedules", "");
@@ -275,6 +276,11 @@ void Settings::setSmartGrindMode(int smart_grind_mode) {
 
 void Settings::setHomeAssistant(const bool homeAssistant) {
     this->homeAssistant = homeAssistant;
+    save();
+}
+
+void Settings::setRLRatingEnabled(const bool enabled) {
+    this->rlRatingEnabled = enabled;
     save();
 }
 
@@ -592,6 +598,7 @@ void Settings::doSave() {
     preferences.putFloat("spc", steamPumpCutoff);
     preferences.putInt("hi", historyIndex);
     preferences.putBool("ab_en", autowakeupEnabled);
+    preferences.putBool("rl_rate", rlRatingEnabled);
 
     // Save schedule format
     String schedulesForSave = "";

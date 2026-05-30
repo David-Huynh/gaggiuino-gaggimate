@@ -89,6 +89,18 @@ class WebUIPlugin : public Plugin {
     // stall mid-asset-serve). Keeping one doc lets its underlying pool grow
     // once and stay put.
     JsonDocument statusDoc{&psramAllocator};
+    bool rlStatusSeen = false;
+    bool rlAddonOnline = false;
+    long rlLastStatusAt = 0;
+    String rlLastShotId = "";
+    long rlLastShotAt = 0;
+    String rlLastRecommendationId = "";
+    long rlLastRecommendationAt = 0;
+    String rlRecommendationApplyStatus = "";
+    String rlMode = "";
+    int rlLocalShotCount = 0;
+    int rlUploadQueueCount = 0;
+    bool rlCommunityUploadEnabled = false;
 };
 
 #endif // WEBUIPLUGIN_H

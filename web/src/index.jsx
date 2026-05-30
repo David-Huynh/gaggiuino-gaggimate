@@ -12,6 +12,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { LocationProvider, Router, Route, ErrorBoundary } from 'preact-iso';
 import lazy from 'preact-iso/lazy';
 
+import { RLPromptOverlay } from './components/RLPromptOverlay.jsx';
 import ApiService, { ApiServiceContext } from './services/ApiService.js';
 import { Navigation } from './components/Navigation.jsx';
 import { Spinner } from './components/Spinner.jsx';
@@ -112,6 +113,7 @@ export function App() {
                 </div>
               </div>
             </div>
+            <RLPromptOverlay />
           </div>
           {navCollapsed && (
             <div className='fab end-auto left-4 md:hidden landscape:hidden'>

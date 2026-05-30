@@ -2,6 +2,44 @@ import { faTrashCan } from '@fortawesome/free-solid-svg-icons/faTrashCan';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import homekitImage from '../../assets/homekit.png';
 
+function formatStatusTime(timestamp) {
+  const value = Number(timestamp || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 'Never';
+  }
+  return new Date(value * 1000).toLocaleString();
+}
+
+function statusText(formData) {
+  if (!formData.rlRatingEnabled) {
+    return 'Disabled';
+  }
+  if (!formData.rlStatusSeen) {
+    return 'Add-on not seen';
+  }
+  return formData.rlAddonOnline ? 'Connected' : 'Offline';
+}
+
+function applyStatusText(value) {
+  const statuses = {
+    applied: 'Applied',
+    partially_applied: 'Partially applied',
+    manual_required: 'Manual required',
+    failed: 'Failed',
+    unknown: 'Unknown',
+  };
+  return statuses[value] || 'None';
+}
+
+function StatusRow({ label, value }) {
+  return (
+    <div className='flex items-center justify-between gap-3 text-sm'>
+      <span className='opacity-70'>{label}</span>
+      <span className='max-w-44 truncate text-right font-medium'>{value}</span>
+    </div>
+  );
+}
+
 export function PluginCard({
   formData,
   onChange,
@@ -353,6 +391,66 @@ export function PluginCard({
                 value={formData.haTopic}
                 onChange={onChange('haTopic')}
               />
+            </div>
+
+            <div className='bg-base-100 rounded-lg p-4'>
+              <div className='flex items-center justify-between gap-4'>
+                <div>
+                  <span className='block text-lg font-medium'>EspressoRL Auto Tuning</span>
+                  <span className='text-sm opacity-70'>
+                    Send shot profiles and ratings, and show BO recommendations.
+                  </span>
+                </div>
+                <input
+                  id='rlRatingEnabled'
+                  name='rlRatingEnabled'
+                  value='rlRatingEnabled'
+                  type='checkbox'
+                  className='toggle toggle-primary'
+                  checked={!!formData.rlRatingEnabled}
+                  onChange={onChange('rlRatingEnabled')}
+                  aria-label='Enable EspressoRL Auto Tuning'
+                />
+              </div>
+              {formData.rlRatingEnabled && (
+                <div className='border-base-300 mt-4 space-y-2 border-t pt-4'>
+                  <div className='flex items-center justify-between gap-3'>
+                    <span className='text-sm font-medium'>Auto Tuning Status</span>
+                    <span
+                      className={`badge ${
+                        formData.rlStatusSeen && formData.rlAddonOnline
+                          ? 'badge-success'
+                          : 'badge-warning'
+                      }`}
+                    >
+                      {statusText(formData)}
+                    </span>
+                  </div>
+                  <StatusRow label='Last status' value={formatStatusTime(formData.rlLastStatusAt)} />
+                  <StatusRow label='Last shot stored' value={formData.rlLastShotId || 'None'} />
+                  <StatusRow
+                    label='Last recommendation'
+                    value={formData.rlLastRecommendationId || 'None'}
+                  />
+                  <StatusRow
+                    label='Apply status'
+                    value={applyStatusText(formData.rlRecommendationApplyStatus)}
+                  />
+                  <StatusRow label='BO mode' value={formData.rlMode || 'None'} />
+                  <StatusRow
+                    label='Local shots'
+                    value={(formData.rlLocalShotCount ?? 0).toString()}
+                  />
+                  <StatusRow
+                    label='Upload queue'
+                    value={(formData.rlUploadQueueCount ?? 0).toString()}
+                  />
+                  <StatusRow
+                    label='Community upload'
+                    value={formData.rlCommunityUploadEnabled ? 'Enabled' : 'Disabled'}
+                  />
+                </div>
+              )}
             </div>
           </div>
         )}

@@ -73,6 +73,74 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
 
+    pluginManager->on("rl:recommendation:received", [this](Event const &event) {
+        if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+            return;
+        }
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:recommendation";
+        doc["recommendation_id"] = event.getString("recommendation_id");
+        doc["shot_id"] = event.getString("shot_id");
+        doc["status"] = event.getString("status");
+        doc["mode"] = event.getString("mode");
+        doc["grind_delta_steps"] = event.getInt("grind_delta_steps");
+        doc["grind_delta_um"] = event.getFloat("grind_delta_um");
+        doc["next_grind_steps"] = event.getFloat("next_grind_steps");
+        doc["next_grind_um"] = event.getFloat("next_grind_um");
+        doc["next_dose_g"] = event.getFloat("next_dose_g");
+        doc["target_yield_g"] = event.getFloat("target_yield_g");
+        doc["target_ratio"] = event.getFloat("target_ratio");
+        ws.textAll(doc.as<String>());
+    });
+
+    pluginManager->on("rl:shot:complete", [this](Event const &event) {
+        if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+            return;
+        }
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:shot-complete";
+        doc["shot_id"] = event.getString("shot_id");
+        doc["recommendation_id"] = event.getString("recommendation_id");
+        ws.textAll(doc.as<String>());
+    });
+
+    pluginManager->on("rl:status:received", [this](Event const &event) {
+        if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+            return;
+        }
+
+        rlStatusSeen = event.getInt("seen") > 0;
+        rlAddonOnline = event.getInt("addon_online") > 0;
+        rlLastStatusAt = event.getInt("timestamp");
+        rlLastShotId = event.getString("last_shot_id");
+        rlLastShotAt = event.getInt("last_shot_at");
+        rlLastRecommendationId = event.getString("last_recommendation_id");
+        rlLastRecommendationAt = event.getInt("last_recommendation_at");
+        rlRecommendationApplyStatus = event.getString("recommendation_apply_status");
+        rlMode = event.getString("mode");
+        rlLocalShotCount = event.getInt("local_shot_count");
+        rlUploadQueueCount = event.getInt("upload_queue_count");
+        rlCommunityUploadEnabled = event.getInt("community_upload_enabled") > 0;
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:status";
+        doc["rlStatusSeen"] = rlStatusSeen;
+        doc["rlAddonOnline"] = rlAddonOnline;
+        doc["rlLastStatusAt"] = rlLastStatusAt;
+        doc["rlLastShotId"] = rlLastShotId;
+        doc["rlLastShotAt"] = rlLastShotAt;
+        doc["rlLastRecommendationId"] = rlLastRecommendationId;
+        doc["rlLastRecommendationAt"] = rlLastRecommendationAt;
+        doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
+        doc["rlMode"] = rlMode;
+        doc["rlLocalShotCount"] = rlLocalShotCount;
+        doc["rlUploadQueueCount"] = rlUploadQueueCount;
+        doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
+        ws.textAll(doc.as<String>());
+    });
+
     // Forward shot history rebuild progress events to WebSocket clients
     pluginManager->on("evt:history-rebuild-progress", [this](Event const &event) {
         JsonDocument doc(&psramAllocator);
@@ -535,6 +603,41 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     handleOTAStart(client->id(), doc);
                 } else if (msgType == "req:autotune-start") {
                     handleAutotuneStart(client->id(), doc);
+                } else if (msgType == "req:rl:recommendation:use") {
+                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
+                        String recommendationId = doc["recommendation_id"].as<String>();
+                        if (!recommendationId.isEmpty()) {
+                            Event event;
+                            event.id = "rl:recommendation:apply";
+                            event.setString("recommendation_id", recommendationId);
+                            pluginManager->trigger(event);
+                        }
+                    }
+                } else if (msgType == "req:rl:recommendation:ignore") {
+                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
+                        String recommendationId = doc["recommendation_id"].as<String>();
+                        if (!recommendationId.isEmpty()) {
+                            Event event;
+                            event.id = "rl:recommendation:ignore";
+                            event.setString("recommendation_id", recommendationId);
+                            pluginManager->trigger(event);
+                        }
+                    }
+                } else if (msgType == "req:rl:rating") {
+                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled() &&
+                        doc["rating"].is<int>()) {
+                        String shotId = doc["shot_id"].as<String>();
+                        String recommendationId = doc["recommendation_id"].as<String>();
+                        int rating = doc["rating"].as<int>();
+                        if (!shotId.isEmpty() && rating >= 1 && rating <= 5) {
+                            Event event;
+                            event.id = "rl:rating";
+                            event.setString("shot_id", shotId);
+                            event.setString("recommendation_id", recommendationId);
+                            event.setInt("rating", rating);
+                            pluginManager->trigger(event);
+                        }
+                    }
                 } else if (msgType == "req:process:activate") {
                     controller->postCommand(CtrlCmd::ACTIVATE);
                 } else if (msgType == "req:process:deactivate") {
@@ -762,7 +865,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
             if (request->hasArg("smartGrindMode"))
                 settings->setSmartGrindMode(request->arg("smartGrindMode").toInt());
-            settings->setHomeAssistant(request->hasArg("homeAssistant"));
+            const bool homeAssistantEnabled = request->hasArg("homeAssistant");
+            settings->setHomeAssistant(homeAssistantEnabled);
+            settings->setRLRatingEnabled(homeAssistantEnabled && request->hasArg("rlRatingEnabled"));
             if (request->hasArg("haUser"))
                 settings->setHomeAssistantUser(request->arg("haUser"));
             if (request->hasArg("haPassword"))
@@ -884,6 +989,19 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["targetSteamTemp"] = settings.getTargetSteamTemp();
     doc["targetWaterTemp"] = settings.getTargetWaterTemp();
     doc["homekit"] = settings.isHomekit();
+    doc["rlRatingEnabled"] = settings.isHomeAssistant() && settings.isRLRatingEnabled();
+    doc["rlStatusSeen"] = rlStatusSeen;
+    doc["rlAddonOnline"] = rlAddonOnline;
+    doc["rlLastStatusAt"] = rlLastStatusAt;
+    doc["rlLastShotId"] = rlLastShotId;
+    doc["rlLastShotAt"] = rlLastShotAt;
+    doc["rlLastRecommendationId"] = rlLastRecommendationId;
+    doc["rlLastRecommendationAt"] = rlLastRecommendationAt;
+    doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
+    doc["rlMode"] = rlMode;
+    doc["rlLocalShotCount"] = rlLocalShotCount;
+    doc["rlUploadQueueCount"] = rlUploadQueueCount;
+    doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
     doc["homeAssistant"] = settings.isHomeAssistant();
     doc["haUser"] = settings.getHomeAssistantUser();
     doc["haPassword"] = settings.getHomeAssistantPassword();

@@ -26,6 +26,9 @@
 #include <display/plugins/LedControlPlugin.h>
 #include <display/plugins/MQTTPlugin.h>
 #include <display/plugins/NetworkWatchdogPlugin.h>
+#ifndef GAGGIMATE_HEADLESS
+#include <display/plugins/RatingPlugin.h>
+#endif
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/plugins/SmartGrindPlugin.h>
 #include <display/plugins/WebUIPlugin.h>
@@ -169,6 +172,11 @@ void Controller::setup() {
     }
     if (settings.isHomeAssistant()) {
         pluginManager->registerPlugin(new MQTTPlugin());
+    }
+    if (settings.isHomeAssistant() && settings.isRLRatingEnabled()) {
+#ifndef GAGGIMATE_HEADLESS
+        pluginManager->registerPlugin(new RatingPlugin());
+#endif
     }
     pluginManager->registerPlugin(new WebUIPlugin());
     pluginManager->registerPlugin(new NetworkWatchdogPlugin());

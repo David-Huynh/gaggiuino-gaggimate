@@ -1,7 +1,10 @@
 #include "MQTTPlugin.h"
 #include "../core/Controller.h"
 #include <ArduinoJson.h>
+#include <cmath>
 #include <ctime>
+#include <display/core/ProfileManager.h>
+#include <display/models/profile.h>
 #include <display/util/PsramAllocator.h>
 #include <esp_log.h>
 
@@ -22,6 +25,10 @@ bool MQTTPlugin::connect(Controller *controller) {
         ESP_LOGD(LOG_TAG.c_str(), "Attempt (%d/%d)", i + 1, MQTT_CONNECTION_RETRIES);
         if (client.connect(clientId.c_str(), haUser.c_str(), haPassword.c_str())) {
             ESP_LOGI(LOG_TAG.c_str(), "Successfully connected");
+            if (settings.isRLRatingEnabled()) {
+                client.subscribe("gaggimate/" + machineTopicId() + "/rl/recommendation");
+                client.subscribe("gaggimate/" + machineTopicId() + "/rl/status");
+            }
             return true;
         }
         delay(MQTT_CONNECTION_DELAY);
@@ -35,15 +42,13 @@ void MQTTPlugin::publishDiscovery(Controller *controller) {
         return;
     const Settings settings = controller->getSettings();
     const String haTopic = settings.getHomeAssistantTopic();
-    String mac = WiFi.macAddress();
-    mac.replace(":", "_");
+    String mac = machineTopicId();
     const char *cmac = mac.c_str();
 
     JsonDocument device(&psramAllocator);
     JsonDocument origin(&psramAllocator);
     JsonDocument components(&psramAllocator);
 
-    // Device information
     device["ids"] = cmac;
     device["name"] = "GaggiMate";
     device["mf"] = "GaggiMate";
@@ -52,7 +57,6 @@ void MQTTPlugin::publishDiscovery(Controller *controller) {
     device["sw"] = controller->getSystemInfo().version;
     device["hw"] = controller->getSystemInfo().hardware;
 
-    // Origin information
     origin["name"] = "GaggiMate";
     origin["sw"] = controller->getSystemInfo().version;
     origin["url"] = "https://gaggimate.eu/";
@@ -111,8 +115,7 @@ void MQTTPlugin::publishDiscovery(Controller *controller) {
 void MQTTPlugin::publish(const std::string &topic, const std::string &message) {
     if (!client.connected())
         return;
-    String mac = WiFi.macAddress();
-    mac.replace(":", "_");
+    String mac = machineTopicId();
     const char *cmac = mac.c_str();
     char publishTopic[80];
     snprintf(publishTopic, sizeof(publishTopic), "gaggimate/%s/%s", cmac, topic.c_str());
@@ -120,21 +123,425 @@ void MQTTPlugin::publish(const std::string &topic, const std::string &message) {
     ESP_LOGD(LOG_TAG.c_str(), "Publishing %s: %s", publishTopic, message.c_str());
     client.publish(publishTopic, message.c_str());
 }
+
 void MQTTPlugin::publishBrewState(const char *state) {
     char json[100];
-    std::time_t now = std::time(nullptr); // Get current timestame
+    std::time_t now = std::time(nullptr);
     snprintf(json, sizeof(json), R"({"state":"%s","timestamp":%ld})", state, now);
     publish("controller/brew/state", json);
 }
 
-void MQTTPlugin::setup(Controller *controller, PluginManager *pluginManager) {
-    pluginManager->on("controller:wifi:connect", [this, controller](const Event &) {
-        if (!connect(controller))
-            return;
-        publishDiscovery(controller);
+void MQTTPlugin::publishMachineState(const char *state) {
+    if (!isAutoTuningEnabled())
+        return;
+
+    JsonDocument doc;
+    doc["event_type"] = "machine_state";
+    doc["schema_version"] = 1;
+    doc["machine_id"] = machineId();
+    doc["machine_adapter"] = "gaggimate";
+    doc["timestamp"] = static_cast<long>(std::time(nullptr));
+    doc["state"] = state;
+    addRecipeMetadata(doc);
+
+    String json;
+    serializeJson(doc, json);
+    publish("machine/state", json.c_str());
+}
+
+void MQTTPlugin::loop() {
+    client.loop();
+    if (!isBrewing)
+        return;
+    unsigned long elapsed = millis() - brewStartMs;
+    if (elapsed - lastSampleMs >= SHOT_SAMPLE_INTERVAL_MS && pressureSamples.size() < SHOT_MAX_SAMPLES) {
+        recordShotSample();
+        lastSampleMs = elapsed;
+    }
+}
+
+void MQTTPlugin::recordShotSample() {
+    pressureSamples.push_back(controller->getCurrentPressure());
+    targetPressureSamples.push_back(controller->getTargetPressure());
+    flowSamples.push_back(controller->getCurrentPumpFlow());
+    targetFlowSamples.push_back(controller->getTargetFlow());
+    weightSamples.push_back(currentShotWeightG());
+    timeSamples.push_back(static_cast<uint16_t>(millis() - brewStartMs));
+}
+
+void MQTTPlugin::publishShotProfile() {
+    if (!isAutoTuningEnabled())
+        return;
+    if (pressureSamples.empty())
+        return;
+
+    const float beverageOutG = currentShotWeightG();
+
+    JsonDocument doc;
+    doc["event_type"] = "shot_profile";
+    doc["schema_version"] = 1;
+    doc["shot_id"] = currentShotId.isEmpty() ? makeShotId() : currentShotId;
+    doc["machine_id"] = machineId();
+    doc["machine_adapter"] = "gaggimate";
+    doc["timestamp"] = static_cast<long>(std::time(nullptr));
+    doc["n_samples"] = pressureSamples.size();
+    doc["beverage_out_g"] = roundf(beverageOutG * 10.0f) / 10.0f;
+    doc["shot_time_s"] = roundf(((millis() - brewStartMs) / 1000.0f) * 10.0f) / 10.0f;
+    addRecipeMetadata(doc);
+
+    if (hasRecommendation) {
+        doc["recommendation_id"] = latestRecommendationId;
+        doc["recommended_grind_delta_steps"] = latestRecommendationGrindDeltaSteps;
+        doc["recommended_grind_delta_um"] = latestRecommendationGrindDeltaUm;
+        doc["recommended_next_grind_steps"] = latestRecommendationNextGrindSteps;
+        doc["recommended_next_grind_um"] = latestRecommendationNextGrindUm;
+        doc["recommended_dose_g"] = latestRecommendationNextDoseG;
+        doc["recommended_target_yield_g"] = latestRecommendationTargetYieldG;
+        doc["recommended_target_ratio"] = latestRecommendationTargetRatio;
+    }
+
+    JsonArray p = doc["pressure"].to<JsonArray>();
+    JsonArray tp = doc["target_pressure"].to<JsonArray>();
+    JsonArray f = doc["flow"].to<JsonArray>();
+    JsonArray tf = doc["target_flow"].to<JsonArray>();
+    JsonArray w = doc["weight"].to<JsonArray>();
+    JsonArray t = doc["time_ms"].to<JsonArray>();
+
+    for (size_t i = 0; i < pressureSamples.size(); i++) {
+        p.add(roundf(pressureSamples[i] * 10.0f) / 10.0f);
+        tp.add(roundf(targetPressureSamples[i] * 10.0f) / 10.0f);
+        f.add(roundf(flowSamples[i] * 100.0f) / 100.0f);
+        tf.add(roundf(targetFlowSamples[i] * 100.0f) / 100.0f);
+        w.add(roundf(weightSamples[i] * 10.0f) / 10.0f);
+        t.add(timeSamples[i]);
+    }
+
+    String json;
+    serializeJson(doc, json);
+    publish("shot/profile", json.c_str());
+}
+
+void MQTTPlugin::handleRecommendation(const String &payload) {
+    if (!pluginManager || !isAutoTuningEnabled())
+        return;
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error)
+        return;
+
+    hasRecommendation = true;
+    latestRecommendationId = doc["recommendation_id"].as<String>();
+    latestRecommendationSourceShotId = doc["shot_id"].as<String>();
+    latestRecommendationGrindDeltaSteps = doc["grind_delta_steps"] | 0;
+    latestRecommendationGrindDeltaUm = doc["grind_delta_um"] | 0.0f;
+    latestRecommendationNextGrindSteps = doc["next_grind_steps"] | 0.0f;
+    latestRecommendationNextGrindUm = doc["next_grind_um"] | 0.0f;
+    latestRecommendationNextDoseG = doc["next_dose_g"] | 0.0f;
+    latestRecommendationTargetYieldG = doc["target_yield_g"] | 0.0f;
+    latestRecommendationTargetRatio = doc["target_ratio"] | 0.0f;
+    latestRecommendationStatus = doc["status"].as<String>();
+
+    Event event;
+    event.id = "rl:recommendation:received";
+    event.setString("shot_id", latestRecommendationSourceShotId);
+    event.setString("recommendation_id", latestRecommendationId);
+    event.setInt("grind_delta_steps", latestRecommendationGrindDeltaSteps);
+    event.setFloat("grind_delta_um", latestRecommendationGrindDeltaUm);
+    event.setFloat("next_grind_steps", latestRecommendationNextGrindSteps);
+    event.setFloat("next_grind_um", latestRecommendationNextGrindUm);
+    event.setFloat("next_dose_g", latestRecommendationNextDoseG);
+    event.setFloat("target_yield_g", latestRecommendationTargetYieldG);
+    event.setFloat("target_ratio", latestRecommendationTargetRatio);
+    event.setString("status", latestRecommendationStatus);
+    event.setString("mode", doc["mode"].as<String>());
+    pluginManager->trigger(event);
+}
+
+void MQTTPlugin::handleStatus(const String &payload) {
+    if (!pluginManager || !isAutoTuningEnabled())
+        return;
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error)
+        return;
+
+    latestStatusSeen = true;
+    latestAddonOnline = doc["addon_online"] | false;
+    latestStatusTimestamp = doc["timestamp"] | 0;
+    latestStatusLastShotId = doc["last_shot_id"].as<String>();
+    latestStatusLastShotAt = doc["last_shot_at"] | 0;
+    latestStatusLastRecommendationId = doc["last_recommendation_id"].as<String>();
+    latestStatusLastRecommendationAt = doc["last_recommendation_at"] | 0;
+    latestStatusRecommendationApplyStatus = doc["recommendation_apply_status"].as<String>();
+    latestStatusMode = doc["mode"].as<String>();
+    latestStatusLocalShotCount = doc["local_shot_count"] | 0;
+    latestStatusUploadQueueCount = doc["upload_queue_count"] | 0;
+    latestStatusCommunityUploadEnabled = doc["community_upload_enabled"] | false;
+
+    Event event;
+    event.id = "rl:status:received";
+    event.setInt("seen", latestStatusSeen ? 1 : 0);
+    event.setInt("addon_online", latestAddonOnline ? 1 : 0);
+    event.setInt("timestamp", static_cast<int>(latestStatusTimestamp));
+    event.setString("last_shot_id", latestStatusLastShotId);
+    event.setInt("last_shot_at", static_cast<int>(latestStatusLastShotAt));
+    event.setString("last_recommendation_id", latestStatusLastRecommendationId);
+    event.setInt("last_recommendation_at", static_cast<int>(latestStatusLastRecommendationAt));
+    event.setString("recommendation_apply_status", latestStatusRecommendationApplyStatus);
+    event.setString("mode", latestStatusMode);
+    event.setInt("local_shot_count", latestStatusLocalShotCount);
+    event.setInt("upload_queue_count", latestStatusUploadQueueCount);
+    event.setInt("community_upload_enabled", latestStatusCommunityUploadEnabled ? 1 : 0);
+    pluginManager->trigger(event);
+}
+
+void MQTTPlugin::applyLatestRecommendation() {
+    if (!hasRecommendation || !controller || !isAutoTuningEnabled())
+        return;
+
+    bool doseApplied = false;
+    bool yieldApplied = false;
+    bool yieldFailed = false;
+
+    if (latestRecommendationNextDoseG > 0.0f && canApplyGrindByWeightTarget()) {
+        controller->setTargetGrindVolume(latestRecommendationNextDoseG);
+        doseApplied = true;
+    }
+
+    if (latestRecommendationTargetYieldG > 0.0f && controller->getProfileManager()) {
+        Profile &profile = controller->getProfileManager()->getSelectedProfile();
+        float currentTarget = profile.getTotalVolume();
+        if (currentTarget > 0.0f) {
+            profile.adjustVolumetricTarget(latestRecommendationTargetYieldG - currentTarget);
+            controller->getProfileManager()->saveProfile(profile);
+            yieldApplied = true;
+        } else {
+            yieldFailed = true;
+        }
+    } else if (latestRecommendationTargetYieldG > 0.0f) {
+        yieldFailed = true;
+    }
+
+    publishRecommendationDecision("accepted", true);
+    publishRecommendationApply(doseApplied, yieldApplied, yieldFailed);
+    publishMachineState("idle");
+}
+
+void MQTTPlugin::ignoreLatestRecommendation() {
+    if (!hasRecommendation || !isAutoTuningEnabled())
+        return;
+    publishRecommendationDecision("ignored", false);
+}
+
+void MQTTPlugin::publishRecommendationDecision(const char *decision, bool includeEditedFields) {
+    if (latestRecommendationId.isEmpty())
+        return;
+
+    JsonDocument doc;
+    doc["event_type"] = "recommendation_decision";
+    doc["schema_version"] = 1;
+    doc["recommendation_id"] = latestRecommendationId;
+    doc["decision"] = decision;
+    doc["source"] = "gaggimate_mqtt";
+    doc["timestamp"] = static_cast<long>(std::time(nullptr));
+
+    JsonObject edited = doc["edited_fields"].to<JsonObject>();
+    if (includeEditedFields) {
+        edited["next_dose_g"] = latestRecommendationNextDoseG;
+        edited["target_yield_g"] = latestRecommendationTargetYieldG;
+    }
+
+    String json;
+    serializeJson(doc, json);
+    publish("rl/recommendation/decision", json.c_str());
+}
+
+void MQTTPlugin::publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed) {
+    if (latestRecommendationId.isEmpty())
+        return;
+
+    const bool grindManual = latestRecommendationGrindDeltaSteps != 0;
+    const bool doseManual = latestRecommendationNextDoseG > 0.0f && !doseApplied;
+    const bool hasManual = grindManual || doseManual;
+    const bool hasApplied = doseApplied || yieldApplied;
+
+    const char *status = "manual_required";
+    if (yieldFailed && !hasApplied) {
+        status = "failed";
+    } else if (hasApplied && (hasManual || yieldFailed)) {
+        status = "partially_applied";
+    } else if (hasApplied) {
+        status = "applied";
+    }
+
+    JsonDocument doc;
+    doc["event_type"] = "recommendation_apply";
+    doc["schema_version"] = 1;
+    doc["recommendation_id"] = latestRecommendationId;
+    doc["machine_id"] = machineId();
+    doc["status"] = status;
+    doc["source"] = "gaggimate_mqtt";
+    doc["timestamp"] = static_cast<long>(std::time(nullptr));
+
+    JsonObject applied = doc["applied_fields"].to<JsonObject>();
+    if (doseApplied) {
+        applied["next_dose_g"] = latestRecommendationNextDoseG;
+    }
+    if (yieldApplied) {
+        applied["target_yield_g"] = latestRecommendationTargetYieldG;
+        applied["target_ratio"] = latestRecommendationTargetRatio;
+    }
+
+    JsonArray manual = doc["manual_fields"].to<JsonArray>();
+    if (grindManual) {
+        manual.add("next_grind_steps");
+    }
+    if (doseManual) {
+        manual.add("next_dose_g");
+    }
+
+    JsonObject failed = doc["failed_fields"].to<JsonObject>();
+    if (yieldFailed) {
+        failed["target_yield_g"] = latestRecommendationTargetYieldG;
+    }
+
+    if (yieldFailed && !hasApplied) {
+        doc["message"] = "Target yield could not be applied; use the recommendation manually.";
+    } else if (hasManual) {
+        doc["message"] = "Some recommendation fields require manual action.";
+    } else {
+        doc["message"] = "Recommendation fields applied.";
+    }
+
+    String json;
+    serializeJson(doc, json);
+    publish("rl/recommendation/apply", json.c_str());
+}
+
+void MQTTPlugin::addRecipeMetadata(JsonDocument &doc) const {
+    const float dose = doseTargetG();
+    const float targetYield = targetYieldG();
+
+    doc["bean_context_id"] = beanContextId();
+    if (dose > 0.0f) {
+        doc["dose_in_g"] = roundf(dose * 10.0f) / 10.0f;
+    }
+    if (targetYield > 0.0f) {
+        doc["target_yield_g"] = roundf(targetYield * 10.0f) / 10.0f;
+    }
+    if (dose > 0.0f && targetYield > 0.0f) {
+        doc["target_ratio"] = roundf((targetYield / dose) * 100.0f) / 100.0f;
+    }
+}
+
+bool MQTTPlugin::isAutoTuningEnabled() const {
+    if (!controller)
+        return false;
+    Settings const &settings = controller->getSettings();
+    return settings.isHomeAssistant() && settings.isRLRatingEnabled();
+}
+
+bool MQTTPlugin::canApplyGrindByWeightTarget() const {
+    if (!controller)
+        return false;
+    Settings const &settings = controller->getSettings();
+    return controller->isGrindVolumetricAvailable() && settings.isVolumetricTarget();
+}
+
+String MQTTPlugin::machineTopicId() const {
+    String mac = WiFi.macAddress();
+    mac.replace(":", "_");
+    return mac;
+}
+
+String MQTTPlugin::machineId() const { return "gaggimate:" + machineTopicId(); }
+
+String MQTTPlugin::beanContextId() const {
+    if (!controller)
+        return "";
+    return controller->getSettings().getSelectedProfile();
+}
+
+String MQTTPlugin::makeShotId() const {
+    return "shot_" + machineTopicId() + "_" + String(static_cast<unsigned long>(std::time(nullptr))) + "_" +
+           String(static_cast<unsigned long>(millis()));
+}
+
+float MQTTPlugin::targetYieldG() const {
+    if (!controller || !controller->getProfileManager())
+        return 0.0f;
+    return controller->getProfileManager()->getSelectedProfile().getTotalVolume();
+}
+
+float MQTTPlugin::doseTargetG() const {
+    if (!controller)
+        return 0.0f;
+    return static_cast<float>(controller->getSettings().getTargetGrindVolume());
+}
+
+float MQTTPlugin::currentShotWeightG() const {
+    if (!controller)
+        return currentBluetoothWeight;
+
+    switch (static_cast<VolumetricMeasurementSource>(shotSource)) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
+        return currentHardwareShotWeight > 0.0f ? currentHardwareShotWeight : currentHardwareWeight;
+    case VolumetricMeasurementSource::FLOW_ESTIMATION:
+        return currentEstimatedWeight;
+    case VolumetricMeasurementSource::BLUETOOTH:
+        return currentBluetoothWeight;
+    case VolumetricMeasurementSource::INACTIVE:
+    default:
+        return currentBluetoothWeight > 0.0f ? currentBluetoothWeight : currentEstimatedWeight;
+    }
+}
+
+void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
+    this->controller = ctrl;
+    this->pluginManager = pm;
+
+    client.onMessage([this](String &topic, String &payload) {
+        if (topic.endsWith("/rl/recommendation")) {
+            handleRecommendation(payload);
+        } else if (topic.endsWith("/rl/status")) {
+            handleStatus(payload);
+        }
     });
 
-    pluginManager->on("boiler:currentTemperature:change", [this](Event const &event) {
+    pm->on("rl:rating", [this](Event const &event) {
+        if (!isAutoTuningEnabled())
+            return;
+        String shotId = event.getString("shot_id");
+        String recommendationId = event.getString("recommendation_id");
+        int rating = event.getInt("rating");
+
+        JsonDocument doc;
+        doc["event_type"] = "shot_feedback";
+        doc["schema_version"] = 1;
+        doc["shot_id"] = shotId;
+        doc["recommendation_id"] = recommendationId;
+        doc["machine_id"] = machineId();
+        doc["rating"] = rating;
+        doc["source"] = "gaggimate_mqtt";
+        doc["timestamp"] = static_cast<long>(std::time(nullptr));
+
+        String json;
+        serializeJson(doc, json);
+        publish("rl/rating", json.c_str());
+    });
+
+    pm->on("rl:recommendation:apply", [this](Event const &) { applyLatestRecommendation(); });
+
+    pm->on("rl:recommendation:ignore", [this](Event const &) { ignoreLatestRecommendation(); });
+
+    pm->on("controller:wifi:connect", [this, ctrl](const Event &) {
+        if (!connect(ctrl))
+            return;
+        publishDiscovery(ctrl);
+        publishMachineState(ctrl->getMode() == MODE_STANDBY ? "standby" : "idle");
+    });
+
+    pm->on("boiler:currentTemperature:change", [this](Event const &event) {
         if (!client.connected())
             return;
         char json[50];
@@ -145,7 +552,8 @@ void MQTTPlugin::setup(Controller *controller, PluginManager *pluginManager) {
         }
         lastTemperature = temp;
     });
-    pluginManager->on("boiler:targetTemperature:change", [this](Event const &event) {
+
+    pm->on("boiler:targetTemperature:change", [this](Event const &event) {
         if (!client.connected())
             return;
         char json[50];
@@ -153,7 +561,8 @@ void MQTTPlugin::setup(Controller *controller, PluginManager *pluginManager) {
         snprintf(json, sizeof(json), R"***({"temperature":%02f})***", temp);
         publish("boilers/0/targetTemperature", json);
     });
-    pluginManager->on("controller:mode:change", [this](Event const &event) {
+
+    pm->on("controller:mode:change", [this](Event const &event) {
         int newMode = event.getInt("value");
         const char *modeStr;
         switch (newMode) {
@@ -174,13 +583,61 @@ void MQTTPlugin::setup(Controller *controller, PluginManager *pluginManager) {
             break;
         default:
             modeStr = "Unknown";
-            break; // Fallback in case of unexpected value
+            break;
         }
         char json[100];
         snprintf(json, sizeof(json), R"({"mode":%d,"mode_str":"%s"})", newMode, modeStr);
         publish("controller/mode", json);
+        publishMachineState(newMode == MODE_STANDBY ? "standby" : "idle");
     });
-    pluginManager->on("controller:brew:start", [this](Event const &) { publishBrewState("brewing"); });
 
-    pluginManager->on("controller:brew:end", [this](Event const &) { publishBrewState("not brewing"); });
+    pm->on("controller:volumetric-measurement:estimation:change",
+           [this](Event const &event) { currentEstimatedWeight = event.getFloat("value"); });
+    pm->on("controller:volumetric-measurement:bluetooth:change",
+           [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pm->on("controller:volumetric-measurement:hardware:change",
+           [this](Event const &event) { currentHardwareWeight = event.getFloat("value"); });
+    pm->on("controller:volumetric-measurement:hardware-shot:change",
+           [this](Event const &event) { currentHardwareShotWeight = event.getFloat("value"); });
+#endif
+
+    pm->on("controller:brew:start", [this](Event const &) {
+        if (isAutoTuningEnabled()) {
+            isBrewing = true;
+            brewStartMs = millis();
+            currentShotId = makeShotId();
+            shotSource = static_cast<int>(controller->getCurrentVolumetricSource());
+            lastSampleMs = 0;
+            currentBluetoothWeight = 0.0f;
+            currentHardwareWeight = 0.0f;
+            currentHardwareShotWeight = 0.0f;
+            currentEstimatedWeight = 0.0f;
+            pressureSamples.clear();
+            targetPressureSamples.clear();
+            flowSamples.clear();
+            targetFlowSamples.clear();
+            weightSamples.clear();
+            timeSamples.clear();
+        }
+        publishBrewState("brewing");
+        publishMachineState("brewing");
+    });
+
+    pm->on("controller:brew:end", [this](Event const &) {
+        if (isAutoTuningEnabled()) {
+            isBrewing = false;
+            publishShotProfile();
+            Event event;
+            event.id = "rl:shot:complete";
+            event.setString("shot_id", currentShotId);
+            event.setString("recommendation_id", latestRecommendationId);
+            event.setInt("grind_delta_steps", latestRecommendationGrindDeltaSteps);
+            event.setFloat("next_dose_g", latestRecommendationNextDoseG);
+            event.setFloat("target_yield_g", latestRecommendationTargetYieldG);
+            pluginManager->trigger(event);
+        }
+        publishBrewState("not brewing");
+        publishMachineState("idle");
+    });
 }

@@ -132,6 +132,7 @@ class Settings {
     float getScaleCalibration2() const { return scaleCalibration2; }
     long getScaleOffset1() const { return scaleOffset1; }
     long getScaleOffset2() const { return scaleOffset2; }
+    bool isRLRatingEnabled() const { return rlRatingEnabled; }
     void setTargetSteamTemp(int target_steam_temp);
     void setTargetWaterTemp(int target_water_temp);
     void setTemperatureOffset(int temperature_offset);
@@ -201,6 +202,7 @@ class Settings {
     void setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules);
     void setButtonBehavior(int index, String behavior);
     void setButtonBehaviorList(const std::vector<String> &behavior_list);
+    void setRLRatingEnabled(bool enabled);
     void setScaleSource(int scale_source);
     // Invoked AFTER the new value is stored and the save flag is set. Fires on
     // every setScaleSource() call, even when the value is unchanged, so the
@@ -293,6 +295,7 @@ class Settings {
     int fullTankDistance = 50;
     int altRelayFunction = ALT_RELAY_GRIND; // Default to grind
     std::vector<String> buttonBehavior;
+    bool rlRatingEnabled = false;
 
     // Scale settings
     int scaleSource = 0; // brew/general source: 0=AUTO, 1=BLE, 2=HW, 3=Predictive, 4=OFF
