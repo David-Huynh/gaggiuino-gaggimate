@@ -624,17 +624,38 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         }
                     }
                 } else if (msgType == "req:rl:rating") {
-                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled() &&
-                        doc["rating"].is<int>()) {
+                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
                         String shotId = doc["shot_id"].as<String>();
                         String recommendationId = doc["recommendation_id"].as<String>();
-                        int rating = doc["rating"].as<int>();
-                        if (!shotId.isEmpty() && rating >= 1 && rating <= 5) {
+                        const bool skipped = doc["skipped"] | false;
+                        const bool hasRating = doc["rating"].is<int>();
+                        const int rating = hasRating ? doc["rating"].as<int>() : 0;
+                        if (!shotId.isEmpty() && (skipped || (hasRating && rating >= 1 && rating <= 5))) {
                             Event event;
                             event.id = "rl:rating";
                             event.setString("shot_id", shotId);
                             event.setString("recommendation_id", recommendationId);
-                            event.setInt("rating", rating);
+                            if (hasRating) {
+                                event.setInt("rating", rating);
+                            }
+                            if (skipped) {
+                                event.setInt("skipped", 1);
+                            }
+                            if (doc["taste_tags"].is<JsonArray>()) {
+                                String tasteTags;
+                                for (JsonVariant tag : doc["taste_tags"].as<JsonArray>()) {
+                                    String value = tag.as<String>();
+                                    value.trim();
+                                    if (value.isEmpty()) {
+                                        continue;
+                                    }
+                                    if (!tasteTags.isEmpty()) {
+                                        tasteTags += ",";
+                                    }
+                                    tasteTags += value;
+                                }
+                                event.setString("taste_tags", tasteTags);
+                            }
                             pluginManager->trigger(event);
                         }
                     }

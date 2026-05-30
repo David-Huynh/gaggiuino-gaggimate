@@ -10,6 +10,23 @@
 
 const String LOG_TAG = F("MQTTPlugin");
 
+static void addTasteTags(JsonDocument &doc, const String &csvTags) {
+    JsonArray tags = doc["taste_tags"].to<JsonArray>();
+    int start = 0;
+    while (start < csvTags.length()) {
+        int end = csvTags.indexOf(',', start);
+        if (end < 0) {
+            end = csvTags.length();
+        }
+        String tag = csvTags.substring(start, end);
+        tag.trim();
+        if (!tag.isEmpty()) {
+            tags.add(tag);
+        }
+        start = end + 1;
+    }
+}
+
 bool MQTTPlugin::connect(Controller *controller) {
     const Settings settings = controller->getSettings();
     const String ip = settings.getHomeAssistantIP();
@@ -514,6 +531,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         String shotId = event.getString("shot_id");
         String recommendationId = event.getString("recommendation_id");
         int rating = event.getInt("rating");
+        bool skipped = event.getInt("skipped") == 1 || rating < 1 || rating > 5;
 
         JsonDocument doc;
         doc["event_type"] = "shot_feedback";
@@ -521,7 +539,11 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         doc["shot_id"] = shotId;
         doc["recommendation_id"] = recommendationId;
         doc["machine_id"] = machineId();
-        doc["rating"] = rating;
+        if (!skipped) {
+            doc["rating"] = rating;
+        }
+        doc["skipped"] = skipped;
+        addTasteTags(doc, event.getString("taste_tags"));
         doc["source"] = "gaggimate_mqtt";
         doc["timestamp"] = static_cast<long>(std::time(nullptr));
 

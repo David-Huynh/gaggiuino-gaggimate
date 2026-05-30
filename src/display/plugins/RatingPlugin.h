@@ -9,14 +9,18 @@
 
 constexpr unsigned long RATING_POPUP_TIMEOUT_MS = 30000;
 
-enum class RLOverlayMode { NONE, RATING, RECOMMENDATION };
+enum class RLOverlayMode { NONE, RATING, TASTE_TAGS, RECOMMENDATION };
 
 class RatingPlugin : public Plugin {
   public:
     void setup(Controller *controller, PluginManager *pluginManager) override;
     void loop() override;
 
-    void submitRating(int rating);
+    void selectRating(int rating);
+    void submitFeedback();
+    void skipRating();
+    bool toggleTasteTag(int index);
+    void clearTasteTags();
     void useRecommendation();
     void ignoreRecommendation();
     void dismissOverlay();
@@ -24,9 +28,13 @@ class RatingPlugin : public Plugin {
 
   private:
     void showRatingOverlay(const String &shotId);
+    void showTasteTagOverlay();
     void storeRecommendation(Event const &event);
     void showRecommendationOverlay();
     bool shouldPromptRecommendation() const;
+    bool feedbackOverlayActive() const;
+    String selectedTasteTagsCsv() const;
+    void clearOverlay(bool clearShotContext);
 
     Controller *controller = nullptr;
     PluginManager *pluginManager = nullptr;
@@ -37,6 +45,8 @@ class RatingPlugin : public Plugin {
 
     String _pendingShotId;
     String _pendingShotRecommendationId;
+    int _pendingRating = 0;
+    uint16_t _selectedTasteTagMask = 0;
     String _pendingRecommendationId;
     String _pendingRecommendationStatus;
     String _pendingMode;

@@ -3,6 +3,16 @@ import { ApiServiceContext } from '../services/ApiService.js';
 
 const RATING_DISMISS_MS = 45000;
 const RECOMMENDATION_STATUSES = new Set(['', 'pending', 'shown']);
+const TASTE_TAGS = [
+  { value: 'sour', label: 'Sour' },
+  { value: 'bitter', label: 'Bitter' },
+  { value: 'weak', label: 'Weak' },
+  { value: 'harsh', label: 'Harsh' },
+  { value: 'thin', label: 'Thin' },
+  { value: 'astringent', label: 'Astringent' },
+  { value: 'channeling_suspected', label: 'Channeling' },
+  { value: 'balanced', label: 'Balanced' },
+];
 
 function formatDose(value) {
   const dose = Number(value);
@@ -12,11 +22,6 @@ function formatDose(value) {
 function formatYield(value) {
   const yieldG = Number(value);
   return Number.isFinite(yieldG) && yieldG > 0 ? `${yieldG.toFixed(1)}g` : '-';
-}
-
-function formatRatio(value) {
-  const ratio = Number(value);
-  return Number.isFinite(ratio) && ratio > 0 ? `1:${ratio.toFixed(2)}` : '-';
 }
 
 function formatGrind(deltaSteps) {
@@ -32,6 +37,16 @@ function formatGrind(deltaSteps) {
 export function RLPromptOverlay() {
   const apiService = useContext(ApiServiceContext);
   const [prompt, setPrompt] = useState(null);
+  const [queuedRecommendation, setQueuedRecommendation] = useState(null);
+
+  const finishFeedback = useCallback(() => {
+    if (queuedRecommendation) {
+      setPrompt(queuedRecommendation);
+      setQueuedRecommendation(null);
+      return;
+    }
+    setPrompt(null);
+  }, [queuedRecommendation]);
 
   useEffect(() => {
     if (!apiService) {
@@ -43,9 +58,16 @@ export function RLPromptOverlay() {
       if (!message.recommendation_id || !RECOMMENDATION_STATUSES.has(status)) {
         return;
       }
-      setPrompt({
+      const nextPrompt = {
         type: 'recommendation',
         ...message,
+      };
+      setPrompt(current => {
+        if (current?.type === 'rating' || current?.type === 'taste_tags') {
+          setQueuedRecommendation(nextPrompt);
+          return current;
+        }
+        return nextPrompt;
       });
     });
 
@@ -53,10 +75,16 @@ export function RLPromptOverlay() {
       if (!message.shot_id) {
         return;
       }
-      setPrompt({
+      const nextPrompt = {
         type: 'rating',
         shot_id: message.shot_id,
         recommendation_id: message.recommendation_id,
+      };
+      setPrompt(current => {
+        if (current?.type === 'recommendation') {
+          setQueuedRecommendation(current);
+        }
+        return nextPrompt;
       });
     });
 
@@ -64,7 +92,10 @@ export function RLPromptOverlay() {
       if (!message.process?.a) {
         return;
       }
-      setPrompt(current => (current?.type === 'rating' ? null : current));
+      setQueuedRecommendation(null);
+      setPrompt(current =>
+        current?.type === 'rating' || current?.type === 'taste_tags' ? null : current,
+      );
     });
 
     return () => {
@@ -78,9 +109,9 @@ export function RLPromptOverlay() {
     if (prompt?.type !== 'rating') {
       return undefined;
     }
-    const timeout = window.setTimeout(() => setPrompt(null), RATING_DISMISS_MS);
+    const timeout = window.setTimeout(() => finishFeedback(), RATING_DISMISS_MS);
     return () => window.clearTimeout(timeout);
-  }, [prompt]);
+  }, [finishFeedback, prompt]);
 
   const close = useCallback(() => setPrompt(null), []);
 
@@ -106,21 +137,69 @@ export function RLPromptOverlay() {
     setPrompt(null);
   }, [apiService, prompt]);
 
-  const rateShot = useCallback(
+  const chooseRating = useCallback(
     rating => {
       if (!prompt?.shot_id) {
         return;
       }
-      apiService.send({
-        tp: 'req:rl:rating',
+      setPrompt({
+        type: 'taste_tags',
         shot_id: prompt.shot_id,
         recommendation_id: prompt.recommendation_id,
         rating,
+        taste_tags: [],
       });
-      setPrompt(null);
     },
-    [apiService, prompt],
+    [prompt],
   );
+
+  const toggleTasteTag = useCallback(
+    tag => {
+      if (prompt?.type !== 'taste_tags') {
+        return;
+      }
+      const currentTags = new Set(prompt.taste_tags || []);
+      if (currentTags.has(tag)) {
+        currentTags.delete(tag);
+      } else {
+        currentTags.add(tag);
+      }
+      setPrompt({
+        ...prompt,
+        taste_tags: Array.from(currentTags),
+      });
+    },
+    [prompt],
+  );
+
+  const submitFeedback = useCallback(
+    ({ skipped = false, clearTags = false } = {}) => {
+      if (!prompt?.shot_id) {
+        return;
+      }
+      const message = {
+        tp: 'req:rl:rating',
+        shot_id: prompt.shot_id,
+        recommendation_id: prompt.recommendation_id,
+        skipped,
+      };
+      if (!skipped && Number.isFinite(Number(prompt.rating))) {
+        message.rating = Number(prompt.rating);
+        message.taste_tags = clearTags ? [] : prompt.taste_tags || [];
+      }
+      apiService.send(message);
+      finishFeedback();
+    },
+    [apiService, finishFeedback, prompt],
+  );
+
+  useEffect(() => {
+    if (prompt?.type !== 'taste_tags') {
+      return undefined;
+    }
+    const timeout = window.setTimeout(() => submitFeedback(), RATING_DISMISS_MS);
+    return () => window.clearTimeout(timeout);
+  }, [prompt, submitFeedback]);
 
   if (!prompt) {
     return null;
@@ -160,8 +239,8 @@ export function RLPromptOverlay() {
             </div>
 
             <div className='text-base-content/70 text-sm'>
-              Ratio {formatRatio(prompt.target_ratio)}. Grind is manual; Use saves yield and only
-              saves grind dose when grind-by-weight is enabled.
+              Grind is manual. Use saves yield and only saves grind dose when grind-by-weight is
+              enabled.
             </div>
 
             <div className='grid grid-cols-3 gap-2'>
@@ -197,16 +276,60 @@ export function RLPromptOverlay() {
                   key={rating}
                   type='button'
                   className='btn btn-primary aspect-square h-auto min-h-12 text-lg'
-                  onClick={() => rateShot(rating)}
+                  onClick={() => chooseRating(rating)}
                 >
                   {rating}
                 </button>
               ))}
             </div>
 
-            <button type='button' className='btn btn-ghost w-full' onClick={close}>
+            <button
+              type='button'
+              className='btn btn-ghost w-full'
+              onClick={() => submitFeedback({ skipped: true })}
+            >
               Skip
             </button>
+          </div>
+        )}
+
+        {prompt.type === 'taste_tags' && (
+          <div className='space-y-4'>
+            <div>
+              <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
+                Optional
+              </div>
+              <h2 className='text-xl font-bold'>What was off?</h2>
+            </div>
+
+            <div className='grid grid-cols-2 gap-2'>
+              {TASTE_TAGS.map(tag => {
+                const selected = prompt.taste_tags?.includes(tag.value);
+                return (
+                  <button
+                    key={tag.value}
+                    type='button'
+                    className={`btn btn-sm ${selected ? 'btn-primary' : 'btn-outline'}`}
+                    onClick={() => toggleTasteTag(tag.value)}
+                  >
+                    {tag.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className='grid grid-cols-2 gap-2'>
+              <button type='button' className='btn btn-primary' onClick={() => submitFeedback()}>
+                Done
+              </button>
+              <button
+                type='button'
+                className='btn btn-ghost'
+                onClick={() => submitFeedback({ clearTags: true })}
+              >
+                No Tags
+              </button>
+            </div>
           </div>
         )}
       </div>
