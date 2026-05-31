@@ -38,6 +38,8 @@ class HWScalePlugin : public Plugin {
     bool present = false;
     bool active = false;
     unsigned long lastCalResendMs = 0;
+    // One-shot guard: auto-zero a calibrated-but-never-tared scale once per boot.
+    bool autoTareRequested = false;
     ScaleSample lastSample{};
 };
 

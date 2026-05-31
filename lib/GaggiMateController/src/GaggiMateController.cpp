@@ -1,5 +1,6 @@
 #include "GaggiMateController.h"
 #ifdef ARDUINO_ARCH_STM32
+#include <IWatchdog.h>
 #include <STM32FreeRTOS.h>
 #else
 #include <freertos/FreeRTOS.h>
@@ -246,12 +247,23 @@ void GaggiMateController::setup() {
 
     ESP_LOGI(LOG_TAG, "Initialization done");
 #ifdef ARDUINO_ARCH_STM32
+    // Independent watchdog: there is otherwise no recovery path on the STM32, so a
+    // wedged control loop or a hard fault would hang until a power cycle (the
+    // "STM32 went silent mid-brew" failure). loop() feeds it every ~100 ms via
+    // IWatchdog.reload(); a 4 s timeout sits far above the loop period yet recovers
+    // quickly. Started here, after all blocking setup (board detect, scale init).
+    IWatchdog.begin(4000000);
     xTaskCreate(ControllerLoopTask, "MainLoop", configMINIMAL_STACK_SIZE * 8, this, configMAX_PRIORITIES - 1, nullptr);
     vTaskStartScheduler();
 #endif
 }
 
 void GaggiMateController::loop() {
+#ifdef ARDUINO_ARCH_STM32
+    // Feed the independent watchdog from the main control loop so a wedged loop
+    // or hard fault resets the STM32 instead of leaving heater/pump state stale.
+    IWatchdog.reload();
+#endif
     unsigned long now = millis();
     if (lastPingTime < now && (now - lastPingTime) / 1000 > PING_TIMEOUT_SECONDS) {
         handlePingTimeout();

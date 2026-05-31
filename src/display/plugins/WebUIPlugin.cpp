@@ -78,11 +78,12 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             return;
         }
 
+        const String status = event.getString("status");
         JsonDocument doc;
         doc["tp"] = "evt:rl:recommendation";
         doc["recommendation_id"] = event.getString("recommendation_id");
         doc["shot_id"] = event.getString("shot_id");
-        doc["status"] = event.getString("status");
+        doc["status"] = status;
         doc["mode"] = event.getString("mode");
         doc["grind_delta_steps"] = event.getInt("grind_delta_steps");
         doc["grind_delta_um"] = event.getFloat("grind_delta_um");
@@ -91,7 +92,12 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["next_dose_g"] = event.getFloat("next_dose_g");
         doc["target_yield_g"] = event.getFloat("target_yield_g");
         doc["target_ratio"] = event.getFloat("target_ratio");
-        ws.textAll(doc.as<String>());
+        const String payload = doc.as<String>();
+        // Cache as the reopen source of truth only while still promptable; a
+        // resolved status (applied/ignored/etc) clears any pending prompt.
+        const bool promptable = status.isEmpty() || status == "pending" || status == "shown";
+        _pendRecJson = promptable ? payload : String("");
+        ws.textAll(payload);
     });
 
     pluginManager->on("rl:shot:complete", [this](Event const &event) {
@@ -99,11 +105,19 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             return;
         }
 
-        JsonDocument doc;
-        doc["tp"] = "evt:rl:shot-complete";
-        doc["shot_id"] = event.getString("shot_id");
-        doc["recommendation_id"] = event.getString("recommendation_id");
-        ws.textAll(doc.as<String>());
+        _pendRateShotId = event.getString("shot_id");
+        _pendRateRecId = event.getString("recommendation_id");
+        sendRatingPrompt(nullptr, false); // pending until the shot is rated or skipped
+    });
+
+    // After a flush (utility cycle) finishes, nudge: if a shot is still unrated,
+    // re-pop the rating prompt ("remember to rate your shot"). Real-brew ends emit
+    // rl:shot:complete via MQTTPlugin already, so only nudge on utility cycles.
+    pluginManager->on("controller:brew:end", [this](Event const &event) {
+        if (event.getInt("utility") == 1 && !_pendRateShotId.isEmpty() &&
+            controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
+            sendRatingPrompt(nullptr, true);
+        }
     });
 
     pluginManager->on("rl:status:received", [this](Event const &event) {
@@ -316,7 +330,11 @@ void WebUIPlugin::loop() {
 
         // Hardware scale: structured snapshot. Flat hw/hwc stay for existing UI.
         auto sObj = statusDoc["scale"].to<JsonObject>();
-        sObj["w"] = displayHwG;
+        // Never surface an implausible headline weight: an uncalibrated/un-tared
+        // controller emits raw counts (tens of thousands of grams). Show 0 when
+        // the sample is unhealthy or out of range; raw per-channel c1/c2 below
+        // stay unclamped for diagnostics.
+        sObj["w"] = (hwHealthy && std::isfinite(displayHwG)) ? displayHwG : 0.0f;
         sObj["sd"] = sc.stddevG;
         sObj["c1"] = sc.ch1G;
         sObj["c2"] = sc.ch2G;
@@ -523,6 +541,14 @@ void WebUIPlugin::setupServer() {
                 // mode. (Was the v1.8.1 behaviour.)
                 client->setCloseClientOnQueueFull(true);
                 ESP_LOGI("WebUIPlugin", "WebSocket client connected (%d open connections)", server->getClients().size());
+                // Replay pending RL prompts so a reloaded/reconnected client restores
+                // its reopen affordance (the WebUI dedupes/minimizes by id).
+                if (!_pendRateShotId.isEmpty()) {
+                    sendRatingPrompt(client, false);
+                }
+                if (!_pendRecJson.isEmpty()) {
+                    client->text(_pendRecJson);
+                }
             } else if (type == WS_EVT_DISCONNECT) {
                 ESP_LOGI("WebUIPlugin", "WebSocket client disconnected (%d open connections)", server->getClients().size());
                 rxBuffers.erase(client->id());
@@ -565,6 +591,27 @@ void WebUIPlugin::stop() {
     }
     serverRunning = false;
     ESP_LOGI("WebUIPlugin", "WebUIPlugin stopped (wifi disconnected)");
+}
+
+void WebUIPlugin::sendRatingPrompt(AsyncWebSocketClient *client, bool nudge) {
+    if (_pendRateShotId.isEmpty()) {
+        return;
+    }
+    JsonDocument doc;
+    doc["tp"] = "evt:rl:shot-complete";
+    doc["shot_id"] = _pendRateShotId;
+    doc["recommendation_id"] = _pendRateRecId;
+    if (nudge) {
+        // Marks a post-flush reminder so the WebUI re-pops even a shot it already
+        // showed/minimized (a plain connect replay only restores the pill).
+        doc["nudge"] = true;
+    }
+    const String payload = doc.as<String>();
+    if (client) {
+        client->text(payload);
+    } else {
+        ws.textAll(payload);
+    }
 }
 
 void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg,
@@ -611,6 +658,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                             event.id = "rl:recommendation:apply";
                             event.setString("recommendation_id", recommendationId);
                             pluginManager->trigger(event);
+                            _pendRecJson = ""; // resolved — drop the reopen affordance
                         }
                     }
                 } else if (msgType == "req:rl:recommendation:ignore") {
@@ -621,6 +669,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                             event.id = "rl:recommendation:ignore";
                             event.setString("recommendation_id", recommendationId);
                             pluginManager->trigger(event);
+                            _pendRecJson = ""; // resolved — drop the reopen affordance
                         }
                     }
                 } else if (msgType == "req:rl:rating") {
@@ -657,6 +706,8 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                                 event.setString("taste_tags", tasteTags);
                             }
                             pluginManager->trigger(event);
+                            _pendRateShotId = ""; // rated/skipped — drop the reopen affordance
+                            _pendRateRecId = "";
                         }
                     }
                 } else if (msgType == "req:process:activate") {

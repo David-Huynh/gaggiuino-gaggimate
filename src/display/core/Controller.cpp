@@ -59,6 +59,13 @@ struct ProcessLock {
     ProcessLock(const ProcessLock &) = delete;
     ProcessLock &operator=(const ProcessLock &) = delete;
 };
+
+// Only genuine safety/runtime faults latch the controller into an error state
+// (which blocks brewing until cleared). The STM32 reports exactly one such fault
+// today: thermal runaway. Everything else arriving via EVT,ERR (framing/transport
+// glitches, an unknown/garbled command line) is a transient comms hiccup and must
+// not stop the machine — see registerRemoteErrorCallback.
+inline bool isLatchingError(int code) { return code == static_cast<int>(ERROR_CODE_RUNAWAY); }
 } // namespace
 
 struct CtrlCmdMsg {
@@ -288,6 +295,11 @@ void Controller::setupBluetooth() {
 #ifndef GAGGIMATE_UART_TX_PIN
 #define GAGGIMATE_UART_TX_PIN 43
 #endif
+
+    // Size the RX ring generously: the display can be busy with WebUI/MQTT/plugin
+    // work between UART drains, so the default 256 B buffer is too easy to
+    // overflow during STM32 telemetry bursts. Must be called before begin().
+    Serial2.setRxBufferSize(2048);
     Serial2.begin(GAGGIMATE_UART_BAUD, SERIAL_8N1, GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
     ESP_LOGI(LOG_TAG, "UART controller link initialized at %d baud (RX=%d, TX=%d)", GAGGIMATE_UART_BAUD,
              GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
@@ -393,7 +405,24 @@ void Controller::setupBluetooth() {
             pluginManager->trigger("controller:autotune:failed");
             return;
         }
-        if (error != ERROR_CODE_TIMEOUT && error != this->error) {
+        // Liveness timeouts are handled by the ping logic and never latch.
+        if (error == static_cast<int>(ERROR_CODE_TIMEOUT)) {
+            return;
+        }
+        // Transport/protocol glitches (framing errors, an unknown/garbled command
+        // line — far more frequent on hardware-scale builds because of the HX711
+        // bus timing) must NOT be treated as a latching safety fault. Historically
+        // EVT,ERR,UNKNOWN_CMD shared code 4 with RUNAWAY, so one bad command would
+        // wedge brewing until a power cycle. Log + count for visibility; do not
+        // stop the machine.
+        if (!isLatchingError(error)) {
+            static uint32_t transportErrCount = 0;
+            ++transportErrCount;
+            ESP_LOGW(LOG_TAG, "Ignoring non-latching remote error %d (transport glitch; count=%lu)", error,
+                     static_cast<unsigned long>(transportErrCount));
+            return;
+        }
+        if (error != this->error) {
             this->error = error;
             deactivate();
             setMode(MODE_STANDBY);
@@ -1241,21 +1270,24 @@ void Controller::activate() {
     default:;
     }
     bool startedBrew = false;
+    bool startedUtility = false;
     int procType = -1;
     {
         ProcessLock lock(processMutex);
         Process *proc = currentProcess;
         startedBrew = proc != nullptr && proc->getType() == MODE_BREW;
+        startedUtility = proc != nullptr && proc->isUtility();
         procType = proc != nullptr ? proc->getType() : -1;
     }
     ESP_LOGI(LOG_TAG, "activate after startProcess: procType=%d startedBrew=%d", procType, startedBrew);
     if (startedBrew) {
-        pluginManager->trigger("controller:brew:start");
+        pluginManager->trigger("controller:brew:start", "utility", startedUtility ? 1 : 0);
     }
 }
 
 void Controller::deactivate() {
     int swappedType = -1;
+    bool brewWasUtility = false;
     {
         ProcessLock lock(processMutex);
         if (currentProcess == nullptr) {
@@ -1265,6 +1297,7 @@ void Controller::deactivate() {
         lastProcess = currentProcess;
         currentProcess = nullptr;
         swappedType = lastProcess->getType();
+        brewWasUtility = lastProcess->isUtility();
     }
     applyConnectionPriority(); // shot ended -> relaxed BLE interval
     if (swappedType == MODE_BREW) {
@@ -1272,7 +1305,7 @@ void Controller::deactivate() {
         // Keep the hardware shot baseline alive after pump stop so UI and shot
         // history can continue showing/recording settled shot-relative weight.
         // clear(), mode change, flush, and next activate() reset it.
-        pluginManager->trigger("controller:brew:end");
+        pluginManager->trigger("controller:brew:end", "utility", brewWasUtility ? 1 : 0);
     } else if (swappedType == MODE_GRIND) {
         pluginManager->trigger("controller:grind:end");
     }
@@ -1482,7 +1515,9 @@ void Controller::onFlush() {
     resetHardwareScaleShotBaseline();
 #endif
     startProcess(new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay()));
-    pluginManager->trigger("controller:brew:start");
+    // utility=1: a flush is not a shot — keep it out of EspressoRL/autotune capture
+    // and the rating prompt (see MQTTPlugin / RatingPlugin brew handlers).
+    pluginManager->trigger("controller:brew:start", "utility", 1);
 }
 
 void Controller::onVolumetricDelete() {

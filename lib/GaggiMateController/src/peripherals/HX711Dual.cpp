@@ -72,15 +72,23 @@ HxResult HX711Dual::try_read(long values[2], bool valid[2], bool saturated[2]) {
         return HxResult::NOT_READY;
     }
 
-    // Critical section: SCK high >60 µs would put the HX711 into power-down.
-    // The 25-clock sequence is ~50 µs, comfortably below that ceiling.
-    taskENTER_CRITICAL();
-
+    // HX711 timing constraint: SCK held HIGH for >60 us latches the chip into
+    // power-down. The obvious guard is to mask interrupts for the whole 25-clock
+    // burst -- but on this single-core MCU that blocks the no-FIFO USART RX ISR
+    // for ~50-150 us (>1 byte-time at 115200 baud), so an inbound command byte
+    // arriving mid-read is silently dropped -> garbled/lost CMD -> valve/pump lag
+    // and spurious protocol errors (the very thing that used to brick brewing).
+    // Instead, guard only each individual SCK-HIGH pulse: HIGH is the window that
+    // must stay <60 us, while SCK held LOW between bits is harmless. This caps the
+    // masked window at a single ~1-2 us pulse and lets the UART ISR run between
+    // bits. try_read holds _mutex for the whole call, so no other task can clock
+    // the bus while we are briefly preempted between bits.
     const bool ready1 = (digitalRead(_dout1) == LOW);
     const bool ready2 = (digitalRead(_dout2) == LOW);
 
     unsigned long buf0 = 0, buf1 = 0;
     for (int i = 23; i >= 0; i--) {
+        taskENTER_CRITICAL();
         digitalWrite(_sck, HIGH);
         delayMicroseconds(1);
         if (ready1 && digitalRead(_dout1) == HIGH)
@@ -88,16 +96,17 @@ HxResult HX711Dual::try_read(long values[2], bool valid[2], bool saturated[2]) {
         if (ready2 && digitalRead(_dout2) == HIGH)
             buf1 |= (1UL << i);
         digitalWrite(_sck, LOW);
+        taskEXIT_CRITICAL();
         delayMicroseconds(1);
     }
     for (uint8_t i = 0; i < _gainPulses; i++) {
+        taskENTER_CRITICAL();
         digitalWrite(_sck, HIGH);
         delayMicroseconds(1);
         digitalWrite(_sck, LOW);
+        taskEXIT_CRITICAL();
         delayMicroseconds(1);
     }
-
-    taskEXIT_CRITICAL();
 
     // Sign-extend 24-bit two's complement to 32-bit.
     long v0 = ready1 ? ((buf0 & 0x800000UL) ? (long)(buf0 | 0xFF000000UL) : (long)buf0) : 0;

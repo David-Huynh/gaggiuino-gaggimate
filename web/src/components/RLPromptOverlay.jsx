@@ -1,8 +1,12 @@
-import { useCallback, useContext, useEffect, useState } from 'preact/hooks';
+import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { ApiServiceContext } from '../services/ApiService.js';
 
 const RATING_DISMISS_MS = 45000;
 const RECOMMENDATION_STATUSES = new Set(['', 'pending', 'shown']);
+// Ids we've already auto-popped this browser session. Persisted so a page reload
+// (which replays the pending prompts from the firmware) restores them as the
+// minimized "reopen" pills instead of popping the modal in your face again.
+const SEEN_STORAGE_KEY = 'rl_seen_prompt_ids';
 const TASTE_TAGS = [
   { value: 'sour', label: 'Sour' },
   { value: 'bitter', label: 'Bitter' },
@@ -34,19 +38,35 @@ function formatGrind(deltaSteps) {
   return `${steps} ${label} ${delta > 0 ? 'finer' : 'coarser'}`;
 }
 
+function loadSeen() {
+  try {
+    return new Set(JSON.parse(window.sessionStorage.getItem(SEEN_STORAGE_KEY) || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+
 export function RLPromptOverlay() {
   const apiService = useContext(ApiServiceContext);
-  const [prompt, setPrompt] = useState(null);
-  const [queuedRecommendation, setQueuedRecommendation] = useState(null);
+  // Pending items are the source of the reopen pills; they persist until the user
+  // acts (rate/skip, use/ignore) or the firmware clears them. `view` is whichever
+  // modal is currently open (null = minimized to pills).
+  const [pendingRating, setPendingRating] = useState(null); // { shot_id, recommendation_id }
+  const [pendingRec, setPendingRec] = useState(null); // { recommendation_id, ...fields }
+  const [view, setView] = useState(null); // { kind: 'rating'|'taste_tags'|'recommendation', ... }
+  const seenRef = useRef(loadSeen());
 
-  const finishFeedback = useCallback(() => {
-    if (queuedRecommendation) {
-      setPrompt(queuedRecommendation);
-      setQueuedRecommendation(null);
+  const markSeen = useCallback(id => {
+    if (!id || seenRef.current.has(id)) {
       return;
     }
-    setPrompt(null);
-  }, [queuedRecommendation]);
+    seenRef.current.add(id);
+    try {
+      window.sessionStorage.setItem(SEEN_STORAGE_KEY, JSON.stringify([...seenRef.current]));
+    } catch {
+      /* sessionStorage unavailable — dedupe degrades to in-memory only */
+    }
+  }, []);
 
   useEffect(() => {
     if (!apiService) {
@@ -56,46 +76,45 @@ export function RLPromptOverlay() {
     const recommendationListener = apiService.on('evt:rl:recommendation', message => {
       const status = message.status || '';
       if (!message.recommendation_id || !RECOMMENDATION_STATUSES.has(status)) {
+        // Resolved or no longer promptable — drop the matching pending prompt.
+        setPendingRec(current =>
+          current && current.recommendation_id === message.recommendation_id ? null : current,
+        );
         return;
       }
-      const nextPrompt = {
-        type: 'recommendation',
-        ...message,
-      };
-      setPrompt(current => {
-        if (current?.type === 'rating' || current?.type === 'taste_tags') {
-          setQueuedRecommendation(nextPrompt);
-          return current;
-        }
-        return nextPrompt;
-      });
+      setPendingRec({ type: 'recommendation', ...message });
+      const firstSee = !seenRef.current.has(message.recommendation_id);
+      markSeen(message.recommendation_id);
+      // Auto-pop only when nothing else is open and we haven't shown it before.
+      if (firstSee) {
+        setView(current => (current ? current : { kind: 'recommendation' }));
+      }
     });
 
     const shotCompleteListener = apiService.on('evt:rl:shot-complete', message => {
       if (!message.shot_id) {
         return;
       }
-      const nextPrompt = {
-        type: 'rating',
-        shot_id: message.shot_id,
-        recommendation_id: message.recommendation_id,
-      };
-      setPrompt(current => {
-        if (current?.type === 'recommendation') {
-          setQueuedRecommendation(current);
-        }
-        return nextPrompt;
-      });
+      setPendingRating({ shot_id: message.shot_id, recommendation_id: message.recommendation_id });
+      const firstSee = !seenRef.current.has(message.shot_id);
+      markSeen(message.shot_id);
+      // `nudge` (post-flush reminder) re-pops even a shot we already showed.
+      if (message.nudge || firstSee) {
+        setView({
+          kind: 'rating',
+          shot_id: message.shot_id,
+          recommendation_id: message.recommendation_id,
+        });
+      }
     });
 
     const brewStartListener = apiService.on('evt:status', message => {
       if (!message.process?.a) {
         return;
       }
-      setQueuedRecommendation(null);
-      setPrompt(current =>
-        current?.type === 'rating' || current?.type === 'taste_tags' ? null : current,
-      );
+      // A shot/flush started — get the modal out of the way but keep the pending
+      // pills so feedback is never lost.
+      setView(null);
     });
 
     return () => {
@@ -103,116 +122,149 @@ export function RLPromptOverlay() {
       apiService.off('evt:rl:shot-complete', shotCompleteListener);
       apiService.off('evt:status', brewStartListener);
     };
-  }, [apiService]);
+  }, [apiService, markSeen]);
 
+  // Timeout folds the rating flow back into a pill instead of discarding it.
   useEffect(() => {
-    if (prompt?.type !== 'rating') {
+    if (view?.kind !== 'rating' && view?.kind !== 'taste_tags') {
       return undefined;
     }
-    const timeout = window.setTimeout(() => finishFeedback(), RATING_DISMISS_MS);
+    const timeout = window.setTimeout(() => setView(null), RATING_DISMISS_MS);
     return () => window.clearTimeout(timeout);
-  }, [finishFeedback, prompt]);
+  }, [view]);
 
-  const close = useCallback(() => setPrompt(null), []);
-
-  const useRecommendation = useCallback(() => {
-    if (!prompt?.recommendation_id) {
-      return;
-    }
-    apiService.send({
-      tp: 'req:rl:recommendation:use',
-      recommendation_id: prompt.recommendation_id,
-    });
-    setPrompt(null);
-  }, [apiService, prompt]);
-
-  const ignoreRecommendation = useCallback(() => {
-    if (!prompt?.recommendation_id) {
-      return;
-    }
-    apiService.send({
-      tp: 'req:rl:recommendation:ignore',
-      recommendation_id: prompt.recommendation_id,
-    });
-    setPrompt(null);
-  }, [apiService, prompt]);
+  const minimize = useCallback(() => setView(null), []);
 
   const chooseRating = useCallback(
     rating => {
-      if (!prompt?.shot_id) {
+      if (!view?.shot_id) {
         return;
       }
-      setPrompt({
-        type: 'taste_tags',
-        shot_id: prompt.shot_id,
-        recommendation_id: prompt.recommendation_id,
+      setView({
+        kind: 'taste_tags',
+        shot_id: view.shot_id,
+        recommendation_id: view.recommendation_id,
         rating,
         taste_tags: [],
       });
     },
-    [prompt],
+    [view],
   );
 
   const toggleTasteTag = useCallback(
     tag => {
-      if (prompt?.type !== 'taste_tags') {
-        return;
-      }
-      const currentTags = new Set(prompt.taste_tags || []);
-      if (currentTags.has(tag)) {
-        currentTags.delete(tag);
-      } else {
-        currentTags.add(tag);
-      }
-      setPrompt({
-        ...prompt,
-        taste_tags: Array.from(currentTags),
+      setView(current => {
+        if (current?.kind !== 'taste_tags') {
+          return current;
+        }
+        const currentTags = new Set(current.taste_tags || []);
+        if (currentTags.has(tag)) {
+          currentTags.delete(tag);
+        } else {
+          currentTags.add(tag);
+        }
+        return { ...current, taste_tags: Array.from(currentTags) };
       });
     },
-    [prompt],
+    [],
   );
 
   const submitFeedback = useCallback(
     ({ skipped = false, clearTags = false } = {}) => {
-      if (!prompt?.shot_id) {
+      const shotId = view?.shot_id || pendingRating?.shot_id;
+      if (!shotId) {
         return;
       }
       const message = {
         tp: 'req:rl:rating',
-        shot_id: prompt.shot_id,
-        recommendation_id: prompt.recommendation_id,
+        shot_id: shotId,
+        recommendation_id: view?.recommendation_id || pendingRating?.recommendation_id,
         skipped,
       };
-      if (!skipped && Number.isFinite(Number(prompt.rating))) {
-        message.rating = Number(prompt.rating);
-        message.taste_tags = clearTags ? [] : prompt.taste_tags || [];
+      if (!skipped && Number.isFinite(Number(view?.rating))) {
+        message.rating = Number(view.rating);
+        message.taste_tags = clearTags ? [] : view.taste_tags || [];
       }
       apiService.send(message);
-      finishFeedback();
+      setPendingRating(null);
+      setView(null);
     },
-    [apiService, finishFeedback, prompt],
+    [apiService, view, pendingRating],
   );
 
-  useEffect(() => {
-    if (prompt?.type !== 'taste_tags') {
-      return undefined;
+  const useRecommendation = useCallback(() => {
+    const recId = pendingRec?.recommendation_id;
+    if (!recId) {
+      return;
     }
-    const timeout = window.setTimeout(() => submitFeedback(), RATING_DISMISS_MS);
-    return () => window.clearTimeout(timeout);
-  }, [prompt, submitFeedback]);
+    apiService.send({ tp: 'req:rl:recommendation:use', recommendation_id: recId });
+    setPendingRec(null);
+    setView(null);
+  }, [apiService, pendingRec]);
 
-  if (!prompt) {
-    return null;
+  const ignoreRecommendation = useCallback(() => {
+    const recId = pendingRec?.recommendation_id;
+    if (!recId) {
+      return;
+    }
+    apiService.send({ tp: 'req:rl:recommendation:ignore', recommendation_id: recId });
+    setPendingRec(null);
+    setView(null);
+  }, [apiService, pendingRec]);
+
+  // Minimized: render the reopen pills (if anything is pending).
+  if (!view) {
+    if (!pendingRating && !pendingRec) {
+      return null;
+    }
+    return (
+      <div className='fixed bottom-4 right-4 z-50 flex flex-col items-end gap-2'>
+        {pendingRating && (
+          <button
+            type='button'
+            className='btn btn-primary btn-sm shadow-lg'
+            onClick={() =>
+              setView({
+                kind: 'rating',
+                shot_id: pendingRating.shot_id,
+                recommendation_id: pendingRating.recommendation_id,
+              })
+            }
+          >
+            ★ Rate last shot
+          </button>
+        )}
+        {pendingRec && (
+          <button
+            type='button'
+            className='btn btn-secondary btn-sm shadow-lg'
+            onClick={() => setView({ kind: 'recommendation' })}
+          >
+            ◎ Recommendation
+          </button>
+        )}
+      </div>
+    );
   }
 
   return (
     <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4'>
       <div
-        className='bg-base-100 border-base-300 w-full max-w-md rounded-lg border p-5 shadow-xl'
+        className='bg-base-100 border-base-300 relative w-full max-w-md rounded-lg border p-5 shadow-xl'
         role='dialog'
         aria-modal='true'
       >
-        {prompt.type === 'recommendation' && (
+        <button
+          type='button'
+          className='btn btn-ghost btn-sm btn-circle absolute right-2 top-2'
+          onClick={minimize}
+          aria-label='Minimize'
+          title='Minimize'
+        >
+          ✕
+        </button>
+
+        {view.kind === 'recommendation' && pendingRec && (
           <div className='space-y-4'>
             <div>
               <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
@@ -225,16 +277,18 @@ export function RLPromptOverlay() {
               <div className='bg-base-200 rounded-md p-3'>
                 <div className='text-base-content/60 text-xs uppercase'>Grind</div>
                 <div className='text-base font-semibold'>
-                  {formatGrind(prompt.grind_delta_steps)}
+                  {formatGrind(pendingRec.grind_delta_steps)}
                 </div>
               </div>
               <div className='bg-base-200 rounded-md p-3'>
                 <div className='text-base-content/60 text-xs uppercase'>Grind Dose</div>
-                <div className='text-base font-semibold'>{formatDose(prompt.next_dose_g)}</div>
+                <div className='text-base font-semibold'>{formatDose(pendingRec.next_dose_g)}</div>
               </div>
               <div className='bg-base-200 rounded-md p-3'>
                 <div className='text-base-content/60 text-xs uppercase'>Yield</div>
-                <div className='text-base font-semibold'>{formatYield(prompt.target_yield_g)}</div>
+                <div className='text-base font-semibold'>
+                  {formatYield(pendingRec.target_yield_g)}
+                </div>
               </div>
             </div>
 
@@ -247,7 +301,7 @@ export function RLPromptOverlay() {
               <button type='button' className='btn btn-primary' onClick={useRecommendation}>
                 Use
               </button>
-              <button type='button' className='btn btn-outline' onClick={close}>
+              <button type='button' className='btn btn-outline' onClick={minimize}>
                 Later
               </button>
               <button
@@ -261,7 +315,7 @@ export function RLPromptOverlay() {
           </div>
         )}
 
-        {prompt.type === 'rating' && (
+        {view.kind === 'rating' && (
           <div className='space-y-4'>
             <div>
               <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
@@ -293,7 +347,7 @@ export function RLPromptOverlay() {
           </div>
         )}
 
-        {prompt.type === 'taste_tags' && (
+        {view.kind === 'taste_tags' && (
           <div className='space-y-4'>
             <div>
               <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
@@ -304,7 +358,7 @@ export function RLPromptOverlay() {
 
             <div className='grid grid-cols-2 gap-2'>
               {TASTE_TAGS.map(tag => {
-                const selected = prompt.taste_tags?.includes(tag.value);
+                const selected = view.taste_tags?.includes(tag.value);
                 return (
                   <button
                     key={tag.value}

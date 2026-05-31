@@ -44,6 +44,22 @@ void HWScalePlugin::onSample(const ScaleSample &s) {
         sendCalibration();
     }
 
+    // Auto-establish a hardware zero once per boot when the scale is calibrated
+    // but has no tare offset (offsets 0,0 -> the controller emits raw counts, i.e.
+    // the tens-of-thousands-of-grams readings). Only while idle (no running
+    // process) so we zero an at-rest platform, and only once; a loaded/noisy
+    // platform makes the tare state machine fail safely without writing bad
+    // offsets. The display owns offsets, so the result persists across boots.
+    if (!autoTareRequested && present && !controller->isActive() &&
+        controller->getSettings().getScaleCalibration1() != 0.0f &&
+        controller->getSettings().getScaleCalibration2() != 0.0f && controller->getSettings().getScaleOffset1() == 0 &&
+        controller->getSettings().getScaleOffset2() == 0 &&
+        !(s.healthBits & (SCALE_HEALTH_TARING | SCALE_HEALTH_CALIBRATING))) {
+        autoTareRequested = true;
+        ESP_LOGI("HWScalePlugin", "Calibrated scale has no tare offset; auto-zeroing once (idle)");
+        controller->scaleTare();
+    }
+
     if (!active || !present) {
         return;
     }

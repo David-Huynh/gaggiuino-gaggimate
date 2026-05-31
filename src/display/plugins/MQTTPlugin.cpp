@@ -624,8 +624,9 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
            [this](Event const &event) { currentHardwareShotWeight = event.getFloat("value"); });
 #endif
 
-    pm->on("controller:brew:start", [this](Event const &) {
-        if (isAutoTuningEnabled()) {
+    pm->on("controller:brew:start", [this](Event const &event) {
+        // A flush (utility cycle) is not a shot — never capture it for EspressoRL.
+        if (isAutoTuningEnabled() && event.getInt("utility") == 0) {
             isBrewing = true;
             brewStartMs = millis();
             currentShotId = makeShotId();
@@ -646,8 +647,10 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         publishMachineState("brewing");
     });
 
-    pm->on("controller:brew:end", [this](Event const &) {
-        if (isAutoTuningEnabled()) {
+    pm->on("controller:brew:end", [this](Event const &event) {
+        // Skip flushes: no shot profile publish and no rl:shot:complete (which would
+        // otherwise pop the rating prompt for a cleaning cycle).
+        if (isAutoTuningEnabled() && event.getInt("utility") == 0) {
             isBrewing = false;
             publishShotProfile();
             Event event;

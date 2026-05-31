@@ -40,6 +40,9 @@ class WebUIPlugin : public Plugin {
     void handleAutotuneStart(uint32_t clientId, JsonDocument &request);
     void handleProfileRequest(uint32_t clientId, JsonDocument &request);
     void handleFlushStart(uint32_t clientId, JsonDocument &request);
+    // Re-send the pending shot rating prompt (to one client on connect, or to all
+    // as a post-flush nudge). No-op when nothing is pending.
+    void sendRatingPrompt(AsyncWebSocketClient *client, bool nudge);
 
     // HTTP handlers
     void handleSettings(AsyncWebServerRequest *request) const;
@@ -101,6 +104,13 @@ class WebUIPlugin : public Plugin {
     int rlLocalShotCount = 0;
     int rlUploadQueueCount = 0;
     bool rlCommunityUploadEnabled = false;
+
+    // Pending RL prompts (serialized evt payloads). WebUIPlugin is the source of
+    // truth so the WebUI can re-pop / reopen after a timeout, a minimize, a flush,
+    // or a full page reload. Empty string = nothing pending.
+    String _pendRateShotId = "";
+    String _pendRateRecId = "";
+    String _pendRecJson = "";
 };
 
 #endif // WEBUIPLUGIN_H
