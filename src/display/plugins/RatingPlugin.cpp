@@ -118,6 +118,10 @@ bool RatingPlugin::autoTuningEnabled() const {
     return settings.isHomeAssistant() && settings.isRLRatingEnabled();
 }
 
+bool RatingPlugin::baselineRecommendation() const {
+    return _pendingMode == "zero_observe";
+}
+
 bool RatingPlugin::feedbackOverlayActive() const {
     return _overlayMode == RLOverlayMode::RATING || _overlayMode == RLOverlayMode::TASTE_TAGS;
 }
@@ -267,6 +271,7 @@ void RatingPlugin::showRecommendationOverlay() {
     closeOverlay();
     _overlayMode = RLOverlayMode::RECOMMENDATION;
     _shownAtMs = millis();
+    const bool baseline = baselineRecommendation();
 
     _overlay = lv_obj_create(lv_layer_top());
     lv_obj_set_size(_overlay, LV_HOR_RES, LV_VER_RES);
@@ -287,7 +292,7 @@ void RatingPlugin::showRecommendationOverlay() {
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, "Next shot");
+    lv_label_set_text(title, baseline ? "Baseline shot" : "Next shot");
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
 
@@ -299,7 +304,13 @@ void RatingPlugin::showRecommendationOverlay() {
                  std::abs(_pendingGrindDeltaSteps) == 1 ? "" : "s");
         grindText = grindBuf;
     }
-    snprintf(recipe, sizeof(recipe), "%s\nGrind %.1fg dose\nYield %.1fg", grindText, _pendingNextDoseG, _pendingTargetYieldG);
+    if (baseline) {
+        snprintf(recipe, sizeof(recipe),
+                 "Pull your current recipe.\nThis first shot starts BO.\nUse Current or Later.");
+    } else {
+        snprintf(recipe, sizeof(recipe), "%s\nGrind %.1fg dose\nYield %.1fg", grindText, _pendingNextDoseG,
+                 _pendingTargetYieldG);
+    }
 
     lv_obj_t *details = lv_label_create(card);
     lv_label_set_text(details, recipe);
@@ -310,18 +321,18 @@ void RatingPlugin::showRecommendationOverlay() {
     lv_obj_align(details, LV_ALIGN_TOP_MID, 0, 52);
 
     lv_obj_t *useBtn = lv_btn_create(card);
-    lv_obj_set_size(useBtn, 104, 42);
-    lv_obj_align(useBtn, LV_ALIGN_BOTTOM_LEFT, 24, -22);
+    lv_obj_set_size(useBtn, baseline ? 148 : 104, 42);
+    lv_obj_align(useBtn, baseline ? LV_ALIGN_BOTTOM_LEFT : LV_ALIGN_BOTTOM_LEFT, baseline ? 44 : 24, -22);
     lv_obj_set_style_bg_color(useBtn, lv_color_hex(0x2E7D32), 0);
     lv_obj_set_style_radius(useBtn, 8, 0);
     lv_obj_add_event_cb(useBtn, use_btn_event_cb, LV_EVENT_CLICKED, this);
     lv_obj_t *useLbl = lv_label_create(useBtn);
-    lv_label_set_text(useLbl, "Use");
+    lv_label_set_text(useLbl, baseline ? "Use Current" : "Use");
     lv_obj_center(useLbl);
 
     lv_obj_t *laterBtn = lv_btn_create(card);
-    lv_obj_set_size(laterBtn, 104, 42);
-    lv_obj_align(laterBtn, LV_ALIGN_BOTTOM_MID, 0, -22);
+    lv_obj_set_size(laterBtn, baseline ? 118 : 104, 42);
+    lv_obj_align(laterBtn, baseline ? LV_ALIGN_BOTTOM_RIGHT : LV_ALIGN_BOTTOM_MID, baseline ? -44 : 0, -22);
     lv_obj_set_style_bg_color(laterBtn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_radius(laterBtn, 8, 0);
     lv_obj_add_event_cb(laterBtn, later_btn_event_cb, LV_EVENT_CLICKED, this);
@@ -329,15 +340,17 @@ void RatingPlugin::showRecommendationOverlay() {
     lv_label_set_text(laterLbl, "Later");
     lv_obj_center(laterLbl);
 
-    lv_obj_t *ignoreBtn = lv_btn_create(card);
-    lv_obj_set_size(ignoreBtn, 104, 42);
-    lv_obj_align(ignoreBtn, LV_ALIGN_BOTTOM_RIGHT, -24, -22);
-    lv_obj_set_style_bg_color(ignoreBtn, lv_color_hex(0x7A2424), 0);
-    lv_obj_set_style_radius(ignoreBtn, 8, 0);
-    lv_obj_add_event_cb(ignoreBtn, ignore_btn_event_cb, LV_EVENT_CLICKED, this);
-    lv_obj_t *ignoreLbl = lv_label_create(ignoreBtn);
-    lv_label_set_text(ignoreLbl, "Ignore");
-    lv_obj_center(ignoreLbl);
+    if (!baseline) {
+        lv_obj_t *ignoreBtn = lv_btn_create(card);
+        lv_obj_set_size(ignoreBtn, 104, 42);
+        lv_obj_align(ignoreBtn, LV_ALIGN_BOTTOM_RIGHT, -24, -22);
+        lv_obj_set_style_bg_color(ignoreBtn, lv_color_hex(0x7A2424), 0);
+        lv_obj_set_style_radius(ignoreBtn, 8, 0);
+        lv_obj_add_event_cb(ignoreBtn, ignore_btn_event_cb, LV_EVENT_CLICKED, this);
+        lv_obj_t *ignoreLbl = lv_label_create(ignoreBtn);
+        lv_label_set_text(ignoreLbl, "Ignore");
+        lv_obj_center(ignoreLbl);
+    }
 }
 
 void RatingPlugin::clearOverlay(bool clearShotContext) {
@@ -452,6 +465,8 @@ void RatingPlugin::useRecommendation() {
 
 void RatingPlugin::ignoreRecommendation() {
     if (_pendingRecommendationId.isEmpty())
+        return;
+    if (baselineRecommendation())
         return;
     if (!autoTuningEnabled()) {
         closeOverlay();

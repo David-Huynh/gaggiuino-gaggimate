@@ -41,9 +41,8 @@ class WebUIPlugin : public Plugin {
     void handleProfileRequest(uint32_t clientId, JsonDocument &request);
     void handleRLRequest(uint32_t clientId, JsonDocument &request);
     void handleFlushStart(uint32_t clientId, JsonDocument &request);
-    // Re-send the pending shot rating prompt (to one client on connect, or to all
-    // as a post-flush nudge). No-op when nothing is pending.
-    void sendRatingPrompt(AsyncWebSocketClient *client, bool nudge);
+    // Send/re-send the pending shot rating prompt. No-op when nothing is pending.
+    void sendRatingPrompt(AsyncWebSocketClient *client);
 
     // HTTP handlers
     void handleSettings(AsyncWebServerRequest *request) const;
@@ -109,8 +108,8 @@ class WebUIPlugin : public Plugin {
     String rlBestKnownRecipe = "";
 
     // Pending RL prompts (serialized evt payloads). WebUIPlugin is the source of
-    // truth so the WebUI can re-pop / reopen after a timeout, a minimize, a flush,
-    // or a full page reload. Empty string = nothing pending.
+    // truth so the WebUI can restore minimized prompt pills after a timeout, a
+    // minimize, or a full page reload. Empty string = nothing pending.
     String _pendRateShotId = "";
     String _pendRateRecId = "";
     String _pendRecJson = "";

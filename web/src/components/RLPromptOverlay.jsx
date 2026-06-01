@@ -98,8 +98,7 @@ export function RLPromptOverlay() {
       setPendingRating({ shot_id: message.shot_id, recommendation_id: message.recommendation_id });
       const firstSee = !seenRef.current.has(message.shot_id);
       markSeen(message.shot_id);
-      // `nudge` (post-flush reminder) re-pops even a shot we already showed.
-      if (message.nudge || firstSee) {
+      if (firstSee) {
         setView({
           kind: 'rating',
           shot_id: message.shot_id,
@@ -266,11 +265,17 @@ export function RLPromptOverlay() {
 
         {view.kind === 'recommendation' && pendingRec && (
           <div className='space-y-4'>
+            {(() => {
+              const baseline = pendingRec.mode === 'zero_observe';
+              return (
+                <>
             <div>
               <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
-                Next Shot
+                {baseline ? 'Baseline Required' : 'Next Shot'}
               </div>
-              <h2 className='text-xl font-bold'>BO Recommendation</h2>
+              <h2 className='text-xl font-bold'>
+                {baseline ? 'Pull your current recipe' : 'BO Recommendation'}
+              </h2>
             </div>
 
             <div className='grid grid-cols-1 gap-2 sm:grid-cols-3'>
@@ -293,25 +298,31 @@ export function RLPromptOverlay() {
             </div>
 
             <div className='text-base-content/70 text-sm'>
-              Grind is manual. Use saves yield and only saves grind dose when grind-by-weight is
-              enabled.
+              {baseline
+                ? 'This first shot starts the bean context. Use your current recipe or tap Later; Ignore becomes available after the baseline is recorded.'
+                : 'Grind is manual. Use saves yield and only saves grind dose when grind-by-weight is enabled.'}
             </div>
 
-            <div className='grid grid-cols-3 gap-2'>
+            <div className={`grid gap-2 ${baseline ? 'grid-cols-2' : 'grid-cols-3'}`}>
               <button type='button' className='btn btn-primary' onClick={useRecommendation}>
-                Use
+                {baseline ? 'Use Current' : 'Use'}
               </button>
               <button type='button' className='btn btn-outline' onClick={minimize}>
                 Later
               </button>
-              <button
-                type='button'
-                className='btn btn-error btn-outline'
-                onClick={ignoreRecommendation}
-              >
-                Ignore
-              </button>
+              {!baseline && (
+                <button
+                  type='button'
+                  className='btn btn-error btn-outline'
+                  onClick={ignoreRecommendation}
+                >
+                  Ignore
+                </button>
+              )}
             </div>
+                </>
+              );
+            })()}
           </div>
         )}
 

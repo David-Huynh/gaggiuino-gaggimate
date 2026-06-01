@@ -186,17 +186,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
 
         _pendRateShotId = event.getString("shot_id");
         _pendRateRecId = event.getString("recommendation_id");
-        sendRatingPrompt(nullptr, false); // pending until the shot is rated or skipped
-    });
-
-    // After a flush (utility cycle) finishes, nudge: if a shot is still unrated,
-    // re-pop the rating prompt ("remember to rate your shot"). Real-brew ends emit
-    // rl:shot:complete via MQTTPlugin already, so only nudge on utility cycles.
-    pluginManager->on("controller:brew:end", [this](Event const &event) {
-        if (event.getInt("utility") == 1 && !_pendRateShotId.isEmpty() &&
-            controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
-            sendRatingPrompt(nullptr, true);
-        }
+        sendRatingPrompt(nullptr); // pending until the shot is rated or skipped
     });
 
     pluginManager->on("rl:status:received", [this](Event const &event) {
@@ -627,7 +617,7 @@ void WebUIPlugin::setupServer() {
                 // Replay pending RL prompts so a reloaded/reconnected client restores
                 // its reopen affordance (the WebUI dedupes/minimizes by id).
                 if (!_pendRateShotId.isEmpty()) {
-                    sendRatingPrompt(client, false);
+                    sendRatingPrompt(client);
                 }
                 if (!_pendRecJson.isEmpty()) {
                     client->text(_pendRecJson);
@@ -676,7 +666,7 @@ void WebUIPlugin::stop() {
     ESP_LOGI("WebUIPlugin", "WebUIPlugin stopped (wifi disconnected)");
 }
 
-void WebUIPlugin::sendRatingPrompt(AsyncWebSocketClient *client, bool nudge) {
+void WebUIPlugin::sendRatingPrompt(AsyncWebSocketClient *client) {
     if (_pendRateShotId.isEmpty()) {
         return;
     }
@@ -684,11 +674,6 @@ void WebUIPlugin::sendRatingPrompt(AsyncWebSocketClient *client, bool nudge) {
     doc["tp"] = "evt:rl:shot-complete";
     doc["shot_id"] = _pendRateShotId;
     doc["recommendation_id"] = _pendRateRecId;
-    if (nudge) {
-        // Marks a post-flush reminder so the WebUI re-pops even a shot it already
-        // showed/minimized (a plain connect replay only restores the pill).
-        doc["nudge"] = true;
-    }
     const String payload = doc.as<String>();
     if (client) {
         client->text(payload);

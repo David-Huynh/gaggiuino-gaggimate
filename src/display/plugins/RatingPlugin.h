@@ -32,6 +32,7 @@ class RatingPlugin : public Plugin {
     void storeRecommendation(Event const &event);
     void showRecommendationOverlay();
     bool autoTuningEnabled() const;
+    bool baselineRecommendation() const;
     bool shouldPromptRecommendation() const;
     bool feedbackOverlayActive() const;
     String selectedTasteTagsCsv() const;
