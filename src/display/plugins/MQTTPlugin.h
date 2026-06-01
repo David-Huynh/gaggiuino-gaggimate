@@ -35,6 +35,8 @@ class MQTTPlugin : public Plugin {
     void clearLatestRecommendation();
     void publishRecommendationDecision(const char *decision, bool includeEditedFields);
     void publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed);
+    void publishShotCorrection(Event const &event);
+    void publishUploadRequeue(Event const &event);
     void addRecipeMetadata(JsonDocument &doc) const;
     bool isAutoTuningEnabled() const;
     bool canApplyGrindByWeightTarget() const;
@@ -90,6 +92,10 @@ class MQTTPlugin : public Plugin {
     int latestStatusLocalShotCount = 0;
     int latestStatusRatedShotCount = 0;
     int latestStatusUploadQueueCount = 0;
+    int latestStatusUploadQueueRejectedCount = 0;
+    String latestStatusUploadQueueLastRejectedId;
+    String latestStatusUploadQueueLastRejectedRecordId;
+    String latestStatusUploadQueueLastRejectedError;
     bool latestStatusCommunityUploadEnabled = false;
     String latestStatusBestKnownRecipe;
 

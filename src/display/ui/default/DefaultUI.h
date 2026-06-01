@@ -48,6 +48,10 @@ class DefaultUI {
     void retireRLContext();
     void retireRLContext(const String &contextId);
     void switchRLContext(const String &contextId);
+    void correctRLLastShotExclude();
+    void correctRLLastShotBadPrep();
+    void correctRLLastShotNotFollowed(const char *fieldName);
+    void requeueRLRejectedUploads();
     void setBrightness(int brightness) {
         if (panelDriver) {
             panelDriver->setBrightness(brightness);
@@ -130,6 +134,10 @@ class DefaultUI {
     String rlMode = "";
     int rlLocalShotCount = 0;
     int rlRatedShotCount = 0;
+    String rlLastShotId = "";
+    int rlUploadQueueRejectedCount = 0;
+    String rlUploadQueueLastRejectedRecordId = "";
+    String rlUploadQueueLastRejectedError = "";
     int rlCommunityUploadEnabled = false;
     String rlBestKnownRecipe = "";
     lv_obj_t *rlBrewPanel = nullptr;

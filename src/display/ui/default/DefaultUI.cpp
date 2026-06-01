@@ -16,6 +16,7 @@
 #include <display/ui/utils/effects.h>
 #include <algorithm>
 #include <ctime>
+#include <cstring>
 #include <utility>
 
 #include "esp_sntp.h"
@@ -220,6 +221,42 @@ static void rl_reset_cb(lv_event_t *e) {
 static void rl_retire_cb(lv_event_t *e) {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
         static_cast<DefaultUI *>(lv_event_get_user_data(e))->retireRLContext();
+    }
+}
+
+static void rl_exclude_last_shot_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->correctRLLastShotExclude();
+    }
+}
+
+static void rl_bad_prep_last_shot_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->correctRLLastShotBadPrep();
+    }
+}
+
+static void rl_not_followed_grind_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->correctRLLastShotNotFollowed("grind");
+    }
+}
+
+static void rl_not_followed_dose_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->correctRLLastShotNotFollowed("dose");
+    }
+}
+
+static void rl_not_followed_yield_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->correctRLLastShotNotFollowed("yield");
+    }
+}
+
+static void rl_requeue_uploads_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->requeueRLRejectedUploads();
     }
 }
 
@@ -438,6 +475,10 @@ void DefaultUI::init() {
         rlMode = event.getString("mode");
         rlLocalShotCount = event.getInt("local_shot_count");
         rlRatedShotCount = event.getInt("rated_shot_count");
+        rlLastShotId = event.getString("last_shot_id");
+        rlUploadQueueRejectedCount = event.getInt("upload_queue_rejected_count");
+        rlUploadQueueLastRejectedRecordId = event.getString("upload_queue_last_rejected_record_id");
+        rlUploadQueueLastRejectedError = event.getString("upload_queue_last_rejected_error");
         rlCommunityUploadEnabled = event.getInt("community_upload_enabled");
         rlBestKnownRecipe = event.getString("best_known_recipe");
         rerender = true;
@@ -899,6 +940,81 @@ void DefaultUI::switchRLContext(const String &contextId) {
     rerender = true;
 }
 
+void DefaultUI::correctRLLastShotExclude() {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlLastShotId.isEmpty()) {
+        return;
+    }
+
+    Event event;
+    event.id = "rl:shot:correction";
+    event.setString("shot_id", rlLastShotId);
+    event.setString("source", "gaggimate_lvgl");
+    event.setInt("has_exclude_from_local_optimization", 1);
+    event.setInt("exclude_from_local_optimization", 1);
+    event.setString("correction_tags", "changed_manually");
+    pluginManager->trigger(event);
+}
+
+void DefaultUI::correctRLLastShotBadPrep() {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlLastShotId.isEmpty()) {
+        return;
+    }
+
+    Event event;
+    event.id = "rl:shot:correction";
+    event.setString("shot_id", rlLastShotId);
+    event.setString("source", "gaggimate_lvgl");
+    event.setInt("has_exclude_from_local_optimization", 1);
+    event.setInt("exclude_from_local_optimization", 1);
+    event.setString("correction_tags", "bad_puck_prep,channeling_suspected");
+    pluginManager->trigger(event);
+}
+
+void DefaultUI::correctRLLastShotNotFollowed(const char *fieldName) {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlLastShotId.isEmpty()) {
+        return;
+    }
+
+    Event event;
+    event.id = "rl:shot:correction";
+    event.setString("shot_id", rlLastShotId);
+    event.setString("source", "gaggimate_lvgl");
+    String tags = "changed_manually";
+    if (strcmp(fieldName, "grind") == 0) {
+        event.setInt("has_grind_followed", 1);
+        event.setInt("grind_followed", 0);
+        tags += ",did_not_follow_grind";
+    } else if (strcmp(fieldName, "dose") == 0) {
+        event.setInt("has_dose_followed", 1);
+        event.setInt("dose_followed", 0);
+        tags += ",did_not_follow_dose";
+    } else if (strcmp(fieldName, "yield") == 0) {
+        event.setInt("has_yield_followed", 1);
+        event.setInt("yield_followed", 0);
+        tags += ",did_not_follow_yield";
+    } else {
+        return;
+    }
+    event.setString("correction_tags", tags);
+    pluginManager->trigger(event);
+}
+
+void DefaultUI::requeueRLRejectedUploads() {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlUploadQueueRejectedCount < 1) {
+        return;
+    }
+
+    Event event;
+    event.id = "rl:upload:requeue";
+    event.setString("source", "gaggimate_lvgl");
+    event.setInt("limit", 50);
+    pluginManager->trigger(event);
+}
+
 void DefaultUI::showRLAutoTuningOverlay() {
     Settings const &settings = controller->getSettings();
     if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
@@ -939,6 +1055,22 @@ void DefaultUI::showRLAutoTuningOverlay() {
     lv_obj_set_width(rl_make_label(card, line), 388);
     snprintf(line, sizeof(line), "Shots: %d local / %d rated", rlLocalShotCount, rlRatedShotCount);
     lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Last shot: %s", rlLastShotId.isEmpty() ? "none" : rlLastShotId.c_str());
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Rejected uploads: %d", rlUploadQueueRejectedCount);
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    if (rlUploadQueueRejectedCount > 0) {
+        snprintf(
+            line,
+            sizeof(line),
+            "Latest reject: %s",
+            rlUploadQueueLastRejectedRecordId.isEmpty() ? "unknown" : rlUploadQueueLastRejectedRecordId.c_str());
+        lv_obj_set_width(rl_make_label(card, line), 388);
+        if (!rlUploadQueueLastRejectedError.isEmpty()) {
+            snprintf(line, sizeof(line), "Error: %s", rlUploadQueueLastRejectedError.c_str());
+            lv_obj_set_width(rl_make_label(card, line), 388);
+        }
+    }
     snprintf(line, sizeof(line), "Best recipe: %s", rlBestKnownRecipe.isEmpty() ? "none yet" : rlBestKnownRecipe.c_str());
     lv_obj_set_width(rl_make_label(card, line), 388);
 
@@ -979,6 +1111,46 @@ void DefaultUI::showRLAutoTuningOverlay() {
     lv_obj_set_flex_align(row4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(row4, LV_OBJ_FLAG_SCROLLABLE);
     rl_make_button(row4, "Retire Bean", rl_retire_cb, this);
+    lv_obj_t *retryBtn = rl_make_button(row4, "Retry Uploads", rl_requeue_uploads_cb, this);
+    if (rlUploadQueueRejectedCount < 1) {
+        lv_obj_add_state(retryBtn, LV_STATE_DISABLED);
+    }
+
+    lv_obj_t *correctionTitle = rl_make_label(card, "Last Shot Correction", &lv_font_montserrat_14);
+    lv_obj_set_width(correctionTitle, 388);
+
+    lv_obj_t *row5 = lv_obj_create(card);
+    lv_obj_remove_style_all(row5);
+    lv_obj_set_size(row5, 388, 38);
+    lv_obj_set_flex_flow(row5, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row5, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row5, 8, 0);
+    lv_obj_clear_flag(row5, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *excludeBtn = rl_make_button(row5, "Exclude", rl_exclude_last_shot_cb, this);
+    lv_obj_t *badPrepBtn = rl_make_button(row5, "Bad Prep", rl_bad_prep_last_shot_cb, this);
+    if (rlLastShotId.isEmpty()) {
+        lv_obj_add_state(excludeBtn, LV_STATE_DISABLED);
+        lv_obj_add_state(badPrepBtn, LV_STATE_DISABLED);
+    }
+
+    lv_obj_t *row6 = lv_obj_create(card);
+    lv_obj_remove_style_all(row6);
+    lv_obj_set_size(row6, 388, 38);
+    lv_obj_set_flex_flow(row6, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row6, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row6, 8, 0);
+    lv_obj_clear_flag(row6, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *grindBtn = rl_make_button(row6, "No Grind", rl_not_followed_grind_cb, this);
+    lv_obj_t *doseBtn = rl_make_button(row6, "No Dose", rl_not_followed_dose_cb, this);
+    lv_obj_t *yieldBtn = rl_make_button(row6, "No Yield", rl_not_followed_yield_cb, this);
+    lv_obj_set_size(grindBtn, 118, 34);
+    lv_obj_set_size(doseBtn, 118, 34);
+    lv_obj_set_size(yieldBtn, 118, 34);
+    if (rlLastShotId.isEmpty()) {
+        lv_obj_add_state(grindBtn, LV_STATE_DISABLED);
+        lv_obj_add_state(doseBtn, LV_STATE_DISABLED);
+        lv_obj_add_state(yieldBtn, LV_STATE_DISABLED);
+    }
 }
 
 void DefaultUI::showRLContextPickerOverlay() {

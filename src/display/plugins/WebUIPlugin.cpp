@@ -206,6 +206,10 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlLocalShotCount = event.getInt("local_shot_count");
         rlRatedShotCount = event.getInt("rated_shot_count");
         rlUploadQueueCount = event.getInt("upload_queue_count");
+        rlUploadQueueRejectedCount = event.getInt("upload_queue_rejected_count");
+        rlUploadQueueLastRejectedId = event.getString("upload_queue_last_rejected_id");
+        rlUploadQueueLastRejectedRecordId = event.getString("upload_queue_last_rejected_record_id");
+        rlUploadQueueLastRejectedError = event.getString("upload_queue_last_rejected_error");
         rlCommunityUploadEnabled = event.getInt("community_upload_enabled") > 0;
         rlBestKnownRecipe = event.getString("best_known_recipe");
 
@@ -223,6 +227,10 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlLocalShotCount"] = rlLocalShotCount;
         doc["rlRatedShotCount"] = rlRatedShotCount;
         doc["rlUploadQueueCount"] = rlUploadQueueCount;
+        doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
+        doc["rlUploadQueueLastRejectedId"] = rlUploadQueueLastRejectedId;
+        doc["rlUploadQueueLastRejectedRecordId"] = rlUploadQueueLastRejectedRecordId;
+        doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
         doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
         doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
         ws.textAll(doc.as<String>());
@@ -746,6 +754,84 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                             _pendRecJson = ""; // resolved — drop the reopen affordance
                         }
                     }
+                } else if (msgType == "req:rl:shot:correction") {
+                    JsonDocument resp;
+                    resp["tp"] = "res:rl:shot:correction";
+                    resp["rid"] = doc["rid"];
+                    if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+                        resp["error"] = F("Auto Tuning is disabled");
+                    } else {
+                        String shotId = doc["shot_id"].as<String>();
+                        if (shotId.isEmpty()) {
+                            shotId = rlLastShotId;
+                        }
+                        if (shotId.isEmpty()) {
+                            resp["error"] = F("No shot available to correct");
+                        } else {
+                            Event event;
+                            event.id = "rl:shot:correction";
+                            event.setString("shot_id", shotId);
+                            event.setString("source", "gaggimate_webui");
+                            if (doc["exclude_from_local_optimization"].is<bool>()) {
+                                event.setInt("has_exclude_from_local_optimization", 1);
+                                event.setInt("exclude_from_local_optimization",
+                                             doc["exclude_from_local_optimization"].as<bool>() ? 1 : 0);
+                            }
+                            if (doc["shot_type"].is<String>()) {
+                                event.setString("shot_type", doc["shot_type"].as<String>());
+                            }
+                            if (doc["grind_followed"].is<bool>()) {
+                                event.setInt("has_grind_followed", 1);
+                                event.setInt("grind_followed", doc["grind_followed"].as<bool>() ? 1 : 0);
+                            }
+                            if (doc["dose_followed"].is<bool>()) {
+                                event.setInt("has_dose_followed", 1);
+                                event.setInt("dose_followed", doc["dose_followed"].as<bool>() ? 1 : 0);
+                            }
+                            if (doc["yield_followed"].is<bool>()) {
+                                event.setInt("has_yield_followed", 1);
+                                event.setInt("yield_followed", doc["yield_followed"].as<bool>() ? 1 : 0);
+                            }
+                            if (doc["correction_tags"].is<JsonArray>()) {
+                                String tags;
+                                for (JsonVariant tag : doc["correction_tags"].as<JsonArray>()) {
+                                    String value = tag.as<String>();
+                                    value.trim();
+                                    if (value.isEmpty()) {
+                                        continue;
+                                    }
+                                    if (!tags.isEmpty()) {
+                                        tags += ",";
+                                    }
+                                    tags += value;
+                                }
+                                event.setString("correction_tags", tags);
+                            }
+                            pluginManager->trigger(event);
+                            resp["success"] = true;
+                            resp["shot_id"] = shotId;
+                        }
+                    }
+                    String msg;
+                    serializeJson(resp, msg);
+                    client->text(msg);
+                } else if (msgType == "req:rl:upload:requeue") {
+                    JsonDocument resp;
+                    resp["tp"] = "res:rl:upload:requeue";
+                    resp["rid"] = doc["rid"];
+                    if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+                        resp["error"] = F("Auto Tuning is disabled");
+                    } else {
+                        Event event;
+                        event.id = "rl:upload:requeue";
+                        event.setString("source", "gaggimate_webui");
+                        event.setInt("limit", doc["limit"] | 50);
+                        pluginManager->trigger(event);
+                        resp["success"] = true;
+                    }
+                    String msg;
+                    serializeJson(resp, msg);
+                    client->text(msg);
                 } else if (msgType == "req:rl:rating") {
                     if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
                         String shotId = doc["shot_id"].as<String>();
@@ -1307,6 +1393,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlLocalShotCount"] = rlLocalShotCount;
     doc["rlRatedShotCount"] = rlRatedShotCount;
     doc["rlUploadQueueCount"] = rlUploadQueueCount;
+    doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
+    doc["rlUploadQueueLastRejectedId"] = rlUploadQueueLastRejectedId;
+    doc["rlUploadQueueLastRejectedRecordId"] = rlUploadQueueLastRejectedRecordId;
+    doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
     doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
     doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
     doc["homeAssistant"] = settings.isHomeAssistant();

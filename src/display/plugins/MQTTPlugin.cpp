@@ -10,8 +10,8 @@
 
 const String LOG_TAG = F("MQTTPlugin");
 
-static void addTasteTags(JsonDocument &doc, const String &csvTags) {
-    JsonArray tags = doc["taste_tags"].to<JsonArray>();
+static void addCsvTags(JsonDocument &doc, const char *field, const String &csvTags) {
+    JsonArray tags = doc[field].to<JsonArray>();
     int start = 0;
     while (start < csvTags.length()) {
         int end = csvTags.indexOf(',', start);
@@ -26,6 +26,8 @@ static void addTasteTags(JsonDocument &doc, const String &csvTags) {
         start = end + 1;
     }
 }
+
+static void addTasteTags(JsonDocument &doc, const String &csvTags) { addCsvTags(doc, "taste_tags", csvTags); }
 
 bool MQTTPlugin::connect(Controller *controller) {
     const Settings settings = controller->getSettings();
@@ -301,6 +303,10 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusLocalShotCount = doc["local_shot_count"] | 0;
     latestStatusRatedShotCount = doc["rated_shot_count"] | 0;
     latestStatusUploadQueueCount = doc["upload_queue_count"] | 0;
+    latestStatusUploadQueueRejectedCount = doc["upload_queue_rejected_count"] | 0;
+    latestStatusUploadQueueLastRejectedId = doc["upload_queue_last_rejected_id"].as<String>();
+    latestStatusUploadQueueLastRejectedRecordId = doc["upload_queue_last_rejected_record_id"].as<String>();
+    latestStatusUploadQueueLastRejectedError = doc["upload_queue_last_rejected_error"].as<String>();
     latestStatusCommunityUploadEnabled = doc["community_upload_enabled"] | false;
     latestStatusBestKnownRecipe = "";
     if (doc["best_known_recipe"].is<JsonObject>()) {
@@ -332,6 +338,10 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setInt("local_shot_count", latestStatusLocalShotCount);
     event.setInt("rated_shot_count", latestStatusRatedShotCount);
     event.setInt("upload_queue_count", latestStatusUploadQueueCount);
+    event.setInt("upload_queue_rejected_count", latestStatusUploadQueueRejectedCount);
+    event.setString("upload_queue_last_rejected_id", latestStatusUploadQueueLastRejectedId);
+    event.setString("upload_queue_last_rejected_record_id", latestStatusUploadQueueLastRejectedRecordId);
+    event.setString("upload_queue_last_rejected_error", latestStatusUploadQueueLastRejectedError);
     event.setInt("community_upload_enabled", latestStatusCommunityUploadEnabled ? 1 : 0);
     event.setString("best_known_recipe", latestStatusBestKnownRecipe);
     pluginManager->trigger(event);
@@ -476,6 +486,67 @@ void MQTTPlugin::publishRecommendationApply(bool doseApplied, bool yieldApplied,
     publish("rl/recommendation/apply", json.c_str());
 }
 
+void MQTTPlugin::publishShotCorrection(Event const &event) {
+    if (!isAutoTuningEnabled())
+        return;
+
+    String shotId = event.getString("shot_id");
+    if (shotId.isEmpty()) {
+        shotId = latestStatusLastShotId;
+    }
+    if (shotId.isEmpty()) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["event_type"] = "shot_correction";
+    doc["schema_version"] = 1;
+    doc["shot_id"] = shotId;
+    doc["machine_id"] = machineId();
+    doc["source"] = event.getString("source").isEmpty() ? "gaggimate_mqtt" : event.getString("source");
+    doc["timestamp"] = static_cast<long>(std::time(nullptr));
+
+    if (event.getInt("has_exclude_from_local_optimization") == 1) {
+        doc["exclude_from_local_optimization"] = event.getInt("exclude_from_local_optimization") == 1;
+    }
+    if (!event.getString("shot_type").isEmpty()) {
+        doc["shot_type"] = event.getString("shot_type");
+    }
+    if (event.getInt("has_grind_followed") == 1) {
+        doc["grind_followed"] = event.getInt("grind_followed") == 1;
+    }
+    if (event.getInt("has_dose_followed") == 1) {
+        doc["dose_followed"] = event.getInt("dose_followed") == 1;
+    }
+    if (event.getInt("has_yield_followed") == 1) {
+        doc["yield_followed"] = event.getInt("yield_followed") == 1;
+    }
+    addCsvTags(doc, "correction_tags", event.getString("correction_tags"));
+
+    String json;
+    serializeJson(doc, json);
+    publish("rl/shot/correction", json.c_str());
+}
+
+void MQTTPlugin::publishUploadRequeue(Event const &event) {
+    if (!isAutoTuningEnabled())
+        return;
+
+    JsonDocument doc;
+    doc["event_type"] = "upload_queue_maintenance";
+    doc["schema_version"] = 1;
+    doc["machine_id"] = machineId();
+    doc["action"] = "requeue_valid_rejected";
+    doc["limit"] = event.getInt("limit") > 0 ? event.getInt("limit") : 50;
+    doc["source"] = event.getString("source").isEmpty() ? "gaggimate_mqtt" : event.getString("source");
+    doc["timestamp"] = static_cast<long>(std::time(nullptr));
+    addRecipeMetadata(doc);
+
+    String json;
+    serializeJson(doc, json);
+    publish("rl/upload/requeue", json.c_str());
+}
+
 void MQTTPlugin::addRecipeMetadata(JsonDocument &doc) const {
     const float dose = doseTargetG();
     const float targetYield = targetYieldG();
@@ -611,6 +682,10 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("rl:recommendation:apply", [this](Event const &) { applyLatestRecommendation(); });
 
     pm->on("rl:recommendation:ignore", [this](Event const &) { ignoreLatestRecommendation(); });
+
+    pm->on("rl:shot:correction", [this](Event const &event) { publishShotCorrection(event); });
+
+    pm->on("rl:upload:requeue", [this](Event const &event) { publishUploadRequeue(event); });
 
     pm->on("rl:settings:changed", [this](Event const &) { publishMachineState("idle"); });
 

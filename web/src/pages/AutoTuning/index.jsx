@@ -8,6 +8,9 @@ import { faPause } from '@fortawesome/free-solid-svg-icons/faPause';
 import { faRotate } from '@fortawesome/free-solid-svg-icons/faRotate';
 import { faChevronRight } from '@fortawesome/free-solid-svg-icons/faChevronRight';
 import { faTrashCan } from '@fortawesome/free-solid-svg-icons/faTrashCan';
+import { faBan } from '@fortawesome/free-solid-svg-icons/faBan';
+import { faTriangleExclamation } from '@fortawesome/free-solid-svg-icons/faTriangleExclamation';
+import { faUpload } from '@fortawesome/free-solid-svg-icons/faUpload';
 
 function StatusCell({ label, value }) {
   return (
@@ -139,6 +142,11 @@ export function AutoTuning() {
         <StatusCell label='Latest recommendation' value={settings?.rlLastRecommendationId} />
         <StatusCell label='Local shots' value={(settings?.rlLocalShotCount ?? 0).toString()} />
         <StatusCell label='Rated shots' value={(settings?.rlRatedShotCount ?? 0).toString()} />
+        <StatusCell label='Upload queued' value={(settings?.rlUploadQueueCount ?? 0).toString()} />
+        <StatusCell
+          label='Upload rejected'
+          value={(settings?.rlUploadQueueRejectedCount ?? 0).toString()}
+        />
         <StatusCell label='Best known recipe' value={bestRecipeText(settings)} />
       </div>
 
@@ -180,6 +188,116 @@ export function AutoTuning() {
             <FontAwesomeIcon icon={faRotate} />
             Reset Dial-In
           </button>
+        </div>
+      </div>
+
+      <div className='border-base-300 bg-base-100 rounded-md border p-4'>
+        <div className='flex flex-col gap-3 lg:flex-row lg:items-center'>
+          <div className='min-w-0 flex-1'>
+            <h2 className='text-lg font-semibold'>Upload Recovery</h2>
+            <div className='text-base-content/60 mt-1 truncate text-sm'>
+              {settings?.rlUploadQueueLastRejectedRecordId
+                ? `${settings.rlUploadQueueLastRejectedRecordId}: ${settings?.rlUploadQueueLastRejectedError || 'Rejected'}`
+                : 'No rejected upload snapshots'}
+            </div>
+          </div>
+          <button
+            type='button'
+            className='btn btn-outline btn-sm'
+            disabled={busy || (settings?.rlUploadQueueRejectedCount ?? 0) < 1}
+            onClick={() => run('req:rl:upload:requeue', { limit: 50 })}
+          >
+            <FontAwesomeIcon icon={faUpload} />
+            Retry Valid
+          </button>
+        </div>
+      </div>
+
+      <div className='border-base-300 bg-base-100 rounded-md border p-4'>
+        <div className='flex flex-col gap-3 lg:flex-row lg:items-center'>
+          <div className='min-w-0 flex-1'>
+            <h2 className='text-lg font-semibold'>Last Shot Correction</h2>
+            <div className='text-base-content/60 mt-1 truncate text-sm'>
+              {settings?.rlLastShotId || 'No shot available yet'}
+            </div>
+          </div>
+          <div className='grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-5'>
+            <button
+              type='button'
+              className='btn btn-outline btn-sm'
+              disabled={busy || !settings?.rlLastShotId}
+              onClick={() =>
+                run('req:rl:shot:correction', {
+                  shot_id: settings?.rlLastShotId,
+                  exclude_from_local_optimization: true,
+                  correction_tags: ['changed_manually'],
+                })
+              }
+            >
+              <FontAwesomeIcon icon={faBan} />
+              Exclude
+            </button>
+            <button
+              type='button'
+              className='btn btn-outline btn-sm'
+              disabled={busy || !settings?.rlLastShotId}
+              onClick={() =>
+                run('req:rl:shot:correction', {
+                  shot_id: settings?.rlLastShotId,
+                  exclude_from_local_optimization: true,
+                  correction_tags: ['bad_puck_prep', 'channeling_suspected'],
+                })
+              }
+            >
+              <FontAwesomeIcon icon={faTriangleExclamation} />
+              Bad Prep
+            </button>
+            <button
+              type='button'
+              className='btn btn-outline btn-sm'
+              disabled={busy || !settings?.rlLastShotId}
+              onClick={() =>
+                run('req:rl:shot:correction', {
+                  shot_id: settings?.rlLastShotId,
+                  grind_followed: false,
+                  correction_tags: ['did_not_follow_grind', 'changed_manually'],
+                })
+              }
+            >
+              <FontAwesomeIcon icon={faBan} />
+              Grind
+            </button>
+            <button
+              type='button'
+              className='btn btn-outline btn-sm'
+              disabled={busy || !settings?.rlLastShotId}
+              onClick={() =>
+                run('req:rl:shot:correction', {
+                  shot_id: settings?.rlLastShotId,
+                  dose_followed: false,
+                  correction_tags: ['did_not_follow_dose', 'changed_manually'],
+                })
+              }
+            >
+              <FontAwesomeIcon icon={faBan} />
+              Dose
+            </button>
+            <button
+              type='button'
+              className='btn btn-outline btn-sm'
+              disabled={busy || !settings?.rlLastShotId}
+              onClick={() =>
+                run('req:rl:shot:correction', {
+                  shot_id: settings?.rlLastShotId,
+                  yield_followed: false,
+                  correction_tags: ['did_not_follow_yield', 'changed_manually'],
+                })
+              }
+            >
+              <FontAwesomeIcon icon={faBan} />
+              Yield
+            </button>
+          </div>
         </div>
       </div>
 

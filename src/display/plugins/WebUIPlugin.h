@@ -104,6 +104,10 @@ class WebUIPlugin : public Plugin {
     int rlLocalShotCount = 0;
     int rlRatedShotCount = 0;
     int rlUploadQueueCount = 0;
+    int rlUploadQueueRejectedCount = 0;
+    String rlUploadQueueLastRejectedId = "";
+    String rlUploadQueueLastRejectedRecordId = "";
+    String rlUploadQueueLastRejectedError = "";
     bool rlCommunityUploadEnabled = false;
     String rlBestKnownRecipe = "";
 
