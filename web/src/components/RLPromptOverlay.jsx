@@ -256,12 +256,12 @@ export function RLPromptOverlay() {
       >
         <button
           type='button'
-          className='btn btn-ghost btn-sm btn-circle absolute right-2 top-2'
+          className='btn btn-ghost btn-xs absolute right-2 top-2'
           onClick={minimize}
           aria-label='Minimize'
           title='Minimize'
         >
-          ✕
+          Minimize
         </button>
 
         {view.kind === 'recommendation' && pendingRec && (
@@ -322,6 +322,9 @@ export function RLPromptOverlay() {
                 Shot Complete
               </div>
               <h2 className='text-xl font-bold'>Taste?</h2>
+              <p className='text-base-content/60 text-sm'>
+                You can rate this shot later from shot history.
+              </p>
             </div>
 
             <div className='grid grid-cols-5 gap-2'>
@@ -354,6 +357,9 @@ export function RLPromptOverlay() {
                 Optional
               </div>
               <h2 className='text-xl font-bold'>What was off?</h2>
+              <p className='text-base-content/60 text-sm'>
+                You can rate this shot later from shot history.
+              </p>
             </div>
 
             <div className='grid grid-cols-2 gap-2'>

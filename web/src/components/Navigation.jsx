@@ -15,7 +15,7 @@ import { faCircleChevronRight } from '@fortawesome/free-solid-svg-icons/faCircle
 import { GmLogoIcon } from '../pages/ShotAnalyzer/components/SourceMarker.jsx';
 import { faGithub } from '@fortawesome/free-brands-svg-icons/faGithub';
 import { faDiscord } from '@fortawesome/free-brands-svg-icons/faDiscord';
-import { useCallback, useEffect, useMemo, useRef } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { hardwareScaleDisabled } from '../config/features.js';
 
 // List of random icons to display - add your icons here (SVG strings, text, or emojis)
@@ -42,40 +42,45 @@ function getRandomIcon() {
   return RANDOM_ICONS[randomIndex];
 }
 
-const NAVIGATION_SECTIONS = [
-  {
-    id: 'dashboard',
-    showDivider: true,
-    items: [{ label: 'Dashboard', link: '/', icon: faHome }],
-  },
-  {
-    id: 'analysis',
-    showDivider: true,
-    items: [
-      { label: 'Profiles', link: '/profiles', icon: faList },
-      { label: 'Shot History', link: '/history', icon: faTimeline },
-      { label: 'Shot Analyzer', link: '/analyzer', icon: faMagnifyingGlassChart, isNew: true },
-      { label: 'Statistics', link: '/statistics', icon: faChartSimple, isNew: true },
-    ],
-  },
-  {
-    id: 'devices',
-    showDivider: true,
-    items: [
-      { label: 'PID Autotune', link: '/pidtune', icon: faTemperatureHalf },
-      { label: 'Bluetooth Devices', link: '/scales', icon: faBluetoothB },
-      ...(!hardwareScaleDisabled
-        ? [{ label: 'Scale Calibration', link: '/scale-calibration', icon: faWeightScale }]
-        : []),
-      { label: 'Settings', link: '/settings', icon: faCog },
-    ],
-  },
-  {
-    id: 'updates',
-    showDivider: true,
-    items: [{ label: 'System & Updates', link: '/ota', icon: faRotate }],
-  },
-];
+function buildNavigationSections(autoTuningVisible) {
+  return [
+    {
+      id: 'dashboard',
+      showDivider: true,
+      items: [{ label: 'Dashboard', link: '/', icon: faHome }],
+    },
+    {
+      id: 'analysis',
+      showDivider: true,
+      items: [
+        { label: 'Profiles', link: '/profiles', icon: faList },
+        ...(autoTuningVisible
+          ? [{ label: 'Auto Tuning', link: '/autotuning', icon: faChartSimple }]
+          : []),
+        { label: 'Shot History', link: '/history', icon: faTimeline },
+        { label: 'Shot Analyzer', link: '/analyzer', icon: faMagnifyingGlassChart, isNew: true },
+        { label: 'Statistics', link: '/statistics', icon: faChartSimple, isNew: true },
+      ],
+    },
+    {
+      id: 'devices',
+      showDivider: true,
+      items: [
+        { label: 'PID Autotune', link: '/pidtune', icon: faTemperatureHalf },
+        { label: 'Bluetooth Devices', link: '/scales', icon: faBluetoothB },
+        ...(!hardwareScaleDisabled
+          ? [{ label: 'Scale Calibration', link: '/scale-calibration', icon: faWeightScale }]
+          : []),
+        { label: 'Settings', link: '/settings', icon: faCog },
+      ],
+    },
+    {
+      id: 'updates',
+      showDivider: true,
+      items: [{ label: 'System & Updates', link: '/ota', icon: faRotate }],
+    },
+  ];
+}
 
 function MenuItem({ collapsed = false, icon, isNew = false, label, link }) {
   const { path } = useLocation();
@@ -111,9 +116,29 @@ function MenuItem({ collapsed = false, icon, isNew = false, label, link }) {
 }
 
 export function Navigation({ collapsed = false, onToggleCollapsed }) {
+  const [autoTuningVisible, setAutoTuningVisible] = useState(false);
   // Compute the icon once per mount so the avatar doesn't reshuffle on every render.
   const randomIcon = useMemo(() => getRandomIcon(), []);
+  const navigationSections = useMemo(
+    () => buildNavigationSections(autoTuningVisible),
+    [autoTuningVisible],
+  );
   const loc = useLocation();
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/settings')
+      .then(response => response.json())
+      .then(settings => {
+        if (!cancelled) {
+          setAutoTuningVisible(!!settings.homeAssistant && !!settings.rlRatingEnabled);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Track the previous route so the collapse-on-navigation effect only fires
   // when the route actually changes, not when `collapsed` flips back to false
@@ -229,7 +254,7 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
               )}
             </div>
           </div>
-          {NAVIGATION_SECTIONS.map(section => (
+          {navigationSections.map(section => (
             <div key={section.id}>
               {section.showDivider ? <hr className='h-5 border-0' /> : null}
               <div className='space-y-1.5'>

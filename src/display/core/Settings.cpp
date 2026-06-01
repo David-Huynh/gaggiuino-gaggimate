@@ -51,6 +51,11 @@ Settings::Settings() {
     historyIndex = preferences.getInt("hi", 0);
     autowakeupEnabled = preferences.getBool("ab_en", false);
     rlRatingEnabled = preferences.getBool("rl_rate", false);
+    rlLocalOptimizationEnabled = preferences.getBool("rl_local", true);
+    rlOptimizationPaused = preferences.getBool("rl_pause", false);
+    rlBeanContextId = preferences.getString("rl_ctx_id", "");
+    rlBeanContextName = preferences.getString("rl_ctx_nm", "");
+    rlBeanContextsJson = preferences.getString("rl_ctxs", "[]");
 
     // Load schedule format: "time1|days1;time2|days2" where days is 7-bit string (e.g., "1111100" for weekdays only)
     String schedulesStr = preferences.getString("ab_schedules", "");
@@ -281,6 +286,31 @@ void Settings::setHomeAssistant(const bool homeAssistant) {
 
 void Settings::setRLRatingEnabled(const bool enabled) {
     this->rlRatingEnabled = enabled;
+    save();
+}
+
+void Settings::setRLLocalOptimizationEnabled(const bool enabled) {
+    this->rlLocalOptimizationEnabled = enabled;
+    save();
+}
+
+void Settings::setRLOptimizationPaused(const bool paused) {
+    this->rlOptimizationPaused = paused;
+    save();
+}
+
+void Settings::setRLBeanContextId(const String &contextId) {
+    this->rlBeanContextId = contextId;
+    save();
+}
+
+void Settings::setRLBeanContextName(const String &contextName) {
+    this->rlBeanContextName = contextName;
+    save();
+}
+
+void Settings::setRLBeanContextsJson(const String &contextsJson) {
+    this->rlBeanContextsJson = contextsJson;
     save();
 }
 
@@ -599,6 +629,11 @@ void Settings::doSave() {
     preferences.putInt("hi", historyIndex);
     preferences.putBool("ab_en", autowakeupEnabled);
     preferences.putBool("rl_rate", rlRatingEnabled);
+    preferences.putBool("rl_local", rlLocalOptimizationEnabled);
+    preferences.putBool("rl_pause", rlOptimizationPaused);
+    preferences.putString("rl_ctx_id", rlBeanContextId);
+    preferences.putString("rl_ctx_nm", rlBeanContextName);
+    preferences.putString("rl_ctxs", rlBeanContextsJson);
 
     // Save schedule format
     String schedulesForSave = "";

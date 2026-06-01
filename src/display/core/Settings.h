@@ -133,6 +133,11 @@ class Settings {
     long getScaleOffset1() const { return scaleOffset1; }
     long getScaleOffset2() const { return scaleOffset2; }
     bool isRLRatingEnabled() const { return rlRatingEnabled; }
+    bool isRLLocalOptimizationEnabled() const { return rlLocalOptimizationEnabled; }
+    bool isRLOptimizationPaused() const { return rlOptimizationPaused; }
+    String getRLBeanContextId() const { return rlBeanContextId; }
+    String getRLBeanContextName() const { return rlBeanContextName; }
+    String getRLBeanContextsJson() const { return rlBeanContextsJson; }
     void setTargetSteamTemp(int target_steam_temp);
     void setTargetWaterTemp(int target_water_temp);
     void setTemperatureOffset(int temperature_offset);
@@ -203,6 +208,11 @@ class Settings {
     void setButtonBehavior(int index, String behavior);
     void setButtonBehaviorList(const std::vector<String> &behavior_list);
     void setRLRatingEnabled(bool enabled);
+    void setRLLocalOptimizationEnabled(bool enabled);
+    void setRLOptimizationPaused(bool paused);
+    void setRLBeanContextId(const String &contextId);
+    void setRLBeanContextName(const String &contextName);
+    void setRLBeanContextsJson(const String &contextsJson);
     void setScaleSource(int scale_source);
     // Invoked AFTER the new value is stored and the save flag is set. Fires on
     // every setScaleSource() call, even when the value is unchanged, so the
@@ -296,6 +306,11 @@ class Settings {
     int altRelayFunction = ALT_RELAY_GRIND; // Default to grind
     std::vector<String> buttonBehavior;
     bool rlRatingEnabled = false;
+    bool rlLocalOptimizationEnabled = true;
+    bool rlOptimizationPaused = false;
+    String rlBeanContextId = "";
+    String rlBeanContextName = "";
+    String rlBeanContextsJson = "[]";
 
     // Scale settings
     int scaleSource = 0; // brew/general source: 0=AUTO, 1=BLE, 2=HW, 3=Predictive, 4=OFF

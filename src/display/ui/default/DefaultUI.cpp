@@ -1,5 +1,6 @@
 #include "DefaultUI.h"
 
+#include <ArduinoJson.h>
 #include <WiFi.h>
 #include <display/core/Controller.h>
 #include <display/core/process/BrewProcess.h>
@@ -13,11 +14,237 @@
 #include <display/ui/default/lvgl/ui_theme_manager.h>
 #include <display/ui/default/lvgl/ui_themes.h>
 #include <display/ui/utils/effects.h>
+#include <algorithm>
+#include <ctime>
 #include <utility>
 
 #include "esp_sntp.h"
 
 static EffectManager effect_mgr;
+
+struct RLContextButtonData {
+    DefaultUI *ui;
+    String id;
+    bool retire;
+};
+
+static String rl_default_context_name() {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "Bean %lu", static_cast<unsigned long>(std::time(nullptr)));
+    return String(buffer);
+}
+
+static String rl_make_context_id(const String &name) {
+    String id = name;
+    id.toLowerCase();
+    id.replace(" ", "_");
+    id.replace("/", "_");
+    id.replace("\\", "_");
+    id.replace(":", "_");
+    id.replace("\"", "");
+    if (id.isEmpty()) {
+        id = "bean";
+    }
+    return "bean_" + id + "_" + String(static_cast<unsigned long>(std::time(nullptr))) + "_" +
+           String(static_cast<unsigned long>(millis()));
+}
+
+static JsonArray rl_load_contexts(JsonDocument &doc, const String &rawJson) {
+    DeserializationError error = deserializeJson(doc, rawJson);
+    if (error || !doc.is<JsonArray>()) {
+        doc.clear();
+        return doc.to<JsonArray>();
+    }
+    return doc.as<JsonArray>();
+}
+
+static JsonObject rl_find_context(JsonArray contexts, const String &id) {
+    for (JsonObject context : contexts) {
+        if (context["id"].as<String>() == id) {
+            return context;
+        }
+    }
+    return JsonObject();
+}
+
+static int rl_current_bag_index(JsonArray contexts, const String &name) {
+    int bag = 0;
+    for (JsonObject context : contexts) {
+        if (context["name"].as<String>() == name) {
+            bag = std::max(bag, context["bag_index"] | 0);
+        }
+    }
+    return bag;
+}
+
+static void rl_mark_other_contexts_available(JsonArray contexts, const String &activeId) {
+    for (JsonObject context : contexts) {
+        if (context["id"].as<String>() != activeId && context["status"].as<String>() == "active") {
+            context["status"] = "available";
+        }
+    }
+}
+
+static void rl_add_context(JsonArray contexts, const String &id, const String &name, int bagIndex, const char *status) {
+    JsonObject context = contexts.add<JsonObject>();
+    context["id"] = id;
+    context["name"] = name;
+    context["bag_index"] = bagIndex;
+    context["status"] = status;
+    context["created_at"] = static_cast<long>(std::time(nullptr));
+}
+
+static void rl_persist_contexts(Settings &settings, JsonDocument &doc) {
+    String json;
+    serializeJson(doc, json);
+    settings.setRLBeanContextsJson(json);
+}
+
+static void rl_emit_context_changed(PluginManager *pluginManager) {
+    if (pluginManager) {
+        pluginManager->trigger("rl:settings:changed");
+    }
+}
+
+static lv_obj_t *rl_make_button(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *userData) {
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 148, 34);
+    lv_obj_set_style_radius(btn, 7, 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xC8860A), LV_STATE_PRESSED);
+    if (cb) {
+        lv_obj_add_event_cb(btn, cb, LV_EVENT_ALL, userData);
+    }
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+    return btn;
+}
+
+static lv_obj_t *rl_make_label(lv_obj_t *parent, const char *text, const lv_font_t *font = &lv_font_montserrat_14) {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xF5F5F5), 0);
+    lv_obj_set_style_text_font(label, font, 0);
+    return label;
+}
+
+static lv_obj_t *rl_make_overlay_card() {
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(overlay, 480, 480);
+    lv_obj_set_align(overlay, LV_ALIGN_CENTER);
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    lv_obj_set_size(card, 420, 420);
+    lv_obj_set_align(card, LV_ALIGN_CENTER);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x171717), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x4A4A4A), 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+    return overlay;
+}
+
+static lv_obj_t *rl_overlay_card(lv_obj_t *overlay) {
+    return lv_obj_get_child(overlay, 0);
+}
+
+static void rl_close_overlay_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(e));
+    if (ui) {
+        ui->markDirty();
+    }
+    lv_obj_t *overlay = static_cast<lv_obj_t *>(lv_event_get_current_target(e));
+    while (overlay && lv_obj_get_parent(overlay) != lv_layer_top()) {
+        overlay = lv_obj_get_parent(overlay);
+    }
+    if (overlay) {
+        lv_obj_del(overlay);
+    }
+}
+
+static void rl_show_overlay_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->showRLAutoTuningOverlay();
+    }
+}
+
+static void rl_show_contexts_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->showRLContextPickerOverlay();
+    }
+}
+
+static void rl_toggle_local_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->toggleRLLocalOptimization();
+    }
+}
+
+static void rl_toggle_pause_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->toggleRLOptimizationPaused();
+    }
+}
+
+static void rl_new_bean_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->startRLNewBean();
+    }
+}
+
+static void rl_new_bag_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->startRLNewBag();
+    }
+}
+
+static void rl_reset_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->resetRLDialIn();
+    }
+}
+
+static void rl_retire_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->retireRLContext();
+    }
+}
+
+static void rl_context_select_cb(lv_event_t *e) {
+    auto *data = static_cast<RLContextButtonData *>(lv_event_get_user_data(e));
+    if (!data) {
+        return;
+    }
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        if (data->retire) {
+            data->ui->retireRLContext(data->id);
+        } else {
+            data->ui->switchRLContext(data->id);
+        }
+        lv_obj_t *overlay = static_cast<lv_obj_t *>(lv_event_get_current_target(e));
+        while (overlay && lv_obj_get_parent(overlay) != lv_layer_top()) {
+            overlay = lv_obj_get_parent(overlay);
+        }
+        if (overlay) {
+            lv_obj_del(overlay);
+        }
+    } else if (lv_event_get_code(e) == LV_EVENT_DELETE) {
+        delete data;
+    }
+}
 
 int16_t calculate_angle(int set_temp, int range, int offset) {
     const double percentage = static_cast<double>(set_temp) / static_cast<double>(MAX_TEMP);
@@ -207,6 +434,15 @@ void DefaultUI::init() {
                       [this](Event const &) { changeScreen(&ui_StandbyScreen, &ui_StandbyScreen_screen_init); });
     pluginManager->on("controller:autotune:result",
                       [this](Event const &) { changeScreen(&ui_StandbyScreen, &ui_StandbyScreen_screen_init); });
+    pluginManager->on("rl:status:received", [this](Event const &event) {
+        rlMode = event.getString("mode");
+        rlLocalShotCount = event.getInt("local_shot_count");
+        rlRatedShotCount = event.getInt("rated_shot_count");
+        rlCommunityUploadEnabled = event.getInt("community_upload_enabled");
+        rlBestKnownRecipe = event.getString("best_known_recipe");
+        rerender = true;
+    });
+    pluginManager->on("rl:settings:changed", [this](Event const &) { rerender = true; });
 
     pluginManager->on("profiles:profile:select", [this](Event const &event) {
         // Reset the local copy before reload: parseProfile() appends to
@@ -303,6 +539,11 @@ void DefaultUI::loop() {
         grindActive = controller->isGrindActive();
         smartGrindActive = settings.isSmartGrindActive();
         grindAvailable = smartGrindActive || settings.getAltRelayFunction() == ALT_RELAY_GRIND;
+        rlAutoTuningEnabled = settings.isHomeAssistant() && settings.isRLRatingEnabled();
+        rlOptimizationPaused = settings.isRLOptimizationPaused();
+        rlLocalOptimizationEnabled = rlAutoTuningEnabled && settings.isRLLocalOptimizationEnabled() &&
+                                     !settings.isRLOptimizationPaused() &&
+                                     !settings.getRLBeanContextId().isEmpty();
         applyTheme();
         if (controller->isErrorState()) {
             changeScreen(&ui_StandbyScreen, &ui_StandbyScreen_screen_init);
@@ -314,6 +555,7 @@ void DefaultUI::loop() {
             updateStandbyScreen();
         if (lv_scr_act() == ui_StatusScreen)
             updateStatusScreen();
+        updateRLAutoTuningWidgets();
         effect_mgr.evaluate_all();
     }
 
@@ -386,6 +628,435 @@ void DefaultUI::onVolumetricDelete() {
     profileDirty = true;
 }
 
+void DefaultUI::updateRLAutoTuningWidgets() {
+    Settings const &settings = controller->getSettings();
+    const bool enabled = settings.isHomeAssistant() && settings.isRLRatingEnabled();
+    const bool visible = lv_scr_act() == ui_BrewScreen && ui_BrewScreen_contentPanel4 != nullptr && enabled &&
+                         brewScreenState == BrewScreenState::Brew;
+
+    if (!visible) {
+        if (lv_scr_act() == ui_BrewScreen && rlBrewPanel != nullptr) {
+            lv_obj_del(rlBrewPanel);
+        }
+        rlBrewPanel = nullptr;
+        rlBrewBeanLabel = nullptr;
+        rlBrewModeLabel = nullptr;
+        rlBrewToggleBtn = nullptr;
+        rlBrewToggleLabel = nullptr;
+        rlBrewContextBtn = nullptr;
+        rlBrewContextLabel = nullptr;
+        rlBrewManageBtn = nullptr;
+        rlBrewManageLabel = nullptr;
+        return;
+    }
+
+    if (rlBrewPanel == nullptr) {
+        rlBrewPanel = lv_obj_create(ui_BrewScreen_contentPanel4);
+        lv_obj_set_size(rlBrewPanel, 310, 74);
+        lv_obj_set_align(rlBrewPanel, LV_ALIGN_CENTER);
+        lv_obj_set_y(rlBrewPanel, 82);
+        lv_obj_set_style_radius(rlBrewPanel, 8, 0);
+        lv_obj_set_style_bg_color(rlBrewPanel, lv_color_hex(0x111111), 0);
+        lv_obj_set_style_bg_opa(rlBrewPanel, LV_OPA_80, 0);
+        lv_obj_set_style_border_width(rlBrewPanel, 1, 0);
+        lv_obj_set_style_border_color(rlBrewPanel, lv_color_hex(0x4A4A4A), 0);
+        lv_obj_set_style_pad_all(rlBrewPanel, 8, 0);
+        lv_obj_clear_flag(rlBrewPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *labels = lv_obj_create(rlBrewPanel);
+        lv_obj_remove_style_all(labels);
+        lv_obj_set_size(labels, 186, 56);
+        lv_obj_set_align(labels, LV_ALIGN_LEFT_MID);
+        lv_obj_set_flex_flow(labels, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(labels, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(labels, LV_OBJ_FLAG_SCROLLABLE);
+
+        rlBrewBeanLabel = rl_make_label(labels, "Optimizing: none", &lv_font_montserrat_14);
+        lv_obj_set_width(rlBrewBeanLabel, 186);
+        rlBrewModeLabel = rl_make_label(labels, "Mode: none", &lv_font_montserrat_14);
+        lv_obj_set_width(rlBrewModeLabel, 186);
+        lv_obj_set_style_text_color(rlBrewModeLabel, lv_color_hex(0xBDBDBD), 0);
+
+        rlBrewContextBtn = rl_make_button(rlBrewPanel, "Beans", rl_show_contexts_cb, this);
+        lv_obj_set_size(rlBrewContextBtn, 54, 26);
+        lv_obj_set_x(rlBrewContextBtn, 84);
+        lv_obj_set_y(rlBrewContextBtn, -15);
+        lv_obj_set_align(rlBrewContextBtn, LV_ALIGN_RIGHT_MID);
+        rlBrewContextLabel = lv_obj_get_child(rlBrewContextBtn, 0);
+
+        rlBrewManageBtn = rl_make_button(rlBrewPanel, "Tune", rl_show_overlay_cb, this);
+        lv_obj_set_size(rlBrewManageBtn, 54, 26);
+        lv_obj_set_x(rlBrewManageBtn, 24);
+        lv_obj_set_y(rlBrewManageBtn, -15);
+        lv_obj_set_align(rlBrewManageBtn, LV_ALIGN_RIGHT_MID);
+        rlBrewManageLabel = lv_obj_get_child(rlBrewManageBtn, 0);
+
+        rlBrewToggleBtn = rl_make_button(rlBrewPanel, "Local On", rl_toggle_local_cb, this);
+        lv_obj_set_size(rlBrewToggleBtn, 114, 26);
+        lv_obj_set_x(rlBrewToggleBtn, 24);
+        lv_obj_set_y(rlBrewToggleBtn, 18);
+        lv_obj_set_align(rlBrewToggleBtn, LV_ALIGN_RIGHT_MID);
+        rlBrewToggleLabel = lv_obj_get_child(rlBrewToggleBtn, 0);
+    }
+
+    const String beanName = settings.getRLBeanContextName().isEmpty() ? "No bean selected" : settings.getRLBeanContextName();
+    const String modeText = rlMode.isEmpty() ? "none" : rlMode;
+    lv_label_set_text_fmt(rlBrewBeanLabel, "Optimizing: %s", beanName.c_str());
+    lv_label_set_text_fmt(rlBrewModeLabel, "Mode: %s", modeText.c_str());
+
+    const bool localOn = settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused() &&
+                         !settings.getRLBeanContextId().isEmpty();
+    lv_label_set_text(rlBrewToggleLabel, localOn ? "Local On" : "Local Off");
+    lv_obj_set_style_bg_color(rlBrewToggleBtn, localOn ? lv_color_hex(0x2F7D32) : lv_color_hex(0x333333), 0);
+    if (settings.getRLBeanContextId().isEmpty()) {
+        lv_obj_add_state(rlBrewToggleBtn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(rlBrewToggleBtn, LV_STATE_DISABLED);
+    }
+}
+
+void DefaultUI::toggleRLLocalOptimization() {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || settings.getRLBeanContextId().isEmpty()) {
+        return;
+    }
+    const bool next = !(settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused());
+    settings.setRLLocalOptimizationEnabled(next);
+    if (next) {
+        settings.setRLOptimizationPaused(false);
+    }
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::toggleRLOptimizationPaused() {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        return;
+    }
+    const bool nextPaused = !settings.isRLOptimizationPaused();
+    settings.setRLOptimizationPaused(nextPaused);
+    if (!nextPaused) {
+        settings.setRLLocalOptimizationEnabled(true);
+    }
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::startRLNewBean() {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        return;
+    }
+
+    JsonDocument contextsDoc;
+    JsonArray contexts = rl_load_contexts(contextsDoc, settings.getRLBeanContextsJson());
+    JsonObject current = rl_find_context(contexts, settings.getRLBeanContextId());
+    if (!current.isNull()) {
+        current["status"] = "retired";
+        current["retired_at"] = static_cast<long>(std::time(nullptr));
+    }
+
+    const String name = rl_default_context_name();
+    const String id = rl_make_context_id(name);
+    rl_mark_other_contexts_available(contexts, id);
+    rl_add_context(contexts, id, name, 1, "active");
+    rl_persist_contexts(settings, contextsDoc);
+    settings.setRLBeanContextId(id);
+    settings.setRLBeanContextName(name);
+    settings.setRLOptimizationPaused(false);
+    settings.setRLLocalOptimizationEnabled(true);
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::startRLNewBag() {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        return;
+    }
+
+    JsonDocument contextsDoc;
+    JsonArray contexts = rl_load_contexts(contextsDoc, settings.getRLBeanContextsJson());
+    String name = settings.getRLBeanContextName();
+    if (name.isEmpty()) {
+        name = rl_default_context_name();
+    }
+
+    JsonObject current = rl_find_context(contexts, settings.getRLBeanContextId());
+    if (!current.isNull()) {
+        current["status"] = "retired";
+        current["retired_at"] = static_cast<long>(std::time(nullptr));
+    }
+
+    const int bagIndex = rl_current_bag_index(contexts, name) + 1;
+    const String id = rl_make_context_id(name);
+    rl_mark_other_contexts_available(contexts, id);
+    rl_add_context(contexts, id, name, bagIndex, "active");
+    rl_persist_contexts(settings, contextsDoc);
+    settings.setRLBeanContextId(id);
+    settings.setRLBeanContextName(name);
+    settings.setRLOptimizationPaused(false);
+    settings.setRLLocalOptimizationEnabled(true);
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::resetRLDialIn() {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        return;
+    }
+
+    JsonDocument contextsDoc;
+    JsonArray contexts = rl_load_contexts(contextsDoc, settings.getRLBeanContextsJson());
+    String name = settings.getRLBeanContextName();
+    if (name.isEmpty()) {
+        name = rl_default_context_name();
+    }
+
+    JsonObject current = rl_find_context(contexts, settings.getRLBeanContextId());
+    if (!current.isNull()) {
+        current["status"] = "retired";
+        current["retired_at"] = static_cast<long>(std::time(nullptr));
+    }
+
+    const int bagIndex = rl_current_bag_index(contexts, name) + 1;
+    const String id = rl_make_context_id(name + "_reset");
+    rl_mark_other_contexts_available(contexts, id);
+    rl_add_context(contexts, id, name, bagIndex, "active");
+    rl_persist_contexts(settings, contextsDoc);
+    settings.setRLBeanContextId(id);
+    settings.setRLBeanContextName(name);
+    settings.setRLOptimizationPaused(false);
+    settings.setRLLocalOptimizationEnabled(true);
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::retireRLContext() {
+    retireRLContext(controller->getSettings().getRLBeanContextId());
+}
+
+void DefaultUI::retireRLContext(const String &contextId) {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || contextId.isEmpty()) {
+        return;
+    }
+
+    JsonDocument contextsDoc;
+    JsonArray contexts = rl_load_contexts(contextsDoc, settings.getRLBeanContextsJson());
+    JsonObject context = rl_find_context(contexts, contextId);
+    if (!context.isNull()) {
+        context["status"] = "retired";
+        context["retired_at"] = static_cast<long>(std::time(nullptr));
+        rl_persist_contexts(settings, contextsDoc);
+    }
+    if (settings.getRLBeanContextId() == contextId) {
+        settings.setRLBeanContextId("");
+        settings.setRLBeanContextName("");
+        settings.setRLLocalOptimizationEnabled(false);
+    }
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::switchRLContext(const String &contextId) {
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || contextId.isEmpty()) {
+        return;
+    }
+
+    JsonDocument contextsDoc;
+    JsonArray contexts = rl_load_contexts(contextsDoc, settings.getRLBeanContextsJson());
+    JsonObject context = rl_find_context(contexts, contextId);
+    if (context.isNull()) {
+        return;
+    }
+
+    rl_mark_other_contexts_available(contexts, contextId);
+    context["status"] = "active";
+    settings.setRLBeanContextId(contextId);
+    settings.setRLBeanContextName(context["name"].as<String>());
+    settings.setRLOptimizationPaused(false);
+    settings.setRLLocalOptimizationEnabled(true);
+    rl_persist_contexts(settings, contextsDoc);
+    settings.save(true);
+    rl_emit_context_changed(pluginManager);
+    pluginManager->trigger("settings:changed");
+    rerender = true;
+}
+
+void DefaultUI::showRLAutoTuningOverlay() {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        return;
+    }
+
+    rlOverlay = rl_make_overlay_card();
+    lv_obj_t *card = rl_overlay_card(rlOverlay);
+
+    lv_obj_t *header = lv_obj_create(card);
+    lv_obj_remove_style_all(header);
+    lv_obj_set_size(header, 388, 38);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = rl_make_label(header, "Auto Tuning", &lv_font_montserrat_20);
+    lv_obj_set_width(title, 240);
+    lv_obj_t *close = rl_make_button(header, "Close", rl_close_overlay_cb, this);
+    lv_obj_set_size(close, 78, 30);
+
+    const String beanName = settings.getRLBeanContextName().isEmpty() ? "No bean selected" : settings.getRLBeanContextName();
+    const String modeText = rlMode.isEmpty() ? "none" : rlMode;
+    char line[160];
+
+    snprintf(line, sizeof(line), "Current bean: %s", beanName.c_str());
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Context: %s", settings.getRLBeanContextId().isEmpty() ? "none" : settings.getRLBeanContextId().c_str());
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Mode: %s", modeText.c_str());
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Local optimization: %s",
+             settings.isRLOptimizationPaused()
+                 ? "paused"
+                 : (settings.isRLLocalOptimizationEnabled() && !settings.getRLBeanContextId().isEmpty() ? "on" : "off"));
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Community upload: %s", rlCommunityUploadEnabled ? "on" : "off");
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Shots: %d local / %d rated", rlLocalShotCount, rlRatedShotCount);
+    lv_obj_set_width(rl_make_label(card, line), 388);
+    snprintf(line, sizeof(line), "Best recipe: %s", rlBestKnownRecipe.isEmpty() ? "none yet" : rlBestKnownRecipe.c_str());
+    lv_obj_set_width(rl_make_label(card, line), 388);
+
+    lv_obj_t *row1 = lv_obj_create(card);
+    lv_obj_remove_style_all(row1);
+    lv_obj_set_size(row1, 388, 38);
+    lv_obj_set_flex_flow(row1, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row1, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row1, 8, 0);
+    lv_obj_clear_flag(row1, LV_OBJ_FLAG_SCROLLABLE);
+    rl_make_button(row1, settings.isRLLocalOptimizationEnabled() ? "Local Off" : "Local On", rl_toggle_local_cb, this);
+    rl_make_button(row1, settings.isRLOptimizationPaused() ? "Resume" : "Pause", rl_toggle_pause_cb, this);
+
+    lv_obj_t *row2 = lv_obj_create(card);
+    lv_obj_remove_style_all(row2);
+    lv_obj_set_size(row2, 388, 38);
+    lv_obj_set_flex_flow(row2, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row2, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row2, 8, 0);
+    lv_obj_clear_flag(row2, LV_OBJ_FLAG_SCROLLABLE);
+    rl_make_button(row2, "Bean List", rl_show_contexts_cb, this);
+    rl_make_button(row2, "New Bean", rl_new_bean_cb, this);
+
+    lv_obj_t *row3 = lv_obj_create(card);
+    lv_obj_remove_style_all(row3);
+    lv_obj_set_size(row3, 388, 38);
+    lv_obj_set_flex_flow(row3, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row3, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row3, 8, 0);
+    lv_obj_clear_flag(row3, LV_OBJ_FLAG_SCROLLABLE);
+    rl_make_button(row3, "New Bag", rl_new_bag_cb, this);
+    rl_make_button(row3, "Reset Dial-In", rl_reset_cb, this);
+
+    lv_obj_t *row4 = lv_obj_create(card);
+    lv_obj_remove_style_all(row4);
+    lv_obj_set_size(row4, 388, 38);
+    lv_obj_set_flex_flow(row4, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row4, LV_OBJ_FLAG_SCROLLABLE);
+    rl_make_button(row4, "Retire Bean", rl_retire_cb, this);
+}
+
+void DefaultUI::showRLContextPickerOverlay() {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        return;
+    }
+
+    rlOverlay = rl_make_overlay_card();
+    lv_obj_t *card = rl_overlay_card(rlOverlay);
+
+    lv_obj_t *header = lv_obj_create(card);
+    lv_obj_remove_style_all(header);
+    lv_obj_set_size(header, 388, 38);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_width(rl_make_label(header, "Bean Contexts", &lv_font_montserrat_20), 240);
+    lv_obj_t *close = rl_make_button(header, "Close", rl_close_overlay_cb, this);
+    lv_obj_set_size(close, 78, 30);
+
+    JsonDocument contextsDoc;
+    JsonArray contexts = rl_load_contexts(contextsDoc, settings.getRLBeanContextsJson());
+    if (contexts.size() == 0) {
+        lv_obj_set_width(rl_make_label(card, "No bean contexts yet."), 388);
+    }
+
+    for (JsonObject context : contexts) {
+        const String id = context["id"].as<String>();
+        const String name = context["name"].as<String>().isEmpty() ? "Unnamed bean" : context["name"].as<String>();
+        const int bagIndex = context["bag_index"] | 1;
+        const String status = context["status"].as<String>();
+        const bool activeContext = id == settings.getRLBeanContextId();
+
+        lv_obj_t *row = lv_obj_create(card);
+        lv_obj_set_size(row, 388, 64);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_bg_color(row, activeContext ? lv_color_hex(0x2B2B2B) : lv_color_hex(0x202020), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x444444), 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *text = lv_obj_create(row);
+        lv_obj_remove_style_all(text);
+        lv_obj_set_size(text, 178, 48);
+        lv_obj_set_flex_flow(text, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(text, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(text, LV_OBJ_FLAG_SCROLLABLE);
+
+        char line[128];
+        snprintf(line, sizeof(line), "%s%s", name.c_str(), activeContext ? " (active)" : "");
+        lv_obj_set_width(rl_make_label(text, line), 178);
+        snprintf(line, sizeof(line), "Bag %d - %s", bagIndex, status.isEmpty() ? "available" : status.c_str());
+        lv_obj_t *detail = rl_make_label(text, line);
+        lv_obj_set_width(detail, 178);
+        lv_obj_set_style_text_color(detail, lv_color_hex(0xBDBDBD), 0);
+
+        auto *switchData = new RLContextButtonData{this, id, false};
+        lv_obj_t *switchBtn = rl_make_button(row, activeContext ? "Active" : "Switch", rl_context_select_cb, switchData);
+        lv_obj_set_size(switchBtn, 78, 30);
+        if (activeContext) {
+            lv_obj_add_state(switchBtn, LV_STATE_DISABLED);
+        }
+
+        auto *retireData = new RLContextButtonData{this, id, true};
+        lv_obj_t *retireBtn = rl_make_button(row, "Retire", rl_context_select_cb, retireData);
+        lv_obj_set_size(retireBtn, 78, 30);
+        if (status == "retired") {
+            lv_obj_add_state(retireBtn, LV_STATE_DISABLED);
+        }
+    }
+}
+
 void DefaultUI::setupPanel() {
     ui_init();
     lv_task_handler();
@@ -415,6 +1086,10 @@ void DefaultUI::setupState() {
     grindActive = controller->isGrindActive();
     smartGrindActive = settings.isSmartGrindActive();
     grindAvailable = smartGrindActive || settings.getAltRelayFunction() == ALT_RELAY_GRIND;
+    rlAutoTuningEnabled = settings.isHomeAssistant() && settings.isRLRatingEnabled();
+    rlOptimizationPaused = settings.isRLOptimizationPaused();
+    rlLocalOptimizationEnabled = rlAutoTuningEnabled && settings.isRLLocalOptimizationEnabled() &&
+                                 !settings.isRLOptimizationPaused() && !settings.getRLBeanContextId().isEmpty();
     mode = controller->getMode();
     currentTemp = static_cast<int>(controller->getCurrentTemp());
     targetTemp = static_cast<int>(controller->getTargetTemp());
@@ -775,6 +1450,17 @@ void DefaultUI::handleScreenChange() {
     lv_obj_t *current = lv_scr_act();
 
     if (current != *targetScreen) {
+        if (current == ui_BrewScreen) {
+            rlBrewPanel = nullptr;
+            rlBrewBeanLabel = nullptr;
+            rlBrewModeLabel = nullptr;
+            rlBrewToggleBtn = nullptr;
+            rlBrewToggleLabel = nullptr;
+            rlBrewContextBtn = nullptr;
+            rlBrewContextLabel = nullptr;
+            rlBrewManageBtn = nullptr;
+            rlBrewManageLabel = nullptr;
+        }
         if (*targetScreen == ui_StandbyScreen) {
             standbyEnterTime = millis();
         } else if (current == ui_StandbyScreen) {

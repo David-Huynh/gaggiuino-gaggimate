@@ -178,8 +178,10 @@ export function Settings() {
         rlRecommendationApplyStatus: message.rlRecommendationApplyStatus,
         rlMode: message.rlMode,
         rlLocalShotCount: message.rlLocalShotCount,
+        rlRatedShotCount: message.rlRatedShotCount,
         rlUploadQueueCount: message.rlUploadQueueCount,
         rlCommunityUploadEnabled: message.rlCommunityUploadEnabled,
+        rlBestKnownRecipe: message.rlBestKnownRecipe,
       }));
     });
     return () => apiService.off('evt:rl:status', listenerId);

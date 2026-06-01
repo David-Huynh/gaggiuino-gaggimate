@@ -9,6 +9,7 @@
 #include <display/core/process/GrindProcess.h>
 #include <display/models/profile.h>
 #include <cmath>
+#include <ctime>
 #include <display/plugins/BLEScalePlugin.h>
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 #include <display/plugins/HWScalePlugin.h>
@@ -34,6 +35,84 @@ static std::unordered_map<uint32_t, PsramString> rxBuffers;
 static std::unordered_map<uint32_t, unsigned long> rxBufferLastActivity;
 static constexpr unsigned long RXBUFFER_IDLE_EVICT_MS = 5UL * 60UL * 1000UL;
 static WebUIPlugin *g_webUIPlugin = nullptr;
+
+#if defined(GAGGIMATE_DISABLE_OTA)
+static constexpr bool OTA_ENABLED = false;
+#else
+static constexpr bool OTA_ENABLED = true;
+#endif
+
+static String defaultRLContextName() {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "Bean %lu", static_cast<unsigned long>(std::time(nullptr)));
+    return String(buffer);
+}
+
+static String makeRLContextId(const String &name) {
+    String id = name;
+    id.toLowerCase();
+    id.replace(" ", "_");
+    id.replace("/", "_");
+    id.replace("\\", "_");
+    id.replace(":", "_");
+    id.replace("\"", "");
+    if (id.isEmpty()) {
+        id = "bean";
+    }
+    return "bean_" + id + "_" + String(static_cast<unsigned long>(std::time(nullptr))) + "_" +
+           String(static_cast<unsigned long>(millis()));
+}
+
+static JsonArray loadRLContexts(JsonDocument &doc, const String &rawJson) {
+    DeserializationError error = deserializeJson(doc, rawJson);
+    if (error || !doc.is<JsonArray>()) {
+        doc.clear();
+        return doc.to<JsonArray>();
+    }
+    return doc.as<JsonArray>();
+}
+
+static int currentBagIndex(JsonArray contexts, const String &name) {
+    int bag = 0;
+    for (JsonObject context : contexts) {
+        if (context["name"].as<String>() == name) {
+            bag = std::max(bag, context["bag_index"] | 0);
+        }
+    }
+    return bag;
+}
+
+static JsonObject findRLContext(JsonArray contexts, const String &contextId) {
+    for (JsonObject context : contexts) {
+        if (context["id"].as<String>() == contextId) {
+            return context;
+        }
+    }
+    return JsonObject();
+}
+
+static void markRLOtherContextsAvailable(JsonArray contexts, const String &activeId) {
+    for (JsonObject context : contexts) {
+        if (context["id"].as<String>() != activeId && context["status"].as<String>() == "active") {
+            context["status"] = "available";
+        }
+    }
+}
+
+static void addRLContext(JsonArray contexts, const String &id, const String &name, int bagIndex, const char *status) {
+    JsonObject context = contexts.add<JsonObject>();
+    context["id"] = id;
+    context["name"] = name;
+    context["bag_index"] = bagIndex;
+    context["status"] = status;
+    context["created_at"] = static_cast<long>(std::time(nullptr));
+}
+
+static void persistRLContexts(Settings &settings, JsonDocument &contextsDoc) {
+    String contextsJson;
+    serializeJson(contextsDoc, contextsJson);
+    settings.setRLBeanContextsJson(contextsJson);
+}
 
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
@@ -135,8 +214,10 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlRecommendationApplyStatus = event.getString("recommendation_apply_status");
         rlMode = event.getString("mode");
         rlLocalShotCount = event.getInt("local_shot_count");
+        rlRatedShotCount = event.getInt("rated_shot_count");
         rlUploadQueueCount = event.getInt("upload_queue_count");
         rlCommunityUploadEnabled = event.getInt("community_upload_enabled") > 0;
+        rlBestKnownRecipe = event.getString("best_known_recipe");
 
         JsonDocument doc;
         doc["tp"] = "evt:rl:status";
@@ -150,8 +231,10 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
         doc["rlMode"] = rlMode;
         doc["rlLocalShotCount"] = rlLocalShotCount;
+        doc["rlRatedShotCount"] = rlRatedShotCount;
         doc["rlUploadQueueCount"] = rlUploadQueueCount;
         doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
+        doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
         ws.textAll(doc.as<String>());
     });
 
@@ -650,6 +733,12 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     handleOTAStart(client->id(), doc);
                 } else if (msgType == "req:autotune-start") {
                     handleAutotuneStart(client->id(), doc);
+                } else if (msgType == "req:rl:context:list" || msgType == "req:rl:context:switch" ||
+                           msgType == "req:rl:context:start-bean" || msgType == "req:rl:context:start-bag" ||
+                           msgType == "req:rl:context:retire" || msgType == "req:rl:context:reset" ||
+                           msgType == "req:rl:local-optimization" || msgType == "req:rl:optimization:pause" ||
+                           msgType == "req:rl:optimization:resume") {
+                    handleRLRequest(client->id(), doc);
                 } else if (msgType == "req:rl:recommendation:use") {
                     if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
                         String recommendationId = doc["recommendation_id"].as<String>();
@@ -901,6 +990,145 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
     ws.text(clientId, buffer);
 }
 
+void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
+    JsonDocument response;
+    auto type = request["tp"].as<String>();
+    response["tp"] = String("res:") + type.substring(4);
+    response["rid"] = request["rid"].as<String>();
+
+    Settings &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
+        response["error"] = F("Auto Tuning is disabled");
+    } else {
+        JsonDocument contextsDoc;
+        JsonArray contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
+
+        if (type == "req:rl:context:start-bean") {
+            String name = request["name"].as<String>();
+            name.trim();
+            if (name.isEmpty()) {
+                name = defaultRLContextName();
+            }
+            JsonObject current = findRLContext(contexts, settings.getRLBeanContextId());
+            if (!current.isNull()) {
+                current["status"] = "retired";
+                current["retired_at"] = static_cast<long>(std::time(nullptr));
+            }
+            const int bagIndex = currentBagIndex(contexts, name) + 1;
+            const String id = makeRLContextId(name);
+            markRLOtherContextsAvailable(contexts, id);
+            addRLContext(contexts, id, name, bagIndex, "active");
+            persistRLContexts(settings, contextsDoc);
+            settings.setRLBeanContextId(id);
+            settings.setRLBeanContextName(name);
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+        } else if (type == "req:rl:context:start-bag") {
+            String name = settings.getRLBeanContextName();
+            if (name.isEmpty()) {
+                name = defaultRLContextName();
+            }
+            JsonObject current = findRLContext(contexts, settings.getRLBeanContextId());
+            if (!current.isNull()) {
+                current["status"] = "retired";
+                current["retired_at"] = static_cast<long>(std::time(nullptr));
+            }
+            const int bagIndex = currentBagIndex(contexts, name) + 1;
+            const String id = makeRLContextId(name);
+            markRLOtherContextsAvailable(contexts, id);
+            addRLContext(contexts, id, name, bagIndex, "active");
+            persistRLContexts(settings, contextsDoc);
+            settings.setRLBeanContextId(id);
+            settings.setRLBeanContextName(name);
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+        } else if (type == "req:rl:context:switch") {
+            const String id = request["id"].as<String>();
+            JsonObject context = findRLContext(contexts, id);
+            if (context.isNull()) {
+                response["error"] = F("Context not found");
+            } else {
+                markRLOtherContextsAvailable(contexts, id);
+                context["status"] = "active";
+                settings.setRLBeanContextId(id);
+                settings.setRLBeanContextName(context["name"].as<String>());
+                persistRLContexts(settings, contextsDoc);
+                settings.save(true);
+            }
+        } else if (type == "req:rl:context:retire") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLBeanContextId();
+            }
+            JsonObject context = findRLContext(contexts, id);
+            if (!context.isNull()) {
+                context["status"] = "retired";
+                context["retired_at"] = static_cast<long>(std::time(nullptr));
+                persistRLContexts(settings, contextsDoc);
+            }
+            if (settings.getRLBeanContextId() == id) {
+                settings.setRLBeanContextId("");
+                settings.setRLBeanContextName("");
+                settings.setRLLocalOptimizationEnabled(false);
+            }
+            settings.save(true);
+        } else if (type == "req:rl:context:reset") {
+            String name = settings.getRLBeanContextName();
+            if (name.isEmpty()) {
+                name = defaultRLContextName();
+            }
+            JsonObject current = findRLContext(contexts, settings.getRLBeanContextId());
+            if (!current.isNull()) {
+                current["status"] = "retired";
+                current["retired_at"] = static_cast<long>(std::time(nullptr));
+            }
+            const int bagIndex = currentBagIndex(contexts, name) + 1;
+            const String id = makeRLContextId(name + "_reset");
+            markRLOtherContextsAvailable(contexts, id);
+            addRLContext(contexts, id, name, bagIndex, "active");
+            persistRLContexts(settings, contextsDoc);
+            settings.setRLBeanContextId(id);
+            settings.setRLBeanContextName(name);
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+        } else if (type == "req:rl:local-optimization") {
+            settings.setRLLocalOptimizationEnabled(request["enabled"] | true);
+            settings.save(true);
+        } else if (type == "req:rl:optimization:pause") {
+            settings.setRLOptimizationPaused(true);
+            settings.save(true);
+        } else if (type == "req:rl:optimization:resume") {
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+        }
+
+        JsonArray arr = response["contexts"].to<JsonArray>();
+        for (JsonObject context : contexts) {
+            JsonObject out = arr.add<JsonObject>();
+            out["id"] = context["id"].as<String>();
+            out["name"] = context["name"].as<String>();
+            out["bag_index"] = context["bag_index"] | 1;
+            out["status"] = context["status"].as<String>();
+            out["active"] = context["id"].as<String>() == settings.getRLBeanContextId();
+        }
+        response["active_context_id"] = settings.getRLBeanContextId();
+        response["active_context_name"] = settings.getRLBeanContextName();
+        response["local_optimization_enabled"] =
+            settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused() &&
+            !settings.getRLBeanContextId().isEmpty();
+        response["optimization_paused"] = settings.isRLOptimizationPaused();
+    }
+
+    size_t bufferSize = measureJson(response);
+    auto *buffer = ws.makeBuffer(bufferSize);
+    serializeJson(response, buffer->get(), bufferSize);
+    ws.text(clientId, buffer);
+}
+
 void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     if (request->method() == HTTP_POST) {
         controller->getSettings().batchUpdate([request](Settings *settings) {
@@ -940,6 +1168,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             const bool homeAssistantEnabled = request->hasArg("homeAssistant");
             settings->setHomeAssistant(homeAssistantEnabled);
             settings->setRLRatingEnabled(homeAssistantEnabled && request->hasArg("rlRatingEnabled"));
+            if (!homeAssistantEnabled || !request->hasArg("rlRatingEnabled")) {
+                settings->setRLLocalOptimizationEnabled(false);
+            }
             if (request->hasArg("haUser"))
                 settings->setHomeAssistantUser(request->arg("haUser"));
             if (request->hasArg("haPassword"))
@@ -1062,6 +1293,23 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["targetWaterTemp"] = settings.getTargetWaterTemp();
     doc["homekit"] = settings.isHomekit();
     doc["rlRatingEnabled"] = settings.isHomeAssistant() && settings.isRLRatingEnabled();
+    doc["rlBeanContextId"] = settings.getRLBeanContextId();
+    doc["rlBeanContextName"] = settings.getRLBeanContextName();
+    doc["rlOptimizationPaused"] = settings.isRLOptimizationPaused();
+    doc["rlLocalOptimizationEnabled"] =
+        settings.isHomeAssistant() && settings.isRLRatingEnabled() && settings.isRLLocalOptimizationEnabled() &&
+        !settings.isRLOptimizationPaused() && !settings.getRLBeanContextId().isEmpty();
+    JsonDocument contextsDoc;
+    JsonArray contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
+    JsonArray contextsOut = doc["rlBeanContexts"].to<JsonArray>();
+    for (JsonObject context : contexts) {
+        JsonObject out = contextsOut.add<JsonObject>();
+        out["id"] = context["id"].as<String>();
+        out["name"] = context["name"].as<String>();
+        out["bag_index"] = context["bag_index"] | 1;
+        out["status"] = context["status"].as<String>();
+        out["active"] = context["id"].as<String>() == settings.getRLBeanContextId();
+    }
     doc["rlStatusSeen"] = rlStatusSeen;
     doc["rlAddonOnline"] = rlAddonOnline;
     doc["rlLastStatusAt"] = rlLastStatusAt;
@@ -1072,8 +1320,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
     doc["rlMode"] = rlMode;
     doc["rlLocalShotCount"] = rlLocalShotCount;
+    doc["rlRatedShotCount"] = rlRatedShotCount;
     doc["rlUploadQueueCount"] = rlUploadQueueCount;
     doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
+    doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
     doc["homeAssistant"] = settings.isHomeAssistant();
     doc["haUser"] = settings.getHomeAssistantUser();
     doc["haPassword"] = settings.getHomeAssistantPassword();

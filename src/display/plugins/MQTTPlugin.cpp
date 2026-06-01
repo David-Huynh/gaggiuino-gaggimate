@@ -159,6 +159,7 @@ void MQTTPlugin::publishMachineState(const char *state) {
     doc["machine_adapter"] = "gaggimate";
     doc["timestamp"] = static_cast<long>(std::time(nullptr));
     doc["state"] = state;
+    doc["local_optimization_enabled"] = localOptimizationEnabled();
     addRecipeMetadata(doc);
 
     String json;
@@ -202,6 +203,12 @@ void MQTTPlugin::publishShotProfile() {
     doc["machine_adapter"] = "gaggimate";
     doc["timestamp"] = static_cast<long>(std::time(nullptr));
     doc["n_samples"] = pressureSamples.size();
+    doc["shot_type"] = "espresso";
+    doc["utility"] = false;
+    doc["exclude_from_local_optimization"] = !localOptimizationEnabled();
+    doc["local_optimization_enabled"] = localOptimizationEnabled();
+    doc["optimization_weight"] = localOptimizationEnabled() ? 1.0f : 0.0f;
+    doc["rating_prompt_allowed"] = true;
     doc["beverage_out_g"] = roundf(beverageOutG * 10.0f) / 10.0f;
     doc["shot_time_s"] = roundf(((millis() - brewStartMs) / 1000.0f) * 10.0f) / 10.0f;
     addRecipeMetadata(doc);
@@ -292,8 +299,24 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusRecommendationApplyStatus = doc["recommendation_apply_status"].as<String>();
     latestStatusMode = doc["mode"].as<String>();
     latestStatusLocalShotCount = doc["local_shot_count"] | 0;
+    latestStatusRatedShotCount = doc["rated_shot_count"] | 0;
     latestStatusUploadQueueCount = doc["upload_queue_count"] | 0;
     latestStatusCommunityUploadEnabled = doc["community_upload_enabled"] | false;
+    latestStatusBestKnownRecipe = "";
+    if (doc["best_known_recipe"].is<JsonObject>()) {
+        JsonObject best = doc["best_known_recipe"].as<JsonObject>();
+        float dose = best["dose_g"] | 0.0f;
+        float yield = best["target_yield_g"] | 0.0f;
+        float grind = best["grind_steps"] | 0.0f;
+        int rating = best["rating"] | 0;
+        char buffer[96];
+        if (rating > 0) {
+            snprintf(buffer, sizeof(buffer), "%.1fg in / %.1fg out / grind %.1f / %d stars", dose, yield, grind, rating);
+        } else {
+            snprintf(buffer, sizeof(buffer), "%.1fg in / %.1fg out / grind %.1f", dose, yield, grind);
+        }
+        latestStatusBestKnownRecipe = buffer;
+    }
 
     Event event;
     event.id = "rl:status:received";
@@ -307,8 +330,10 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setString("recommendation_apply_status", latestStatusRecommendationApplyStatus);
     event.setString("mode", latestStatusMode);
     event.setInt("local_shot_count", latestStatusLocalShotCount);
+    event.setInt("rated_shot_count", latestStatusRatedShotCount);
     event.setInt("upload_queue_count", latestStatusUploadQueueCount);
     event.setInt("community_upload_enabled", latestStatusCommunityUploadEnabled ? 1 : 0);
+    event.setString("best_known_recipe", latestStatusBestKnownRecipe);
     pluginManager->trigger(event);
 }
 
@@ -348,6 +373,22 @@ void MQTTPlugin::ignoreLatestRecommendation() {
     if (!hasRecommendation || !isAutoTuningEnabled())
         return;
     publishRecommendationDecision("ignored", false);
+    clearLatestRecommendation();
+    publishMachineState("idle");
+}
+
+void MQTTPlugin::clearLatestRecommendation() {
+    hasRecommendation = false;
+    latestRecommendationId = "";
+    latestRecommendationSourceShotId = "";
+    latestRecommendationGrindDeltaSteps = 0;
+    latestRecommendationGrindDeltaUm = 0.0f;
+    latestRecommendationNextGrindSteps = 0.0f;
+    latestRecommendationNextGrindUm = 0.0f;
+    latestRecommendationNextDoseG = 0.0f;
+    latestRecommendationTargetYieldG = 0.0f;
+    latestRecommendationTargetRatio = 0.0f;
+    latestRecommendationStatus = "";
 }
 
 void MQTTPlugin::publishRecommendationDecision(const char *decision, bool includeEditedFields) {
@@ -440,6 +481,7 @@ void MQTTPlugin::addRecipeMetadata(JsonDocument &doc) const {
     const float targetYield = targetYieldG();
 
     doc["bean_context_id"] = beanContextId();
+    doc["bean_context_name"] = beanContextName();
     if (dose > 0.0f) {
         doc["dose_in_g"] = roundf(dose * 10.0f) / 10.0f;
     }
@@ -476,7 +518,21 @@ String MQTTPlugin::machineId() const { return "gaggimate:" + machineTopicId(); }
 String MQTTPlugin::beanContextId() const {
     if (!controller)
         return "";
-    return controller->getSettings().getSelectedProfile();
+    return controller->getSettings().getRLBeanContextId();
+}
+
+String MQTTPlugin::beanContextName() const {
+    if (!controller)
+        return "";
+    return controller->getSettings().getRLBeanContextName();
+}
+
+bool MQTTPlugin::localOptimizationEnabled() const {
+    if (!controller)
+        return false;
+    Settings const &settings = controller->getSettings();
+    return settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused() &&
+           !settings.getRLBeanContextId().isEmpty();
 }
 
 String MQTTPlugin::makeShotId() const {
@@ -555,6 +611,8 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("rl:recommendation:apply", [this](Event const &) { applyLatestRecommendation(); });
 
     pm->on("rl:recommendation:ignore", [this](Event const &) { ignoreLatestRecommendation(); });
+
+    pm->on("rl:settings:changed", [this](Event const &) { publishMachineState("idle"); });
 
     pm->on("controller:wifi:connect", [this, ctrl](const Event &) {
         if (!connect(ctrl))

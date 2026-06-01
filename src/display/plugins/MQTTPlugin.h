@@ -32,6 +32,7 @@ class MQTTPlugin : public Plugin {
     void handleStatus(const String &payload);
     void applyLatestRecommendation();
     void ignoreLatestRecommendation();
+    void clearLatestRecommendation();
     void publishRecommendationDecision(const char *decision, bool includeEditedFields);
     void publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed);
     void addRecipeMetadata(JsonDocument &doc) const;
@@ -40,6 +41,8 @@ class MQTTPlugin : public Plugin {
     String machineTopicId() const;
     String machineId() const;
     String beanContextId() const;
+    String beanContextName() const;
+    bool localOptimizationEnabled() const;
     String makeShotId() const;
     float targetYieldG() const;
     float doseTargetG() const;
@@ -85,8 +88,10 @@ class MQTTPlugin : public Plugin {
     String latestStatusRecommendationApplyStatus;
     String latestStatusMode;
     int latestStatusLocalShotCount = 0;
+    int latestStatusRatedShotCount = 0;
     int latestStatusUploadQueueCount = 0;
     bool latestStatusCommunityUploadEnabled = false;
+    String latestStatusBestKnownRecipe;
 
     std::vector<float> pressureSamples;
     std::vector<float> targetPressureSamples;

@@ -38,6 +38,7 @@ const ShotAnalyzer = lazy(() => import('./pages/ShotAnalyzer/index.jsx').then(m 
 const StatisticsPage = lazy(() =>
   import('./pages/Statistics/index.jsx').then(m => m.StatisticsPage),
 );
+const AutoTuning = lazy(() => import('./pages/AutoTuning/index.jsx').then(m => m.AutoTuning));
 
 const apiService = new ApiService();
 const DESKTOP_NAV_COLLAPSED_STORAGE_KEY = 'gaggimate.desktopNavCollapsed';
@@ -93,6 +94,7 @@ export function App() {
                       <Route path='/profiles' component={ProfileList} />
                       <Route path='/profiles/:id' component={ProfileEdit} />
                       <Route path='/settings' component={Settings} />
+                      <Route path='/autotuning' component={AutoTuning} />
                       <Route path='/ota' component={OTA} />
                       <Route path='/scales' component={Scales} />
                       {ScaleCalibration && (

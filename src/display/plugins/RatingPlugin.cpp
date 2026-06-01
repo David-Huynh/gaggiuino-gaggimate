@@ -46,6 +46,8 @@ void RatingPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pluginManager = pm;
 
     pm->on("rl:recommendation:received", [this](Event const &event) {
+        if (!autoTuningEnabled())
+            return;
         storeRecommendation(event);
         if (!feedbackOverlayActive() && shouldPromptRecommendation()) {
             showRecommendationOverlay();
@@ -53,7 +55,7 @@ void RatingPlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
 
     pm->on("rl:shot:complete", [this](Event const &event) {
-        if (!controller || !controller->getSettings().isRLRatingEnabled())
+        if (!autoTuningEnabled())
             return;
         String shotId = event.getString("shot_id");
         if (!shotId.isEmpty()) {
@@ -64,11 +66,23 @@ void RatingPlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
 
     pm->on("controller:brew:start", [this](Event const &) { closeOverlay(); });
+    pm->on("settings:changed", [this](Event const &) {
+        if (!autoTuningEnabled()) {
+            _hasPendingRecommendation = false;
+            closeOverlay();
+        }
+    });
+    pm->on("rl:settings:changed", [this](Event const &) {
+        if (!autoTuningEnabled()) {
+            _hasPendingRecommendation = false;
+            closeOverlay();
+        }
+    });
 }
 
 void RatingPlugin::loop() {
     if (_overlay && _overlayMode == RLOverlayMode::RATING && (millis() - _shownAtMs > RATING_POPUP_TIMEOUT_MS)) {
-        dismissOverlay();
+        clearOverlay(false);
     } else if (_overlay && _overlayMode == RLOverlayMode::TASTE_TAGS &&
                (millis() - _shownAtMs > RATING_POPUP_TIMEOUT_MS)) {
         submitFeedback();
@@ -90,11 +104,18 @@ void RatingPlugin::storeRecommendation(Event const &event) {
 }
 
 bool RatingPlugin::shouldPromptRecommendation() const {
-    if (!controller || !controller->getSettings().isRLRatingEnabled())
+    if (!autoTuningEnabled())
         return false;
     if (!_hasPendingRecommendation || _pendingRecommendationId.isEmpty())
         return false;
     return _pendingRecommendationStatus == "pending" || _pendingRecommendationStatus == "shown" || _pendingRecommendationStatus.isEmpty();
+}
+
+bool RatingPlugin::autoTuningEnabled() const {
+    if (!controller)
+        return false;
+    Settings const &settings = controller->getSettings();
+    return settings.isHomeAssistant() && settings.isRLRatingEnabled();
 }
 
 bool RatingPlugin::feedbackOverlayActive() const {
@@ -380,6 +401,10 @@ String RatingPlugin::selectedTasteTagsCsv() const {
 void RatingPlugin::submitFeedback() {
     if (_pendingShotId.isEmpty())
         return;
+    if (!autoTuningEnabled()) {
+        closeOverlay();
+        return;
+    }
 
     Event event;
     event.id = "rl:rating";
@@ -395,6 +420,10 @@ void RatingPlugin::submitFeedback() {
 void RatingPlugin::skipRating() {
     if (_pendingShotId.isEmpty())
         return;
+    if (!autoTuningEnabled()) {
+        closeOverlay();
+        return;
+    }
 
     Event event;
     event.id = "rl:rating";
@@ -409,6 +438,10 @@ void RatingPlugin::skipRating() {
 void RatingPlugin::useRecommendation() {
     if (_pendingRecommendationId.isEmpty())
         return;
+    if (!autoTuningEnabled()) {
+        closeOverlay();
+        return;
+    }
     Event event;
     event.id = "rl:recommendation:apply";
     event.setString("recommendation_id", _pendingRecommendationId);
@@ -420,6 +453,10 @@ void RatingPlugin::useRecommendation() {
 void RatingPlugin::ignoreRecommendation() {
     if (_pendingRecommendationId.isEmpty())
         return;
+    if (!autoTuningEnabled()) {
+        closeOverlay();
+        return;
+    }
     Event event;
     event.id = "rl:recommendation:ignore";
     event.setString("recommendation_id", _pendingRecommendationId);

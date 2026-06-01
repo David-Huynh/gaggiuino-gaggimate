@@ -438,9 +438,18 @@ export function PluginCard({
                   />
                   <StatusRow label='BO mode' value={formData.rlMode || 'None'} />
                   <StatusRow
+                    label='Active bean'
+                    value={formData.rlBeanContextName || 'No bean selected'}
+                  />
+                  <StatusRow
                     label='Local shots'
                     value={(formData.rlLocalShotCount ?? 0).toString()}
                   />
+                  <StatusRow
+                    label='Rated shots'
+                    value={(formData.rlRatedShotCount ?? 0).toString()}
+                  />
+                  <StatusRow label='Best recipe' value={formData.rlBestKnownRecipe || 'None'} />
                   <StatusRow
                     label='Upload queue'
                     value={(formData.rlUploadQueueCount ?? 0).toString()}
@@ -449,6 +458,9 @@ export function PluginCard({
                     label='Community upload'
                     value={formData.rlCommunityUploadEnabled ? 'Enabled' : 'Disabled'}
                   />
+                  <a href='/autotuning' className='btn btn-outline btn-sm mt-2 w-full'>
+                    Open Auto Tuning
+                  </a>
                 </div>
               )}
             </div>

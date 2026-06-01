@@ -39,6 +39,7 @@ class WebUIPlugin : public Plugin {
     void handleOTAStart(uint32_t clientId, JsonDocument &request);
     void handleAutotuneStart(uint32_t clientId, JsonDocument &request);
     void handleProfileRequest(uint32_t clientId, JsonDocument &request);
+    void handleRLRequest(uint32_t clientId, JsonDocument &request);
     void handleFlushStart(uint32_t clientId, JsonDocument &request);
     // Re-send the pending shot rating prompt (to one client on connect, or to all
     // as a post-flush nudge). No-op when nothing is pending.
@@ -102,8 +103,10 @@ class WebUIPlugin : public Plugin {
     String rlRecommendationApplyStatus = "";
     String rlMode = "";
     int rlLocalShotCount = 0;
+    int rlRatedShotCount = 0;
     int rlUploadQueueCount = 0;
     bool rlCommunityUploadEnabled = false;
+    String rlBestKnownRecipe = "";
 
     // Pending RL prompts (serialized evt payloads). WebUIPlugin is the source of
     // truth so the WebUI can re-pop / reopen after a timeout, a minimize, a flush,

@@ -193,6 +193,14 @@ const ProcessControls = props => {
 
   const isSmartGrindEnabled = settings?.smartGrindActive || false;
   const altRelayFunction = settings?.altRelayFunction !== undefined ? settings.altRelayFunction : 1;
+  const autoTuningEnabled = !!settings?.homeAssistant && !!settings?.rlRatingEnabled;
+  const [localOptimizationEnabled, setLocalOptimizationEnabled] = useState(true);
+
+  useEffect(() => {
+    if (settings?.rlLocalOptimizationEnabled !== undefined) {
+      setLocalOptimizationEnabled(!!settings.rlLocalOptimizationEnabled);
+    }
+  }, [settings?.rlLocalOptimizationEnabled]);
 
   // Show grind elements if SmartGrind is enabled OR if Alt Relay is set to grind
   const isGrindAvailable = isSmartGrindEnabled || altRelayFunction === 1; // ALT_RELAY_GRIND = 1
@@ -274,6 +282,15 @@ const ProcessControls = props => {
         setIsFlushing(false);
       });
   }, [apiService]);
+
+  const toggleLocalOptimization = useCallback(() => {
+    const next = !localOptimizationEnabled;
+    setLocalOptimizationEnabled(next);
+    apiService.send({
+      tp: 'req:rl:local-optimization',
+      enabled: next,
+    });
+  }, [apiService, localOptimizationEnabled]);
 
   const handleButtonClick = () => {
     if (active) {
@@ -383,6 +400,35 @@ const ProcessControls = props => {
                   className='max-h-36 w-full'
                 />
               )}
+            </div>
+          )}
+          {autoTuningEnabled && (
+            <div className='border-base-300 mx-auto mt-3 flex w-full max-w-xl flex-col gap-2 rounded-md border p-3 text-left sm:flex-row sm:items-center sm:justify-between'>
+              <div className='min-w-0'>
+                <div className='text-base-content/60 text-xs uppercase'>Optimizing</div>
+                <a
+                  href='/autotuning'
+                  className='text-base-content flex min-w-0 items-center gap-2 font-semibold'
+                >
+                  <span className='truncate'>
+                    {settings?.rlBeanContextName || 'No bean selected'}
+                  </span>
+                  <FontAwesomeIcon icon={faRectangleList} className='text-base-content/60' />
+                </a>
+                <div className='text-base-content/60 text-xs'>
+                  Mode: {settings?.rlMode || 'none'}
+                </div>
+              </div>
+              <label className='flex items-center justify-between gap-3 text-sm sm:justify-end'>
+                <span>Local optimization</span>
+                <input
+                  type='checkbox'
+                  className='toggle toggle-primary toggle-sm'
+                  checked={localOptimizationEnabled}
+                  onChange={toggleLocalOptimization}
+                  disabled={!settings?.rlBeanContextId}
+                />
+              </label>
             </div>
           )}
         </div>

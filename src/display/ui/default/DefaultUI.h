@@ -38,6 +38,16 @@ class DefaultUI {
     void onNextProfile();
     void onPreviousProfile();
     void onProfileSelect();
+    void showRLAutoTuningOverlay();
+    void showRLContextPickerOverlay();
+    void toggleRLLocalOptimization();
+    void toggleRLOptimizationPaused();
+    void startRLNewBean();
+    void startRLNewBag();
+    void resetRLDialIn();
+    void retireRLContext();
+    void retireRLContext(const String &contextId);
+    void switchRLContext(const String &contextId);
     void setBrightness(int brightness) {
         if (panelDriver) {
             panelDriver->setBrightness(brightness);
@@ -65,6 +75,7 @@ class DefaultUI {
 
     void updateStandbyScreen();
     void updateStatusScreen() const;
+    void updateRLAutoTuningWidgets();
 
     void adjustDials(lv_obj_t *dials);
     void adjustTempTarget(lv_obj_t *dials);
@@ -113,6 +124,24 @@ class DefaultUI {
     int smartGrindActive = false;
     int grindAvailable = false;
     int initialized = false;
+    int rlAutoTuningEnabled = false;
+    int rlLocalOptimizationEnabled = false;
+    int rlOptimizationPaused = false;
+    String rlMode = "";
+    int rlLocalShotCount = 0;
+    int rlRatedShotCount = 0;
+    int rlCommunityUploadEnabled = false;
+    String rlBestKnownRecipe = "";
+    lv_obj_t *rlBrewPanel = nullptr;
+    lv_obj_t *rlBrewBeanLabel = nullptr;
+    lv_obj_t *rlBrewModeLabel = nullptr;
+    lv_obj_t *rlBrewToggleBtn = nullptr;
+    lv_obj_t *rlBrewToggleLabel = nullptr;
+    lv_obj_t *rlBrewContextBtn = nullptr;
+    lv_obj_t *rlBrewContextLabel = nullptr;
+    lv_obj_t *rlBrewManageBtn = nullptr;
+    lv_obj_t *rlBrewManageLabel = nullptr;
+    lv_obj_t *rlOverlay = nullptr;
 
     // Seasonal flags
     int christmasMode = false;
