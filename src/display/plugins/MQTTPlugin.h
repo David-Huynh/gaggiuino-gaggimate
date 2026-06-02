@@ -27,10 +27,6 @@ class MQTTPlugin : public Plugin {
     void publishDiscovery(Controller *controller);
     void recordShotSample();
     void publishShotProfile();
-    void startShotFinalization();
-    void finalizeShotProfile();
-    void updatePendingShotFinalization();
-    bool shouldWaitForSettledShotWeight() const;
     void publishMachineState(const char *state);
     void handleRecommendation(const String &payload);
     void handleStatus(const String &payload);
@@ -66,11 +62,7 @@ class MQTTPlugin : public Plugin {
     float lastTemperature = 0;
 
     bool isBrewing = false;
-    bool pendingShotFinalization = false;
     unsigned long brewStartMs = 0;
-    unsigned long brewEndElapsedMs = 0;
-    unsigned long shotFinalizeStartMs = 0;
-    unsigned long shotWeightStableSinceMs = 0;
     unsigned long lastSampleMs = 0;
     String currentShotId;
     int shotSource = 0;
@@ -79,7 +71,6 @@ class MQTTPlugin : public Plugin {
     float currentHardwareWeight = 0.0f;
     float currentHardwareShotWeight = 0.0f;
     float currentEstimatedWeight = 0.0f;
-    float lastFinalizeWeightG = 0.0f;
 
     bool hasRecommendation = false;
     String latestRecommendationId;

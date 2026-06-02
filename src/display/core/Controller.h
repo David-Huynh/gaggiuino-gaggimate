@@ -310,9 +310,6 @@ class Controller {
     // Source the active process consumes weight from; set per-process in
     // activate()/activateGrind() via the role resolver.
     VolumetricMeasurementSource currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
-    // Source latched for the most recently stopped process. Kept briefly so
-    // post-stop scale settling can still update lastProcess and delay learning.
-    VolumetricMeasurementSource lastVolumetricSource = VolumetricMeasurementSource::INACTIVE;
     static const unsigned long BLUETOOTH_MEASUREMENT_GRACE_MS = 2000;
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
 

@@ -12,9 +12,6 @@
 const String LOG_TAG = F("MQTTPlugin");
 constexpr const char *FLOW_CALIBRATION_URL = "https://ggazzo.github.io/gaggimate-pump-flow-calibration/";
 constexpr float MAX_CANONICAL_FLOW_G_PER_S = 20.0f;
-constexpr unsigned long SHOT_WEIGHT_SETTLE_MAX_MS = 3500;
-constexpr unsigned long SHOT_WEIGHT_SETTLE_STABLE_MS = 1000;
-constexpr float SHOT_WEIGHT_SETTLE_THRESHOLD_G = 0.15f;
 
 static void addCsvTags(JsonDocument &doc, const char *field, const String &csvTags) {
     JsonArray tags = doc[field].to<JsonArray>();
@@ -177,7 +174,6 @@ void MQTTPlugin::publishMachineState(const char *state) {
 
 void MQTTPlugin::loop() {
     client.loop();
-    updatePendingShotFinalization();
     if (!isBrewing)
         return;
     unsigned long elapsed = millis() - brewStartMs;
@@ -238,8 +234,7 @@ void MQTTPlugin::publishShotProfile() {
         doc["predictive_weight_interpretation"] = "estimated beverage output from pump/puck model";
     }
     doc["beverage_out_g"] = roundf(beverageOutG * 10.0f) / 10.0f;
-    const unsigned long shotElapsedMs = brewEndElapsedMs > 0 ? brewEndElapsedMs : (millis() - brewStartMs);
-    doc["shot_time_s"] = roundf((static_cast<float>(shotElapsedMs) / 1000.0f) * 10.0f) / 10.0f;
+    doc["shot_time_s"] = roundf(((millis() - brewStartMs) / 1000.0f) * 10.0f) / 10.0f;
     addRecipeMetadata(doc);
 
     if (hasRecommendation) {
@@ -274,58 +269,6 @@ void MQTTPlugin::publishShotProfile() {
     String json;
     serializeJson(doc, json);
     publish("shot/profile", json.c_str());
-}
-
-void MQTTPlugin::startShotFinalization() {
-    if (!shouldWaitForSettledShotWeight()) {
-        finalizeShotProfile();
-        return;
-    }
-    pendingShotFinalization = true;
-    shotFinalizeStartMs = millis();
-    shotWeightStableSinceMs = shotFinalizeStartMs;
-    lastFinalizeWeightG = currentShotWeightG();
-}
-
-void MQTTPlugin::finalizeShotProfile() {
-    if (pendingShotFinalization) {
-        pendingShotFinalization = false;
-    }
-    publishShotProfile();
-    Event event;
-    event.id = "rl:shot:complete";
-    event.setString("shot_id", currentShotId);
-    event.setString("recommendation_id", latestRecommendationId);
-    event.setInt("grind_delta_steps", latestRecommendationGrindDeltaSteps);
-    event.setFloat("next_dose_g", latestRecommendationNextDoseG);
-    event.setFloat("target_yield_g", latestRecommendationTargetYieldG);
-    pluginManager->trigger(event);
-}
-
-void MQTTPlugin::updatePendingShotFinalization() {
-    if (!pendingShotFinalization)
-        return;
-
-    const unsigned long now = millis();
-    const float weight = currentShotWeightG();
-    if (std::isfinite(weight) && std::fabs(weight - lastFinalizeWeightG) <= SHOT_WEIGHT_SETTLE_THRESHOLD_G) {
-        if (shotWeightStableSinceMs == 0) {
-            shotWeightStableSinceMs = now;
-        }
-    } else {
-        lastFinalizeWeightG = weight;
-        shotWeightStableSinceMs = now;
-    }
-
-    const bool stable = shotWeightStableSinceMs != 0 && (now - shotWeightStableSinceMs) >= SHOT_WEIGHT_SETTLE_STABLE_MS;
-    const bool timedOut = (now - shotFinalizeStartMs) >= SHOT_WEIGHT_SETTLE_MAX_MS;
-    if (stable || timedOut) {
-        finalizeShotProfile();
-    }
-}
-
-bool MQTTPlugin::shouldWaitForSettledShotWeight() const {
-    return static_cast<VolumetricMeasurementSource>(shotSource) == VolumetricMeasurementSource::HARDWARE_SCALE;
 }
 
 void MQTTPlugin::handleRecommendation(const String &payload) {
@@ -892,11 +835,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         // A flush (utility cycle) is not a shot — never capture it for EspressoRL.
         if (isAutoTuningEnabled() && event.getInt("utility") == 0) {
             isBrewing = true;
-            pendingShotFinalization = false;
             brewStartMs = millis();
-            brewEndElapsedMs = 0;
-            shotFinalizeStartMs = 0;
-            shotWeightStableSinceMs = 0;
             currentShotId = makeShotId();
             shotSource = static_cast<int>(controller->getCurrentVolumetricSource());
             lastSampleMs = 0;
@@ -904,7 +843,6 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
             currentHardwareWeight = 0.0f;
             currentHardwareShotWeight = 0.0f;
             currentEstimatedWeight = 0.0f;
-            lastFinalizeWeightG = 0.0f;
             pressureSamples.clear();
             targetPressureSamples.clear();
             flowSamples.clear();
@@ -922,8 +860,15 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         // otherwise pop the rating prompt for a cleaning cycle).
         if (isAutoTuningEnabled() && event.getInt("utility") == 0) {
             isBrewing = false;
-            brewEndElapsedMs = millis() - brewStartMs;
-            startShotFinalization();
+            publishShotProfile();
+            Event event;
+            event.id = "rl:shot:complete";
+            event.setString("shot_id", currentShotId);
+            event.setString("recommendation_id", latestRecommendationId);
+            event.setInt("grind_delta_steps", latestRecommendationGrindDeltaSteps);
+            event.setFloat("next_dose_g", latestRecommendationNextDoseG);
+            event.setFloat("target_yield_g", latestRecommendationTargetYieldG);
+            pluginManager->trigger(event);
         }
         publishBrewState("not brewing");
         publishMachineState("idle");
