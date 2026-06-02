@@ -1051,6 +1051,14 @@ void DefaultUI::showRLAutoTuningOverlay() {
                  ? "paused"
                  : (settings.isRLLocalOptimizationEnabled() && !settings.getRLBeanContextId().isEmpty() ? "on" : "off"));
     lv_obj_set_width(rl_make_label(card, line), 388);
+    if (settings.getScaleSource() == SCALE_SOURCE_PREDICTIVE) {
+        lv_obj_t *warning = rl_make_label(card, "Predictive weight: calibrate pump flow first");
+        lv_obj_set_width(warning, 388);
+        lv_obj_set_style_text_color(warning, lv_color_hex(0xF2C94C), 0);
+        lv_obj_t *guide = rl_make_label(card, "Guide: ggazzo.github.io/gaggimate-pump-flow-calibration");
+        lv_obj_set_width(guide, 388);
+        lv_obj_set_style_text_color(guide, lv_color_hex(0xBDBDBD), 0);
+    }
     snprintf(line, sizeof(line), "Community upload: %s", rlCommunityUploadEnabled ? "on" : "off");
     lv_obj_set_width(rl_make_label(card, line), 388);
     snprintf(line, sizeof(line), "Shots: %d local / %d rated", rlLocalShotCount, rlRatedShotCount);

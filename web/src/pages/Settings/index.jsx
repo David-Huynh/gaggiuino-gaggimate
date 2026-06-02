@@ -1,5 +1,6 @@
 import { faFileExport } from '@fortawesome/free-solid-svg-icons/faFileExport';
 import { faFileImport } from '@fortawesome/free-solid-svg-icons/faFileImport';
+import { faCircleInfo } from '@fortawesome/free-solid-svg-icons/faCircleInfo';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { computed } from '@preact/signals';
 import { useQuery } from 'preact-fetching';
@@ -27,6 +28,7 @@ const ledControl = computed(() => machine.value.capabilities.ledControl);
 const pressureAvailable = computed(() => machine.value.capabilities.pressure);
 const connected = computed(() => machine.value.connected);
 const tofDistance = computed(() => machine.value.status.tofDistance);
+const FLOW_CALIBRATION_URL = 'https://ggazzo.github.io/gaggimate-pump-flow-calibration/';
 
 /**
  * Split a PID CSV string into the form's two-input shape.
@@ -461,6 +463,25 @@ export function Settings() {
                 otherwise it falls back to hardware (if present) and then predictive pump flow. Off
                 disables volumetric targeting.
               </p>
+              {parseInt(formData.scaleSource) === 3 && (
+                <div className='alert alert-warning mt-3 items-start text-sm'>
+                  <FontAwesomeIcon icon={faCircleInfo} className='mt-0.5' />
+                  <div>
+                    <div className='font-medium'>Predictive weight depends on calibrated pump flow.</div>
+                    <div className='text-xs opacity-80'>
+                      EspressoRL yield optimization is only trustworthy in Predictive mode after pump flow is calibrated.
+                      <a
+                        href={FLOW_CALIBRATION_URL}
+                        target='_blank'
+                        rel='noreferrer'
+                        className='link ml-1'
+                      >
+                        Open calibration guide
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {!hardwareScaleDisabled && (
@@ -890,9 +911,23 @@ export function Settings() {
               </div>
             </SettingsFormField>
             <SettingsFormField
-              label='Pump Flow Coefficients'
+              label={
+                <span className='inline-flex items-center gap-2'>
+                  <span>Pump Flow Coefficients</span>
+                  <a
+                    href={FLOW_CALIBRATION_URL}
+                    target='_blank'
+                    rel='noreferrer'
+                    className='link tooltip tooltip-right'
+                    data-tip='Open pump flow calibration guide'
+                    aria-label='Open pump flow calibration guide'
+                  >
+                    <FontAwesomeIcon icon={faCircleInfo} />
+                  </a>
+                </span>
+              }
               htmlFor='pumpModelCoeffs'
-              helpText='Enter 2 values (flow at 1 bar, flow at 9 bar)'
+              helpText='Enter 2 values (flow at 1 bar, flow at 9 bar). Predictive weight and predictive Auto Tuning depend on these values.'
             >
               <input
                 id='pumpModelCoeffs'

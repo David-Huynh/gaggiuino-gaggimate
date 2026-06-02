@@ -1298,6 +1298,7 @@ void Controller::deactivate() {
         currentProcess = nullptr;
         swappedType = lastProcess->getType();
         brewWasUtility = lastProcess->isUtility();
+        lastVolumetricSource = currentVolumetricSource;
     }
     applyConnectionPriority(); // shot ended -> relaxed BLE interval
     if (swappedType == MODE_BREW) {
@@ -1324,6 +1325,7 @@ void Controller::clear() {
         delete lastProcess;
         lastProcess = nullptr;
         currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+        lastVolumetricSource = VolumetricMeasurementSource::INACTIVE;
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         resetHardwareScaleShotBaseline();
 #endif
@@ -1457,7 +1459,13 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
         return;
 #endif
     }
-    if (currentVolumetricSource != source) {
+    bool sourceMatches = currentVolumetricSource == source;
+    {
+        ProcessLock lock(processMutex);
+        Process *last = lastProcess;
+        sourceMatches = sourceMatches || (last != nullptr && !last->isComplete() && lastVolumetricSource == source);
+    }
+    if (!sourceMatches) {
         ESP_LOGD(LOG_TAG, "Ignoring volumetric measurement, source does not match");
         return;
     }
