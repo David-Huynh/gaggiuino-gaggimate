@@ -12,15 +12,73 @@ import { faBan } from '@fortawesome/free-solid-svg-icons/faBan';
 import { faTriangleExclamation } from '@fortawesome/free-solid-svg-icons/faTriangleExclamation';
 import { faUpload } from '@fortawesome/free-solid-svg-icons/faUpload';
 
-function StatusCell({ label, value }) {
+function Panel({ title, subtitle, action, children, className = '' }) {
   return (
-    <div className='border-base-300 rounded-md border p-3'>
-      <div className='text-base-content/60 text-xs uppercase'>{label}</div>
-      <div className='text-base-content mt-1 min-h-6 break-words text-sm font-semibold'>
+    <section className={`border-base-300 bg-base-100 rounded-md border p-4 ${className}`}>
+      {(title || action) && (
+        <div className='mb-4 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between'>
+          <div className='min-w-0'>
+            {title && <h2 className='text-base font-semibold sm:text-lg'>{title}</h2>}
+            {subtitle && (
+              <div className='text-base-content/60 mt-1 text-xs break-words sm:text-sm'>
+                {subtitle}
+              </div>
+            )}
+          </div>
+          {action && <div className='flex shrink-0 flex-wrap gap-2'>{action}</div>}
+        </div>
+      )}
+      {children}
+    </section>
+  );
+}
+
+function StatCard({ label, value, tone = 'neutral' }) {
+  const toneClass =
+    {
+      success: 'border-success/40 bg-success/10',
+      warning: 'border-warning/40 bg-warning/10',
+      error: 'border-error/40 bg-error/10',
+      primary: 'border-primary/40 bg-primary/10',
+      neutral: 'border-base-300 bg-base-200/40',
+    }[tone] || 'border-base-300 bg-base-200/40';
+
+  return (
+    <div className={`min-w-0 rounded-md border p-3 ${toneClass}`}>
+      <div className='text-base-content/60 text-xs tracking-wide uppercase'>{label}</div>
+      <div className='text-base-content mt-1 min-h-6 text-lg leading-tight font-semibold break-words'>
         {value || 'None'}
       </div>
     </div>
   );
+}
+
+function InfoRow({ label, value, compact = false }) {
+  return (
+    <div className='border-base-300/70 flex min-w-0 flex-col gap-1 border-b py-2 last:border-b-0 sm:flex-row sm:items-center sm:justify-between'>
+      <span className='text-base-content/60 shrink-0 text-xs tracking-wide uppercase'>{label}</span>
+      <span
+        className={`min-w-0 text-sm font-medium break-words ${
+          compact ? 'text-base-content/70 font-mono text-xs' : 'text-base-content'
+        }`}
+      >
+        {value || 'None'}
+      </span>
+    </div>
+  );
+}
+
+function StatusPill({ children, tone = 'neutral' }) {
+  const toneClass =
+    {
+      success: 'badge-success',
+      warning: 'badge-warning',
+      error: 'badge-error',
+      primary: 'badge-primary',
+      neutral: 'badge-neutral',
+    }[tone] || 'badge-neutral';
+
+  return <span className={`badge badge-sm whitespace-nowrap ${toneClass}`}>{children}</span>;
 }
 
 function bestRecipeText(settings) {
@@ -28,6 +86,30 @@ function bestRecipeText(settings) {
     return settings.rlBestKnownRecipe;
   }
   return 'None yet';
+}
+
+function shortId(value) {
+  if (!value) {
+    return 'None';
+  }
+  if (value.length <= 24) {
+    return value;
+  }
+  return `${value.slice(0, 12)}...${value.slice(-8)}`;
+}
+
+function localOptimizationLabel(localOn, paused) {
+  if (paused) {
+    return 'Paused';
+  }
+  return localOn ? 'On' : 'Off for shots';
+}
+
+function localOptimizationTone(localOn, paused) {
+  if (paused) {
+    return 'warning';
+  }
+  return localOn ? 'success' : 'neutral';
 }
 
 export function AutoTuning() {
@@ -101,61 +183,102 @@ export function AutoTuning() {
   const activeName = settings?.rlBeanContextName || 'No bean selected';
   const localOn = !!settings?.rlLocalOptimizationEnabled;
   const paused = !!settings?.rlOptimizationPaused;
+  const uploadRejectedCount = settings?.rlUploadQueueRejectedCount ?? 0;
+  const hasRejectedUploads = uploadRejectedCount > 0;
+  const lastRejectedText = settings?.rlUploadQueueLastRejectedRecordId
+    ? `${settings.rlUploadQueueLastRejectedRecordId}: ${
+        settings?.rlUploadQueueLastRejectedError || 'Rejected'
+      }`
+    : 'No rejected upload snapshots';
 
   return (
-    <div className='space-y-5'>
-      <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
-        <div>
+    <div className='mx-auto flex w-full max-w-6xl flex-col gap-4'>
+      <div className='flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between'>
+        <div className='min-w-0'>
           <h1 className='text-2xl font-bold sm:text-3xl'>Auto Tuning</h1>
-          <div className='text-base-content/60 text-sm'>Optimizing: {activeName}</div>
+          <div className='mt-2 flex flex-wrap items-center gap-2'>
+            <StatusPill tone={localOptimizationTone(localOn, paused)}>
+              Local optimization {localOptimizationLabel(localOn, paused)}
+            </StatusPill>
+            <StatusPill tone={settings?.rlCommunityUploadEnabled ? 'primary' : 'neutral'}>
+              Community upload {settings?.rlCommunityUploadEnabled ? 'On' : 'Off'}
+            </StatusPill>
+          </div>
         </div>
-        <div className='flex gap-2'>
-          <button
-            type='button'
-            className='btn btn-outline btn-sm'
-            disabled={busy || paused}
-            onClick={() => run('req:rl:optimization:pause')}
-          >
-            <FontAwesomeIcon icon={faPause} />
-            Pause
-          </button>
-          <button
-            type='button'
-            className='btn btn-primary btn-sm'
-            disabled={busy || !paused}
-            onClick={() => run('req:rl:optimization:resume')}
-          >
-            <FontAwesomeIcon icon={faPlay} />
-            Resume
-          </button>
+        <div className='grid grid-cols-1 gap-2 sm:grid-cols-2 lg:flex lg:justify-end'>
+          {paused ? (
+            <button
+              type='button'
+              className='btn btn-primary btn-sm'
+              disabled={busy}
+              onClick={() => run('req:rl:optimization:resume')}
+            >
+              <FontAwesomeIcon icon={faPlay} />
+              Resume
+            </button>
+          ) : (
+            <button
+              type='button'
+              className='btn btn-outline btn-sm'
+              disabled={busy}
+              onClick={() => run('req:rl:optimization:pause')}
+            >
+              <FontAwesomeIcon icon={faPause} />
+              Pause
+            </button>
+          )}
         </div>
       </div>
 
-      <div className='grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4'>
-        <StatusCell label='Current bean' value={activeName} />
-        <StatusCell label='Context/session' value={settings?.rlBeanContextId} />
-        <StatusCell label='Optimizer mode' value={settings?.rlMode || 'No mode yet'} />
-        <StatusCell
-          label='Local optimization'
-          value={paused ? 'Paused' : localOn ? 'On' : 'Excluded'}
-        />
-        <StatusCell label='Latest recommendation' value={settings?.rlLastRecommendationId} />
-        <StatusCell label='Local shots' value={(settings?.rlLocalShotCount ?? 0).toString()} />
-        <StatusCell label='Rated shots' value={(settings?.rlRatedShotCount ?? 0).toString()} />
-        <StatusCell label='Upload queued' value={(settings?.rlUploadQueueCount ?? 0).toString()} />
-        <StatusCell
-          label='Upload rejected'
-          value={(settings?.rlUploadQueueRejectedCount ?? 0).toString()}
-        />
-        <StatusCell label='Best known recipe' value={bestRecipeText(settings)} />
+      <div className='grid grid-cols-1 gap-4 lg:grid-cols-3'>
+        <Panel className='lg:col-span-2' title='Active Session'>
+          <div className='grid grid-cols-1 gap-4 md:grid-cols-[minmax(0,1fr)_220px]'>
+            <div className='min-w-0'>
+              <div className='text-base-content/60 text-xs tracking-wide uppercase'>Optimizing</div>
+              <div className='mt-1 text-2xl leading-tight font-semibold break-words'>
+                {activeName}
+              </div>
+              <div className='mt-3 flex flex-wrap gap-2'>
+                <StatusPill tone='primary'>{settings?.rlMode || 'No mode yet'}</StatusPill>
+                <StatusPill tone={localOptimizationTone(localOn, paused)}>
+                  {localOptimizationLabel(localOn, paused)}
+                </StatusPill>
+              </div>
+            </div>
+            <div className='bg-base-200/60 min-w-0 rounded-md p-3'>
+              <InfoRow label='Context' value={shortId(settings?.rlBeanContextId)} compact />
+              <InfoRow
+                label='Recommendation'
+                value={shortId(settings?.rlLastRecommendationId)}
+                compact
+              />
+            </div>
+          </div>
+          <div className='bg-base-200/60 mt-4 rounded-md p-3'>
+            <InfoRow label='Best recipe' value={bestRecipeText(settings)} />
+          </div>
+        </Panel>
+
+        <Panel title='Progress'>
+          <div className='grid grid-cols-2 gap-3'>
+            <StatCard label='Local shots' value={(settings?.rlLocalShotCount ?? 0).toString()} />
+            <StatCard label='Rated shots' value={(settings?.rlRatedShotCount ?? 0).toString()} />
+            <StatCard label='Queued' value={(settings?.rlUploadQueueCount ?? 0).toString()} />
+            <StatCard
+              label='Rejected'
+              value={uploadRejectedCount.toString()}
+              tone={hasRejectedUploads ? 'warning' : 'neutral'}
+            />
+          </div>
+        </Panel>
       </div>
 
-      <div className='border-base-300 bg-base-100 rounded-md border p-4'>
-        <div className='grid grid-cols-1 gap-3 lg:grid-cols-[1fr_auto_auto_auto]'>
-          <label className='input input-bordered flex items-center gap-2'>
+      <Panel title='Bean Management'>
+        <div className='grid grid-cols-1 gap-3 lg:grid-cols-[minmax(0,1fr)_auto_auto_auto]'>
+          <label className='input input-bordered flex min-w-0 items-center gap-2'>
             <input
               type='text'
-              className='grow'
+              className='min-w-0 grow'
               value={beanName}
               placeholder='Bean name'
               onInput={event => setBeanName(event.currentTarget.value)}
@@ -163,7 +286,7 @@ export function AutoTuning() {
           </label>
           <button
             type='button'
-            className='btn btn-primary'
+            className='btn btn-primary w-full lg:w-auto'
             disabled={busy}
             onClick={() => run('req:rl:context:start-bean', { name: beanName })}
           >
@@ -172,7 +295,7 @@ export function AutoTuning() {
           </button>
           <button
             type='button'
-            className='btn btn-outline'
+            className='btn btn-outline w-full lg:w-auto'
             disabled={busy || !settings?.rlBeanContextId}
             onClick={() => run('req:rl:context:start-bag')}
           >
@@ -181,50 +304,49 @@ export function AutoTuning() {
           </button>
           <button
             type='button'
-            className='btn btn-outline'
+            className='btn btn-outline w-full lg:w-auto'
             disabled={busy}
             onClick={() => run('req:rl:context:reset')}
           >
             <FontAwesomeIcon icon={faRotate} />
-            Reset Dial-In
+            Reset
           </button>
         </div>
-      </div>
+      </Panel>
 
-      <div className='border-base-300 bg-base-100 rounded-md border p-4'>
-        <div className='flex flex-col gap-3 lg:flex-row lg:items-center'>
-          <div className='min-w-0 flex-1'>
-            <h2 className='text-lg font-semibold'>Upload Recovery</h2>
-            <div className='text-base-content/60 mt-1 truncate text-sm'>
-              {settings?.rlUploadQueueLastRejectedRecordId
-                ? `${settings.rlUploadQueueLastRejectedRecordId}: ${settings?.rlUploadQueueLastRejectedError || 'Rejected'}`
-                : 'No rejected upload snapshots'}
-            </div>
-          </div>
-          <button
-            type='button'
-            className='btn btn-outline btn-sm'
-            disabled={busy || (settings?.rlUploadQueueRejectedCount ?? 0) < 1}
-            onClick={() => run('req:rl:upload:requeue', { limit: 50 })}
-          >
-            <FontAwesomeIcon icon={faUpload} />
-            Retry Valid
-          </button>
-        </div>
-      </div>
-
-      <div className='border-base-300 bg-base-100 rounded-md border p-4'>
-        <div className='flex flex-col gap-3 lg:flex-row lg:items-center'>
-          <div className='min-w-0 flex-1'>
-            <h2 className='text-lg font-semibold'>Last Shot Correction</h2>
-            <div className='text-base-content/60 mt-1 truncate text-sm'>
-              {settings?.rlLastShotId || 'No shot available yet'}
-            </div>
-          </div>
-          <div className='grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-5'>
+      <div className='grid grid-cols-1 gap-4 xl:grid-cols-2'>
+        <Panel
+          title='Upload Recovery'
+          subtitle={lastRejectedText}
+          action={
             <button
               type='button'
               className='btn btn-outline btn-sm'
+              disabled={busy || !hasRejectedUploads}
+              onClick={() => run('req:rl:upload:requeue', { limit: 50 })}
+            >
+              <FontAwesomeIcon icon={faUpload} />
+              Retry Valid
+            </button>
+          }
+        >
+          <div className='text-base-content/70 text-sm break-words'>
+            {hasRejectedUploads
+              ? `${uploadRejectedCount} rejected snapshot${
+                  uploadRejectedCount === 1 ? '' : 's'
+                } waiting for review.`
+              : 'Upload queue is clear.'}
+          </div>
+        </Panel>
+
+        <Panel
+          title='Last Shot Correction'
+          subtitle={settings?.rlLastShotId || 'No shot available yet'}
+        >
+          <div className='grid grid-cols-2 gap-2 sm:grid-cols-3'>
+            <button
+              type='button'
+              className='btn btn-outline btn-sm min-h-10 whitespace-normal'
               disabled={busy || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
@@ -239,7 +361,7 @@ export function AutoTuning() {
             </button>
             <button
               type='button'
-              className='btn btn-outline btn-sm'
+              className='btn btn-outline btn-sm min-h-10 whitespace-normal'
               disabled={busy || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
@@ -254,7 +376,7 @@ export function AutoTuning() {
             </button>
             <button
               type='button'
-              className='btn btn-outline btn-sm'
+              className='btn btn-outline btn-sm min-h-10 whitespace-normal'
               disabled={busy || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
@@ -265,11 +387,11 @@ export function AutoTuning() {
               }
             >
               <FontAwesomeIcon icon={faBan} />
-              Grind
+              Grind not followed
             </button>
             <button
               type='button'
-              className='btn btn-outline btn-sm'
+              className='btn btn-outline btn-sm min-h-10 whitespace-normal'
               disabled={busy || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
@@ -280,11 +402,11 @@ export function AutoTuning() {
               }
             >
               <FontAwesomeIcon icon={faBan} />
-              Dose
+              Dose not followed
             </button>
             <button
               type='button'
-              className='btn btn-outline btn-sm'
+              className='btn btn-outline btn-sm min-h-10 whitespace-normal sm:col-span-1'
               disabled={busy || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
@@ -295,17 +417,16 @@ export function AutoTuning() {
               }
             >
               <FontAwesomeIcon icon={faBan} />
-              Yield
+              Yield not followed
             </button>
           </div>
-        </div>
+        </Panel>
       </div>
 
-      <div className='space-y-3'>
-        <h2 className='text-lg font-semibold'>Bean Contexts</h2>
+      <Panel title='Bean Contexts'>
         <div className='grid grid-cols-1 gap-3'>
           {contexts.length === 0 && (
-            <div className='border-base-300 bg-base-100 rounded-md border p-4 text-sm opacity-70'>
+            <div className='bg-base-200/60 rounded-md p-4 text-sm opacity-70'>
               No bean contexts yet.
             </div>
           )}
@@ -321,12 +442,14 @@ export function AutoTuning() {
                   {context.active && <span className='badge badge-primary'>Active</span>}
                   {context.status === 'retired' && <span className='badge'>Retired</span>}
                 </div>
-                <div className='text-base-content/50 mt-1 truncate text-xs'>{context.id}</div>
+                <div className='text-base-content/50 mt-1 font-mono text-xs break-all'>
+                  {context.id}
+                </div>
               </div>
-              <div className='flex gap-2'>
+              <div className='grid grid-cols-2 gap-2 sm:flex sm:shrink-0'>
                 <button
                   type='button'
-                  className='btn btn-outline btn-sm'
+                  className='btn btn-outline btn-sm w-full sm:w-auto'
                   disabled={busy || context.active}
                   onClick={() => run('req:rl:context:switch', { id: context.id })}
                 >
@@ -335,7 +458,7 @@ export function AutoTuning() {
                 </button>
                 <button
                   type='button'
-                  className='btn btn-error btn-outline btn-sm'
+                  className='btn btn-error btn-outline btn-sm w-full sm:w-auto'
                   disabled={busy || context.status === 'retired'}
                   onClick={() => run('req:rl:context:retire', { id: context.id })}
                 >
@@ -346,7 +469,7 @@ export function AutoTuning() {
             </div>
           ))}
         </div>
-      </div>
+      </Panel>
     </div>
   );
 }

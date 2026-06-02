@@ -131,6 +131,92 @@ static lv_obj_t *rl_make_label(lv_obj_t *parent, const char *text, const lv_font
     return label;
 }
 
+static String rl_short_text(const String &value, size_t prefix = 12, size_t suffix = 6) {
+    if (value.isEmpty()) {
+        return "none";
+    }
+    if (value.length() <= prefix + suffix + 3) {
+        return value;
+    }
+    return value.substring(0, prefix) + "..." + value.substring(value.length() - suffix);
+}
+
+static lv_obj_t *rl_make_section(lv_obj_t *parent, const char *title) {
+    lv_obj_t *section = lv_obj_create(parent);
+    lv_obj_set_size(section, 388, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(section, 8, 0);
+    lv_obj_set_style_bg_color(section, lv_color_hex(0x202020), 0);
+    lv_obj_set_style_bg_opa(section, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(section, 1, 0);
+    lv_obj_set_style_border_color(section, lv_color_hex(0x3A3A3A), 0);
+    lv_obj_set_style_pad_all(section, 10, 0);
+    lv_obj_set_style_pad_row(section, 8, 0);
+    lv_obj_set_flex_flow(section, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(section, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(section, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (title) {
+        lv_obj_t *label = rl_make_label(section, title, &lv_font_montserrat_14);
+        lv_obj_set_width(label, 360);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xF2C94C), 0);
+    }
+    return section;
+}
+
+static lv_obj_t *rl_make_action_row(lv_obj_t *parent, int height = 36) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, 360, height);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
+}
+
+static lv_obj_t *rl_make_pill(lv_obj_t *parent, const char *text, lv_color_t color) {
+    lv_obj_t *pill = lv_obj_create(parent);
+    lv_obj_set_size(pill, LV_SIZE_CONTENT, 24);
+    lv_obj_set_style_radius(pill, 12, 0);
+    lv_obj_set_style_bg_color(pill, color, 0);
+    lv_obj_set_style_bg_opa(pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(pill, 0, 0);
+    lv_obj_set_style_pad_left(pill, 8, 0);
+    lv_obj_set_style_pad_right(pill, 8, 0);
+    lv_obj_set_style_pad_top(pill, 3, 0);
+    lv_obj_set_style_pad_bottom(pill, 3, 0);
+    lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *label = rl_make_label(pill, text, &lv_font_montserrat_14);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(label);
+    return pill;
+}
+
+static void rl_add_info_row(lv_obj_t *parent, const char *labelText, const String &value, bool compact = false) {
+    lv_obj_t *row = rl_make_action_row(parent, 24);
+    lv_obj_t *label = rl_make_label(row, labelText, &lv_font_montserrat_14);
+    lv_obj_set_width(label, 116);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xBDBDBD), 0);
+
+    lv_obj_t *valueLabel = rl_make_label(row, value.c_str(), &lv_font_montserrat_14);
+    lv_obj_set_width(valueLabel, 236);
+    if (compact) {
+        lv_obj_set_style_text_color(valueLabel, lv_color_hex(0xD0D0D0), 0);
+    }
+}
+
+static void rl_add_stat_pair(lv_obj_t *parent, const char *leftLabel, int leftValue, const char *rightLabel, int rightValue) {
+    char left[48];
+    char right[48];
+    snprintf(left, sizeof(left), "%s: %d", leftLabel, leftValue);
+    snprintf(right, sizeof(right), "%s: %d", rightLabel, rightValue);
+    lv_obj_t *row = rl_make_action_row(parent, 26);
+    lv_obj_t *leftObj = rl_make_label(row, left, &lv_font_montserrat_14);
+    lv_obj_set_width(leftObj, 176);
+    lv_obj_t *rightObj = rl_make_label(row, right, &lv_font_montserrat_14);
+    lv_obj_set_width(rightObj, 176);
+}
+
 static lv_obj_t *rl_make_overlay_card() {
     lv_obj_t *overlay = lv_obj_create(lv_layer_top());
     lv_obj_set_size(overlay, 480, 480);
@@ -1038,102 +1124,65 @@ void DefaultUI::showRLAutoTuningOverlay() {
 
     const String beanName = settings.getRLBeanContextName().isEmpty() ? "No bean selected" : settings.getRLBeanContextName();
     const String modeText = rlMode.isEmpty() ? "none" : rlMode;
-    char line[160];
+    const bool hasContext = !settings.getRLBeanContextId().isEmpty();
+    const bool localActive = settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused() && hasContext;
+    const char *localText = settings.isRLOptimizationPaused() ? "Local paused" : (localActive ? "Local on" : "Local off");
 
-    snprintf(line, sizeof(line), "Current bean: %s", beanName.c_str());
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    snprintf(line, sizeof(line), "Context: %s", settings.getRLBeanContextId().isEmpty() ? "none" : settings.getRLBeanContextId().c_str());
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    snprintf(line, sizeof(line), "Mode: %s", modeText.c_str());
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    snprintf(line, sizeof(line), "Local optimization: %s",
-             settings.isRLOptimizationPaused()
-                 ? "paused"
-                 : (settings.isRLLocalOptimizationEnabled() && !settings.getRLBeanContextId().isEmpty() ? "on" : "off"));
-    lv_obj_set_width(rl_make_label(card, line), 388);
+    lv_obj_t *session = rl_make_section(card, "Active Session");
+    lv_obj_t *beanLabel = rl_make_label(session, beanName.c_str(), &lv_font_montserrat_20);
+    lv_obj_set_width(beanLabel, 360);
+    lv_obj_t *pillRow = rl_make_action_row(session, 28);
+    rl_make_pill(pillRow, modeText.c_str(), lv_color_hex(0x245A8D));
+    rl_make_pill(pillRow, localText, localActive ? lv_color_hex(0x2F7D32) : lv_color_hex(0x555555));
+    rl_add_info_row(session, "Context", rl_short_text(settings.getRLBeanContextId()), true);
+    rl_add_info_row(session, "Best recipe", rlBestKnownRecipe.isEmpty() ? String("none yet") : rlBestKnownRecipe);
+
+    lv_obj_t *progress = rl_make_section(card, "Progress");
+    rl_add_stat_pair(progress, "Local", rlLocalShotCount, "Rated", rlRatedShotCount);
+    rl_add_info_row(progress, "Rejected", String(rlUploadQueueRejectedCount));
+    rl_add_info_row(progress, "Community", rlCommunityUploadEnabled ? String("on") : String("off"));
+
     if (settings.getScaleSource() == SCALE_SOURCE_PREDICTIVE) {
-        lv_obj_t *warning = rl_make_label(card, "Predictive weight: calibrate pump flow first");
-        lv_obj_set_width(warning, 388);
+        lv_obj_t *warningSection = rl_make_section(card, "Predictive Weight");
+        lv_obj_t *warning = rl_make_label(warningSection, "Calibrate pump flow before optimizing.");
+        lv_obj_set_width(warning, 360);
         lv_obj_set_style_text_color(warning, lv_color_hex(0xF2C94C), 0);
-        lv_obj_t *guide = rl_make_label(card, "Guide: ggazzo.github.io/gaggimate-pump-flow-calibration");
-        lv_obj_set_width(guide, 388);
+        lv_obj_t *guide = rl_make_label(warningSection, "ggazzo.github.io/gaggimate-pump-flow-calibration");
+        lv_obj_set_width(guide, 360);
         lv_obj_set_style_text_color(guide, lv_color_hex(0xBDBDBD), 0);
     }
-    snprintf(line, sizeof(line), "Community upload: %s", rlCommunityUploadEnabled ? "on" : "off");
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    snprintf(line, sizeof(line), "Shots: %d local / %d rated", rlLocalShotCount, rlRatedShotCount);
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    snprintf(line, sizeof(line), "Last shot: %s", rlLastShotId.isEmpty() ? "none" : rlLastShotId.c_str());
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    snprintf(line, sizeof(line), "Rejected uploads: %d", rlUploadQueueRejectedCount);
-    lv_obj_set_width(rl_make_label(card, line), 388);
-    if (rlUploadQueueRejectedCount > 0) {
-        snprintf(
-            line,
-            sizeof(line),
-            "Latest reject: %s",
-            rlUploadQueueLastRejectedRecordId.isEmpty() ? "unknown" : rlUploadQueueLastRejectedRecordId.c_str());
-        lv_obj_set_width(rl_make_label(card, line), 388);
-        if (!rlUploadQueueLastRejectedError.isEmpty()) {
-            snprintf(line, sizeof(line), "Error: %s", rlUploadQueueLastRejectedError.c_str());
-            lv_obj_set_width(rl_make_label(card, line), 388);
-        }
-    }
-    snprintf(line, sizeof(line), "Best recipe: %s", rlBestKnownRecipe.isEmpty() ? "none yet" : rlBestKnownRecipe.c_str());
-    lv_obj_set_width(rl_make_label(card, line), 388);
 
-    lv_obj_t *row1 = lv_obj_create(card);
-    lv_obj_remove_style_all(row1);
-    lv_obj_set_size(row1, 388, 38);
-    lv_obj_set_flex_flow(row1, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row1, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row1, 8, 0);
-    lv_obj_clear_flag(row1, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *actions = rl_make_section(card, "Bean Management");
+    lv_obj_t *row1 = rl_make_action_row(actions);
     rl_make_button(row1, settings.isRLLocalOptimizationEnabled() ? "Local Off" : "Local On", rl_toggle_local_cb, this);
     rl_make_button(row1, settings.isRLOptimizationPaused() ? "Resume" : "Pause", rl_toggle_pause_cb, this);
 
-    lv_obj_t *row2 = lv_obj_create(card);
-    lv_obj_remove_style_all(row2);
-    lv_obj_set_size(row2, 388, 38);
-    lv_obj_set_flex_flow(row2, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row2, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row2, 8, 0);
-    lv_obj_clear_flag(row2, LV_OBJ_FLAG_SCROLLABLE);
-    rl_make_button(row2, "Bean List", rl_show_contexts_cb, this);
+    lv_obj_t *row2 = rl_make_action_row(actions);
+    rl_make_button(row2, "Beans", rl_show_contexts_cb, this);
     rl_make_button(row2, "New Bean", rl_new_bean_cb, this);
 
-    lv_obj_t *row3 = lv_obj_create(card);
-    lv_obj_remove_style_all(row3);
-    lv_obj_set_size(row3, 388, 38);
-    lv_obj_set_flex_flow(row3, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row3, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row3, 8, 0);
-    lv_obj_clear_flag(row3, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *row3 = rl_make_action_row(actions);
     rl_make_button(row3, "New Bag", rl_new_bag_cb, this);
-    rl_make_button(row3, "Reset Dial-In", rl_reset_cb, this);
+    rl_make_button(row3, "Reset", rl_reset_cb, this);
 
-    lv_obj_t *row4 = lv_obj_create(card);
-    lv_obj_remove_style_all(row4);
-    lv_obj_set_size(row4, 388, 38);
-    lv_obj_set_flex_flow(row4, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(row4, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *row4 = rl_make_action_row(actions);
     rl_make_button(row4, "Retire Bean", rl_retire_cb, this);
     lv_obj_t *retryBtn = rl_make_button(row4, "Retry Uploads", rl_requeue_uploads_cb, this);
     if (rlUploadQueueRejectedCount < 1) {
         lv_obj_add_state(retryBtn, LV_STATE_DISABLED);
     }
 
-    lv_obj_t *correctionTitle = rl_make_label(card, "Last Shot Correction", &lv_font_montserrat_14);
-    lv_obj_set_width(correctionTitle, 388);
+    if (rlUploadQueueRejectedCount > 0) {
+        lv_obj_t *upload = rl_make_section(card, "Upload Recovery");
+        rl_add_info_row(upload, "Latest", rl_short_text(rlUploadQueueLastRejectedRecordId), true);
+        if (!rlUploadQueueLastRejectedError.isEmpty()) {
+            rl_add_info_row(upload, "Error", rlUploadQueueLastRejectedError, true);
+        }
+    }
 
-    lv_obj_t *row5 = lv_obj_create(card);
-    lv_obj_remove_style_all(row5);
-    lv_obj_set_size(row5, 388, 38);
-    lv_obj_set_flex_flow(row5, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row5, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row5, 8, 0);
-    lv_obj_clear_flag(row5, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *correction = rl_make_section(card, "Last Shot");
+    rl_add_info_row(correction, "Shot", rl_short_text(rlLastShotId), true);
+    lv_obj_t *row5 = rl_make_action_row(correction);
     lv_obj_t *excludeBtn = rl_make_button(row5, "Exclude", rl_exclude_last_shot_cb, this);
     lv_obj_t *badPrepBtn = rl_make_button(row5, "Bad Prep", rl_bad_prep_last_shot_cb, this);
     if (rlLastShotId.isEmpty()) {
@@ -1141,13 +1190,7 @@ void DefaultUI::showRLAutoTuningOverlay() {
         lv_obj_add_state(badPrepBtn, LV_STATE_DISABLED);
     }
 
-    lv_obj_t *row6 = lv_obj_create(card);
-    lv_obj_remove_style_all(row6);
-    lv_obj_set_size(row6, 388, 38);
-    lv_obj_set_flex_flow(row6, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row6, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(row6, 8, 0);
-    lv_obj_clear_flag(row6, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *row6 = rl_make_action_row(correction);
     lv_obj_t *grindBtn = rl_make_button(row6, "No Grind", rl_not_followed_grind_cb, this);
     lv_obj_t *doseBtn = rl_make_button(row6, "No Dose", rl_not_followed_dose_cb, this);
     lv_obj_t *yieldBtn = rl_make_button(row6, "No Yield", rl_not_followed_yield_cb, this);
