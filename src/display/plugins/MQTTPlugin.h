@@ -25,6 +25,7 @@ class MQTTPlugin : public Plugin {
     void publish(const std::string &topic, const std::string &message);
     void publishBrewState(const char *state);
     void publishDiscovery(Controller *controller);
+    void resetShotCapture();
     void recordShotSample();
     void publishShotProfile();
     void publishMachineState(const char *state);

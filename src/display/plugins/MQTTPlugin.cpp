@@ -177,14 +177,7 @@ void MQTTPlugin::loop() {
     if (!isBrewing)
         return;
     if (!isAutoTuningParticipating()) {
-        isBrewing = false;
-        pressureSamples.clear();
-        targetPressureSamples.clear();
-        flowSamples.clear();
-        pumpFlowSamples.clear();
-        targetFlowSamples.clear();
-        weightSamples.clear();
-        timeSamples.clear();
+        resetShotCapture();
         return;
     }
     unsigned long elapsed = millis() - brewStartMs;
@@ -192,6 +185,20 @@ void MQTTPlugin::loop() {
         recordShotSample();
         lastSampleMs = elapsed;
     }
+}
+
+void MQTTPlugin::resetShotCapture() {
+    isBrewing = false;
+    brewStartMs = 0;
+    lastSampleMs = 0;
+    currentShotId = "";
+    pressureSamples.clear();
+    targetPressureSamples.clear();
+    flowSamples.clear();
+    pumpFlowSamples.clear();
+    targetFlowSamples.clear();
+    weightSamples.clear();
+    timeSamples.clear();
 }
 
 void MQTTPlugin::recordShotSample() {
@@ -779,7 +786,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("rl:settings:changed", [this](Event const &) {
         if (!isAutoTuningParticipating()) {
             clearLatestRecommendation();
-            isBrewing = false;
+            resetShotCapture();
             return;
         }
         publishMachineState("idle");
@@ -856,22 +863,15 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("controller:brew:start", [this](Event const &event) {
         // A flush (utility cycle) is not a shot — never capture it for EspressoRL.
         if (isAutoTuningParticipating() && event.getInt("utility") == 0) {
+            resetShotCapture();
             isBrewing = true;
             brewStartMs = millis();
             currentShotId = makeShotId();
             shotSource = static_cast<int>(controller->getCurrentVolumetricSource());
-            lastSampleMs = 0;
             currentBluetoothWeight = 0.0f;
             currentHardwareWeight = 0.0f;
             currentHardwareShotWeight = 0.0f;
             currentEstimatedWeight = 0.0f;
-            pressureSamples.clear();
-            targetPressureSamples.clear();
-            flowSamples.clear();
-            pumpFlowSamples.clear();
-            targetFlowSamples.clear();
-            weightSamples.clear();
-            timeSamples.clear();
         }
         publishBrewState("brewing");
         publishMachineState("brewing");
@@ -880,18 +880,22 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("controller:brew:end", [this](Event const &event) {
         // Skip flushes: no shot profile publish and no rl:shot:complete (which would
         // otherwise pop the rating prompt for a cleaning cycle).
-        if (isAutoTuningParticipating() && event.getInt("utility") == 0) {
+        const bool capturedEspressoShot =
+            isBrewing && isAutoTuningParticipating() && event.getInt("utility") == 0 && !pressureSamples.empty();
+        if (capturedEspressoShot) {
+            const String completedShotId = currentShotId;
             isBrewing = false;
             publishShotProfile();
             Event event;
             event.id = "rl:shot:complete";
-            event.setString("shot_id", currentShotId);
+            event.setString("shot_id", completedShotId);
             event.setString("recommendation_id", latestRecommendationId);
             event.setInt("grind_delta_steps", latestRecommendationGrindDeltaSteps);
             event.setFloat("next_dose_g", latestRecommendationNextDoseG);
             event.setFloat("target_yield_g", latestRecommendationTargetYieldG);
             pluginManager->trigger(event);
         }
+        resetShotCapture();
         publishBrewState("not brewing");
         publishMachineState("idle");
     });
