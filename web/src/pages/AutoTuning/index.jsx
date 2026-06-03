@@ -183,6 +183,7 @@ export function AutoTuning() {
   const activeName = settings?.rlBeanContextName || 'No bean selected';
   const localOn = !!settings?.rlLocalOptimizationEnabled;
   const paused = !!settings?.rlOptimizationPaused;
+  const canSendRLEvents = localOn && !paused && !!settings?.rlBeanContextId;
   const uploadRejectedCount = settings?.rlUploadQueueRejectedCount ?? 0;
   const hasRejectedUploads = uploadRejectedCount > 0;
   const lastRejectedText = settings?.rlUploadQueueLastRejectedRecordId
@@ -322,7 +323,7 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm'
-              disabled={busy || !hasRejectedUploads}
+              disabled={busy || !canSendRLEvents || !hasRejectedUploads}
               onClick={() => run('req:rl:upload:requeue', { limit: 50 })}
             >
               <FontAwesomeIcon icon={faUpload} />
@@ -347,7 +348,7 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
                   shot_id: settings?.rlLastShotId,
@@ -362,7 +363,7 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
                   shot_id: settings?.rlLastShotId,
@@ -377,7 +378,7 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
                   shot_id: settings?.rlLastShotId,
@@ -392,7 +393,7 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
                   shot_id: settings?.rlLastShotId,
@@ -407,7 +408,7 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal sm:col-span-1'
-              disabled={busy || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
               onClick={() =>
                 run('req:rl:shot:correction', {
                   shot_id: settings?.rlLastShotId,

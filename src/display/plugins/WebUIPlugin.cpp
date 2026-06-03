@@ -114,6 +114,11 @@ static void persistRLContexts(Settings &settings, JsonDocument &contextsDoc) {
     settings.setRLBeanContextsJson(contextsJson);
 }
 
+static bool rlParticipationEnabled(Settings const &settings) {
+    return settings.isHomeAssistant() && settings.isRLRatingEnabled() && settings.isRLLocalOptimizationEnabled() &&
+           !settings.isRLOptimizationPaused() && !settings.getRLBeanContextId().isEmpty();
+}
+
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
 void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) {
@@ -153,7 +158,8 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
 
     pluginManager->on("rl:recommendation:received", [this](Event const &event) {
-        if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+        if (!rlParticipationEnabled(controller->getSettings())) {
+            _pendRecJson = "";
             return;
         }
 
@@ -180,7 +186,9 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
 
     pluginManager->on("rl:shot:complete", [this](Event const &event) {
-        if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+        if (!rlParticipationEnabled(controller->getSettings())) {
+            _pendRateShotId = "";
+            _pendRateRecId = "";
             return;
         }
 
@@ -235,6 +243,20 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
         ws.textAll(doc.as<String>());
     });
+    auto clearRLPromptsIfInactive = [this](Event const &) {
+        if (rlParticipationEnabled(controller->getSettings())) {
+            return;
+        }
+        _pendRateShotId = "";
+        _pendRateRecId = "";
+        _pendRecJson = "";
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:prompts-clear";
+        ws.textAll(doc.as<String>());
+    };
+    pluginManager->on("settings:changed", clearRLPromptsIfInactive);
+    pluginManager->on("rl:settings:changed", clearRLPromptsIfInactive);
 
     // Forward shot history rebuild progress events to WebSocket clients
     pluginManager->on("evt:history-rebuild-progress", [this](Event const &event) {
@@ -624,6 +646,11 @@ void WebUIPlugin::setupServer() {
                 ESP_LOGI("WebUIPlugin", "WebSocket client connected (%d open connections)", server->getClients().size());
                 // Replay pending RL prompts so a reloaded/reconnected client restores
                 // its reopen affordance (the WebUI dedupes/minimizes by id).
+                if (!rlParticipationEnabled(controller->getSettings())) {
+                    _pendRateShotId = "";
+                    _pendRateRecId = "";
+                    _pendRecJson = "";
+                }
                 if (!_pendRateShotId.isEmpty()) {
                     sendRatingPrompt(client);
                 }
@@ -733,7 +760,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                            msgType == "req:rl:optimization:resume") {
                     handleRLRequest(client->id(), doc);
                 } else if (msgType == "req:rl:recommendation:use") {
-                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
+                    if (rlParticipationEnabled(controller->getSettings())) {
                         String recommendationId = doc["recommendation_id"].as<String>();
                         if (!recommendationId.isEmpty()) {
                             Event event;
@@ -744,7 +771,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         }
                     }
                 } else if (msgType == "req:rl:recommendation:ignore") {
-                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
+                    if (rlParticipationEnabled(controller->getSettings())) {
                         String recommendationId = doc["recommendation_id"].as<String>();
                         if (!recommendationId.isEmpty()) {
                             Event event;
@@ -758,7 +785,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     JsonDocument resp;
                     resp["tp"] = "res:rl:shot:correction";
                     resp["rid"] = doc["rid"];
-                    if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+                    if (!rlParticipationEnabled(controller->getSettings())) {
                         resp["error"] = F("Auto Tuning is disabled");
                     } else {
                         String shotId = doc["shot_id"].as<String>();
@@ -819,7 +846,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     JsonDocument resp;
                     resp["tp"] = "res:rl:upload:requeue";
                     resp["rid"] = doc["rid"];
-                    if (!controller->getSettings().isHomeAssistant() || !controller->getSettings().isRLRatingEnabled()) {
+                    if (!rlParticipationEnabled(controller->getSettings())) {
                         resp["error"] = F("Auto Tuning is disabled");
                     } else {
                         Event event;
@@ -833,7 +860,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     serializeJson(resp, msg);
                     client->text(msg);
                 } else if (msgType == "req:rl:rating") {
-                    if (controller->getSettings().isHomeAssistant() && controller->getSettings().isRLRatingEnabled()) {
+                    if (rlParticipationEnabled(controller->getSettings())) {
                         String shotId = doc["shot_id"].as<String>();
                         String recommendationId = doc["recommendation_id"].as<String>();
                         const bool skipped = doc["skipped"] | false;
@@ -1071,6 +1098,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
     if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled()) {
         response["error"] = F("Auto Tuning is disabled");
     } else {
+        bool changed = false;
         JsonDocument contextsDoc;
         JsonArray contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
 
@@ -1095,6 +1123,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             settings.setRLOptimizationPaused(false);
             settings.setRLLocalOptimizationEnabled(true);
             settings.save(true);
+            changed = true;
         } else if (type == "req:rl:context:start-bag") {
             String name = settings.getRLBeanContextName();
             if (name.isEmpty()) {
@@ -1115,6 +1144,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             settings.setRLOptimizationPaused(false);
             settings.setRLLocalOptimizationEnabled(true);
             settings.save(true);
+            changed = true;
         } else if (type == "req:rl:context:switch") {
             const String id = request["id"].as<String>();
             JsonObject context = findRLContext(contexts, id);
@@ -1127,6 +1157,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
                 settings.setRLBeanContextName(context["name"].as<String>());
                 persistRLContexts(settings, contextsDoc);
                 settings.save(true);
+                changed = true;
             }
         } else if (type == "req:rl:context:retire") {
             String id = request["id"].as<String>();
@@ -1145,6 +1176,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
                 settings.setRLLocalOptimizationEnabled(false);
             }
             settings.save(true);
+            changed = true;
         } else if (type == "req:rl:context:reset") {
             String name = settings.getRLBeanContextName();
             if (name.isEmpty()) {
@@ -1165,16 +1197,25 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             settings.setRLOptimizationPaused(false);
             settings.setRLLocalOptimizationEnabled(true);
             settings.save(true);
+            changed = true;
         } else if (type == "req:rl:local-optimization") {
             settings.setRLLocalOptimizationEnabled(request["enabled"] | true);
             settings.save(true);
+            changed = true;
         } else if (type == "req:rl:optimization:pause") {
             settings.setRLOptimizationPaused(true);
             settings.save(true);
+            changed = true;
         } else if (type == "req:rl:optimization:resume") {
             settings.setRLOptimizationPaused(false);
             settings.setRLLocalOptimizationEnabled(true);
             settings.save(true);
+            changed = true;
+        }
+
+        if (changed) {
+            pluginManager->trigger("settings:changed");
+            pluginManager->trigger("rl:settings:changed");
         }
 
         JsonArray arr = response["contexts"].to<JsonArray>();

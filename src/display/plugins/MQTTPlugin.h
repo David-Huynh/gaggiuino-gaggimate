@@ -39,6 +39,7 @@ class MQTTPlugin : public Plugin {
     void publishUploadRequeue(Event const &event);
     void addRecipeMetadata(JsonDocument &doc) const;
     bool isAutoTuningEnabled() const;
+    bool isAutoTuningParticipating() const;
     bool canApplyGrindByWeightTarget() const;
     String machineTopicId() const;
     String machineId() const;

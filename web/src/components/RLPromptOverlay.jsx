@@ -116,10 +116,17 @@ export function RLPromptOverlay() {
       setView(null);
     });
 
+    const clearListener = apiService.on('evt:rl:prompts-clear', () => {
+      setPendingRating(null);
+      setPendingRec(null);
+      setView(null);
+    });
+
     return () => {
       apiService.off('evt:rl:recommendation', recommendationListener);
       apiService.off('evt:rl:shot-complete', shotCompleteListener);
       apiService.off('evt:status', brewStartListener);
+      apiService.off('evt:rl:prompts-clear', clearListener);
     };
   }, [apiService, markSeen]);
 
@@ -150,23 +157,20 @@ export function RLPromptOverlay() {
     [view],
   );
 
-  const toggleTasteTag = useCallback(
-    tag => {
-      setView(current => {
-        if (current?.kind !== 'taste_tags') {
-          return current;
-        }
-        const currentTags = new Set(current.taste_tags || []);
-        if (currentTags.has(tag)) {
-          currentTags.delete(tag);
-        } else {
-          currentTags.add(tag);
-        }
-        return { ...current, taste_tags: Array.from(currentTags) };
-      });
-    },
-    [],
-  );
+  const toggleTasteTag = useCallback(tag => {
+    setView(current => {
+      if (current?.kind !== 'taste_tags') {
+        return current;
+      }
+      const currentTags = new Set(current.taste_tags || []);
+      if (currentTags.has(tag)) {
+        currentTags.delete(tag);
+      } else {
+        currentTags.add(tag);
+      }
+      return { ...current, taste_tags: Array.from(currentTags) };
+    });
+  }, []);
 
   const submitFeedback = useCallback(
     ({ skipped = false, clearTags = false } = {}) => {
@@ -217,7 +221,7 @@ export function RLPromptOverlay() {
       return null;
     }
     return (
-      <div className='fixed bottom-4 right-4 z-50 flex flex-col items-end gap-2'>
+      <div className='fixed right-4 bottom-4 z-50 flex flex-col items-end gap-2'>
         {pendingRating && (
           <button
             type='button'
@@ -255,7 +259,7 @@ export function RLPromptOverlay() {
       >
         <button
           type='button'
-          className='btn btn-ghost btn-xs absolute right-2 top-2'
+          className='btn btn-ghost btn-xs absolute top-2 right-2'
           onClick={minimize}
           aria-label='Minimize'
           title='Minimize'
@@ -269,57 +273,59 @@ export function RLPromptOverlay() {
               const baseline = pendingRec.mode === 'zero_observe';
               return (
                 <>
-            <div>
-              <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
-                {baseline ? 'Baseline Required' : 'Next Shot'}
-              </div>
-              <h2 className='text-xl font-bold'>
-                {baseline ? 'Pull your current recipe' : 'BO Recommendation'}
-              </h2>
-            </div>
+                  <div>
+                    <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
+                      {baseline ? 'Baseline Required' : 'Next Shot'}
+                    </div>
+                    <h2 className='text-xl font-bold'>
+                      {baseline ? 'Pull your current recipe' : 'BO Recommendation'}
+                    </h2>
+                  </div>
 
-            <div className='grid grid-cols-1 gap-2 sm:grid-cols-3'>
-              <div className='bg-base-200 rounded-md p-3'>
-                <div className='text-base-content/60 text-xs uppercase'>Grind</div>
-                <div className='text-base font-semibold'>
-                  {formatGrind(pendingRec.grind_delta_steps)}
-                </div>
-              </div>
-              <div className='bg-base-200 rounded-md p-3'>
-                <div className='text-base-content/60 text-xs uppercase'>Grind Dose</div>
-                <div className='text-base font-semibold'>{formatDose(pendingRec.next_dose_g)}</div>
-              </div>
-              <div className='bg-base-200 rounded-md p-3'>
-                <div className='text-base-content/60 text-xs uppercase'>Yield</div>
-                <div className='text-base font-semibold'>
-                  {formatYield(pendingRec.target_yield_g)}
-                </div>
-              </div>
-            </div>
+                  <div className='grid grid-cols-1 gap-2 sm:grid-cols-3'>
+                    <div className='bg-base-200 rounded-md p-3'>
+                      <div className='text-base-content/60 text-xs uppercase'>Grind</div>
+                      <div className='text-base font-semibold'>
+                        {formatGrind(pendingRec.grind_delta_steps)}
+                      </div>
+                    </div>
+                    <div className='bg-base-200 rounded-md p-3'>
+                      <div className='text-base-content/60 text-xs uppercase'>Grind Dose</div>
+                      <div className='text-base font-semibold'>
+                        {formatDose(pendingRec.next_dose_g)}
+                      </div>
+                    </div>
+                    <div className='bg-base-200 rounded-md p-3'>
+                      <div className='text-base-content/60 text-xs uppercase'>Yield</div>
+                      <div className='text-base font-semibold'>
+                        {formatYield(pendingRec.target_yield_g)}
+                      </div>
+                    </div>
+                  </div>
 
-            <div className='text-base-content/70 text-sm'>
-              {baseline
-                ? 'This first shot starts the bean context. Use your current recipe or tap Later; Ignore becomes available after the baseline is recorded.'
-                : 'Grind is manual. Use saves yield and only saves grind dose when grind-by-weight is enabled.'}
-            </div>
+                  <div className='text-base-content/70 text-sm'>
+                    {baseline
+                      ? 'This first shot starts the bean context. Use your current recipe or tap Later; Ignore becomes available after the baseline is recorded.'
+                      : 'Grind is manual. Use saves yield and only saves grind dose when grind-by-weight is enabled.'}
+                  </div>
 
-            <div className={`grid gap-2 ${baseline ? 'grid-cols-2' : 'grid-cols-3'}`}>
-              <button type='button' className='btn btn-primary' onClick={useRecommendation}>
-                {baseline ? 'Use Current' : 'Use'}
-              </button>
-              <button type='button' className='btn btn-outline' onClick={minimize}>
-                Later
-              </button>
-              {!baseline && (
-                <button
-                  type='button'
-                  className='btn btn-error btn-outline'
-                  onClick={ignoreRecommendation}
-                >
-                  Ignore
-                </button>
-              )}
-            </div>
+                  <div className={`grid gap-2 ${baseline ? 'grid-cols-2' : 'grid-cols-3'}`}>
+                    <button type='button' className='btn btn-primary' onClick={useRecommendation}>
+                      {baseline ? 'Use Current' : 'Use'}
+                    </button>
+                    <button type='button' className='btn btn-outline' onClick={minimize}>
+                      Later
+                    </button>
+                    {!baseline && (
+                      <button
+                        type='button'
+                        className='btn btn-error btn-outline'
+                        onClick={ignoreRecommendation}
+                      >
+                        Ignore
+                      </button>
+                    )}
+                  </div>
                 </>
               );
             })()}
@@ -329,7 +335,7 @@ export function RLPromptOverlay() {
         {view.kind === 'rating' && (
           <div className='space-y-4'>
             <div>
-              <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
+              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
                 Shot Complete
               </div>
               <h2 className='text-xl font-bold'>Taste?</h2>
@@ -364,7 +370,7 @@ export function RLPromptOverlay() {
         {view.kind === 'taste_tags' && (
           <div className='space-y-4'>
             <div>
-              <div className='text-base-content/60 text-xs font-semibold uppercase tracking-wide'>
+              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
                 Optional
               </div>
               <h2 className='text-xl font-bold'>What was off?</h2>

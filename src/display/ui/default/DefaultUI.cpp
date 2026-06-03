@@ -1028,7 +1028,8 @@ void DefaultUI::switchRLContext(const String &contextId) {
 
 void DefaultUI::correctRLLastShotExclude() {
     Settings const &settings = controller->getSettings();
-    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlLastShotId.isEmpty()) {
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlLastShotId.isEmpty()) {
         return;
     }
 
@@ -1044,7 +1045,8 @@ void DefaultUI::correctRLLastShotExclude() {
 
 void DefaultUI::correctRLLastShotBadPrep() {
     Settings const &settings = controller->getSettings();
-    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlLastShotId.isEmpty()) {
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlLastShotId.isEmpty()) {
         return;
     }
 
@@ -1060,7 +1062,8 @@ void DefaultUI::correctRLLastShotBadPrep() {
 
 void DefaultUI::correctRLLastShotNotFollowed(const char *fieldName) {
     Settings const &settings = controller->getSettings();
-    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlLastShotId.isEmpty()) {
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlLastShotId.isEmpty()) {
         return;
     }
 
@@ -1090,7 +1093,8 @@ void DefaultUI::correctRLLastShotNotFollowed(const char *fieldName) {
 
 void DefaultUI::requeueRLRejectedUploads() {
     Settings const &settings = controller->getSettings();
-    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || rlUploadQueueRejectedCount < 1) {
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlUploadQueueRejectedCount < 1) {
         return;
     }
 
@@ -1126,6 +1130,7 @@ void DefaultUI::showRLAutoTuningOverlay() {
     const String modeText = rlMode.isEmpty() ? "none" : rlMode;
     const bool hasContext = !settings.getRLBeanContextId().isEmpty();
     const bool localActive = settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused() && hasContext;
+    const bool canSendRLEvents = localActive;
     const char *localText = settings.isRLOptimizationPaused() ? "Local paused" : (localActive ? "Local on" : "Local off");
 
     lv_obj_t *session = rl_make_section(card, "Active Session");
@@ -1168,7 +1173,7 @@ void DefaultUI::showRLAutoTuningOverlay() {
     lv_obj_t *row4 = rl_make_action_row(actions);
     rl_make_button(row4, "Retire Bean", rl_retire_cb, this);
     lv_obj_t *retryBtn = rl_make_button(row4, "Retry Uploads", rl_requeue_uploads_cb, this);
-    if (rlUploadQueueRejectedCount < 1) {
+    if (!canSendRLEvents || rlUploadQueueRejectedCount < 1) {
         lv_obj_add_state(retryBtn, LV_STATE_DISABLED);
     }
 
@@ -1185,7 +1190,7 @@ void DefaultUI::showRLAutoTuningOverlay() {
     lv_obj_t *row5 = rl_make_action_row(correction);
     lv_obj_t *excludeBtn = rl_make_button(row5, "Exclude", rl_exclude_last_shot_cb, this);
     lv_obj_t *badPrepBtn = rl_make_button(row5, "Bad Prep", rl_bad_prep_last_shot_cb, this);
-    if (rlLastShotId.isEmpty()) {
+    if (!canSendRLEvents || rlLastShotId.isEmpty()) {
         lv_obj_add_state(excludeBtn, LV_STATE_DISABLED);
         lv_obj_add_state(badPrepBtn, LV_STATE_DISABLED);
     }
@@ -1197,7 +1202,7 @@ void DefaultUI::showRLAutoTuningOverlay() {
     lv_obj_set_size(grindBtn, 118, 34);
     lv_obj_set_size(doseBtn, 118, 34);
     lv_obj_set_size(yieldBtn, 118, 34);
-    if (rlLastShotId.isEmpty()) {
+    if (!canSendRLEvents || rlLastShotId.isEmpty()) {
         lv_obj_add_state(grindBtn, LV_STATE_DISABLED);
         lv_obj_add_state(doseBtn, LV_STATE_DISABLED);
         lv_obj_add_state(yieldBtn, LV_STATE_DISABLED);

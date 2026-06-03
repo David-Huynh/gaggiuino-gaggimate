@@ -115,7 +115,8 @@ bool RatingPlugin::autoTuningEnabled() const {
     if (!controller)
         return false;
     Settings const &settings = controller->getSettings();
-    return settings.isHomeAssistant() && settings.isRLRatingEnabled();
+    return settings.isHomeAssistant() && settings.isRLRatingEnabled() && settings.isRLLocalOptimizationEnabled() &&
+           !settings.isRLOptimizationPaused() && !settings.getRLBeanContextId().isEmpty();
 }
 
 bool RatingPlugin::baselineRecommendation() const {

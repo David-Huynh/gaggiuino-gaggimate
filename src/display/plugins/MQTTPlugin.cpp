@@ -154,7 +154,7 @@ void MQTTPlugin::publishBrewState(const char *state) {
 }
 
 void MQTTPlugin::publishMachineState(const char *state) {
-    if (!isAutoTuningEnabled())
+    if (!isAutoTuningParticipating())
         return;
 
     JsonDocument doc;
@@ -176,6 +176,17 @@ void MQTTPlugin::loop() {
     client.loop();
     if (!isBrewing)
         return;
+    if (!isAutoTuningParticipating()) {
+        isBrewing = false;
+        pressureSamples.clear();
+        targetPressureSamples.clear();
+        flowSamples.clear();
+        pumpFlowSamples.clear();
+        targetFlowSamples.clear();
+        weightSamples.clear();
+        timeSamples.clear();
+        return;
+    }
     unsigned long elapsed = millis() - brewStartMs;
     if (elapsed - lastSampleMs >= SHOT_SAMPLE_INTERVAL_MS && pressureSamples.size() < SHOT_MAX_SAMPLES) {
         recordShotSample();
@@ -198,7 +209,7 @@ void MQTTPlugin::recordShotSample() {
 }
 
 void MQTTPlugin::publishShotProfile() {
-    if (!isAutoTuningEnabled())
+    if (!isAutoTuningParticipating())
         return;
     if (pressureSamples.empty())
         return;
@@ -218,9 +229,9 @@ void MQTTPlugin::publishShotProfile() {
     doc["n_samples"] = pressureSamples.size();
     doc["shot_type"] = "espresso";
     doc["utility"] = false;
-    doc["exclude_from_local_optimization"] = !localOptimizationEnabled();
-    doc["local_optimization_enabled"] = localOptimizationEnabled();
-    doc["optimization_weight"] = localOptimizationEnabled() ? 1.0f : 0.0f;
+    doc["exclude_from_local_optimization"] = false;
+    doc["local_optimization_enabled"] = true;
+    doc["optimization_weight"] = 1.0f;
     doc["rating_prompt_allowed"] = true;
     doc["weight_source"] = weightSourceName();
     doc["flow_source"] = flowSourceName();
@@ -272,8 +283,10 @@ void MQTTPlugin::publishShotProfile() {
 }
 
 void MQTTPlugin::handleRecommendation(const String &payload) {
-    if (!pluginManager || !isAutoTuningEnabled())
+    if (!pluginManager || !isAutoTuningParticipating()) {
+        clearLatestRecommendation();
         return;
+    }
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
     if (error)
@@ -372,7 +385,7 @@ void MQTTPlugin::handleStatus(const String &payload) {
 }
 
 void MQTTPlugin::applyLatestRecommendation() {
-    if (!hasRecommendation || !controller || !isAutoTuningEnabled())
+    if (!hasRecommendation || !controller || !isAutoTuningParticipating())
         return;
 
     bool doseApplied = false;
@@ -404,7 +417,7 @@ void MQTTPlugin::applyLatestRecommendation() {
 }
 
 void MQTTPlugin::ignoreLatestRecommendation() {
-    if (!hasRecommendation || !isAutoTuningEnabled())
+    if (!hasRecommendation || !isAutoTuningParticipating())
         return;
     publishRecommendationDecision("ignored", false);
     clearLatestRecommendation();
@@ -426,7 +439,7 @@ void MQTTPlugin::clearLatestRecommendation() {
 }
 
 void MQTTPlugin::publishRecommendationDecision(const char *decision, bool includeEditedFields) {
-    if (latestRecommendationId.isEmpty())
+    if (!isAutoTuningParticipating() || latestRecommendationId.isEmpty())
         return;
 
     JsonDocument doc;
@@ -449,7 +462,7 @@ void MQTTPlugin::publishRecommendationDecision(const char *decision, bool includ
 }
 
 void MQTTPlugin::publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed) {
-    if (latestRecommendationId.isEmpty())
+    if (!isAutoTuningParticipating() || latestRecommendationId.isEmpty())
         return;
 
     const bool grindManual = latestRecommendationGrindDeltaSteps != 0;
@@ -511,7 +524,7 @@ void MQTTPlugin::publishRecommendationApply(bool doseApplied, bool yieldApplied,
 }
 
 void MQTTPlugin::publishShotCorrection(Event const &event) {
-    if (!isAutoTuningEnabled())
+    if (!isAutoTuningParticipating())
         return;
 
     String shotId = event.getString("shot_id");
@@ -553,7 +566,7 @@ void MQTTPlugin::publishShotCorrection(Event const &event) {
 }
 
 void MQTTPlugin::publishUploadRequeue(Event const &event) {
-    if (!isAutoTuningEnabled())
+    if (!isAutoTuningParticipating())
         return;
 
     JsonDocument doc;
@@ -594,6 +607,8 @@ bool MQTTPlugin::isAutoTuningEnabled() const {
     Settings const &settings = controller->getSettings();
     return settings.isHomeAssistant() && settings.isRLRatingEnabled();
 }
+
+bool MQTTPlugin::isAutoTuningParticipating() const { return isAutoTuningEnabled() && localOptimizationEnabled(); }
 
 bool MQTTPlugin::canApplyGrindByWeightTarget() const {
     if (!controller)
@@ -727,7 +742,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
 
     pm->on("rl:rating", [this](Event const &event) {
-        if (!isAutoTuningEnabled())
+        if (!isAutoTuningParticipating())
             return;
         String shotId = event.getString("shot_id");
         String recommendationId = event.getString("recommendation_id");
@@ -761,7 +776,14 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
 
     pm->on("rl:upload:requeue", [this](Event const &event) { publishUploadRequeue(event); });
 
-    pm->on("rl:settings:changed", [this](Event const &) { publishMachineState("idle"); });
+    pm->on("rl:settings:changed", [this](Event const &) {
+        if (!isAutoTuningParticipating()) {
+            clearLatestRecommendation();
+            isBrewing = false;
+            return;
+        }
+        publishMachineState("idle");
+    });
 
     pm->on("controller:wifi:connect", [this, ctrl](const Event &) {
         if (!connect(ctrl))
@@ -833,7 +855,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
 
     pm->on("controller:brew:start", [this](Event const &event) {
         // A flush (utility cycle) is not a shot — never capture it for EspressoRL.
-        if (isAutoTuningEnabled() && event.getInt("utility") == 0) {
+        if (isAutoTuningParticipating() && event.getInt("utility") == 0) {
             isBrewing = true;
             brewStartMs = millis();
             currentShotId = makeShotId();
@@ -858,7 +880,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("controller:brew:end", [this](Event const &event) {
         // Skip flushes: no shot profile publish and no rl:shot:complete (which would
         // otherwise pop the rating prompt for a cleaning cycle).
-        if (isAutoTuningEnabled() && event.getInt("utility") == 0) {
+        if (isAutoTuningParticipating() && event.getInt("utility") == 0) {
             isBrewing = false;
             publishShotProfile();
             Event event;
