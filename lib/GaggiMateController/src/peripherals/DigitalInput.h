@@ -5,7 +5,8 @@
 #endif
 #include <Arduino.h>
 
-constexpr int INPUT_CHECK_INTERVAL_MS = 100;
+constexpr int INPUT_CHECK_INTERVAL_MS = 20;
+constexpr unsigned long INPUT_DEBOUNCE_MS = 80;
 
 using input_callback_t = std::function<void(const bool state)>;
 
@@ -14,14 +15,13 @@ class DigitalInput {
     DigitalInput(uint8_t pin, const input_callback_t &callback, int debounce_count = 1);
     void setup();
     void loop();
-    bool getState() const { return !_current_state; };
+    bool getState() const { return !_stable_state; };
 
   private:
     uint8_t _pin;
-    uint8_t _debounce_count;
-    uint8_t _stable_counter = 0;
-    int _current_state = 2;
-    int _last_state = 2;
+    uint8_t _stable_state = HIGH;
+    uint8_t _candidate_state = HIGH;
+    unsigned long _candidate_since_ms = 0;
     xTaskHandle taskHandle;
     input_callback_t _callback;
 

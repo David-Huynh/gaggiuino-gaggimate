@@ -1,6 +1,7 @@
 #ifndef NANOPBCOMM_UART_TRANSPORT_H
 #define NANOPBCOMM_UART_TRANSPORT_H
 
+#include "../GaggiMateComm.h"
 #include "../Transport.h"
 #include "UartFraming.h"
 #include <Arduino.h>
@@ -36,6 +37,7 @@ class UartTransport : public Transport {
 
     bool send(const uint8_t *data, size_t length) override;
     bool isConnected() const override { return _connected; }
+    UartDiagnostics getDiagnostics() const { return _diagnostics; }
 
   private:
     static constexpr size_t MAX_DATAGRAM = 256; // == Endpoint::BUFFER_SIZE; bigger is dropped
@@ -58,6 +60,7 @@ class UartTransport : public Transport {
     size_t _rxLen = 0;
     bool _rxOverflow = false;
     uint8_t _decodeBuf[DECODE_CAP]{};
+    UartDiagnostics _diagnostics{};
 
     // TX scratch, guarded by _txMutex.
     uint8_t _txStage[DECODE_CAP]{};

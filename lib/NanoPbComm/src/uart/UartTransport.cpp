@@ -61,9 +61,14 @@ void UartTransport::loop() {
 }
 
 bool UartTransport::send(const uint8_t *data, size_t length) {
-    if (data == nullptr || length == 0 || length > MAX_DATAGRAM)
+    if (data == nullptr || length == 0 || length > MAX_DATAGRAM) {
+        _diagnostics.displayTxDropCount++;
         return false; // length 0 is reserved for keepalives
-    return writeDatagram(data, length);
+    }
+    const bool ok = writeDatagram(data, length);
+    if (!ok)
+        _diagnostics.displayTxDropCount++;
+    return ok;
 }
 
 bool UartTransport::writeDatagram(const uint8_t *data, size_t length) {
@@ -95,8 +100,11 @@ void UartTransport::processByte(uint8_t byte) {
     }
     if (_rxLen < sizeof(_rxBuf))
         _rxBuf[_rxLen++] = byte;
-    else
+    else {
+        if (!_rxOverflow)
+            _diagnostics.displayRxOverflowCount++;
         _rxOverflow = true; // too big, drop the rest until the next delimiter
+    }
 }
 
 void UartTransport::handleFrame(const uint8_t *block, size_t blockLen) {
@@ -115,8 +123,10 @@ void UartTransport::handleFrame(const uint8_t *block, size_t blockLen) {
     }
 
     markAlive();
-    if (payloadLen > 0)
+    if (payloadLen > 0) {
+        _diagnostics.displayParsedEventCount++;
         emitData(_decodeBuf, payloadLen); // empty == keepalive, swallow it
+    }
 }
 
 void UartTransport::markAlive() {

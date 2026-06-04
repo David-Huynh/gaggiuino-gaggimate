@@ -168,6 +168,7 @@ class Controller {
     bool isLowWaterLevel() const { return getWaterLevel() < 20; };
 
     SystemInfo getSystemInfo() const { return systemInfo; }
+    UartDiagnostics getUartDiagnostics() const;
 
     GaggiMateClient *getClientController() { return &comms; }
 

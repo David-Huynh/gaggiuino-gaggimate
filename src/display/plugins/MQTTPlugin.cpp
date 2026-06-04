@@ -33,6 +33,10 @@ static void addCsvTags(JsonDocument &doc, const char *field, const String &csvTa
 
 static void addTasteTags(JsonDocument &doc, const String &csvTags) { addCsvTags(doc, "taste_tags", csvTags); }
 
+static uint32_t counterDelta(uint32_t current, uint32_t previous) {
+    return current >= previous ? current - previous : current;
+}
+
 static const char *phaseTypeName(PhaseType phase) {
     switch (phase) {
     case PhaseType::PHASE_TYPE_PREINFUSION:
@@ -199,6 +203,7 @@ void MQTTPlugin::publishMachineState(const char *state) {
     doc["state"] = state;
     doc["local_optimization_enabled"] = localOptimizationEnabled();
     addRecipeMetadata(doc);
+    addUartDiagnostics(doc);
 
     String json;
     serializeJson(doc, json);
@@ -232,6 +237,7 @@ void MQTTPlugin::resetShotCapture() {
     targetFlowSamples.clear();
     weightSamples.clear();
     timeSamples.clear();
+    shotStartUartDiagnostics = {};
 }
 
 void MQTTPlugin::recordShotSample() {
@@ -287,6 +293,7 @@ void MQTTPlugin::publishShotProfile() {
     doc["beverage_out_g"] = roundf(beverageOutG * 10.0f) / 10.0f;
     doc["shot_time_s"] = roundf(((millis() - brewStartMs) / 1000.0f) * 10.0f) / 10.0f;
     addRecipeMetadata(doc);
+    addUartDiagnostics(doc, &shotStartUartDiagnostics);
 
     Process *lastProcess = controller ? controller->getLastProcess() : nullptr;
     BrewProcess *brew = nullptr;
@@ -711,6 +718,59 @@ void MQTTPlugin::addRecipeMetadata(JsonDocument &doc) const {
     }
 }
 
+void MQTTPlugin::addUartDiagnostics(JsonDocument &doc, const UartDiagnostics *startSnapshot) const {
+    if (!controller)
+        return;
+    const UartDiagnostics diagnostics = controller->getUartDiagnostics();
+
+    doc["uart_remote_error_count"] = diagnostics.remoteErrorCount;
+    doc["uart_remote_timeout_count"] = diagnostics.remoteTimeoutCount;
+    doc["uart_remote_runaway_count"] = diagnostics.remoteRunawayCount;
+    doc["uart_rx_overflow_count"] = diagnostics.remoteRxOverflowCount;
+    doc["uart_unknown_command_count"] = diagnostics.remoteUnknownCommandCount;
+    doc["uart_queue_drop_count"] = diagnostics.remoteQueueDropCount;
+    doc["uart_queue_high_watermark"] = diagnostics.remoteQueueHighWatermark;
+    doc["uart_out_command_count"] = diagnostics.remoteOutCommandCount;
+    doc["uart_adv_command_count"] = diagnostics.remoteAdvCommandCount;
+    doc["uart_ping_command_count"] = diagnostics.remotePingCommandCount;
+    doc["uart_valid_command_count"] = diagnostics.remoteValidCommandCount;
+    doc["uart_last_command_age_ms"] = diagnostics.remoteLastCommandAgeMs;
+    doc["uart_loop_late_count"] = diagnostics.remoteLoopLateCount;
+    doc["uart_loop_max_late_ms"] = diagnostics.remoteLoopMaxLateMs;
+    doc["uart_last_remote_error_code"] = diagnostics.lastRemoteErrorCode;
+    doc["uart_display_tx_drop_count"] = diagnostics.displayTxDropCount;
+    doc["uart_display_rx_overflow_count"] = diagnostics.displayRxOverflowCount;
+    doc["uart_display_parsed_event_count"] = diagnostics.displayParsedEventCount;
+
+    if (!startSnapshot)
+        return;
+    doc["uart_remote_error_count_delta"] = counterDelta(diagnostics.remoteErrorCount, startSnapshot->remoteErrorCount);
+    doc["uart_remote_timeout_count_delta"] =
+        counterDelta(diagnostics.remoteTimeoutCount, startSnapshot->remoteTimeoutCount);
+    doc["uart_remote_runaway_count_delta"] =
+        counterDelta(diagnostics.remoteRunawayCount, startSnapshot->remoteRunawayCount);
+    doc["uart_rx_overflow_count_delta"] =
+        counterDelta(diagnostics.remoteRxOverflowCount, startSnapshot->remoteRxOverflowCount);
+    doc["uart_unknown_command_count_delta"] =
+        counterDelta(diagnostics.remoteUnknownCommandCount, startSnapshot->remoteUnknownCommandCount);
+    doc["uart_queue_drop_count_delta"] =
+        counterDelta(diagnostics.remoteQueueDropCount, startSnapshot->remoteQueueDropCount);
+    doc["uart_out_command_count_delta"] =
+        counterDelta(diagnostics.remoteOutCommandCount, startSnapshot->remoteOutCommandCount);
+    doc["uart_adv_command_count_delta"] =
+        counterDelta(diagnostics.remoteAdvCommandCount, startSnapshot->remoteAdvCommandCount);
+    doc["uart_ping_command_count_delta"] =
+        counterDelta(diagnostics.remotePingCommandCount, startSnapshot->remotePingCommandCount);
+    doc["uart_valid_command_count_delta"] =
+        counterDelta(diagnostics.remoteValidCommandCount, startSnapshot->remoteValidCommandCount);
+    doc["uart_loop_late_count_delta"] =
+        counterDelta(diagnostics.remoteLoopLateCount, startSnapshot->remoteLoopLateCount);
+    doc["uart_display_tx_drop_count_delta"] =
+        counterDelta(diagnostics.displayTxDropCount, startSnapshot->displayTxDropCount);
+    doc["uart_display_rx_overflow_count_delta"] =
+        counterDelta(diagnostics.displayRxOverflowCount, startSnapshot->displayRxOverflowCount);
+}
+
 bool MQTTPlugin::isAutoTuningEnabled() const {
     if (!controller)
         return false;
@@ -778,7 +838,10 @@ float MQTTPlugin::currentShotWeightG() const {
 
     switch (static_cast<VolumetricMeasurementSource>(shotSource)) {
     case VolumetricMeasurementSource::HARDWARE_SCALE:
-        return currentHardwareShotWeight > 0.0f ? currentHardwareShotWeight : currentHardwareWeight;
+        // Use only shot-relative hardware scale weight while brewing. Falling
+        // back to raw hardware weight leaks the pre-tare drip-tray/cup offset
+        // into canonical EspressoRL samples.
+        return currentHardwareShotWeight > 0.0f ? currentHardwareShotWeight : 0.0f;
     case VolumetricMeasurementSource::FLOW_ESTIMATION:
         return currentEstimatedWeight;
     case VolumetricMeasurementSource::BLUETOOTH:
@@ -801,7 +864,11 @@ float MQTTPlugin::currentShotFlowGPerS(float currentWeightG, uint16_t elapsedMs)
     if (dtS <= 0.0f || !std::isfinite(dtS) || !std::isfinite(currentWeightG)) {
         return 0.0f;
     }
-    const float flow = (currentWeightG - weightSamples.back()) / dtS;
+    const float previousWeightG = weightSamples.back();
+    if (!std::isfinite(previousWeightG) || previousWeightG < 0.0f || currentWeightG < 0.0f) {
+        return 0.0f;
+    }
+    const float flow = (currentWeightG - previousWeightG) / dtS;
     if (!std::isfinite(flow) || flow <= 0.0f) {
         return 0.0f;
     }
@@ -969,6 +1036,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
             resetShotCapture();
             isBrewing = true;
             brewStartMs = millis();
+            shotStartUartDiagnostics = controller->getUartDiagnostics();
             currentShotId = makeShotId();
             shotSource = static_cast<int>(controller->getCurrentVolumetricSource());
             currentBluetoothWeight = 0.0f;

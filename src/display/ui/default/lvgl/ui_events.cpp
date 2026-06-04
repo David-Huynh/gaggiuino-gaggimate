@@ -50,14 +50,14 @@ void onBrewScreen(lv_event_t *e) {
 
 void onWaterScreen(lv_event_t *e) {
     controller.getUI()->changeScreen(&ui_SimpleProcessScreen, &ui_SimpleProcessScreen_screen_init);
-    controller.postCommand(CtrlCmd::SET_MODE, MODE_WATER);
     controller.postCommand(CtrlCmd::DEACTIVATE);
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_WATER);
 }
 
 void onSteamScreen(lv_event_t *e) {
     controller.getUI()->changeScreen(&ui_SimpleProcessScreen, &ui_SimpleProcessScreen_screen_init);
-    controller.postCommand(CtrlCmd::SET_MODE, MODE_STEAM);
     controller.postCommand(CtrlCmd::DEACTIVATE);
+    controller.postCommand(CtrlCmd::SET_MODE, MODE_STEAM);
 }
 
 void onWakeup(lv_event_t *e) {

@@ -60,6 +60,29 @@ struct ScaleSample {
     uint32_t sampleSeq = 0;
 };
 
+// Numeric UART diagnostics that can be safely exposed in machine/shot payloads.
+// Keep this sanitized: no raw frames, no secrets, no user content.
+struct UartDiagnostics {
+    uint32_t remoteErrorCount = 0;
+    uint32_t remoteTimeoutCount = 0;
+    uint32_t remoteRunawayCount = 0;
+    uint32_t remoteRxOverflowCount = 0;
+    uint32_t remoteUnknownCommandCount = 0;
+    uint32_t remoteQueueDropCount = 0;
+    uint32_t remoteQueueHighWatermark = 0;
+    uint32_t remoteOutCommandCount = 0;
+    uint32_t remoteAdvCommandCount = 0;
+    uint32_t remotePingCommandCount = 0;
+    uint32_t remoteValidCommandCount = 0;
+    uint32_t remoteLastCommandAgeMs = 0;
+    uint32_t remoteLoopLateCount = 0;
+    uint32_t remoteLoopMaxLateMs = 0;
+    uint32_t lastRemoteErrorCode = 0;
+    uint32_t displayTxDropCount = 0;
+    uint32_t displayRxOverflowCount = 0;
+    uint32_t displayParsedEventCount = 0;
+};
+
 constexpr uint16_t SCALE_HEALTH_OK = 0;
 constexpr uint16_t SCALE_HEALTH_NOT_CALIBRATED = 1u << 0;
 constexpr uint16_t SCALE_HEALTH_SAT_CH1 = 1u << 1;

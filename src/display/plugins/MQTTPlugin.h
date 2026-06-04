@@ -3,6 +3,7 @@
 
 #include "../core/Plugin.h"
 #include "../core/PluginManager.h"
+#include "GaggiMateComm.h"
 #include <ArduinoJson.h>
 #include <MQTT.h>
 #include <WiFi.h>
@@ -39,6 +40,7 @@ class MQTTPlugin : public Plugin {
     void publishShotCorrection(Event const &event);
     void publishUploadRequeue(Event const &event);
     void addRecipeMetadata(JsonDocument &doc) const;
+    void addUartDiagnostics(JsonDocument &doc, const UartDiagnostics *startSnapshot = nullptr) const;
     bool isAutoTuningEnabled() const;
     bool isAutoTuningParticipating() const;
     bool canApplyGrindByWeightTarget() const;
@@ -68,6 +70,7 @@ class MQTTPlugin : public Plugin {
     unsigned long lastSampleMs = 0;
     String currentShotId;
     int shotSource = 0;
+    UartDiagnostics shotStartUartDiagnostics{};
 
     float currentBluetoothWeight = 0.0f;
     float currentHardwareWeight = 0.0f;

@@ -83,7 +83,10 @@ void GaggiMateController::setup() {
     if (this->ledController->isAvailable()) {
         _config.capabilites.ledControls = true;
         _config.capabilites.tof = true;
-        _comms.onLedControl([this](uint8_t channel, uint8_t brightness) { ledController->setChannel(channel, brightness); });
+        _comms.onLedControl([this](uint8_t channel, uint8_t brightness) {
+            handlePing();
+            ledController->setChannel(channel, brightness);
+        });
     }
 
     if (_config.capabilites.ledControls) {
@@ -104,7 +107,10 @@ void GaggiMateController::setup() {
     this->steamBtn->setup();
     if (_config.capabilites.pressure) {
         pressureSensor->setup();
-        _comms.onPressureScale([this](float scale) { this->pressureSensor->setScale(scale); });
+        _comms.onPressureScale([this](float scale) {
+            handlePing();
+            this->pressureSensor->setScale(scale);
+        });
     }
 #if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
     if (_config.capabilites.scale && scale != nullptr) {
@@ -119,12 +125,19 @@ void GaggiMateController::setup() {
                 _comms.sendScaleCalibrationResult(channel, factor);
             }
         });
-        _comms.onScaleTare([this]() { scale->requestTare(); });
+        _comms.onScaleTare([this]() {
+            handlePing();
+            scale->requestTare();
+        });
         _comms.onScaleCalibration([this](float c1, float c2, long offset1, long offset2) {
+            handlePing();
             scale->setCalibration(c1, c2);
             scale->setOffset(offset1, offset2);
         });
-        _comms.onScaleCalibrationStart([this](uint8_t channel, float refWeight) { scale->requestCalibration(channel, refWeight); });
+        _comms.onScaleCalibrationStart([this](uint8_t channel, float refWeight) {
+            handlePing();
+            scale->requestCalibration(channel, refWeight);
+        });
     }
 #endif
     // Set up thermal feedforward for main heater if pressure/dimming capability exists
@@ -184,9 +197,12 @@ void GaggiMateController::setup() {
     // Binary outputs: index 0 = brew valve, index 1 = alt relay.
     _comms.onRelayControl([this](uint8_t index, bool open) {
         if (index == 1) {
-            // Alt relay: independent function, no watchdog/error gating (matches
-            // the previous dedicated alt-control path).
-            this->alt->set(open);
+            handlePing();
+            if (errorState != ERROR_CODE_NONE) {
+                return;
+            }
+            if (this->alt)
+                this->alt->set(open);
             return;
         }
         if (index != 0) { // only 0 (brew valve) and 1 (alt) exist
@@ -203,12 +219,14 @@ void GaggiMateController::setup() {
         }
     });
     _comms.onPidSettings([this](float Kp, float Ki, float Kd, float Kf) {
+        handlePing();
         this->heater->setTunings(Kp, Ki, Kd);
 
         // Apply thermal feedforward parameters if available
         this->heater->setFeedforwardScale(Kf);
     });
     _comms.onPumpModelCoeffs([this](float a, float b, float c, float d) {
+        handlePing();
         if (_config.capabilites.dimming) {
             auto dimmedPump = static_cast<DimmedPump *>(pump);
             // Check if this is a flow measurement call (a and b are flow measurements, c and d are nan)
@@ -228,6 +246,7 @@ void GaggiMateController::setup() {
         this->heater->autotune(static_cast<int>(testTimeSec), static_cast<int>(windowSize), static_cast<int>(heaterWattage));
     });
     _comms.onTare([this]() {
+        handlePing();
         if (!_config.capabilites.dimming) {
             return;
         }
@@ -332,6 +351,9 @@ void GaggiMateController::handlePing() {
 
 void GaggiMateController::handlePingTimeout() {
     ESP_LOGE(LOG_TAG, "Ping timeout detected. Turning off heater and pump for safety.\n");
+    if (errorState != ERROR_CODE_TIMEOUT) {
+        _comm->sendError(ERROR_CODE_TIMEOUT);
+    }
     // Turn off the heater and pump as a safety measure
     this->heater->setSetpoint(0);
     this->pump->setPower(0);

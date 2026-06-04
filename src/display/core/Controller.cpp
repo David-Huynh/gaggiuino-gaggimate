@@ -964,13 +964,21 @@ void Controller::applyConnectionPriority(bool force) {
 
 float Controller::getTargetTemp() const {
     Process *proc = currentProcess;
+    if (proc != nullptr && proc->isActive()) {
+        switch (proc->getType()) {
+        case MODE_BREW:
+            return static_cast<BrewProcess *>(proc)->getTemperature();
+        case MODE_STEAM:
+            return settings.getTargetSteamTemp();
+        case MODE_WATER:
+            return settings.getTargetWaterTemp();
+        default:
+            break;
+        }
+    }
     switch (mode) {
     case MODE_BREW:
     case MODE_GRIND:
-        if (proc != nullptr && proc->isActive() && proc->getType() == MODE_BREW) {
-            auto brewProcess = static_cast<BrewProcess *>(proc);
-            return brewProcess->getTemperature();
-        }
         return profileManager->getSelectedProfile().temperature;
     case MODE_STEAM:
         return settings.getTargetSteamTemp();
@@ -979,6 +987,14 @@ float Controller::getTargetTemp() const {
     default:
         return 0;
     }
+}
+
+UartDiagnostics Controller::getUartDiagnostics() const {
+#ifdef GAGGIMATE_UART_COMMS
+    return comms.getDiagnostics();
+#else
+    return {};
+#endif
 }
 
 void Controller::setTargetTemp(float temperature) {
@@ -1564,6 +1580,14 @@ void Controller::handleBrewButton(int brewButtonStatus) {
 }
 
 void Controller::handleSteamButton(int steamButtonStatus) {
+    {
+        ProcessLock lock(processMutex);
+        Process *proc = currentProcess;
+        if (proc != nullptr && proc->isActive() && proc->getType() == MODE_BREW) {
+            ESP_LOGW(LOG_TAG, "Ignoring steam button state %d while brew process is active", steamButtonStatus);
+            return;
+        }
+    }
     if (steamButtonStatus) {
         if (getMode() != MODE_STEAM) {
             setMode(MODE_STEAM);
