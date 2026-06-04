@@ -72,6 +72,63 @@ static JsonArray loadRLContexts(JsonDocument &doc, const String &rawJson) {
     return doc.as<JsonArray>();
 }
 
+static String limitedRLString(JsonVariant value, size_t maxLength) {
+    String text = value.as<String>();
+    text.trim();
+    if (text.length() > maxLength) {
+        text = text.substring(0, maxLength);
+    }
+    return text;
+}
+
+static void copyRLRecentShots(JsonDocument &target, const String &rawJson) {
+    JsonArray out = target["rlRecentShots"].to<JsonArray>();
+    JsonDocument recentDoc;
+    DeserializationError error = deserializeJson(recentDoc, rawJson);
+    if (error || !recentDoc.is<JsonArray>()) {
+        return;
+    }
+
+    int copied = 0;
+    for (JsonVariant item : recentDoc.as<JsonArray>()) {
+        if (!item.is<JsonObject>()) {
+            continue;
+        }
+        JsonObject src = item.as<JsonObject>();
+        String shotId = limitedRLString(src["shot_id"], 160);
+        if (shotId.isEmpty()) {
+            continue;
+        }
+
+        JsonObject shot = out.add<JsonObject>();
+        shot["shot_id"] = shotId;
+        shot["timestamp"] = src["timestamp"] | 0;
+        shot["shot_type"] = limitedRLString(src["shot_type"], 40);
+        shot["shot_time_s"] = src["shot_time_s"] | 0.0f;
+        shot["beverage_out_g"] = src["beverage_out_g"] | 0.0f;
+        shot["target_yield_g"] = src["target_yield_g"] | 0.0f;
+        shot["human_rating"] = src["human_rating"] | 0;
+        shot["exclude_from_local_optimization"] = src["exclude_from_local_optimization"] | false;
+        shot["optimization_weight"] = src["optimization_weight"] | 0.0f;
+        shot["profile_label"] = limitedRLString(src["profile_label"], 80);
+        shot["profile_type"] = limitedRLString(src["profile_type"], 40);
+        shot["final_phase_index"] = src["final_phase_index"] | 0;
+        shot["final_phase_name"] = limitedRLString(src["final_phase_name"], 80);
+        shot["final_phase_type"] = limitedRLString(src["final_phase_type"], 40);
+        shot["final_phase_elapsed_s"] = src["final_phase_elapsed_s"] | 0.0f;
+        shot["final_pump_target"] = limitedRLString(src["final_pump_target"], 40);
+        shot["shot_end_state"] = limitedRLString(src["shot_end_state"], 40);
+        shot["profile_flow_valid"] = src["profile_flow_valid"] | false;
+        shot["profile_flow_masked"] = src["profile_flow_masked"] | false;
+        shot["rejected_upload"] = src["rejected_upload"] | false;
+
+        copied++;
+        if (copied >= 10) {
+            break;
+        }
+    }
+}
+
 static int currentBagIndex(JsonArray contexts, const String &name) {
     int bag = 0;
     for (JsonObject context : contexts) {
@@ -225,6 +282,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlUploadQueueLastRejectedError = event.getString("upload_queue_last_rejected_error");
         rlCommunityUploadEnabled = event.getInt("community_upload_enabled") > 0;
         rlBestKnownRecipe = event.getString("best_known_recipe");
+        rlRecentShotsJson = event.getString("recent_shots_json").isEmpty() ? "[]" : event.getString("recent_shots_json");
 
         JsonDocument doc;
         doc["tp"] = "evt:rl:status";
@@ -251,6 +309,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
         doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
         doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
+        copyRLRecentShots(doc, rlRecentShotsJson);
         ws.textAll(doc.as<String>());
     });
     auto clearRLPromptsIfInactive = [this](Event const &) {
@@ -875,6 +934,11 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         event.setString("source", "gaggimate_webui");
                         event.setString("action", action);
                         event.setInt("limit", doc["limit"] | 50);
+                        String localRecordId = doc["local_record_id"].as<String>();
+                        localRecordId.trim();
+                        if (!localRecordId.isEmpty()) {
+                            event.setString("local_record_id", localRecordId);
+                        }
                         pluginManager->trigger(event);
                         resp["success"] = true;
                     }
@@ -1467,6 +1531,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
     doc["rlCommunityUploadEnabled"] = rlCommunityUploadEnabled;
     doc["rlBestKnownRecipe"] = rlBestKnownRecipe;
+    copyRLRecentShots(doc, rlRecentShotsJson);
     doc["homeAssistant"] = settings.isHomeAssistant();
     doc["haUser"] = settings.getHomeAssistantUser();
     doc["haPassword"] = settings.getHomeAssistantPassword();

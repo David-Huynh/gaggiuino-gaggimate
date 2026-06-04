@@ -53,6 +53,8 @@ class DefaultUI {
     void correctRLLastShotNotFollowed(const char *fieldName);
     void requeueRLRejectedUploads();
     void purgeRLRejectedUploads();
+    void purgeRLSelectedRejectedUpload();
+    void selectRLRecentShotDelta(int delta);
     void setBrightness(int brightness) {
         if (panelDriver) {
             panelDriver->setBrightness(brightness);
@@ -97,6 +99,8 @@ class DefaultUI {
     void updateTempStableFlag();
     void adjustHeatingIndicator(lv_obj_t *contentPanel);
     void reloadProfiles();
+    String currentRLCorrectionShotId();
+    int currentRLRecentShotCount() const;
 
     Driver *panelDriver = nullptr;
     Controller *controller;
@@ -142,6 +146,8 @@ class DefaultUI {
     float rlLastShotBeverageOutG = 0.0f;
     float rlLastShotTargetYieldG = 0.0f;
     int rlLastShotHumanRating = 0;
+    String rlRecentShotsJson = "[]";
+    int rlSelectedShotIndex = 0;
     int rlUploadQueueRejectedCount = 0;
     String rlUploadQueueLastRejectedRecordId = "";
     String rlUploadQueueLastRejectedError = "";

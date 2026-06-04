@@ -116,6 +116,32 @@ function formatLastShotSubtitle(settings) {
   return `${formatTimestamp(settings.rlLastShotAt)} - ${shortId(settings.rlLastShotId)}`;
 }
 
+function formatShotSubtitle(shot) {
+  if (!shot?.shot_id) {
+    return 'No shot selected';
+  }
+  return `${formatTimestamp(shot.timestamp)} - ${shortId(shot.shot_id)}`;
+}
+
+function shotDetailList(shot) {
+  if (!shot) {
+    return [];
+  }
+  return [
+    shot.shot_type && `Type ${shot.shot_type}`,
+    Number(shot.shot_time_s) > 0 && `${Number(shot.shot_time_s).toFixed(1)}s`,
+    Number(shot.beverage_out_g) > 0 && `${Number(shot.beverage_out_g).toFixed(1)}g out`,
+    Number(shot.target_yield_g) > 0 && `target ${Number(shot.target_yield_g).toFixed(1)}g`,
+    Number(shot.human_rating) > 0 && `${shot.human_rating} star`,
+    shot.profile_label && `Profile ${shot.profile_label}`,
+    shot.final_phase_name && `Ended ${shot.final_phase_name}`,
+    shot.final_phase_type && `Phase ${shot.final_phase_type}`,
+    shot.shot_end_state && `State ${shot.shot_end_state}`,
+    shot.profile_flow_masked && 'Flow masked',
+    shot.rejected_upload && 'Rejected upload',
+  ].filter(Boolean);
+}
+
 function localOptimizationLabel(localOn, paused) {
   if (paused) {
     return 'Paused';
@@ -136,6 +162,7 @@ export function AutoTuning() {
   const [loading, setLoading] = useState(true);
   const [beanName, setBeanName] = useState('');
   const [busy, setBusy] = useState(false);
+  const [selectedShotId, setSelectedShotId] = useState('');
 
   const loadSettings = useCallback(async () => {
     const response = await fetch('/api/settings');
@@ -160,6 +187,17 @@ export function AutoTuning() {
     });
     return () => apiService.off('evt:rl:status', listenerId);
   }, [apiService]);
+
+  useEffect(() => {
+    const recent = Array.isArray(settings?.rlRecentShots) ? settings.rlRecentShots : [];
+    if (recent.length === 0) {
+      setSelectedShotId('');
+      return;
+    }
+    if (!selectedShotId || !recent.some(shot => shot.shot_id === selectedShotId)) {
+      setSelectedShotId(recent[0].shot_id || '');
+    }
+  }, [selectedShotId, settings?.rlRecentShots]);
 
   const run = useCallback(
     async (tp, payload = {}) => {
@@ -204,20 +242,27 @@ export function AutoTuning() {
   const canSendRLEvents = localOn && !paused && !!settings?.rlBeanContextId;
   const uploadRejectedCount = settings?.rlUploadQueueRejectedCount ?? 0;
   const hasRejectedUploads = uploadRejectedCount > 0;
+  const recentShots = Array.isArray(settings?.rlRecentShots) ? settings.rlRecentShots : [];
+  const selectedShot =
+    recentShots.find(shot => shot.shot_id === selectedShotId) ||
+    recentShots[0] ||
+    (settings?.rlLastShotId
+      ? {
+          shot_id: settings.rlLastShotId,
+          timestamp: settings.rlLastShotAt,
+          shot_type: settings.rlLastShotType,
+          shot_time_s: settings.rlLastShotTimeS,
+          beverage_out_g: settings.rlLastShotBeverageOutG,
+          target_yield_g: settings.rlLastShotTargetYieldG,
+          human_rating: settings.rlLastShotHumanRating,
+        }
+      : null);
+  const selectedShotDetails = shotDetailList(selectedShot);
   const lastRejectedText = settings?.rlUploadQueueLastRejectedRecordId
     ? `${settings.rlUploadQueueLastRejectedRecordId}: ${
         settings?.rlUploadQueueLastRejectedError || 'Rejected'
       }`
     : 'No rejected upload snapshots';
-  const lastShotDetails = [
-    settings?.rlLastShotType && `Type ${settings.rlLastShotType}`,
-    Number(settings?.rlLastShotTimeS) > 0 && `${Number(settings.rlLastShotTimeS).toFixed(1)}s`,
-    Number(settings?.rlLastShotBeverageOutG) > 0 &&
-      `${Number(settings.rlLastShotBeverageOutG).toFixed(1)}g out`,
-    Number(settings?.rlLastShotTargetYieldG) > 0 &&
-      `target ${Number(settings.rlLastShotTargetYieldG).toFixed(1)}g`,
-    Number(settings?.rlLastShotHumanRating) > 0 && `${settings.rlLastShotHumanRating} star`,
-  ].filter(Boolean);
 
   return (
     <div className='mx-auto flex w-full max-w-6xl flex-col gap-4'>
@@ -379,15 +424,33 @@ export function AutoTuning() {
         </Panel>
 
         <Panel
-          title='Last Shot Correction'
-          subtitle={formatLastShotSubtitle(settings)}
+          title='Shot Correction'
+          subtitle={selectedShot ? formatShotSubtitle(selectedShot) : formatLastShotSubtitle(settings)}
         >
-          {settings?.rlLastShotId && (
+          {recentShots.length > 0 && (
+            <div className='mb-3'>
+              <label className='text-base-content/60 mb-1 block text-xs tracking-wide uppercase'>
+                Recent shot
+              </label>
+              <select
+                className='select select-bordered w-full'
+                value={selectedShot?.shot_id || ''}
+                onChange={event => setSelectedShotId(event.currentTarget.value)}
+              >
+                {recentShots.map(shot => (
+                  <option key={shot.shot_id} value={shot.shot_id}>
+                    {formatTimestamp(shot.timestamp)} - {shortId(shot.shot_id)}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {selectedShot && (
             <div className='bg-base-200/50 mb-3 rounded-md p-3 text-sm'>
-              <div className='text-base-content font-medium break-words'>{settings.rlLastShotId}</div>
-              {lastShotDetails.length > 0 && (
+              <div className='text-base-content font-medium break-words'>{selectedShot.shot_id}</div>
+              {selectedShotDetails.length > 0 && (
                 <div className='text-base-content/70 mt-1 flex flex-wrap gap-x-3 gap-y-1'>
-                  {lastShotDetails.map(detail => (
+                  {selectedShotDetails.map(detail => (
                     <span key={detail}>{detail}</span>
                   ))}
                 </div>
@@ -398,10 +461,10 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !selectedShot?.shot_id}
               onClick={() =>
                 run('req:rl:shot:correction', {
-                  shot_id: settings?.rlLastShotId,
+                  shot_id: selectedShot?.shot_id,
                   exclude_from_local_optimization: true,
                   correction_tags: ['changed_manually'],
                 })
@@ -413,10 +476,10 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !selectedShot?.shot_id}
               onClick={() =>
                 run('req:rl:shot:correction', {
-                  shot_id: settings?.rlLastShotId,
+                  shot_id: selectedShot?.shot_id,
                   exclude_from_local_optimization: true,
                   correction_tags: ['bad_puck_prep', 'channeling_suspected'],
                 })
@@ -428,10 +491,10 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !selectedShot?.shot_id}
               onClick={() =>
                 run('req:rl:shot:correction', {
-                  shot_id: settings?.rlLastShotId,
+                  shot_id: selectedShot?.shot_id,
                   grind_followed: false,
                   correction_tags: ['did_not_follow_grind', 'changed_manually'],
                 })
@@ -443,10 +506,10 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal'
-              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !selectedShot?.shot_id}
               onClick={() =>
                 run('req:rl:shot:correction', {
-                  shot_id: settings?.rlLastShotId,
+                  shot_id: selectedShot?.shot_id,
                   dose_followed: false,
                   correction_tags: ['did_not_follow_dose', 'changed_manually'],
                 })
@@ -458,10 +521,10 @@ export function AutoTuning() {
             <button
               type='button'
               className='btn btn-outline btn-sm min-h-10 whitespace-normal sm:col-span-1'
-              disabled={busy || !canSendRLEvents || !settings?.rlLastShotId}
+              disabled={busy || !canSendRLEvents || !selectedShot?.shot_id}
               onClick={() =>
                 run('req:rl:shot:correction', {
-                  shot_id: settings?.rlLastShotId,
+                  shot_id: selectedShot?.shot_id,
                   yield_followed: false,
                   correction_tags: ['did_not_follow_yield', 'changed_manually'],
                 })
@@ -469,6 +532,21 @@ export function AutoTuning() {
             >
               <FontAwesomeIcon icon={faBan} />
               Yield not followed
+            </button>
+            <button
+              type='button'
+              className='btn btn-error btn-outline btn-sm col-span-2 min-h-10 whitespace-normal sm:col-span-1'
+              disabled={busy || !canSendRLEvents || !selectedShot?.shot_id || !selectedShot?.rejected_upload}
+              onClick={() =>
+                run('req:rl:upload:requeue', {
+                  action: 'purge_rejected',
+                  limit: 1,
+                  local_record_id: selectedShot?.shot_id,
+                })
+              }
+            >
+              <FontAwesomeIcon icon={faTrashCan} />
+              Purge rejected
             </button>
           </div>
         </Panel>

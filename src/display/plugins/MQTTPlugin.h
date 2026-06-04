@@ -109,6 +109,7 @@ class MQTTPlugin : public Plugin {
     String latestStatusUploadQueueLastRejectedError;
     bool latestStatusCommunityUploadEnabled = false;
     String latestStatusBestKnownRecipe;
+    String latestStatusRecentShotsJson = "[]";
 
     std::vector<float> pressureSamples;
     std::vector<float> targetPressureSamples;

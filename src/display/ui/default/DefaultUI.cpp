@@ -368,6 +368,24 @@ static void rl_purge_rejected_uploads_cb(lv_event_t *e) {
     }
 }
 
+static void rl_purge_selected_rejected_upload_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->purgeRLSelectedRejectedUpload();
+    }
+}
+
+static void rl_recent_prev_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->selectRLRecentShotDelta(-1);
+    }
+}
+
+static void rl_recent_next_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->selectRLRecentShotDelta(1);
+    }
+}
+
 static void rl_context_select_cb(lv_event_t *e) {
     auto *data = static_cast<RLContextButtonData *>(lv_event_get_user_data(e));
     if (!data) {
@@ -590,6 +608,13 @@ void DefaultUI::init() {
         rlLastShotBeverageOutG = event.getInt("last_shot_beverage_out_g_x10") / 10.0f;
         rlLastShotTargetYieldG = event.getInt("last_shot_target_yield_g_x10") / 10.0f;
         rlLastShotHumanRating = event.getInt("last_shot_human_rating");
+        rlRecentShotsJson = event.getString("recent_shots_json").isEmpty() ? "[]" : event.getString("recent_shots_json");
+        int recentCount = currentRLRecentShotCount();
+        if (recentCount <= 0) {
+            rlSelectedShotIndex = 0;
+        } else if (rlSelectedShotIndex >= recentCount) {
+            rlSelectedShotIndex = recentCount - 1;
+        }
         rlUploadQueueRejectedCount = event.getInt("upload_queue_rejected_count");
         rlUploadQueueLastRejectedRecordId = event.getString("upload_queue_last_rejected_record_id");
         rlUploadQueueLastRejectedError = event.getString("upload_queue_last_rejected_error");
@@ -1054,16 +1079,62 @@ void DefaultUI::switchRLContext(const String &contextId) {
     rerender = true;
 }
 
+int DefaultUI::currentRLRecentShotCount() const {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, rlRecentShotsJson);
+    if (error || !doc.is<JsonArray>()) {
+        return 0;
+    }
+    return doc.as<JsonArray>().size();
+}
+
+String DefaultUI::currentRLCorrectionShotId() {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, rlRecentShotsJson);
+    if (error || !doc.is<JsonArray>() || doc.as<JsonArray>().size() == 0) {
+        return rlLastShotId;
+    }
+    JsonArray shots = doc.as<JsonArray>();
+    if (rlSelectedShotIndex < 0) {
+        rlSelectedShotIndex = 0;
+    }
+    if (rlSelectedShotIndex >= static_cast<int>(shots.size())) {
+        rlSelectedShotIndex = static_cast<int>(shots.size()) - 1;
+    }
+    String shotId = shots[rlSelectedShotIndex]["shot_id"].as<String>();
+    return shotId.isEmpty() ? rlLastShotId : shotId;
+}
+
+void DefaultUI::selectRLRecentShotDelta(int delta) {
+    int count = currentRLRecentShotCount();
+    if (count <= 0) {
+        rlSelectedShotIndex = 0;
+        return;
+    }
+    rlSelectedShotIndex += delta;
+    if (rlSelectedShotIndex < 0) {
+        rlSelectedShotIndex = count - 1;
+    } else if (rlSelectedShotIndex >= count) {
+        rlSelectedShotIndex = 0;
+    }
+    if (rlOverlay != nullptr) {
+        lv_obj_del(rlOverlay);
+        rlOverlay = nullptr;
+        showRLAutoTuningOverlay();
+    }
+}
+
 void DefaultUI::correctRLLastShotExclude() {
     Settings const &settings = controller->getSettings();
+    String shotId = currentRLCorrectionShotId();
     if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
-        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlLastShotId.isEmpty()) {
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || shotId.isEmpty()) {
         return;
     }
 
     Event event;
     event.id = "rl:shot:correction";
-    event.setString("shot_id", rlLastShotId);
+    event.setString("shot_id", shotId);
     event.setString("source", "gaggimate_lvgl");
     event.setInt("has_exclude_from_local_optimization", 1);
     event.setInt("exclude_from_local_optimization", 1);
@@ -1073,14 +1144,15 @@ void DefaultUI::correctRLLastShotExclude() {
 
 void DefaultUI::correctRLLastShotBadPrep() {
     Settings const &settings = controller->getSettings();
+    String shotId = currentRLCorrectionShotId();
     if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
-        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlLastShotId.isEmpty()) {
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || shotId.isEmpty()) {
         return;
     }
 
     Event event;
     event.id = "rl:shot:correction";
-    event.setString("shot_id", rlLastShotId);
+    event.setString("shot_id", shotId);
     event.setString("source", "gaggimate_lvgl");
     event.setInt("has_exclude_from_local_optimization", 1);
     event.setInt("exclude_from_local_optimization", 1);
@@ -1090,14 +1162,15 @@ void DefaultUI::correctRLLastShotBadPrep() {
 
 void DefaultUI::correctRLLastShotNotFollowed(const char *fieldName) {
     Settings const &settings = controller->getSettings();
+    String shotId = currentRLCorrectionShotId();
     if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
-        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlLastShotId.isEmpty()) {
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || shotId.isEmpty()) {
         return;
     }
 
     Event event;
     event.id = "rl:shot:correction";
-    event.setString("shot_id", rlLastShotId);
+    event.setString("shot_id", shotId);
     event.setString("source", "gaggimate_lvgl");
     String tags = "changed_manually";
     if (strcmp(fieldName, "grind") == 0) {
@@ -1146,6 +1219,23 @@ void DefaultUI::purgeRLRejectedUploads() {
     event.setString("source", "gaggimate_lvgl");
     event.setString("action", "purge_rejected");
     event.setInt("limit", 50);
+    pluginManager->trigger(event);
+}
+
+void DefaultUI::purgeRLSelectedRejectedUpload() {
+    Settings const &settings = controller->getSettings();
+    String shotId = currentRLCorrectionShotId();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || shotId.isEmpty()) {
+        return;
+    }
+
+    Event event;
+    event.id = "rl:upload:requeue";
+    event.setString("source", "gaggimate_lvgl");
+    event.setString("action", "purge_rejected");
+    event.setInt("limit", 1);
+    event.setString("local_record_id", shotId);
     pluginManager->trigger(event);
 }
 
@@ -1232,29 +1322,83 @@ void DefaultUI::showRLAutoTuningOverlay() {
         }
     }
 
-    lv_obj_t *correction = rl_make_section(card, "Last Shot");
-    rl_add_info_row(correction, "Shot", rl_short_text(rlLastShotId), true);
-    rl_add_info_row(correction, "Date/time", rl_format_datetime(rlLastShotAt));
-    if (!rlLastShotType.isEmpty()) {
-        rl_add_info_row(correction, "Type", rlLastShotType);
+    String correctionShotId = rlLastShotId;
+    long correctionShotAt = rlLastShotAt;
+    String correctionShotType = rlLastShotType;
+    float correctionShotTimeS = rlLastShotTimeS;
+    float correctionBeverageOutG = rlLastShotBeverageOutG;
+    float correctionTargetYieldG = rlLastShotTargetYieldG;
+    int correctionHumanRating = rlLastShotHumanRating;
+    String correctionProfileLabel = "";
+    String correctionFinalPhase = "";
+    String correctionEndState = "";
+    bool correctionRejectedUpload = false;
+    int recentCount = 0;
+
+    JsonDocument recentDoc;
+    DeserializationError recentError = deserializeJson(recentDoc, rlRecentShotsJson);
+    if (!recentError && recentDoc.is<JsonArray>()) {
+        JsonArray shots = recentDoc.as<JsonArray>();
+        recentCount = shots.size();
+        if (recentCount > 0) {
+            if (rlSelectedShotIndex < 0) {
+                rlSelectedShotIndex = 0;
+            }
+            if (rlSelectedShotIndex >= recentCount) {
+                rlSelectedShotIndex = recentCount - 1;
+            }
+            JsonObject shot = shots[rlSelectedShotIndex].as<JsonObject>();
+            correctionShotId = shot["shot_id"].as<String>();
+            correctionShotAt = shot["timestamp"] | 0;
+            correctionShotType = shot["shot_type"].as<String>();
+            correctionShotTimeS = shot["shot_time_s"] | 0.0f;
+            correctionBeverageOutG = shot["beverage_out_g"] | 0.0f;
+            correctionTargetYieldG = shot["target_yield_g"] | 0.0f;
+            correctionHumanRating = shot["human_rating"] | 0;
+            correctionProfileLabel = shot["profile_label"].as<String>();
+            correctionFinalPhase = shot["final_phase_name"].as<String>();
+            correctionEndState = shot["shot_end_state"].as<String>();
+            correctionRejectedUpload = shot["rejected_upload"] | false;
+        }
     }
-    if (rlLastShotBeverageOutG > 0.0f || rlLastShotTargetYieldG > 0.0f) {
+
+    lv_obj_t *correction = rl_make_section(card, "Recent Shot");
+    if (recentCount > 1) {
+        lv_obj_t *shotNav = rl_make_action_row(correction);
+        rl_make_button(shotNav, "Prev", rl_recent_prev_cb, this);
+        rl_make_button(shotNav, "Next", rl_recent_next_cb, this);
+    }
+    rl_add_info_row(correction, "Shot", rl_short_text(correctionShotId), true);
+    rl_add_info_row(correction, "Date/time", rl_format_datetime(correctionShotAt));
+    if (!correctionShotType.isEmpty()) {
+        rl_add_info_row(correction, "Type", correctionShotType);
+    }
+    if (correctionBeverageOutG > 0.0f || correctionTargetYieldG > 0.0f) {
         char yieldBuffer[48];
-        snprintf(yieldBuffer, sizeof(yieldBuffer), "%.1fg / %.1fg", rlLastShotBeverageOutG, rlLastShotTargetYieldG);
+        snprintf(yieldBuffer, sizeof(yieldBuffer), "%.1fg / %.1fg", correctionBeverageOutG, correctionTargetYieldG);
         rl_add_info_row(correction, "Yield", String(yieldBuffer));
     }
-    if (rlLastShotTimeS > 0.0f) {
+    if (correctionShotTimeS > 0.0f) {
         char timeBuffer[24];
-        snprintf(timeBuffer, sizeof(timeBuffer), "%.1fs", rlLastShotTimeS);
+        snprintf(timeBuffer, sizeof(timeBuffer), "%.1fs", correctionShotTimeS);
         rl_add_info_row(correction, "Time", String(timeBuffer));
     }
-    if (rlLastShotHumanRating > 0) {
-        rl_add_info_row(correction, "Rating", String(rlLastShotHumanRating));
+    if (correctionHumanRating > 0) {
+        rl_add_info_row(correction, "Rating", String(correctionHumanRating));
+    }
+    if (!correctionProfileLabel.isEmpty()) {
+        rl_add_info_row(correction, "Profile", correctionProfileLabel);
+    }
+    if (!correctionFinalPhase.isEmpty()) {
+        rl_add_info_row(correction, "Ended", correctionFinalPhase);
+    }
+    if (!correctionEndState.isEmpty()) {
+        rl_add_info_row(correction, "State", correctionEndState);
     }
     lv_obj_t *row5 = rl_make_action_row(correction);
     lv_obj_t *excludeBtn = rl_make_button(row5, "Exclude", rl_exclude_last_shot_cb, this);
     lv_obj_t *badPrepBtn = rl_make_button(row5, "Bad Prep", rl_bad_prep_last_shot_cb, this);
-    if (!canSendRLEvents || rlLastShotId.isEmpty()) {
+    if (!canSendRLEvents || correctionShotId.isEmpty()) {
         lv_obj_add_state(excludeBtn, LV_STATE_DISABLED);
         lv_obj_add_state(badPrepBtn, LV_STATE_DISABLED);
     }
@@ -1266,10 +1410,15 @@ void DefaultUI::showRLAutoTuningOverlay() {
     lv_obj_set_size(grindBtn, 118, 34);
     lv_obj_set_size(doseBtn, 118, 34);
     lv_obj_set_size(yieldBtn, 118, 34);
-    if (!canSendRLEvents || rlLastShotId.isEmpty()) {
+    if (!canSendRLEvents || correctionShotId.isEmpty()) {
         lv_obj_add_state(grindBtn, LV_STATE_DISABLED);
         lv_obj_add_state(doseBtn, LV_STATE_DISABLED);
         lv_obj_add_state(yieldBtn, LV_STATE_DISABLED);
+    }
+    lv_obj_t *row7 = rl_make_action_row(correction);
+    lv_obj_t *purgeSelectedBtn = rl_make_button(row7, "Purge Sel", rl_purge_selected_rejected_upload_cb, this);
+    if (!canSendRLEvents || correctionShotId.isEmpty() || !correctionRejectedUpload) {
+        lv_obj_add_state(purgeSelectedBtn, LV_STATE_DISABLED);
     }
 }
 

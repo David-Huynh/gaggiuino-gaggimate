@@ -115,6 +115,7 @@ class WebUIPlugin : public Plugin {
     String rlUploadQueueLastRejectedError = "";
     bool rlCommunityUploadEnabled = false;
     String rlBestKnownRecipe = "";
+    String rlRecentShotsJson = "[]";
 
     // Pending RL prompts (serialized evt payloads). WebUIPlugin is the source of
     // truth so the WebUI can restore minimized prompt pills after a timeout, a

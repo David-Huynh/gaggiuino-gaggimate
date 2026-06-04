@@ -432,6 +432,14 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusUploadQueueLastRejectedError = doc["upload_queue_last_rejected_error"].as<String>();
     latestStatusCommunityUploadEnabled = doc["community_upload_enabled"] | false;
     latestStatusBestKnownRecipe = "";
+    latestStatusRecentShotsJson = "[]";
+    if (doc["recent_shots"].is<JsonArray>()) {
+        String recent;
+        serializeJson(doc["recent_shots"], recent);
+        if (recent.length() <= 4096) {
+            latestStatusRecentShotsJson = recent;
+        }
+    }
     if (doc["best_known_recipe"].is<JsonObject>()) {
         JsonObject best = doc["best_known_recipe"].as<JsonObject>();
         float dose = best["dose_g"] | 0.0f;
@@ -472,6 +480,7 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setString("upload_queue_last_rejected_error", latestStatusUploadQueueLastRejectedError);
     event.setInt("community_upload_enabled", latestStatusCommunityUploadEnabled ? 1 : 0);
     event.setString("best_known_recipe", latestStatusBestKnownRecipe);
+    event.setString("recent_shots_json", latestStatusRecentShotsJson);
     pluginManager->trigger(event);
 }
 
@@ -673,6 +682,9 @@ void MQTTPlugin::publishUploadRequeue(Event const &event) {
     }
     doc["action"] = action;
     doc["limit"] = event.getInt("limit") > 0 ? event.getInt("limit") : 50;
+    if (!event.getString("local_record_id").isEmpty()) {
+        doc["local_record_id"] = event.getString("local_record_id");
+    }
     doc["source"] = event.getString("source").isEmpty() ? "gaggimate_mqtt" : event.getString("source");
     doc["timestamp"] = static_cast<long>(std::time(nullptr));
     addRecipeMetadata(doc);
