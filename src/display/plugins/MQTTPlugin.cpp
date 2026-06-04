@@ -5,6 +5,7 @@
 #include <cmath>
 #include <ctime>
 #include <display/core/ProfileManager.h>
+#include <display/core/process/BrewProcess.h>
 #include <display/models/profile.h>
 #include <display/util/PsramAllocator.h>
 #include <esp_log.h>
@@ -31,6 +32,38 @@ static void addCsvTags(JsonDocument &doc, const char *field, const String &csvTa
 }
 
 static void addTasteTags(JsonDocument &doc, const String &csvTags) { addCsvTags(doc, "taste_tags", csvTags); }
+
+static const char *phaseTypeName(PhaseType phase) {
+    switch (phase) {
+    case PhaseType::PHASE_TYPE_PREINFUSION:
+        return "preinfusion";
+    case PhaseType::PHASE_TYPE_BREW:
+        return "brew";
+    default:
+        return "brew";
+    }
+}
+
+static const char *pumpTargetName(const Phase &phase) {
+    if (phase.pumpIsSimple) {
+        return "simple";
+    }
+    switch (phase.pumpAdvanced.target) {
+    case PumpTarget::PUMP_TARGET_PRESSURE:
+        return "pressure";
+    case PumpTarget::PUMP_TARGET_FLOW:
+        return "flow";
+    default:
+        return "pressure";
+    }
+}
+
+static const char *shotEndStateName(const BrewProcess *brew) {
+    if (!brew) {
+        return "unknown";
+    }
+    return brew->processPhase == ProcessPhase::FINISHED ? "finished" : "manual_or_interrupted";
+}
 
 bool MQTTPlugin::connect(Controller *controller) {
     const Settings settings = controller->getSettings();
@@ -254,6 +287,47 @@ void MQTTPlugin::publishShotProfile() {
     doc["beverage_out_g"] = roundf(beverageOutG * 10.0f) / 10.0f;
     doc["shot_time_s"] = roundf(((millis() - brewStartMs) / 1000.0f) * 10.0f) / 10.0f;
     addRecipeMetadata(doc);
+
+    Process *lastProcess = controller ? controller->getLastProcess() : nullptr;
+    BrewProcess *brew = nullptr;
+    if (lastProcess && lastProcess->getType() == MODE_BREW) {
+        brew = static_cast<BrewProcess *>(lastProcess);
+    }
+    Profile *profile = nullptr;
+    if (brew) {
+        profile = &brew->profile;
+    } else if (controller && controller->getProfileManager()) {
+        profile = &controller->getProfileManager()->getSelectedProfile();
+    }
+    if (profile) {
+        doc["profile_id"] = profile->id;
+        doc["profile_label"] = profile->label;
+        doc["profile_type"] = profile->type;
+        doc["profile_phase_count"] = static_cast<int>(profile->phases.size());
+        doc["profile_temperature_c"] = profile->temperature;
+    }
+    if (brew) {
+        const Phase &phase = brew->currentPhase;
+        const unsigned long phaseEndMs = brew->finished > 0 ? brew->finished : millis();
+        const float phaseElapsedS =
+            phaseEndMs >= brew->currentPhaseStarted ? (phaseEndMs - brew->currentPhaseStarted) / 1000.0f : 0.0f;
+        doc["final_phase_index"] = static_cast<int>(brew->phaseIndex);
+        doc["final_phase_name"] = phase.name;
+        doc["final_phase_type"] = phaseTypeName(phase.phase);
+        doc["final_phase_elapsed_s"] = roundf(phaseElapsedS * 10.0f) / 10.0f;
+        doc["final_pump_target"] = pumpTargetName(phase);
+        if (!phase.pumpIsSimple) {
+            if (phase.pumpAdvanced.pressure >= 0.0f) {
+                doc["final_target_pressure"] = phase.pumpAdvanced.pressure;
+            }
+            if (phase.pumpAdvanced.flow >= 0.0f) {
+                doc["final_target_flow"] = phase.pumpAdvanced.flow;
+            }
+        }
+        doc["final_valve_open"] = phase.valve > 0;
+        doc["final_phase_temperature_c"] = brew->getTemperature();
+        doc["shot_end_state"] = shotEndStateName(brew);
+    }
 
     if (hasRecommendation) {
         doc["recommendation_id"] = latestRecommendationId;
