@@ -207,6 +207,11 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlLastStatusAt = event.getInt("timestamp");
         rlLastShotId = event.getString("last_shot_id");
         rlLastShotAt = event.getInt("last_shot_at");
+        rlLastShotType = event.getString("last_shot_type");
+        rlLastShotTimeS = event.getInt("last_shot_time_s_x10") / 10.0f;
+        rlLastShotBeverageOutG = event.getInt("last_shot_beverage_out_g_x10") / 10.0f;
+        rlLastShotTargetYieldG = event.getInt("last_shot_target_yield_g_x10") / 10.0f;
+        rlLastShotHumanRating = event.getInt("last_shot_human_rating");
         rlLastRecommendationId = event.getString("last_recommendation_id");
         rlLastRecommendationAt = event.getInt("last_recommendation_at");
         rlRecommendationApplyStatus = event.getString("recommendation_apply_status");
@@ -228,6 +233,11 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlLastStatusAt"] = rlLastStatusAt;
         doc["rlLastShotId"] = rlLastShotId;
         doc["rlLastShotAt"] = rlLastShotAt;
+        doc["rlLastShotType"] = rlLastShotType;
+        doc["rlLastShotTimeS"] = rlLastShotTimeS;
+        doc["rlLastShotBeverageOutG"] = rlLastShotBeverageOutG;
+        doc["rlLastShotTargetYieldG"] = rlLastShotTargetYieldG;
+        doc["rlLastShotHumanRating"] = rlLastShotHumanRating;
         doc["rlLastRecommendationId"] = rlLastRecommendationId;
         doc["rlLastRecommendationAt"] = rlLastRecommendationAt;
         doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
@@ -849,9 +859,21 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     if (!rlParticipationEnabled(controller->getSettings())) {
                         resp["error"] = F("Auto Tuning is disabled");
                     } else {
+                        String action = doc["action"].as<String>();
+                        if (action.isEmpty()) {
+                            action = "requeue_valid_rejected";
+                        }
+                        if (action != "requeue_valid_rejected" && action != "purge_rejected") {
+                            resp["error"] = F("Unsupported upload maintenance action");
+                            String msg;
+                            serializeJson(resp, msg);
+                            client->text(msg);
+                            return;
+                        }
                         Event event;
                         event.id = "rl:upload:requeue";
                         event.setString("source", "gaggimate_webui");
+                        event.setString("action", action);
                         event.setInt("limit", doc["limit"] | 50);
                         pluginManager->trigger(event);
                         resp["success"] = true;
@@ -1427,6 +1449,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlLastStatusAt"] = rlLastStatusAt;
     doc["rlLastShotId"] = rlLastShotId;
     doc["rlLastShotAt"] = rlLastShotAt;
+    doc["rlLastShotType"] = rlLastShotType;
+    doc["rlLastShotTimeS"] = rlLastShotTimeS;
+    doc["rlLastShotBeverageOutG"] = rlLastShotBeverageOutG;
+    doc["rlLastShotTargetYieldG"] = rlLastShotTargetYieldG;
+    doc["rlLastShotHumanRating"] = rlLastShotHumanRating;
     doc["rlLastRecommendationId"] = rlLastRecommendationId;
     doc["rlLastRecommendationAt"] = rlLastRecommendationAt;
     doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;

@@ -97,6 +97,11 @@ class WebUIPlugin : public Plugin {
     long rlLastStatusAt = 0;
     String rlLastShotId = "";
     long rlLastShotAt = 0;
+    String rlLastShotType = "";
+    float rlLastShotTimeS = 0.0f;
+    float rlLastShotBeverageOutG = 0.0f;
+    float rlLastShotTargetYieldG = 0.0f;
+    int rlLastShotHumanRating = 0;
     String rlLastRecommendationId = "";
     long rlLastRecommendationAt = 0;
     String rlRecommendationApplyStatus = "";

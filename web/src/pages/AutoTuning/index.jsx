@@ -98,6 +98,24 @@ function shortId(value) {
   return `${value.slice(0, 12)}...${value.slice(-8)}`;
 }
 
+function formatTimestamp(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return 'No date/time available';
+  }
+  return new Date(timestamp * 1000).toLocaleString(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+}
+
+function formatLastShotSubtitle(settings) {
+  if (!settings?.rlLastShotId) {
+    return 'No shot available yet';
+  }
+  return `${formatTimestamp(settings.rlLastShotAt)} - ${shortId(settings.rlLastShotId)}`;
+}
+
 function localOptimizationLabel(localOn, paused) {
   if (paused) {
     return 'Paused';
@@ -191,6 +209,15 @@ export function AutoTuning() {
         settings?.rlUploadQueueLastRejectedError || 'Rejected'
       }`
     : 'No rejected upload snapshots';
+  const lastShotDetails = [
+    settings?.rlLastShotType && `Type ${settings.rlLastShotType}`,
+    Number(settings?.rlLastShotTimeS) > 0 && `${Number(settings.rlLastShotTimeS).toFixed(1)}s`,
+    Number(settings?.rlLastShotBeverageOutG) > 0 &&
+      `${Number(settings.rlLastShotBeverageOutG).toFixed(1)}g out`,
+    Number(settings?.rlLastShotTargetYieldG) > 0 &&
+      `target ${Number(settings.rlLastShotTargetYieldG).toFixed(1)}g`,
+    Number(settings?.rlLastShotHumanRating) > 0 && `${settings.rlLastShotHumanRating} star`,
+  ].filter(Boolean);
 
   return (
     <div className='mx-auto flex w-full max-w-6xl flex-col gap-4'>
@@ -320,15 +347,26 @@ export function AutoTuning() {
           title='Upload Recovery'
           subtitle={lastRejectedText}
           action={
-            <button
-              type='button'
-              className='btn btn-outline btn-sm'
-              disabled={busy || !canSendRLEvents || !hasRejectedUploads}
-              onClick={() => run('req:rl:upload:requeue', { limit: 50 })}
-            >
-              <FontAwesomeIcon icon={faUpload} />
-              Retry Valid
-            </button>
+            <>
+              <button
+                type='button'
+                className='btn btn-outline btn-sm'
+                disabled={busy || !canSendRLEvents || !hasRejectedUploads}
+                onClick={() => run('req:rl:upload:requeue', { action: 'requeue_valid_rejected', limit: 50 })}
+              >
+                <FontAwesomeIcon icon={faUpload} />
+                Retry Valid
+              </button>
+              <button
+                type='button'
+                className='btn btn-outline btn-sm'
+                disabled={busy || !canSendRLEvents || !hasRejectedUploads}
+                onClick={() => run('req:rl:upload:requeue', { action: 'purge_rejected', limit: 50 })}
+              >
+                <FontAwesomeIcon icon={faTrashCan} />
+                Purge Rejected
+              </button>
+            </>
           }
         >
           <div className='text-base-content/70 text-sm break-words'>
@@ -342,8 +380,20 @@ export function AutoTuning() {
 
         <Panel
           title='Last Shot Correction'
-          subtitle={settings?.rlLastShotId || 'No shot available yet'}
+          subtitle={formatLastShotSubtitle(settings)}
         >
+          {settings?.rlLastShotId && (
+            <div className='bg-base-200/50 mb-3 rounded-md p-3 text-sm'>
+              <div className='text-base-content font-medium break-words'>{settings.rlLastShotId}</div>
+              {lastShotDetails.length > 0 && (
+                <div className='text-base-content/70 mt-1 flex flex-wrap gap-x-3 gap-y-1'>
+                  {lastShotDetails.map(detail => (
+                    <span key={detail}>{detail}</span>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <div className='grid grid-cols-2 gap-2 sm:grid-cols-3'>
             <button
               type='button'

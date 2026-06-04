@@ -52,6 +52,7 @@ class DefaultUI {
     void correctRLLastShotBadPrep();
     void correctRLLastShotNotFollowed(const char *fieldName);
     void requeueRLRejectedUploads();
+    void purgeRLRejectedUploads();
     void setBrightness(int brightness) {
         if (panelDriver) {
             panelDriver->setBrightness(brightness);
@@ -135,6 +136,12 @@ class DefaultUI {
     int rlLocalShotCount = 0;
     int rlRatedShotCount = 0;
     String rlLastShotId = "";
+    long rlLastShotAt = 0;
+    String rlLastShotType = "";
+    float rlLastShotTimeS = 0.0f;
+    float rlLastShotBeverageOutG = 0.0f;
+    float rlLastShotTargetYieldG = 0.0f;
+    int rlLastShotHumanRating = 0;
     int rlUploadQueueRejectedCount = 0;
     String rlUploadQueueLastRejectedRecordId = "";
     String rlUploadQueueLastRejectedError = "";

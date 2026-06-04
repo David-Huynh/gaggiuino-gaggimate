@@ -1223,8 +1223,7 @@ void Controller::activate() {
         resolved = ScaleSourceResolver::resolveBrewSource(brewSrcSetting, scaleAvailability());
         // A hardware-scale brew needs its software shot baseline (the pre-brew
         // cup weight). If no healthy sample is available, fall back to predictive
-        // pump-flow rather than blocking the brew. Done before the tare decision
-        // below so the fallback still gets its pump-flow tare.
+        // pump-flow rather than blocking the brew.
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
         if (resolved == VolumetricMeasurementSource::HARDWARE_SCALE && !captureHardwareScaleShotBaseline()) {
             ESP_LOGW(LOG_TAG, "HW scale baseline unavailable; falling back to predictive flow for this brew");
@@ -1233,16 +1232,11 @@ void Controller::activate() {
 #endif
     }
 
-    // Tare the pump-flow estimator for every source except the hardware scale.
-    // BLE/predictive brews want the estimator zeroed at the start; a HW brew uses
-    // the software baseline captured above, and a pump/hardware tare here would
-    // race it (post-tare samples read ≈ 0 g while the baseline still holds the
-    // cup weight, so weight − baseline clamps to 0 for the whole shot).
-    if (resolved == VolumetricMeasurementSource::HARDWARE_SCALE) {
-        ESP_LOGI(LOG_TAG, "activate: skipping pump-flow tare (HW scale uses software shot baseline)");
-    } else {
-        comms.tare();
-    }
+    // TARE resets the pump/pressure controller and predictive volumetric
+    // estimator. It does not tare the HX711 hardware scale; hardware scale tare
+    // is a separate scale command path. Always reset pump control at brew start
+    // so hardware-scale brews do not inherit stale pressure-controller state.
+    comms.tare();
     currentVolumetricSource = resolved;
     ESP_LOGI(LOG_TAG, "activate: mode=%d brewSrcSetting=%d resolvedSource=%d", mode, brewSrcSetting, static_cast<int>(resolved));
 

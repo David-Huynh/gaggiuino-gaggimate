@@ -141,6 +141,22 @@ static String rl_short_text(const String &value, size_t prefix = 12, size_t suff
     return value.substring(0, prefix) + "..." + value.substring(value.length() - suffix);
 }
 
+static String rl_format_datetime(long timestamp) {
+    if (timestamp <= 0) {
+        return "unknown";
+    }
+    std::time_t raw = static_cast<std::time_t>(timestamp);
+    std::tm *local = std::localtime(&raw);
+    if (local == nullptr) {
+        return "unknown";
+    }
+    char buffer[24];
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", local) == 0) {
+        return "unknown";
+    }
+    return String(buffer);
+}
+
 static lv_obj_t *rl_make_section(lv_obj_t *parent, const char *title) {
     lv_obj_t *section = lv_obj_create(parent);
     lv_obj_set_size(section, 388, LV_SIZE_CONTENT);
@@ -343,6 +359,12 @@ static void rl_not_followed_yield_cb(lv_event_t *e) {
 static void rl_requeue_uploads_cb(lv_event_t *e) {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
         static_cast<DefaultUI *>(lv_event_get_user_data(e))->requeueRLRejectedUploads();
+    }
+}
+
+static void rl_purge_rejected_uploads_cb(lv_event_t *e) {
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(e))->purgeRLRejectedUploads();
     }
 }
 
@@ -562,6 +584,12 @@ void DefaultUI::init() {
         rlLocalShotCount = event.getInt("local_shot_count");
         rlRatedShotCount = event.getInt("rated_shot_count");
         rlLastShotId = event.getString("last_shot_id");
+        rlLastShotAt = event.getInt("last_shot_at");
+        rlLastShotType = event.getString("last_shot_type");
+        rlLastShotTimeS = event.getInt("last_shot_time_s_x10") / 10.0f;
+        rlLastShotBeverageOutG = event.getInt("last_shot_beverage_out_g_x10") / 10.0f;
+        rlLastShotTargetYieldG = event.getInt("last_shot_target_yield_g_x10") / 10.0f;
+        rlLastShotHumanRating = event.getInt("last_shot_human_rating");
         rlUploadQueueRejectedCount = event.getInt("upload_queue_rejected_count");
         rlUploadQueueLastRejectedRecordId = event.getString("upload_queue_last_rejected_record_id");
         rlUploadQueueLastRejectedError = event.getString("upload_queue_last_rejected_error");
@@ -1101,6 +1129,22 @@ void DefaultUI::requeueRLRejectedUploads() {
     Event event;
     event.id = "rl:upload:requeue";
     event.setString("source", "gaggimate_lvgl");
+    event.setString("action", "requeue_valid_rejected");
+    event.setInt("limit", 50);
+    pluginManager->trigger(event);
+}
+
+void DefaultUI::purgeRLRejectedUploads() {
+    Settings const &settings = controller->getSettings();
+    if (!settings.isHomeAssistant() || !settings.isRLRatingEnabled() || !settings.isRLLocalOptimizationEnabled() ||
+        settings.isRLOptimizationPaused() || settings.getRLBeanContextId().isEmpty() || rlUploadQueueRejectedCount < 1) {
+        return;
+    }
+
+    Event event;
+    event.id = "rl:upload:requeue";
+    event.setString("source", "gaggimate_lvgl");
+    event.setString("action", "purge_rejected");
     event.setInt("limit", 50);
     pluginManager->trigger(event);
 }
@@ -1172,9 +1216,12 @@ void DefaultUI::showRLAutoTuningOverlay() {
 
     lv_obj_t *row4 = rl_make_action_row(actions);
     rl_make_button(row4, "Retire Bean", rl_retire_cb, this);
-    lv_obj_t *retryBtn = rl_make_button(row4, "Retry Uploads", rl_requeue_uploads_cb, this);
+    lv_obj_t *retryBtn = rl_make_button(row4, "Retry Valid", rl_requeue_uploads_cb, this);
+    lv_obj_t *row4b = rl_make_action_row(actions);
+    lv_obj_t *purgeBtn = rl_make_button(row4b, "Purge Rej", rl_purge_rejected_uploads_cb, this);
     if (!canSendRLEvents || rlUploadQueueRejectedCount < 1) {
         lv_obj_add_state(retryBtn, LV_STATE_DISABLED);
+        lv_obj_add_state(purgeBtn, LV_STATE_DISABLED);
     }
 
     if (rlUploadQueueRejectedCount > 0) {
@@ -1187,6 +1234,23 @@ void DefaultUI::showRLAutoTuningOverlay() {
 
     lv_obj_t *correction = rl_make_section(card, "Last Shot");
     rl_add_info_row(correction, "Shot", rl_short_text(rlLastShotId), true);
+    rl_add_info_row(correction, "Date/time", rl_format_datetime(rlLastShotAt));
+    if (!rlLastShotType.isEmpty()) {
+        rl_add_info_row(correction, "Type", rlLastShotType);
+    }
+    if (rlLastShotBeverageOutG > 0.0f || rlLastShotTargetYieldG > 0.0f) {
+        char yieldBuffer[48];
+        snprintf(yieldBuffer, sizeof(yieldBuffer), "%.1fg / %.1fg", rlLastShotBeverageOutG, rlLastShotTargetYieldG);
+        rl_add_info_row(correction, "Yield", String(yieldBuffer));
+    }
+    if (rlLastShotTimeS > 0.0f) {
+        char timeBuffer[24];
+        snprintf(timeBuffer, sizeof(timeBuffer), "%.1fs", rlLastShotTimeS);
+        rl_add_info_row(correction, "Time", String(timeBuffer));
+    }
+    if (rlLastShotHumanRating > 0) {
+        rl_add_info_row(correction, "Rating", String(rlLastShotHumanRating));
+    }
     lv_obj_t *row5 = rl_make_action_row(correction);
     lv_obj_t *excludeBtn = rl_make_button(row5, "Exclude", rl_exclude_last_shot_cb, this);
     lv_obj_t *badPrepBtn = rl_make_button(row5, "Bad Prep", rl_bad_prep_last_shot_cb, this);

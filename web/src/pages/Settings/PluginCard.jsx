@@ -10,6 +10,13 @@ function formatStatusTime(timestamp) {
   return new Date(value * 1000).toLocaleString();
 }
 
+function lastShotStatusText(formData) {
+  if (!formData.rlLastShotId) {
+    return 'None';
+  }
+  return `${formatStatusTime(formData.rlLastShotAt)} - ${formData.rlLastShotId}`;
+}
+
 function statusText(formData) {
   if (!formData.rlRatingEnabled) {
     return 'Disabled';
@@ -427,7 +434,7 @@ export function PluginCard({
                     </span>
                   </div>
                   <StatusRow label='Last status' value={formatStatusTime(formData.rlLastStatusAt)} />
-                  <StatusRow label='Last shot stored' value={formData.rlLastShotId || 'None'} />
+                  <StatusRow label='Last shot stored' value={lastShotStatusText(formData)} />
                   <StatusRow
                     label='Last recommendation'
                     value={formData.rlLastRecommendationId || 'None'}

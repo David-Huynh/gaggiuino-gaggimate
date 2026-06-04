@@ -91,6 +91,11 @@ class MQTTPlugin : public Plugin {
     long latestStatusTimestamp = 0;
     String latestStatusLastShotId;
     long latestStatusLastShotAt = 0;
+    String latestStatusLastShotType;
+    float latestStatusLastShotTimeS = 0.0f;
+    float latestStatusLastShotBeverageOutG = 0.0f;
+    float latestStatusLastShotTargetYieldG = 0.0f;
+    int latestStatusLastShotHumanRating = 0;
     String latestStatusLastRecommendationId;
     long latestStatusLastRecommendationAt = 0;
     String latestStatusRecommendationApplyStatus;

@@ -340,6 +340,11 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusTimestamp = doc["timestamp"] | 0;
     latestStatusLastShotId = doc["last_shot_id"].as<String>();
     latestStatusLastShotAt = doc["last_shot_at"] | 0;
+    latestStatusLastShotType = doc["last_shot_type"].as<String>();
+    latestStatusLastShotTimeS = doc["last_shot_time_s"] | 0.0f;
+    latestStatusLastShotBeverageOutG = doc["last_shot_beverage_out_g"] | 0.0f;
+    latestStatusLastShotTargetYieldG = doc["last_shot_target_yield_g"] | 0.0f;
+    latestStatusLastShotHumanRating = doc["last_shot_human_rating"] | 0;
     latestStatusLastRecommendationId = doc["last_recommendation_id"].as<String>();
     latestStatusLastRecommendationAt = doc["last_recommendation_at"] | 0;
     latestStatusRecommendationApplyStatus = doc["recommendation_apply_status"].as<String>();
@@ -375,6 +380,11 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setInt("timestamp", static_cast<int>(latestStatusTimestamp));
     event.setString("last_shot_id", latestStatusLastShotId);
     event.setInt("last_shot_at", static_cast<int>(latestStatusLastShotAt));
+    event.setString("last_shot_type", latestStatusLastShotType);
+    event.setInt("last_shot_time_s_x10", static_cast<int>(latestStatusLastShotTimeS * 10.0f));
+    event.setInt("last_shot_beverage_out_g_x10", static_cast<int>(latestStatusLastShotBeverageOutG * 10.0f));
+    event.setInt("last_shot_target_yield_g_x10", static_cast<int>(latestStatusLastShotTargetYieldG * 10.0f));
+    event.setInt("last_shot_human_rating", latestStatusLastShotHumanRating);
     event.setString("last_recommendation_id", latestStatusLastRecommendationId);
     event.setInt("last_recommendation_at", static_cast<int>(latestStatusLastRecommendationAt));
     event.setString("recommendation_apply_status", latestStatusRecommendationApplyStatus);
@@ -580,7 +590,14 @@ void MQTTPlugin::publishUploadRequeue(Event const &event) {
     doc["event_type"] = "upload_queue_maintenance";
     doc["schema_version"] = 1;
     doc["machine_id"] = machineId();
-    doc["action"] = "requeue_valid_rejected";
+    String action = event.getString("action");
+    if (action.isEmpty()) {
+        action = "requeue_valid_rejected";
+    }
+    if (action != "requeue_valid_rejected" && action != "purge_rejected") {
+        return;
+    }
+    doc["action"] = action;
     doc["limit"] = event.getInt("limit") > 0 ? event.getInt("limit") : 50;
     doc["source"] = event.getString("source").isEmpty() ? "gaggimate_mqtt" : event.getString("source");
     doc["timestamp"] = static_cast<long>(std::time(nullptr));
