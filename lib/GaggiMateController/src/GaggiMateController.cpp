@@ -352,7 +352,7 @@ void GaggiMateController::handlePing() {
 void GaggiMateController::handlePingTimeout() {
     ESP_LOGE(LOG_TAG, "Ping timeout detected. Turning off heater and pump for safety.\n");
     if (errorState != ERROR_CODE_TIMEOUT) {
-        _comm->sendError(ERROR_CODE_TIMEOUT);
+        _comms.sendError(ERROR_CODE_TIMEOUT);
     }
     // Turn off the heater and pump as a safety measure
     this->heater->setSetpoint(0);

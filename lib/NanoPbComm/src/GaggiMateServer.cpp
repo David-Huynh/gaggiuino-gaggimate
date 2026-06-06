@@ -50,7 +50,11 @@ void GaggiMateServer::pumpTask(void *arg) {
     TickType_t lastWake = xTaskGetTickCount();
     for (;;) {
         self->loop();
+#if defined(ARDUINO_ARCH_STM32)
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(15));
+#else
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(15));
+#endif
     }
 }
 

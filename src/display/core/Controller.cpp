@@ -1484,21 +1484,14 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
     }
 }
 
-void Controller::scaleTare() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+void Controller::scaleTare() {
     comms.scaleTare();
-#endif
 }
 
 void Controller::sendScaleCalibration(float c1, float c2) {
-#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    (void)c1;
-    (void)c2;
-#else
     comms.sendScaleCalibration(c1, c2, settings.getScaleOffset1(), settings.getScaleOffset2());
-#endif
 }
-
 
 ScaleSample Controller::getScaleSample() const {
     ScaleSample s{};
