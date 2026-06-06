@@ -1,8 +1,10 @@
 #include "BLEScalePlugin.h"
 #include "remote_scales.h"
 #include "remote_scales_plugin_registry.h"
+#include <cctype>
 #include <cmath> // For isfinite()
 #include <display/core/Controller.h>
+#include <NimBLEDevice.h>
 #include <scales/acaia.h>
 #include <scales/bookoo.h>
 #include <scales/decent.h>
@@ -15,6 +17,41 @@
 #include <scales/timemore.h>
 #include <scales/varia.h>
 #include <scales/weighmybru.h>
+
+namespace {
+
+bool startsWithIgnoreCase(const std::string &value, const char *prefix) {
+    for (size_t i = 0; prefix[i] != '\0'; ++i) {
+        if (i >= value.size()) {
+            return false;
+        }
+        const auto lhs = static_cast<unsigned char>(value[i]);
+        const auto rhs = static_cast<unsigned char>(prefix[i]);
+        if (std::tolower(lhs) != std::tolower(rhs)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool handlesWeighMyBrewCompatibilityName(const DiscoveredDevice &device) {
+    return startsWithIgnoreCase(device.getName(), "weighmybr");
+}
+
+std::unique_ptr<RemoteScales> createWeighMyBrewScale(const DiscoveredDevice &device) {
+    return std::make_unique<WeighMyBrewScales>(device);
+}
+
+void applyWeighMyBrewCompatibilityPlugin() {
+    RemoteScalesPlugin plugin = RemoteScalesPlugin{
+        .id = "plugin-weighmybrew-compat",
+        .handles = handlesWeighMyBrewCompatibilityName,
+        .initialise = createWeighMyBrewScale,
+    };
+    RemoteScalesPluginRegistry::getInstance()->registerPlugin(plugin);
+}
+
+} // namespace
 
 void on_ble_measurement(float value) {
     if (&BLEScales != nullptr) {
@@ -61,6 +98,12 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
     this->pluginManager = manager;
     this->pluginRegistry = RemoteScalesPluginRegistry::getInstance();
 
+    if (!NimBLEDevice::getInitialized()) {
+        NimBLEDevice::init("GaggiMate");
+        NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+        NimBLEDevice::setMTU(256);
+    }
+
     // Apply scale plugins with error checking
     AcaiaScalesPlugin::apply();
     BookooScalesPlugin::apply();
@@ -72,6 +115,7 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
     TimemoreScalesPlugin::apply();
     VariaScalesPlugin::apply();
     WeighMyBrewScalePlugin::apply();
+    applyWeighMyBrewCompatibilityPlugin();
     myscalePlugin::apply();
     TimemoreDotScalesPlugin::apply();
 

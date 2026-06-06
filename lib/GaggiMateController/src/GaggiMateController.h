@@ -42,6 +42,9 @@ class GaggiMateController {
     void stopPidAutotune(void);
     void sendSensorData(void);
     void handleSerialCommand(char c);
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    ControllerDiagnostics buildControllerDiagnostics(void);
+#endif
 
     ControllerConfig _config = ControllerConfig{};
     GaggiMateServer _comms;
@@ -65,6 +68,16 @@ class GaggiMateController {
     String _version;
     unsigned long lastPingTime = 0;
     size_t errorState = ERROR_CODE_NONE;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    uint32_t boilerCommandCount = 0;
+    uint32_t pumpCommandCount = 0;
+    uint32_t relayCommandCount = 0;
+    uint32_t pingCommandCount = 0;
+    uint32_t tareCommandCount = 0;
+    float lastBoilerSetpoint = 0.0f;
+    float lastPumpPower = 0.0f;
+    bool lastRelayOpen = false;
+#endif
 
     const char *LOG_TAG = "GaggiMateController";
 };

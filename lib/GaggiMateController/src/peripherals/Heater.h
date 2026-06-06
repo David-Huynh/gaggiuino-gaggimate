@@ -32,6 +32,8 @@ class Heater {
 
     void setSetpoint(float setpoint);
     float getSetpoint() { return setpoint; };
+    float getOutput() const { return output; }
+    bool isRelayOn() const { return relayStatus; }
     void setTunings(float Kp, float Ki, float Kd);
     void autotune(int testTimeSec, int windowSize, int heaterWattage);
 

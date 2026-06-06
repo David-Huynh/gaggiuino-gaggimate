@@ -81,6 +81,40 @@ struct UartDiagnostics {
     uint32_t displayTxDropCount = 0;
     uint32_t displayRxOverflowCount = 0;
     uint32_t displayParsedEventCount = 0;
+    uint32_t displayTxByteCount = 0;
+    uint32_t displayRxByteCount = 0;
+    uint32_t displayValidFrameCount = 0;
+    uint32_t displayMalformedFrameCount = 0;
+    uint32_t displayCrcErrorCount = 0;
+    uint32_t displayLinkUpCount = 0;
+    uint32_t displayLinkDownCount = 0;
+};
+
+struct ControllerDiagnostics {
+    uint32_t errorCode = 0;
+    bool thermocoupleError = false;
+    uint32_t thermocoupleStatus = 0;
+    uint32_t thermocoupleErrorCount = 0;
+    uint32_t thermocoupleReadCount = 0;
+    float thermocoupleRawTemperature = 0.0f;
+    float thermocoupleTemperature = 0.0f;
+    bool thermocoupleTaskRunning = false;
+    float heaterSetpoint = 0.0f;
+    float heaterOutput = 0.0f;
+    bool heaterRelay = false;
+    uint32_t boilerCommandCount = 0;
+    uint32_t pumpCommandCount = 0;
+    uint32_t relayCommandCount = 0;
+    uint32_t pingCommandCount = 0;
+    uint32_t tareCommandCount = 0;
+    float lastBoilerSetpoint = 0.0f;
+    float lastPumpPower = 0.0f;
+    bool lastRelayOpen = false;
+    uint32_t uartRxBytes = 0;
+    uint32_t uartTxBytes = 0;
+    uint32_t uartValidFrames = 0;
+    uint32_t uartParsedPayloads = 0;
+    uint32_t freeHeap = 0;
 };
 
 constexpr uint16_t SCALE_HEALTH_OK = 0;

@@ -35,6 +35,7 @@ using ScaleCalibrationStart = gaggimate_ScaleCalibrationStart;
 using DeviceCapabilities = gaggimate_Capabilities;
 using SystemInfo = gaggimate_SystemInfo;
 using SensorData = gaggimate_SensorData;
+using ControllerDiagnostics = gaggimate_ControllerDiagnostics;
 using BoilerReading = gaggimate_BoilerReading;
 using ButtonState = gaggimate_ButtonState;
 using AutotuneResult = gaggimate_AutotuneResult;

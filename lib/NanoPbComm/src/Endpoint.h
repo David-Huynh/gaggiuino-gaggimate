@@ -99,7 +99,11 @@ class Endpoint {
     static constexpr uint8_t MAX_RETRIES = 5;
     static constexpr size_t HANDLER_SLOTS = 32;  // > highest Payload_*_tag
     static constexpr size_t RX_QUEUE_DEPTH = 12; // inbound payloads awaiting dispatch
+#if defined(ARDUINO_ARCH_STM32)
+    static constexpr uint32_t DISPATCH_STACK = 768; // STM32 FreeRTOS stack depth is in words, not bytes
+#else
     static constexpr uint32_t DISPATCH_STACK = 6144;
+#endif
 
     Transport &_transport;
     CoalescingPrioQueue<QUEUE_CAPACITY, uint16_t, gm::Payload, MAX_KEYS> _queue;

@@ -2,13 +2,18 @@
 #include <cstdio>
 #include <cstring>
 #if defined(ARDUINO_ARCH_STM32)
-#define ESP_LOGE(tag, fmt, ...)                                                                                                  \
-    do {                                                                                                                         \
-        Serial.printf("[E][%s] " fmt "\n", tag, ##__VA_ARGS__);                                                                 \
-    } while (0)
+#define ESP_LOGE(tag, fmt, ...) ((void)0)
 #else
 #include <esp_log.h>
 #endif
+
+namespace {
+#if defined(ARDUINO_ARCH_STM32)
+constexpr uint32_t SERVER_PUMP_STACK = 768; // STM32 FreeRTOS stack depth is in words, not bytes
+#else
+constexpr uint32_t SERVER_PUMP_STACK = 4096;
+#endif
+} // namespace
 
 GaggiMateServer::GaggiMateServer()
 #if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
@@ -24,8 +29,12 @@ void GaggiMateServer::init(const String &deviceName, const String &hardware, con
     setSystemInfo(hardware, version, dimming, pressure, ledControl, tof, scale);
     registerHandlers();
     _endpoint.onConnection([this](bool connected) {
-        if (connected)
+        if (connected) {
+            _systemInfoAcknowledged = false;
             pushSystemInfo();
+        } else {
+            _systemInfoAcknowledged = false;
+        }
     });
     _endpoint.begin();
 #if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
@@ -36,9 +45,9 @@ void GaggiMateServer::init(const String &deviceName, const String &hardware, con
 #endif
 
 #if defined(ARDUINO_ARCH_STM32)
-    if (xTaskCreate(pumpTask, "GaggiMateServer", 4096, this, 1, &_taskHandle) != pdPASS) {
+    if (xTaskCreate(pumpTask, "GaggiMateServer", SERVER_PUMP_STACK, this, 1, &_taskHandle) != pdPASS) {
 #else
-    if (xTaskCreatePinnedToCore(pumpTask, "GaggiMateServer", 4096, this, 1, &_taskHandle, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(pumpTask, "GaggiMateServer", SERVER_PUMP_STACK, this, 1, &_taskHandle, 0) != pdPASS) {
 #endif
         _taskHandle = nullptr;
         ESP_LOGE("GaggiMateServer", "Failed to create pump task; ACK/retransmit will not run");
@@ -61,6 +70,9 @@ void GaggiMateServer::pumpTask(void *arg) {
 void GaggiMateServer::loop() {
 #if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
     _transport.loop();
+    if (_endpoint.isConnected() && !_systemInfoAcknowledged && millis() - _lastSystemInfoPushMs >= SYSTEM_INFO_RETRY_MS) {
+        pushSystemInfo();
+    }
 #endif
     _endpoint.loop();
 }
@@ -93,11 +105,14 @@ void GaggiMateServer::setSystemInfo(const String &hardware, const String &versio
 }
 
 void GaggiMateServer::pushSystemInfo() {
+    _lastSystemInfoPushMs = millis();
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_system_info_tag;
     p.content.system_info = _systemInfo;
     _endpoint.send(p);
 }
+
+void GaggiMateServer::acknowledgeSystemInfo() { _systemInfoAcknowledged = true; }
 
 gm::Payload GaggiMateServer::buildSensorData(float temperature, float pressure, float puckFlow, float pumpFlow,
                                              float puckResistance) {
@@ -110,6 +125,33 @@ gm::Payload GaggiMateServer::buildSensorData(float temperature, float pressure, 
     p.content.sensor.puck_flow = puckFlow;
     p.content.sensor.pump_flow = pumpFlow;
     p.content.sensor.puck_resistance = puckResistance;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    p.content.sensor.has_diagnostics = true;
+    p.content.sensor.diagnostics.error_code = _controllerDiagnostics.errorCode;
+    p.content.sensor.diagnostics.thermocouple_error = _controllerDiagnostics.thermocoupleError;
+    p.content.sensor.diagnostics.thermocouple_status = _controllerDiagnostics.thermocoupleStatus;
+    p.content.sensor.diagnostics.thermocouple_error_count = _controllerDiagnostics.thermocoupleErrorCount;
+    p.content.sensor.diagnostics.thermocouple_read_count = _controllerDiagnostics.thermocoupleReadCount;
+    p.content.sensor.diagnostics.thermocouple_raw_temperature = _controllerDiagnostics.thermocoupleRawTemperature;
+    p.content.sensor.diagnostics.thermocouple_temperature = _controllerDiagnostics.thermocoupleTemperature;
+    p.content.sensor.diagnostics.thermocouple_task_running = _controllerDiagnostics.thermocoupleTaskRunning;
+    p.content.sensor.diagnostics.heater_setpoint = _controllerDiagnostics.heaterSetpoint;
+    p.content.sensor.diagnostics.heater_output = _controllerDiagnostics.heaterOutput;
+    p.content.sensor.diagnostics.heater_relay = _controllerDiagnostics.heaterRelay;
+    p.content.sensor.diagnostics.boiler_command_count = _controllerDiagnostics.boilerCommandCount;
+    p.content.sensor.diagnostics.pump_command_count = _controllerDiagnostics.pumpCommandCount;
+    p.content.sensor.diagnostics.relay_command_count = _controllerDiagnostics.relayCommandCount;
+    p.content.sensor.diagnostics.ping_command_count = _controllerDiagnostics.pingCommandCount;
+    p.content.sensor.diagnostics.tare_command_count = _controllerDiagnostics.tareCommandCount;
+    p.content.sensor.diagnostics.last_boiler_setpoint = _controllerDiagnostics.lastBoilerSetpoint;
+    p.content.sensor.diagnostics.last_pump_power = _controllerDiagnostics.lastPumpPower;
+    p.content.sensor.diagnostics.last_relay_open = _controllerDiagnostics.lastRelayOpen;
+    p.content.sensor.diagnostics.uart_rx_bytes = _controllerDiagnostics.uartRxBytes;
+    p.content.sensor.diagnostics.uart_tx_bytes = _controllerDiagnostics.uartTxBytes;
+    p.content.sensor.diagnostics.uart_valid_frames = _controllerDiagnostics.uartValidFrames;
+    p.content.sensor.diagnostics.uart_parsed_payloads = _controllerDiagnostics.uartParsedPayloads;
+    p.content.sensor.diagnostics.free_heap = _controllerDiagnostics.freeHeap;
+#endif
     return p;
 }
 
@@ -223,10 +265,12 @@ void GaggiMateServer::registerHandlers() {
             _relayCb(static_cast<uint8_t>(p.content.relay.index), p.content.relay.open);
     });
     _endpoint.on(gaggimate_Payload_pid_tag, [this](const gm::Payload &p) {
+        acknowledgeSystemInfo();
         if (_pidCb)
             _pidCb(p.content.pid.kp, p.content.pid.ki, p.content.pid.kd, p.content.pid.kf);
     });
     _endpoint.on(gaggimate_Payload_pump_model_tag, [this](const gm::Payload &p) {
+        acknowledgeSystemInfo();
         if (_pumpModelCb)
             _pumpModelCb(p.content.pump_model.a, p.content.pump_model.b, p.content.pump_model.c, p.content.pump_model.d);
     });
@@ -235,6 +279,7 @@ void GaggiMateServer::registerHandlers() {
             _autotuneCb(p.content.autotune.test_time, p.content.autotune.samples, p.content.autotune.heater_wattage);
     });
     _endpoint.on(gaggimate_Payload_pressure_scale_tag, [this](const gm::Payload &p) {
+        acknowledgeSystemInfo();
         if (_pressureScaleCb)
             _pressureScaleCb(p.content.pressure_scale.scale);
     });

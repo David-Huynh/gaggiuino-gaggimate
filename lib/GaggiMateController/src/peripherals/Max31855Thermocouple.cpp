@@ -31,7 +31,9 @@ void Max31855Thermocouple::setup() {
     max31855->begin();
     max31855->setSPIspeed(1000000);
 
-    xTaskCreate(monitorTask, "Max31855Thermocouple::monitor", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
+    if (xTaskCreate(monitorTask, "Max31855Thermocouple::monitor", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle) != pdPASS) {
+        taskHandle = nullptr;
+    }
 }
 
 void Max31855Thermocouple::loop() {
@@ -49,12 +51,15 @@ void Max31855Thermocouple::loop() {
 
     float temp;
     int status = max31855->read();
+    lastReadStatus = static_cast<uint8_t>(status);
+    readCount++;
     if (status != STATUS_OK) {
         ESP_LOGE(LOG_TAG, "Failed to read temperature: %d\n", status);
         temp = 0.0f;
     } else {
         temp = max31855->getTemperature();
     }
+    lastRawTemperature = temp;
 
     if (temp <= 0.0f) {
         ESP_LOGE(LOG_TAG, "Temperature reported below 0°C: %.2f\n", temp);

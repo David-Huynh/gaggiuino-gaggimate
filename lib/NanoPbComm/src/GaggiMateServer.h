@@ -43,6 +43,20 @@ class GaggiMateServer {
 
     void setSystemInfo(const String &hardware, const String &version, bool dimming, bool pressure, bool ledControl, bool tof,
                        bool scale);
+    void setControllerDiagnostics(const ControllerDiagnostics &diagnostics) {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        _controllerDiagnostics = diagnostics;
+#else
+        (void)diagnostics;
+#endif
+    }
+    UartDiagnostics getDiagnostics() const {
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+        return _transport.getDiagnostics();
+#else
+        return {};
+#endif
+    }
 
     // Build a payload without sending (compose your own batch, then send()).
     // sendSensorData reports boiler 0; the wire format supports several boilers.
@@ -98,6 +112,12 @@ class GaggiMateServer {
 #endif
     Endpoint _endpoint;
     gm::SystemInfo _systemInfo = gaggimate_SystemInfo_init_zero;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    ControllerDiagnostics _controllerDiagnostics{};
+#endif
+    bool _systemInfoAcknowledged = false;
+    unsigned long _lastSystemInfoPushMs = 0;
+    static constexpr unsigned long SYSTEM_INFO_RETRY_MS = 1000;
 
     PingCallback _pingCb;
     BoilerCallback _boilerCb;
@@ -115,6 +135,7 @@ class GaggiMateServer {
 
     void registerHandlers();
     void pushSystemInfo();
+    void acknowledgeSystemInfo();
 
     // Drives the endpoint send pump / retransmit independently of the
     // controller's (slow, 250ms) main loop, on the NimBLE core.

@@ -169,6 +169,7 @@ class Controller {
 
     SystemInfo getSystemInfo() const { return systemInfo; }
     UartDiagnostics getUartDiagnostics() const;
+    ControllerDiagnostics getControllerDiagnostics() const { return comms.getControllerDiagnostics(); }
 
     GaggiMateClient *getClientController() { return &comms; }
 

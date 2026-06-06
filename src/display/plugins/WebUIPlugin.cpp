@@ -566,6 +566,50 @@ void WebUIPlugin::loop() {
         statusDoc["grindSource"] = static_cast<int>(controller->getResolvedGrindSource());
         statusDoc["activeSource"] = static_cast<int>(controller->getCurrentVolumetricSource());
         statusDoc["scaleCapable"] = controller->scaleAvailability().hardwareCapable;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        statusDoc["err"] = controller->getError();
+        statusDoc["ready"] = controller->isReady();
+        const ControllerDiagnostics controllerDiagnostics = controller->getControllerDiagnostics();
+        auto ctrlObj = statusDoc["ctrl"].to<JsonObject>();
+        ctrlObj["e"] = controllerDiagnostics.errorCode;
+        ctrlObj["te"] = controllerDiagnostics.thermocoupleError;
+        ctrlObj["ts"] = controllerDiagnostics.thermocoupleStatus;
+        ctrlObj["tec"] = controllerDiagnostics.thermocoupleErrorCount;
+        ctrlObj["trc"] = controllerDiagnostics.thermocoupleReadCount;
+        ctrlObj["traw"] = controllerDiagnostics.thermocoupleRawTemperature;
+        ctrlObj["tf"] = controllerDiagnostics.thermocoupleTemperature;
+        ctrlObj["ttask"] = controllerDiagnostics.thermocoupleTaskRunning;
+        ctrlObj["hsp"] = controllerDiagnostics.heaterSetpoint;
+        ctrlObj["hout"] = controllerDiagnostics.heaterOutput;
+        ctrlObj["hr"] = controllerDiagnostics.heaterRelay;
+        ctrlObj["bcmd"] = controllerDiagnostics.boilerCommandCount;
+        ctrlObj["pcmd"] = controllerDiagnostics.pumpCommandCount;
+        ctrlObj["rcmd"] = controllerDiagnostics.relayCommandCount;
+        ctrlObj["ping"] = controllerDiagnostics.pingCommandCount;
+        ctrlObj["tare"] = controllerDiagnostics.tareCommandCount;
+        ctrlObj["lbsp"] = controllerDiagnostics.lastBoilerSetpoint;
+        ctrlObj["lpp"] = controllerDiagnostics.lastPumpPower;
+        ctrlObj["lro"] = controllerDiagnostics.lastRelayOpen;
+        ctrlObj["urx"] = controllerDiagnostics.uartRxBytes;
+        ctrlObj["utx"] = controllerDiagnostics.uartTxBytes;
+        ctrlObj["uvf"] = controllerDiagnostics.uartValidFrames;
+        ctrlObj["upe"] = controllerDiagnostics.uartParsedPayloads;
+        ctrlObj["heap"] = controllerDiagnostics.freeHeap;
+#if defined(GAGGIMATE_UART_COMMS)
+        const UartDiagnostics uartDiagnostics = controller->getUartDiagnostics();
+        statusDoc["uc"] = controller->getClientController()->isConnected();
+        statusDoc["upe"] = uartDiagnostics.displayParsedEventCount;
+        statusDoc["uro"] = uartDiagnostics.displayRxOverflowCount;
+        statusDoc["utd"] = uartDiagnostics.displayTxDropCount;
+        statusDoc["utb"] = uartDiagnostics.displayTxByteCount;
+        statusDoc["urb"] = uartDiagnostics.displayRxByteCount;
+        statusDoc["uvf"] = uartDiagnostics.displayValidFrameCount;
+        statusDoc["umf"] = uartDiagnostics.displayMalformedFrameCount;
+        statusDoc["ucrc"] = uartDiagnostics.displayCrcErrorCount;
+        statusDoc["ulu"] = uartDiagnostics.displayLinkUpCount;
+        statusDoc["uld"] = uartDiagnostics.displayLinkDownCount;
+#endif
+#endif
 
         Process *process = controller->getProcess();
         if (process == nullptr) {

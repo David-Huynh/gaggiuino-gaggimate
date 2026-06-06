@@ -215,6 +215,35 @@ void GaggiMateClient::registerHandlers() {
             temperature = p.content.sensor.boilers[0].temperature;
             pressure = p.content.sensor.boilers[0].pressure;
         }
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        if (p.content.sensor.has_diagnostics) {
+            const gm::ControllerDiagnostics &d = p.content.sensor.diagnostics;
+            _controllerDiagnostics.errorCode = d.error_code;
+            _controllerDiagnostics.thermocoupleError = d.thermocouple_error;
+            _controllerDiagnostics.thermocoupleStatus = d.thermocouple_status;
+            _controllerDiagnostics.thermocoupleErrorCount = d.thermocouple_error_count;
+            _controllerDiagnostics.thermocoupleReadCount = d.thermocouple_read_count;
+            _controllerDiagnostics.thermocoupleRawTemperature = d.thermocouple_raw_temperature;
+            _controllerDiagnostics.thermocoupleTemperature = d.thermocouple_temperature;
+            _controllerDiagnostics.thermocoupleTaskRunning = d.thermocouple_task_running;
+            _controllerDiagnostics.heaterSetpoint = d.heater_setpoint;
+            _controllerDiagnostics.heaterOutput = d.heater_output;
+            _controllerDiagnostics.heaterRelay = d.heater_relay;
+            _controllerDiagnostics.boilerCommandCount = d.boiler_command_count;
+            _controllerDiagnostics.pumpCommandCount = d.pump_command_count;
+            _controllerDiagnostics.relayCommandCount = d.relay_command_count;
+            _controllerDiagnostics.pingCommandCount = d.ping_command_count;
+            _controllerDiagnostics.tareCommandCount = d.tare_command_count;
+            _controllerDiagnostics.lastBoilerSetpoint = d.last_boiler_setpoint;
+            _controllerDiagnostics.lastPumpPower = d.last_pump_power;
+            _controllerDiagnostics.lastRelayOpen = d.last_relay_open;
+            _controllerDiagnostics.uartRxBytes = d.uart_rx_bytes;
+            _controllerDiagnostics.uartTxBytes = d.uart_tx_bytes;
+            _controllerDiagnostics.uartValidFrames = d.uart_valid_frames;
+            _controllerDiagnostics.uartParsedPayloads = d.uart_parsed_payloads;
+            _controllerDiagnostics.freeHeap = d.free_heap;
+        }
+#endif
         _sensorCb(temperature, pressure, p.content.sensor.puck_flow, p.content.sensor.pump_flow,
                   p.content.sensor.puck_resistance);
     });

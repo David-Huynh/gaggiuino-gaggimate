@@ -156,6 +156,10 @@ void GaggiMateController::setup() {
     // arrives independently (or batched together in one frame for an atomic
     // update). Control messages feed the connection watchdog via handlePing().
     _comms.onBoilerControl([this](uint8_t index, BoilerControlMode mode, float setpoint) {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        boilerCommandCount++;
+        lastBoilerSetpoint = setpoint;
+#endif
         if (index != 0) { // single boiler today; reject unknown devices
             ESP_LOGW(LOG_TAG, "Ignoring boiler control for unsupported index %u", index);
             return;
@@ -172,6 +176,10 @@ void GaggiMateController::setup() {
         }
     });
     _comms.onPumpControl([this](uint8_t index, PumpControlMode mode, float power, float pressure, float flow) {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        pumpCommandCount++;
+        lastPumpPower = power;
+#endif
         if (index != 0) { // single pump today; reject unknown devices
             ESP_LOGW(LOG_TAG, "Ignoring pump control for unsupported index %u", index);
             return;
@@ -196,6 +204,12 @@ void GaggiMateController::setup() {
     });
     // Binary outputs: index 0 = brew valve, index 1 = alt relay.
     _comms.onRelayControl([this](uint8_t index, bool open) {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        relayCommandCount++;
+        if (index == 0) {
+            lastRelayOpen = open;
+        }
+#endif
         if (index == 1) {
             handlePing();
             if (errorState != ERROR_CODE_NONE) {
@@ -237,7 +251,12 @@ void GaggiMateController::setup() {
             }
         }
     });
-    _comms.onPing([this]() { handlePing(); });
+    _comms.onPing([this]() {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        pingCommandCount++;
+#endif
+        handlePing();
+    });
     _comms.onAutotune([this](uint32_t testTimeSec, uint32_t windowSize, uint32_t heaterWattage) {
         handlePing();
         if (errorState != ERROR_CODE_NONE) { // don't re-engage the heater while faulted
@@ -246,6 +265,9 @@ void GaggiMateController::setup() {
         this->heater->autotune(static_cast<int>(testTimeSec), static_cast<int>(windowSize), static_cast<int>(heaterWattage));
     });
     _comms.onTare([this]() {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        tareCommandCount++;
+#endif
         handlePing();
         if (!_config.capabilites.dimming) {
             return;
@@ -291,7 +313,11 @@ void GaggiMateController::loop() {
     if (errorState != ERROR_CODE_NONE) {
         ESP_LOGW("GaggiMateController", "Error state: %d", errorState);
     }
+#ifdef ARDUINO_ARCH_STM32
+    vTaskDelay(pdMS_TO_TICKS(250));
+#else
     delay(250);
+#endif
     if (Serial.available()) {
         while (Serial.available()) {
             char c = Serial.read();
@@ -375,7 +401,50 @@ void GaggiMateController::thermalRunawayShutdown() {
     _comms.sendError(ERROR_CODE_RUNAWAY);
 }
 
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+ControllerDiagnostics GaggiMateController::buildControllerDiagnostics() {
+    ControllerDiagnostics diagnostics{};
+    diagnostics.errorCode = static_cast<uint32_t>(errorState);
+    if (thermocouple != nullptr) {
+        diagnostics.thermocoupleError = thermocouple->isErrorState();
+        diagnostics.thermocoupleStatus = thermocouple->lastStatus();
+        diagnostics.thermocoupleErrorCount = static_cast<uint32_t>(thermocouple->getErrorCount());
+        diagnostics.thermocoupleReadCount = thermocouple->getReadCount();
+        diagnostics.thermocoupleRawTemperature = thermocouple->rawTemperature();
+        diagnostics.thermocoupleTemperature = thermocouple->filteredTemperature();
+        diagnostics.thermocoupleTaskRunning = thermocouple->isTaskRunning();
+    }
+    if (heater != nullptr) {
+        diagnostics.heaterSetpoint = heater->getSetpoint();
+        diagnostics.heaterOutput = heater->getOutput();
+        diagnostics.heaterRelay = heater->isRelayOn();
+    }
+    diagnostics.boilerCommandCount = boilerCommandCount;
+    diagnostics.pumpCommandCount = pumpCommandCount;
+    diagnostics.relayCommandCount = relayCommandCount;
+    diagnostics.pingCommandCount = pingCommandCount;
+    diagnostics.tareCommandCount = tareCommandCount;
+    diagnostics.lastBoilerSetpoint = lastBoilerSetpoint;
+    diagnostics.lastPumpPower = lastPumpPower;
+    diagnostics.lastRelayOpen = lastRelayOpen;
+
+    const UartDiagnostics uart = _comms.getDiagnostics();
+    diagnostics.uartRxBytes = uart.displayRxByteCount;
+    diagnostics.uartTxBytes = uart.displayTxByteCount;
+    diagnostics.uartValidFrames = uart.displayValidFrameCount;
+    diagnostics.uartParsedPayloads = uart.displayParsedEventCount;
+
+#if defined(ARDUINO_ARCH_STM32) || defined(ESP32)
+    diagnostics.freeHeap = static_cast<uint32_t>(xPortGetFreeHeapSize());
+#endif
+    return diagnostics;
+}
+#endif
+
 void GaggiMateController::sendSensorData() {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    _comms.setControllerDiagnostics(buildControllerDiagnostics());
+#endif
     if (_config.capabilites.pressure) {
         // Flow/volumetric come from the DimmedPump; only cast when this board
         // actually has one (pressure and dimming are configured independently).

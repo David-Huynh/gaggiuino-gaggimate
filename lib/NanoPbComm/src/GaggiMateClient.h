@@ -79,6 +79,13 @@ class GaggiMateClient {
         return {};
 #endif
     }
+    ControllerDiagnostics getControllerDiagnostics() const {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        return _controllerDiagnostics;
+#else
+        return {};
+#endif
+    }
 
     // Tight connection interval (responsive control) while active; relaxed when
     // idle to give the shared radio back to Wi-Fi.
@@ -161,6 +168,9 @@ class GaggiMateClient {
     BleClientTransport _transport;
 #endif
     Endpoint _endpoint;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    ControllerDiagnostics _controllerDiagnostics{};
+#endif
 
     ConnectionCallback _connCb;
     IncompatibleCallback _incompatibleCb;

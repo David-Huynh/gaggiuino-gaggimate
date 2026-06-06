@@ -24,6 +24,12 @@ class Max31855Thermocouple : public TemperatureSensor {
                          const temperature_error_callback_t &error_callback);
     float read() override;
     bool isErrorState() override;
+    float rawTemperature() const { return lastRawTemperature; }
+    float filteredTemperature() const { return temperature; }
+    uint8_t lastStatus() const { return lastReadStatus; }
+    int getErrorCount() const { return errorCount; }
+    uint32_t getReadCount() const { return readCount; }
+    bool isTaskRunning() const { return taskHandle != nullptr; }
 
     void setup();
     void loop();
@@ -38,6 +44,9 @@ class Max31855Thermocouple : public TemperatureSensor {
     size_t bufferIndex = 0;
 
     float temperature = .0f;
+    float lastRawTemperature = .0f;
+    uint8_t lastReadStatus = STATUS_NOREAD;
+    uint32_t readCount = 0;
 
     int csPin = 0;
     int misoPin = 0;
