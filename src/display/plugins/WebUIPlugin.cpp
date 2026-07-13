@@ -62,6 +62,39 @@ static void *mbedtlsPsramCalloc(size_t n, size_t size) { // NOSONAR
 }
 static void mbedtlsPsramFree(void *p) { heap_caps_free(p); } // NOSONAR
 
+#if defined(GAGGIMATE_DISABLE_OTA)
+static constexpr bool OTA_ENABLED = false;
+#else
+static constexpr bool OTA_ENABLED = true;
+#endif
+
+#if defined(GAGGIMATE_UART_COMMS)
+static constexpr bool CONTROLLER_OTA_ENABLED = false;
+#else
+static constexpr bool CONTROLLER_OTA_ENABLED = true;
+#endif
+
+#ifndef BUILD_GIT_REPOSITORY
+#define BUILD_GIT_REPOSITORY "David-Huynh/gaggiuino-gaggimate"
+#endif
+
+static String otaReleaseUrlForChannel(const String &channel) {
+    return String("https://github.com/") + BUILD_GIT_REPOSITORY + "/releases/" +
+           (channel == "latest" ? "latest" : "tag/nightly");
+}
+
+static const char *otaDisplayFirmwareName() {
+#if defined(GAGGIMATE_UART_COMMS) && defined(GAGGIMATE_N16R8)
+    return "display-headless-uart-n16r8-firmware.bin";
+#elif defined(GAGGIMATE_UART_COMMS)
+    return "display-headless-uart-firmware.bin";
+#elif defined(GAGGIMATE_HEADLESS)
+    return "display-headless-firmware.bin";
+#else
+    return "display-firmware.bin";
+#endif
+}
+
 static String defaultRLContextName() { return String("Bean ") + String(static_cast<long long>(EpochTime::now())); }
 
 static String defaultRLGrinderContextName() { return String("Grinder ") + String(static_cast<long long>(EpochTime::now())); }
@@ -477,8 +510,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     this->profileManager = _controller->getProfileManager();
     this->pluginManager = _pluginManager;
     this->ota = new GitHubOTA(
-        BUILD_GIT_VERSION, controller->getSystemInfo().version,
-        RELEASE_URL + (controller->getSettings().getOTAChannel() == "latest" ? "latest" : "tag/nightly"),
+        BUILD_GIT_VERSION, controller->getSystemInfo().version, otaReleaseUrlForChannel(controller->getSettings().getOTAChannel()),
         [this](uint8_t phase) {
             pluginManager->trigger("ota:update:phase", "phase", phase);
             updateOTAProgress(phase, 0);
@@ -487,7 +519,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             pluginManager->trigger("ota:update:progress", "progress", progress);
             updateOTAProgress(phase, progress);
         },
-        "display-firmware.bin", "display-filesystem.bin", "board-firmware.bin");
+        otaDisplayFirmwareName(), "display-filesystem.bin", "board-firmware.bin");
     pluginManager->on("controller:wifi:connect", [this](Event const &event) {
         apMode = event.getInt("AP");
         start();
@@ -501,7 +533,9 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
     pluginManager->on("controller:ready", [this](Event const &) {
         ota->setControllerVersion(controller->getSystemInfo().version);
+#ifndef GAGGIMATE_UART_COMMS
         ota->init(controller->getClientController()->getClient());
+#endif
     });
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
@@ -973,7 +1007,7 @@ void WebUIPlugin::loop() {
         // firmware over BLE (wants a low-latency link), a display update is over
         // Wi-Fi (wants BLE to stay out of the radio's way). "" = both.
         pluginManager->trigger("ota:update:start", "component", updateComponent);
-        ota->update(updateComponent != "display", updateComponent != "controller");
+        ota->update(CONTROLLER_OTA_ENABLED && updateComponent != "display", updateComponent != "controller");
         pluginManager->trigger("ota:update:end");
         updating = false;
     }
@@ -1025,9 +1059,11 @@ void WebUIPlugin::loop() {
         statusDoc["pw"] = controller->getCurrentPumpPower();
         statusDoc["hp"] = controller->getCurrentHeaterPower();
 
-        if (controller->getClientController()->getClient()->isConnected()) {
+#ifndef GAGGIMATE_UART_COMMS
+        if (controller->getClientController()->getClient() != nullptr && controller->getClientController()->getClient()->isConnected()) {
             statusDoc["rssi"] = controller->getClientController()->getClient()->getRssi();
         }
+#endif
         if (controller->getClientController()->hasLatency()) {
             statusDoc["lat"] = controller->getClientController()->getLatencyMs();
         }
@@ -1843,7 +1879,7 @@ void WebUIPlugin::handleOTASettings(uint32_t clientId, JsonDocument &request) {
     if (request["update"].as<bool>()) {
         if (!request["channel"].isNull()) {
             controller->getSettings().setOTAChannel(request["channel"].as<String>() == "latest" ? "latest" : "nightly");
-            ota->setReleaseUrl(RELEASE_URL + (controller->getSettings().getOTAChannel() == "latest" ? "latest" : "tag/nightly"));
+            ota->setReleaseUrl(otaReleaseUrlForChannel(controller->getSettings().getOTAChannel()));
             lastUpdateCheck = 0;
         }
     }
@@ -1851,12 +1887,22 @@ void WebUIPlugin::handleOTASettings(uint32_t clientId, JsonDocument &request) {
 }
 
 void WebUIPlugin::handleOTAStart(uint32_t clientId, JsonDocument &request) {
-    updating = true;
-    if (request["cp"].is<String>()) {
-        updateComponent = request["cp"].as<String>();
-    } else {
-        updateComponent = "";
+    if (!OTA_ENABLED) {
+        return;
     }
+
+    String component = request["cp"].is<String>() ? request["cp"].as<String>() : "";
+    if (component == "controller" && !CONTROLLER_OTA_ENABLED) {
+        updateOTAStatus("Controller OTA unavailable");
+        return;
+    }
+    if (component != "display" && component != "controller") {
+        component = "";
+    }
+    updateComponent = component;
+    updating = true;
+    updateOTAStatus("Updating...");
+    updateOTAProgress(component == "controller" ? PHASE_CONTROLLER_FW : PHASE_DISPLAY_FW, 0);
 }
 
 void WebUIPlugin::handleAutotuneStart(uint32_t clientId, JsonDocument &request) {
@@ -2820,8 +2866,10 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
     JsonDocument doc(&psramAllocator);
     doc["latestVersion"] = ota->getCurrentVersion();
     doc["tp"] = "res:ota-settings";
-    doc["displayUpdateAvailable"] = ota->isUpdateAvailable(false);
-    doc["controllerUpdateAvailable"] = ota->isUpdateAvailable(true);
+    doc["otaEnabled"] = OTA_ENABLED;
+    doc["controllerOtaEnabled"] = CONTROLLER_OTA_ENABLED;
+    doc["displayUpdateAvailable"] = OTA_ENABLED && ota->isUpdateAvailable(false);
+    doc["controllerUpdateAvailable"] = OTA_ENABLED && CONTROLLER_OTA_ENABLED && ota->isUpdateAvailable(true);
     doc["displayVersion"] = BUILD_GIT_VERSION;
     doc["controllerVersion"] = controller->getSystemInfo().version;
     doc["hardware"] = controller->getSystemInfo().hardware;
@@ -2849,6 +2897,14 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
         doc["heapLargest"] = static_cast<uint32_t>(largest);
         doc["heapTotal"] = static_cast<uint32_t>(total);
     }
+    {
+        size_t free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        size_t total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+        doc["psramFree"] = static_cast<uint32_t>(free);
+        doc["psramLargest"] = static_cast<uint32_t>(largest);
+        doc["psramTotal"] = static_cast<uint32_t>(total);
+    }
     doc["controllerTaskHealth"] = controller->isTaskHealthy();
 #ifndef GAGGIMATE_HEADLESS
     doc["uiTaskHealth"] = controller->getUI()->isTaskHealthy();
@@ -2872,6 +2928,7 @@ void WebUIPlugin::updateOTAProgress(uint8_t phase, int progress) {
     if (ws.getClients().empty()) {
         return;
     }
+    progress = std::min(std::max(progress, 0), 100);
     JsonDocument doc(&psramAllocator);
     doc["tp"] = "evt:ota-progress";
     doc["phase"] = phase;

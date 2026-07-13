@@ -1,7 +1,9 @@
 #include "GitHubOTA.h"
 #include "common.h"
+#include "logging.h"
 #include "semver_extensions.h"
 #include <ArduinoJson.h>
+#include <algorithm>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <Update.h>
@@ -28,7 +30,13 @@ GitHubOTA::GitHubOTA(const String &display_version, const String &controller_ver
     Updater.onStart(update_started);
     Updater.onEnd(update_finished);
     Updater.onProgress([progress_callback, this](int bytesReceived, int totalBytes) {
-        int percentage = 100.0 * bytesReceived / totalBytes;
+        if (totalBytes <= 0) {
+            progress_callback(phase, 0);
+            ESP_LOGV("update_progress", "Data received, Progress total unknown\r");
+            return;
+        }
+        int percentage = static_cast<int>((100.0f * bytesReceived) / totalBytes);
+        percentage = std::min(std::max(percentage, 0), 100);
         progress_callback(phase, percentage);
         ESP_LOGV("update_progress", "Data received, Progress: %d %%\r", percentage);
     });

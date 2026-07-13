@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 
 #include "common.h"
+#include "logging.h"
 #include "semver.h"
 #include "semver_extensions.h"
 #include <ArduinoJson.h>

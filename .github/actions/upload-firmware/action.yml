@@ -39,6 +39,11 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+
+        if [[ -z "${UPDATE_SERVER_HOST:-}" || -z "${UPDATE_SERVER_API_KEY:-}" ]]; then
+          echo "UPDATE_SERVER_HOST or UPDATE_SERVER_API_KEY is not set; skipping update-server upload."
+          exit 0
+        fi
         
         FORM_ARGS=(
           -F "channel=${{ inputs.channel }}"

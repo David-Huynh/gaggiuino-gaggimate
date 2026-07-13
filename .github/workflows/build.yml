@@ -36,9 +36,13 @@ jobs:
           mkdir -p upload/display
           mkdir -p upload/headless
           mkdir -p upload/controller
-          git tag -d nightly
-          git tag -d db
-          git describe --tags --dirty > out/version.txt
+          git tag -d nightly || true
+          git tag -d db || true
+          version="$(git describe --tags --dirty --exclude nightly --exclude db 2>/dev/null || true)"
+          if [[ -z "$version" ]]; then
+            version="v1.8.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "$version" > out/version.txt
       - name: Build Web
         run: ./scripts/build_webui.sh
       - name: Build controller
@@ -63,6 +67,7 @@ jobs:
           pio run -t buildfs -e display
           cp .pio/build/display/littlefs.bin out/display-filesystem.bin
           cp .pio/build/display/littlefs.bin out/display-headless-filesystem.bin
+          cp .pio/build/display/littlefs.bin out/display-headless-uart-n16r8-filesystem.bin
           cp .pio/build/display/littlefs.bin upload/display/filesystem.bin
           cp .pio/build/display/littlefs.bin upload/headless/filesystem.bin
       - name: Build display
@@ -101,6 +106,18 @@ jobs:
           target: 'headless'
           firmware_dir: 'upload/headless'
           firmware_files: 'bootloader.bin,partitions.bin,firmware.bin,filesystem.bin'
+      - name: Build headless UART
+        run: |
+          pio run -e display-headless-uart
+          cp .pio/build/display-headless-uart/firmware.bin out/display-headless-uart-firmware.bin
+          cp .pio/build/display-headless-uart/partitions.bin out/display-headless-uart-partitions.bin
+          cp .pio/build/display-headless-uart/bootloader.bin out/display-headless-uart-bootloader.bin
+      - name: Build headless UART N16R8
+        run: |
+          pio run -e display-headless-uart-n16r8
+          cp .pio/build/display-headless-uart-n16r8/firmware.bin out/display-headless-uart-n16r8-firmware.bin
+          cp .pio/build/display-headless-uart-n16r8/partitions.bin out/display-headless-uart-n16r8-partitions.bin
+          cp .pio/build/display-headless-uart-n16r8/bootloader.bin out/display-headless-uart-n16r8-bootloader.bin
       - name: Archive Firmware Files
         uses: actions/upload-artifact@v4
         with:
@@ -122,7 +139,7 @@ jobs:
         uses: ncipollo/release-action@bcfe5470707e8832e12347755757cec0eb3c22af
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          artifacts: release/*.bin
+          artifacts: release/*
           generateReleaseNotes: true
           allowUpdates: true
           token: ${{ secrets.GITHUB_TOKEN }}

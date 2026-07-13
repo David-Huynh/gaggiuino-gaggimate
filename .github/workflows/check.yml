@@ -24,3 +24,35 @@ jobs:
         run: platformio check -e display --fail-on-defect=medium -f "-<*>" -f "+<src/display/>" -f "-<src/display/ui>"
       - name: Run static code analysis for controller
         run: platformio check -e controller --fail-on-defect=medium -f "-<*>" -f "+<src/controller/>"
+
+  uart-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-pio
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+      - name: Build WebUI
+        run: ./scripts/build_webui.sh
+      - name: Build UART ESP32 display
+        run: platformio run -e display-headless-uart
+      - name: Build UART ESP32 N16R8 display
+        run: platformio run -e display-headless-uart-n16r8
+      - name: Build UART STM32 controller
+        run: platformio run -e stm32f4

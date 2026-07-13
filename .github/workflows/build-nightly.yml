@@ -2,6 +2,7 @@ on:
   push:
     branches:
       - "master"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -38,9 +39,13 @@ jobs:
           mkdir -p upload/display
           mkdir -p upload/headless
           mkdir -p upload/controller
-          git tag -d nightly
-          git tag -d db
-          git describe --tags --dirty > out/version.txt
+          git tag -d nightly || true
+          git tag -d db || true
+          version="$(git describe --tags --dirty --exclude nightly --exclude db 2>/dev/null || true)"
+          if [[ -z "$version" ]]; then
+            version="v1.8.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "$version" > out/version.txt
       - name: Build Web
         run: ./scripts/build_webui.sh
       - name: Build controller
@@ -68,6 +73,7 @@ jobs:
           cp .pio/build/display/littlefs.bin upload/headless/filesystem.bin
           cp .pio/build/display/littlefs.bin out/display-filesystem.bin
           cp .pio/build/display/littlefs.bin out/display-headless-filesystem.bin
+          cp .pio/build/display/littlefs.bin out/display-headless-uart-n16r8-filesystem.bin
       - name: Build display
         run: |
           export PLATFORMIO_BUILD_FLAGS="'-DNIGHTLY_BUILD'"
@@ -106,6 +112,20 @@ jobs:
           target: 'headless'
           firmware_dir: 'upload/headless'
           firmware_files: 'bootloader.bin,partitions.bin,firmware.bin,filesystem.bin'
+      - name: Build headless UART
+        run: |
+          export PLATFORMIO_BUILD_FLAGS="'-DNIGHTLY_BUILD'"
+          pio run -e display-headless-uart
+          cp .pio/build/display-headless-uart/firmware.bin out/display-headless-uart-firmware.bin
+          cp .pio/build/display-headless-uart/partitions.bin out/display-headless-uart-partitions.bin
+          cp .pio/build/display-headless-uart/bootloader.bin out/display-headless-uart-bootloader.bin
+      - name: Build headless UART N16R8
+        run: |
+          export PLATFORMIO_BUILD_FLAGS="'-DNIGHTLY_BUILD'"
+          pio run -e display-headless-uart-n16r8
+          cp .pio/build/display-headless-uart-n16r8/firmware.bin out/display-headless-uart-n16r8-firmware.bin
+          cp .pio/build/display-headless-uart-n16r8/partitions.bin out/display-headless-uart-n16r8-partitions.bin
+          cp .pio/build/display-headless-uart-n16r8/bootloader.bin out/display-headless-uart-n16r8-bootloader.bin
       - name: Archive Firmware Files
         uses: actions/upload-artifact@v4
         with:
@@ -119,11 +139,21 @@ jobs:
       pages: write
       pull-requests: write
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
       - name: Download Firmware Files
         uses: actions/download-artifact@v4
         with:
           name: gaggimate-firmware
           path: release
+      - name: Move nightly tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly "${GITHUB_SHA}"
+          git push --force origin refs/tags/nightly
       - name: Update Nightly Release
         uses: andelf/nightly-release@c5ed4bdb7c1da04a4fa1e40bc5e67306f682563b
         env:

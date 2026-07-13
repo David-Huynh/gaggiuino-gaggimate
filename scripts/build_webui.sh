@@ -25,4 +25,4 @@ gzip -f dist/assets/*.css
 gzip -f dist/*.html
 
 # Pack the built bundle into firmware-embeddable flash artifacts.
-python3 "$ROOT/scripts/embed_webui.py" --src "$ROOT/web/dist" --out "$ROOT/src/display/webassets"
+python "$ROOT/scripts/embed_webui.py" --src "$ROOT/web/dist" --out "$ROOT/src/display/webassets"
