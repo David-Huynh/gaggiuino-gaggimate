@@ -35,6 +35,7 @@ struct MqttOutboxLock {
 constexpr const char *MQTT_OUTBOX_DIR = "/rlm";
 constexpr size_t MAX_MQTT_OUTBOX_ITEMS = 64;
 constexpr size_t MAX_MQTT_OUTBOX_BYTES = 128 * 1024;
+
 } // namespace
 
 static bool mqttJsonNumber(JsonVariantConst value) {
@@ -603,6 +604,7 @@ void MQTTPlugin::publishMachineState(const char *state, const bool force) {
     doc["community_upload_owner"] = "gaggimate";
     AutoTuningPayloadMetadata::addRecipe(controller, doc);
     AutoTuningPayloadMetadata::addProfile(controller, doc);
+    addUartDiagnostics(doc);
 
     String json;
     serializeJson(doc, json);
@@ -1220,6 +1222,31 @@ void MQTTPlugin::publishLocalReset(Event const &event) {
     clearLatestRecommendationAndNotify();
 }
 
+void MQTTPlugin::addUartDiagnostics(JsonDocument &doc) const {
+    if (!controller) {
+        return;
+    }
+    const UartDiagnostics diagnostics = controller->getUartDiagnostics();
+    doc["uart_remote_error_count"] = diagnostics.remoteErrorCount;
+    doc["uart_remote_timeout_count"] = diagnostics.remoteTimeoutCount;
+    doc["uart_remote_runaway_count"] = diagnostics.remoteRunawayCount;
+    doc["uart_rx_overflow_count"] = diagnostics.remoteRxOverflowCount;
+    doc["uart_unknown_command_count"] = diagnostics.remoteUnknownCommandCount;
+    doc["uart_queue_drop_count"] = diagnostics.remoteQueueDropCount;
+    doc["uart_queue_high_watermark"] = diagnostics.remoteQueueHighWatermark;
+    doc["uart_out_command_count"] = diagnostics.remoteOutCommandCount;
+    doc["uart_adv_command_count"] = diagnostics.remoteAdvCommandCount;
+    doc["uart_ping_command_count"] = diagnostics.remotePingCommandCount;
+    doc["uart_valid_command_count"] = diagnostics.remoteValidCommandCount;
+    doc["uart_last_command_age_ms"] = diagnostics.remoteLastCommandAgeMs;
+    doc["uart_loop_late_count"] = diagnostics.remoteLoopLateCount;
+    doc["uart_loop_max_late_ms"] = diagnostics.remoteLoopMaxLateMs;
+    doc["uart_last_remote_error_code"] = diagnostics.lastRemoteErrorCode;
+    doc["uart_display_tx_drop_count"] = diagnostics.displayTxDropCount;
+    doc["uart_display_rx_overflow_count"] = diagnostics.displayRxOverflowCount;
+    doc["uart_display_parsed_event_count"] = diagnostics.displayParsedEventCount;
+}
+
 bool MQTTPlugin::isAutoTuningEnabled() const {
     if (!controller)
         return false;
@@ -1250,7 +1277,7 @@ bool MQTTPlugin::canApplyGrindByWeightTarget() const {
     if (!controller)
         return false;
     Settings const &settings = controller->getSettings();
-    return controller->isVolumetricAvailable() && settings.isVolumetricTarget();
+    return controller->isGrindVolumetricAvailable() && settings.isVolumetricTarget();
 }
 
 String MQTTPlugin::machineTopicId() const {

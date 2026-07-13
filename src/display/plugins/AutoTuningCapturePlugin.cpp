@@ -82,6 +82,11 @@ void AutoTuningCapturePlugin::setup(Controller *ctrl, PluginManager *pm) {
            [this](Event const &event) { currentEstimatedWeight = event.getFloat("value"); });
     pm->on("controller:volumetric-measurement:bluetooth:change",
            [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pm->on("controller:volumetric-measurement:hardware:change",
+           [this](Event const &event) { currentHardwareWeight = event.getFloat("value"); });
+#endif
+
     pm->on("controller:grind:start", [this](Event const &) {
         pendingMeasuredDoseAvailable = false;
         pendingMeasuredDoseG = 0.0f;
@@ -109,6 +114,7 @@ void AutoTuningCapturePlugin::setup(Controller *ctrl, PluginManager *pm) {
             currentShotId = makeShotId();
             shotSource = static_cast<int>(controller->getCurrentVolumetricSource());
             currentBluetoothWeight = 0.0f;
+            currentHardwareWeight = 0.0f;
             currentEstimatedWeight = 0.0f;
         }
     });
@@ -530,6 +536,8 @@ float AutoTuningCapturePlugin::currentShotWeightG() const {
         return currentBluetoothWeight;
 
     switch (static_cast<VolumetricMeasurementSource>(shotSource)) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
+        return currentHardwareWeight;
     case VolumetricMeasurementSource::FLOW_ESTIMATION:
         return currentEstimatedWeight;
     case VolumetricMeasurementSource::BLUETOOTH:
@@ -588,6 +596,8 @@ float AutoTuningCapturePlugin::currentShotFlowGPerS(float currentWeightG, uint16
 
 const char *AutoTuningCapturePlugin::weightSourceName() const {
     switch (static_cast<VolumetricMeasurementSource>(shotSource)) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
+        return "hardware_scale";
     case VolumetricMeasurementSource::BLUETOOTH:
         return "bluetooth_scale";
     case VolumetricMeasurementSource::FLOW_ESTIMATION:
@@ -600,6 +610,7 @@ const char *AutoTuningCapturePlugin::weightSourceName() const {
 
 const char *AutoTuningCapturePlugin::flowSourceName() const {
     switch (static_cast<VolumetricMeasurementSource>(shotSource)) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
     case VolumetricMeasurementSource::BLUETOOTH:
         return "beverage_weight_derivative";
     case VolumetricMeasurementSource::FLOW_ESTIMATION:

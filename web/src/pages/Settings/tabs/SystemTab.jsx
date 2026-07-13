@@ -30,6 +30,11 @@ const getRssiStatusClass = rssi => {
   return 'status-success';
 };
 
+const clampProgress = value => {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.max(0, Math.min(100, Math.round(numeric))) : 0;
+};
+
 function OtaProgressView({ phase, progress }) {
   const getOtaPhaseText = p => {
     switch (p) {
@@ -46,9 +51,18 @@ function OtaProgressView({ phase, progress }) {
 
   return (
     <div className='flex flex-col items-center gap-4 py-12'>
-      <Spinner size={8} />
+      {phase !== 4 && <Spinner size={8} />}
       <span className='text-base-content text-xl font-medium'>{getOtaPhaseText(phase)}</span>
       <span className='text-base-content text-lg font-medium'>{phase === 4 ? 100 : progress}%</span>
+      <div className='bg-base-300 h-3 w-full max-w-md overflow-hidden rounded'>
+        <div
+          className='bg-primary h-full transition-all duration-300'
+          style={{ width: `${phase === 4 ? 100 : progress}%` }}
+        />
+      </div>
+      <span className='text-base-content/70 max-w-md text-center text-sm'>
+        Keep the machine powered. The update continues after this browser page is closed.
+      </span>
       {phase === 4 && (
         <a href='/' className='btn btn-primary'>
           Back
@@ -118,6 +132,24 @@ function StorageAndMemorySection({ formData }) {
                 : 0
               ).toFixed(2)}
               %)
+            </div>
+          </div>
+        )}
+
+        {formData.psramTotal > 0 && (
+          <div className='flex flex-col space-y-2'>
+            <span className='text-base-content/70 text-sm font-medium'>Memory (PSRAM)</span>
+            <div className='bg-base-300 h-3 w-full overflow-hidden rounded'>
+              <div
+                className='bg-primary h-full transition-all'
+                style={{
+                  width: `${((formData.psramTotal - formData.psramFree) / formData.psramTotal) * 100 || 0}%`,
+                }}
+              />
+            </div>
+            <div className='text-base-content/60 text-xs'>
+              {((formData.psramTotal - formData.psramFree || 0) / 1024 / 1024).toFixed(2)} MB /{' '}
+              {(formData.psramTotal / 1024 / 1024).toFixed(2)} MB
             </div>
           </div>
         )}
@@ -237,8 +269,14 @@ export function SystemTab() {
 
   useEffect(() => {
     const listenerId = apiService.on('evt:ota-progress', msg => {
-      setProgress(msg.progress);
-      setPhase(msg.phase);
+      const nextPhase = Number(msg.phase) || 0;
+      const nextProgress = nextPhase === 4 ? 100 : clampProgress(msg.progress);
+      setPhase(currentPhase => {
+        setProgress(currentProgress =>
+          currentPhase === nextPhase ? Math.max(currentProgress, nextProgress) : nextProgress,
+        );
+        return nextPhase;
+      });
     });
     return () => {
       apiService.off('evt:ota-progress', listenerId);
@@ -284,6 +322,8 @@ export function SystemTab() {
 
   const onUpdate = useCallback(
     component => {
+      setPhase(component === 'controller' ? 3 : 1);
+      setProgress(0);
       apiService.send({ tp: 'req:ota-start', cp: component });
     },
     [apiService],
@@ -360,14 +400,16 @@ export function SystemTab() {
                   Update available: {formData.latestVersion}
                 </span>
               )}
-              <button
-                type='button'
-                className='btn btn-secondary btn-sm'
-                disabled={!formData.controllerUpdateAvailable || submitting}
-                onClick={() => onUpdate('controller')}
-              >
-                Update Controller
-              </button>
+              {formData.controllerOtaEnabled !== false && (
+                <button
+                  type='button'
+                  className='btn btn-secondary btn-sm'
+                  disabled={!formData.controllerUpdateAvailable || submitting}
+                  onClick={() => onUpdate('controller')}
+                >
+                  Update Controller
+                </button>
+              )}
             </div>
           </div>
 

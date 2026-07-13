@@ -1,6 +1,12 @@
 #include "UartTransport.h"
 #include <cstring>
+#if defined(ARDUINO_ARCH_STM32)
+#define ESP_LOGE(tag, fmt, ...) ((void)0)
+#define ESP_LOGW(tag, fmt, ...) ((void)0)
+#define ESP_LOGI(tag, fmt, ...) ((void)0)
+#else
 #include <esp_log.h>
+#endif
 
 UartTransport::~UartTransport() {
     // Detach before tearing down so a stray loop() can't call back into us.
@@ -22,6 +28,11 @@ void UartTransport::begin() {
     const unsigned long now = millis();
     _lastRxMs = now;
     _lastKeepaliveMs = now;
+    // UART is point-to-point and has no BLE-style connection callback. Treat the
+    // configured port as usable immediately so startup payloads (SystemInfo on
+    // STM32) can be sent synchronously; loop() will mark it down after the normal
+    // timeout if the peer never answers.
+    setConnected(true);
 }
 
 void UartTransport::loop() {
@@ -31,6 +42,7 @@ void UartTransport::loop() {
         const int byte = _stream.read();
         if (byte < 0)
             break;
+        _diagnostics.displayRxByteCount++;
         processByte(static_cast<uint8_t>(byte));
     }
 
@@ -46,9 +58,19 @@ void UartTransport::loop() {
 }
 
 bool UartTransport::send(const uint8_t *data, size_t length) {
-    if (data == nullptr || length == 0 || length > MAX_DATAGRAM)
+    if (data == nullptr || length == 0 || length > MAX_DATAGRAM) {
+        _diagnostics.displayTxDropCount++;
         return false; // length 0 is reserved for keepalives
-    return writeDatagram(data, length);
+    }
+    const bool ok = writeDatagram(data, length);
+    if (!ok)
+        _diagnostics.displayTxDropCount++;
+    return ok;
+}
+
+void UartTransport::disconnect() {
+    _lastRxMs = 0;
+    setConnected(false);
 }
 
 bool UartTransport::writeDatagram(const uint8_t *data, size_t length) {
@@ -66,6 +88,7 @@ bool UartTransport::writeDatagram(const uint8_t *data, size_t length) {
     _txEncoded[encLen++] = 0x00;
 
     const size_t written = _stream.write(_txEncoded, encLen);
+    _diagnostics.displayTxByteCount += static_cast<uint32_t>(written);
     unlockTx();
     return written == encLen;
 }
@@ -80,13 +103,17 @@ void UartTransport::processByte(uint8_t byte) {
     }
     if (_rxLen < sizeof(_rxBuf))
         _rxBuf[_rxLen++] = byte;
-    else
+    else {
+        if (!_rxOverflow)
+            _diagnostics.displayRxOverflowCount++;
         _rxOverflow = true; // too big, drop the rest until the next delimiter
+    }
 }
 
 void UartTransport::handleFrame(const uint8_t *block, size_t blockLen) {
     const size_t decodedLen = gm_uart::cobsDecode(block, blockLen, _decodeBuf, sizeof(_decodeBuf));
     if (decodedLen < CRC_LEN) {
+        _diagnostics.displayMalformedFrameCount++;
         ESP_LOGW(LOG_TAG, "Dropping malformed frame (%u block bytes)", static_cast<unsigned>(blockLen));
         return;
     }
@@ -95,13 +122,17 @@ void UartTransport::handleFrame(const uint8_t *block, size_t blockLen) {
     const uint16_t received = static_cast<uint16_t>(_decodeBuf[payloadLen]) | static_cast<uint16_t>(_decodeBuf[payloadLen + 1])
                                                                                   << 8;
     if (received != gm_uart::crc16(_decodeBuf, payloadLen)) {
+        _diagnostics.displayCrcErrorCount++;
         ESP_LOGW(LOG_TAG, "Dropping frame with bad CRC (%u payload bytes)", static_cast<unsigned>(payloadLen));
         return;
     }
 
+    _diagnostics.displayValidFrameCount++;
     markAlive();
-    if (payloadLen > 0)
+    if (payloadLen > 0) {
+        _diagnostics.displayParsedEventCount++;
         emitData(_decodeBuf, payloadLen); // empty == keepalive, swallow it
+    }
 }
 
 void UartTransport::markAlive() {
@@ -113,6 +144,11 @@ void UartTransport::setConnected(bool connected) {
     if (_connected == connected)
         return;
     _connected = connected;
+    if (connected) {
+        _diagnostics.displayLinkUpCount++;
+    } else {
+        _diagnostics.displayLinkDownCount++;
+    }
     ESP_LOGI(LOG_TAG, "%s", connected ? "Link up" : "Link down");
     emitConnection(connected);
 }

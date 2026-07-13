@@ -9,6 +9,7 @@ import {
 import { getMetricStats } from './metricStats';
 import { analyzeExecutedPhase } from './phaseAnalysis';
 import { mergeSkippedProfilePhases } from './skippedPhases';
+import { isWeightTelemetryAvailable } from './weightRate';
 import {
   buildRecordedExitReasonByPhase,
   getBrewCompletionLabel,
@@ -151,7 +152,7 @@ export function calculateShotMetrics(shotData, profileData, settings) {
 
   let globalScaleLost = false;
   if (isBrewByWeight) {
-    globalScaleLost = gSamples.some(s => s.systemInfo?.bluetoothScaleConnected === false);
+    globalScaleLost = gSamples.some(sample => !isWeightTelemetryAvailable(sample));
   }
 
   // --- 3. GLOBAL TOTALS ---

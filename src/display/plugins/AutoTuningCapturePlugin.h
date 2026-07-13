@@ -49,6 +49,7 @@ class AutoTuningCapturePlugin : public Plugin {
     String currentShotId;
     int shotSource = 0;
     float currentBluetoothWeight = 0.0f;
+    float currentHardwareWeight = 0.0f;
     float currentEstimatedWeight = 0.0f;
 
     bool pendingMeasuredDoseAvailable = false;

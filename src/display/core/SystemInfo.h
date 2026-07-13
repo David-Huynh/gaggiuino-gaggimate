@@ -2,15 +2,18 @@
 #define DISPLAY_SYSTEM_INFO_H
 
 #include <Arduino.h>
+#include <algorithm>
+#include <vector>
 
 // Controller capabilities + identity as the display tracks them. Populated from
 // the SystemInfo message the controller pushes on connect. (Previously lived in
-// the NimBLEComm library.)
+// the NanoPbComm SystemInfo payload.)
 struct SystemCapabilities {
     bool dimming;
     bool pressure;
     bool ledControl;
     bool tof;
+    bool scale;
     std::vector<uint32_t> addons;
 
     bool hasAddon(uint32_t addon) const { return std::find(addons.begin(), addons.end(), addon) != addons.end(); }

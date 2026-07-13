@@ -1,7 +1,7 @@
 #include "NtcThermistor.h"
+#include "logging.h"
 #include <Arduino.h>
 #include <SPI.h>
-#include <freertos/FreeRTOS.h>
 
 NtcThermistor::NtcThermistor(ADSAdc *adc, uint8_t channel, const temperature_error_callback_t &error_callback)
     : taskHandle(nullptr), _adc(adc), _channel(channel) {
@@ -56,6 +56,10 @@ void NtcThermistor::loop() {
     auto *thermocouple = static_cast<NtcThermistor *>(arg);
     while (true) {
         thermocouple->loop();
+#ifdef ARDUINO_ARCH_STM32
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(NTC_UPDATE_INTERVAL));
+#else
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(NTC_UPDATE_INTERVAL));
+#endif
     }
 }

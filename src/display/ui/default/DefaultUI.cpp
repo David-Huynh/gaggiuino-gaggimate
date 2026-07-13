@@ -442,6 +442,15 @@ void DefaultUI::init() {
         estimatedWeight = 0.0;
         rerender = true;
     });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pluginManager->on("controller:scale:sample", [=](Event const &event) {
+        double newWeight = event.getFloat("value");
+        if (round(newWeight * 10.0) != round(hardwareWeight * 10.0)) {
+            hardwareWeight = newWeight;
+            rerender = true;
+        }
+    });
+#endif
     xTaskCreatePinnedToCore(profileLoopTask, "DefaultUI::loopProfiles", configMINIMAL_STACK_SIZE * 8, this, 1, &profileTaskHandle,
                             0);
 }
@@ -474,9 +483,12 @@ void DefaultUI::loop() {
         updateProfileInfo();
         updateBoiler();
         updateBrewProcess();
-        const auto weightSource = controller->getCurrentVolumetricSource();
+        const auto weightSource =
+            controller->isActive() ? controller->getCurrentVolumetricSource() : controller->getResolvedBrewSource();
         double displayWeight = 0.0;
-        if (weightSource == VolumetricMeasurementSource::BLUETOOTH) {
+        if (weightSource == VolumetricMeasurementSource::HARDWARE_SCALE) {
+            displayWeight = hardwareWeight;
+        } else if (weightSource == VolumetricMeasurementSource::BLUETOOTH) {
             displayWeight = bluetoothWeight;
         } else if (weightSource == VolumetricMeasurementSource::FLOW_ESTIMATION) {
             displayWeight = estimatedWeight;
@@ -1366,7 +1378,7 @@ void DefaultUI::updateState() {
     uiFlags.brew_adjustments(brewScreenState == BrewScreenState::Settings);
     uiFlags.active(controller->isActive());
     uiFlags.grind_active(controller->isGrindActive());
-    uiFlags.grind_volumetric(controller->isVolumetricAvailable() && settings.isVolumetricTarget());
+    uiFlags.grind_volumetric(controller->isGrindVolumetricAvailable() && settings.isVolumetricTarget());
     uiFlags.heating_flash(heatingFlash);
     uiFlags.temperature_stable(isTemperatureStable);
     uiFlags.has_prev_profile(currentProfileIdx > 0);

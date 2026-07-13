@@ -34,6 +34,7 @@ class PressureSensor {
     ADSAdc *_adc = nullptr;
     uint8_t _channel;
     TwoStateKalmanFilter _filter;
+    const char *LOG_TAG = "PressureSensor";
 };
 
 #endif // PRESSURESENSOR_H

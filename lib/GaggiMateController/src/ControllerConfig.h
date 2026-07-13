@@ -2,12 +2,19 @@
 #define CONTROLLERCONFIG_H
 #include <string>
 
+#if defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+#define GAGGIMATE_HARDWARE_SCALE_ENABLED false
+#else
+#define GAGGIMATE_HARDWARE_SCALE_ENABLED true
+#endif
+
 struct Capabilities {
     bool dimming;
     bool pressure;
     bool ssrPump;
     bool ledControls;
     bool tof;
+    bool scale;
 };
 
 struct ControllerConfig {
@@ -80,6 +87,7 @@ const ControllerConfig GM_STANDARD_REV_1X = {.name = "GaggiMate Standard Rev 1.x
                                                  .ssrPump = false,
                                                  .ledControls = false,
                                                  .tof = false,
+                                                 .scale = false,
                                              }};
 
 const ControllerConfig GM_STANDARD_REV_2X = {.name = "GaggiMate Standard Rev 2.x",
@@ -112,6 +120,7 @@ const ControllerConfig GM_STANDARD_REV_2X = {.name = "GaggiMate Standard Rev 2.x
                                                  .ssrPump = true,
                                                  .ledControls = false,
                                                  .tof = false,
+                                                 .scale = false,
                                              }};
 
 const ControllerConfig GM_PRO_REV_1x = {.name = "GaggiMate Pro Rev 1.0",
@@ -147,6 +156,7 @@ const ControllerConfig GM_PRO_REV_1x = {.name = "GaggiMate Pro Rev 1.0",
                                             .ssrPump = false,
                                             .ledControls = false,
                                             .tof = false,
+                                            .scale = false,
                                         }};
 
 const ControllerConfig GM_PRO_LEGO = {.name = "GaggiMate Pro Lego Build",
@@ -182,6 +192,7 @@ const ControllerConfig GM_PRO_LEGO = {.name = "GaggiMate Pro Lego Build",
                                           .ssrPump = false,
                                           .ledControls = false,
                                           .tof = false,
+                                          .scale = false,
                                       }};
 
 const ControllerConfig GM_PRO_REV_11 = {.name = "GaggiMate Pro Rev 1.1",
@@ -217,6 +228,71 @@ const ControllerConfig GM_PRO_REV_11 = {.name = "GaggiMate Pro Rev 1.1",
                                             .ssrPump = false,
                                             .ledControls = false,
                                             .tof = false,
+                                            .scale = false,
+                                        }};
+
+// STM32F4 Controller - replaces peripheral ESP32, communicates via UART
+// Source of truth: gaggiuino/src/pindef.h
+// Arduino STM32 mapping (BlackPill F411CE variant):
+// PA0-PA15=0-15, PB0-PB10=16-26, PB12-PB15=27-30, PC13-PC15=31-33
+const ControllerConfig GM_STM32F4_V1 = {.name = "GaggiMate STM32F4 Controller v1.0",
+                                        .autodetectValue = 99, // Not used in STM32 (no voltage divider), unique ID for reference
+
+                                        // Heater SSR relay: PA15 (relayPin in Gaggiuino pindef)
+                                        .heaterPin = 15, // Arduino pin for PA15 on STM32F4
+
+                                        // Pump PWM output: PA1
+                                        .pumpPin = 1,      // Arduino pin for PA1 on STM32F4
+                                        .pumpSensePin = 0, // Not used on this board (kept for backward compatibility)
+                                        .pumpOn = 1,       // Active high
+
+                                        // Valve relay: PC13 (also onboard LED on BlackPill)
+                                        .valvePin = 31, // Arduino pin for PC13 on BlackPill F411CE
+                                        .valveOn = 1,   // Active high
+
+                                        // Auxiliary relay: not available on standard Gaggiuino PCB
+                                        .altPin = 0,
+                                        .altOn = 1,
+
+                                        // I2C1 for pressure sensor (PB6=SCL, PB7=SDA)
+                                        .pressureScl = 22, // Arduino pin for PB6
+                                        .pressureSda = 23, // Arduino pin for PB7
+
+                                        // SPI1 for thermocouple MAX31855 (PA5=SCK, PA7=MOSI, PB4=MISO, PA6=CS)
+                                        .maxSckPin = 5,   // Arduino pin for PA5
+                                        .maxCsPin = 6,    // Arduino pin for PA6
+                                        .maxMisoPin = 20, // Arduino pin for PB4
+
+                                        // Brew button: PC14
+                                        .brewButtonPin = 32, // Arduino pin for PC14 on BlackPill F411CE
+
+                                        // Steam button: PC15
+                                        .steamButtonPin = 33, // Arduino pin for PC15 on BlackPill F411CE
+
+                                        // HX711: SCK=PB0, DOUT1=PB8, DOUT2=PB9
+                                        .scaleSclPin = 16,  // Arduino pin for PB0
+                                        .scaleSdaPin = 24,  // Arduino pin for PB8
+                                        .scaleSda1Pin = 25, // Arduino pin for PB9
+
+                                        // LED/TOF I2C (same I2C1: PB6=SCL, PB7=SDA)
+                                        .sunriseSclPin = 22, // Arduino pin for PB6 (I2C1 SCL)
+                                        .sunriseSdaPin = 23, // Arduino pin for PB7 (I2C1 SDA)
+
+                                        // Unused extension pins (placeholder for future use)
+                                        .ext1Pin = 0,
+                                        .ext2Pin = 0,
+                                        .ext3Pin = 0,
+                                        .ext4Pin = 0,
+                                        .ext5Pin = 0,
+
+                                        // Full capabilities with UART communication
+                                        .capabilites = {
+                                            .dimming = true,     // Supports dimmed pump control
+                                            .pressure = true,    // Supports pressure sensor
+                                            .ssrPump = false,    // Uses dimmed pump, not SSR
+                                            .ledControls = true, // Supports LED control
+                                            .tof = true,         // Supports time-of-flight sensor
+                                            .scale = GAGGIMATE_HARDWARE_SCALE_ENABLED, // Supports HX711 hardware scale
                                         }};
 
 const ControllerConfig GM_STANDARD_REV_3X = {.name = "GaggiMate Standard Rev 3.x",

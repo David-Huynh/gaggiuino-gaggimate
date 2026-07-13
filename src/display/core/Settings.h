@@ -5,9 +5,11 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <display/core/AutoTuning.h>
+#include <display/core/PredictiveDelayPolicy.h>
 #include <display/core/Property.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
+#include <functional>
 #include <vector>
 
 #define PREFERENCES_KEY "controller"
@@ -81,6 +83,7 @@ class Settings {
     int getStartupMode() const { return startupMode.get(); }
     int getStandbyTimeout() const { return standbyTimeout.get(); }
     double getBrewDelay() const { return brewDelay.get(); }
+    double getHardwareBrewDelay() const { return hardwareBrewDelay.get(); }
     double getGrindDelay() const { return grindDelay.get(); }
     bool isDelayAdjust() const { return delayAdjust.get(); }
     String getPid() const { return pid.get(); }
@@ -94,6 +97,8 @@ class Settings {
     bool isVolumetricTarget() const { return volumetricTarget.get(); }
     String getOTAChannel() const { return otaChannel.get(); }
     String getSavedScale() const { return savedScale.get(); }
+    String getSavedBrewScale() const { return savedBrewScale.get(); }
+    String getSavedGrindScale() const { return savedGrindScale.get(); }
     bool isBoilerFillActive() const { return boilerFillActive.get(); }
     int getStartupFillTime() const { return startupFillTime.get(); }
     int getSteamFillTime() const { return steamFillTime.get(); }
@@ -159,6 +164,16 @@ class Settings {
     float getIntegralGain() const { return integralGain.get(); }
     float getMaxPumpPower() const { return maxPumpPower.get(); }
 
+    int getScaleSource() const;
+    float getScaleCalibration1() const { return scaleCalibration1.get(); }
+    float getScaleCalibration2() const { return scaleCalibration2.get(); }
+    long getScaleOffset1() const { return scaleOffset1.get(); }
+    long getScaleOffset2() const { return scaleOffset2.get(); }
+    long getScaleCalTimestamp1() const { return scaleCalTimestamp1.get(); }
+    long getScaleCalTimestamp2() const { return scaleCalTimestamp2.get(); }
+    float getScaleCalStddev1() const { return scaleCalStddev1.get(); }
+    float getScaleCalStddev2() const { return scaleCalStddev2.get(); }
+
     bool isRLAutoTuningEnabled() const { return rlAutoTuningEnabled.get(); }
     bool isRLLocalOptimizationEnabled() const { return rlLocalOptimizationEnabled.get(); }
     bool isRLOptimizationPaused() const { return rlOptimizationPaused.get(); }
@@ -192,6 +207,7 @@ class Settings {
     void setStartupMode(int startup_mode);
     void setStandbyTimeout(int standby_timeout);
     void setBrewDelay(double brewDelay);
+    void setHardwareBrewDelay(double hardwareBrewDelay);
     void setGrindDelay(double grindDelay);
     void setDelayAdjust(bool delay_adjust);
     void setPid(const String &pid);
@@ -205,6 +221,8 @@ class Settings {
     void setVolumetricTarget(bool volumetric_target);
     void setOTAChannel(const String &otaChannel);
     void setSavedScale(const String &savedScale);
+    void setSavedBrewScale(const String &savedScale);
+    void setSavedGrindScale(const String &savedScale);
     void setBoilerFillActive(bool boiler_fill_active);
     void setStartupFillTime(int startup_fill_time);
     void setSteamFillTime(int steam_fill_time);
@@ -274,6 +292,17 @@ class Settings {
     void setRLOptimizerMode(const String &optimizerMode);
     bool setRLRecipeDomain(AutoTuning::RecipeDomain const &domain);
 
+    void setScaleSource(int scaleSource);
+    void setOnScaleSourceChange(std::function<void(int)> callback) { onScaleSourceChange = std::move(callback); }
+    void setScaleCalibration1(float calibration1);
+    void setScaleCalibration2(float calibration2);
+    void setScaleOffset1(long offset1);
+    void setScaleOffset2(long offset2);
+    void setScaleCalTimestamp1(long timestamp);
+    void setScaleCalTimestamp2(long timestamp);
+    void setScaleCalStddev1(float stddev);
+    void setScaleCalStddev2(float stddev);
+
     void setCommutationGain(float commutationGain);
     void setConvergenceGain(float convergenceGain);
     void setIntegralGain(float integralGain);
@@ -292,6 +321,7 @@ class Settings {
     Property<double> targetGrindVolume{registry, "tgv", 18.0};
     Property<int> targetGrindDuration{registry, "tgd", 25000};
     Property<double> brewDelay{registry, "del_br", 800.0};
+    Property<double> hardwareBrewDelay{registry, "del_br_hw", PredictiveDelayPolicy::DEFAULT_HARDWARE_BREW_DELAY_MS};
     Property<double> grindDelay{registry, "del_gd", 1000.0};
     Property<bool> delayAdjust{registry, "del_ad", true};
     Property<int> startupMode{registry, "sm", MODE_STANDBY};
@@ -304,6 +334,8 @@ class Settings {
     Property<String> wifiApPassword{registry, "wap", ""}; // empty until generated on first start
     Property<String> mdnsName{registry, "mn", DEFAULT_MDNS_NAME};
     Property<String> savedScale{registry, "ssc", ""};
+    Property<String> savedBrewScale{registry, "ssc_br", ""};
+    Property<String> savedGrindScale{registry, "ssc_gr", ""};
     Property<bool> homekit{registry, "hk", false};
     Property<bool> volumetricTarget{registry, "vt", false};
     Property<bool> boilerFillActive{registry, "bf_a", false};
@@ -375,6 +407,18 @@ class Settings {
     Property<float> rlDoseMaxG{registry, "rl_dose_max", 30.0f};
     Property<float> rlTargetOutputMinG{registry, "rl_out_min", 5.0f};
     Property<float> rlTargetOutputMaxG{registry, "rl_out_max", 250.0f};
+
+    // Scale source: 0=AUTO, 1=BLE, 2=hardware, 3=predictive, 4=off.
+    Property<int> scaleSource{registry, "sc_src", 0};
+    Property<float> scaleCalibration1{registry, "sc_c1", 0.0f};
+    Property<float> scaleCalibration2{registry, "sc_c2", 0.0f};
+    Property<long> scaleOffset1{registry, "sc_o1", 0};
+    Property<long> scaleOffset2{registry, "sc_o2", 0};
+    Property<long> scaleCalTimestamp1{registry, "sc_cts1", 0};
+    Property<long> scaleCalTimestamp2{registry, "sc_cts2", 0};
+    Property<float> scaleCalStddev1{registry, "sc_csd1", 0.0f};
+    Property<float> scaleCalStddev2{registry, "sc_csd2", 0.0f};
+    std::function<void(int)> onScaleSourceChange;
 
     // Pump settings
     Property<String> pumpModelCoeffs{registry, "pmc", DEFAULT_PUMP_MODEL_COEFFS};

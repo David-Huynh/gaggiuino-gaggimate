@@ -6,6 +6,7 @@
 #include <display/core/Controller.h>
 #include <display/core/Event.h>
 #include <display/core/Plugin.h>
+#include <display/core/ScaleSourceResolver.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
 
@@ -93,14 +94,19 @@ class ShotHistoryPlugin : public Plugin {
     unsigned long lastWeightChangeTime = 0;
     float currentTemperature = 0.0f;
     float currentBluetoothWeight = 0.0f;
+    float currentHardwareWeight = 0.0f;
     float lastStableWeight = 0.0f;
-    // Trailing-sample weight and EMA flow for the active volumetric source.
+    // Trailing-sample weight + EMA flow on the *active* scale source (BLE or HW),
+    // chosen each tick from settings.getScaleSource(). Generalized from the
+    // previously BLE-only currentBluetoothFlow / lastBluetoothWeight fields.
     float lastScaleWeight = 0.0f;
     float currentScaleFlow = 0.0f;
     float lastBluetoothWeight = 0.0f;
     float currentBluetoothFlow = 0.0f;
     float currentEstimatedWeight = 0.0f;
     float currentPuckResistance = 0.0f;
+    bool sawShotHistoryControlTarget = false;
+    uint8_t hardwareScaleFinishSettleSamples = 0;
     unsigned long lastLoggedElapsedMs = 0;
     String currentProfileName;
 

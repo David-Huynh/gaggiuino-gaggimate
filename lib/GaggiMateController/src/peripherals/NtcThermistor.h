@@ -3,8 +3,12 @@
 
 #include "ADSAdc.h"
 #include "TemperatureSensor.h"
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#endif
 
 constexpr int NTC_UPDATE_INTERVAL = 250;
 constexpr int NTC_ERROR_WINDOW = 20;
@@ -43,7 +47,7 @@ class NtcThermistor : public TemperatureSensor {
     temperature_error_callback_t error_callback;
 
     const char *LOG_TAG = "NtcThermocouple";
-    static void monitorTask(void *arg);
+    [[noreturn]] static void monitorTask(void *arg);
 };
 
 #endif // NTCTHERMOCOUPLE_H

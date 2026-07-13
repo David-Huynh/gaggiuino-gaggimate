@@ -44,6 +44,9 @@ message Payload {
         PressureScale pressure_scale = 9;
         Tare tare = 10;
         LedControl led = 11;
+        ScaleTare scale_tare = 12;
+        ScaleCalibration scale_calibration = 13;
+        ScaleCalibrationStart scale_calibration_start = 14;
 
         // Responses: controller -> display
         SystemInfo system_info = 20;
@@ -53,6 +56,10 @@ message Payload {
         VolumetricMeasurement volumetric = 24;
         TofMeasurement tof = 25;
         Error error = 26;
+        WeightMeasurement weight = 27;
+        ScaleOffsets scale_offsets = 28;
+        ScaleCalibrationResult scale_calibration_result = 29;
+        ScaleSample scale_sample = 30;
     }
 }
 
@@ -154,6 +161,20 @@ message LedControl {
     repeated LedChannel channels = 1;
 }
 
+message ScaleTare {}
+
+message ScaleCalibration {
+    float calibration1 = 1;
+    float calibration2 = 2;
+    int32 offset1 = 3;
+    int32 offset2 = 4;
+}
+
+message ScaleCalibrationStart {
+    uint32 channel = 1;
+    float reference_weight = 2;
+}
+
 // ---------------------------------------------------------------------------
 // Responses (controller -> display)
 // ---------------------------------------------------------------------------
@@ -164,6 +185,7 @@ message Capabilities {
     bool led_control = 3;
     bool tof = 4;
     repeated Addon addons = 5;
+    bool scale = 6;
 }
 
 message Addon {
@@ -192,6 +214,37 @@ message SensorData {
     float puck_resistance = 4;
     float pump_power = 5;   // pump power 0..100 %
     float heater_power = 6; // heater power 0..100 %
+    ControllerDiagnostics diagnostics = 7;
+}
+
+// Runtime controller diagnostics. This is telemetry, not control protocol; it is
+// carried with SensorData so the display/WebUI can inspect STM32-side state even
+// when serial logging is disabled.
+message ControllerDiagnostics {
+    uint32 error_code = 1;
+    bool thermocouple_error = 2;
+    uint32 thermocouple_status = 3;
+    uint32 thermocouple_error_count = 4;
+    uint32 thermocouple_read_count = 5;
+    float thermocouple_raw_temperature = 6;
+    float thermocouple_temperature = 7;
+    bool thermocouple_task_running = 8;
+    float heater_setpoint = 9;
+    float heater_output = 10;
+    bool heater_relay = 11;
+    uint32 boiler_command_count = 12;
+    uint32 pump_command_count = 13;
+    uint32 relay_command_count = 14;
+    uint32 ping_command_count = 15;
+    uint32 tare_command_count = 16;
+    float last_boiler_setpoint = 17;
+    float last_pump_power = 18;
+    bool last_relay_open = 19;
+    uint32 uart_rx_bytes = 20;
+    uint32 uart_tx_bytes = 21;
+    uint32 uart_valid_frames = 22;
+    uint32 uart_parsed_payloads = 23;
+    uint32 free_heap = 24;
 }
 
 message ButtonState {
@@ -226,4 +279,29 @@ enum ErrorCode {
 
 message Error {
     ErrorCode code = 1;
+}
+
+message WeightMeasurement {
+    float weight = 1;
+}
+
+message ScaleSample {
+    float weight_g = 1;
+    float stddev_g = 2;
+    float ch1_g = 3;
+    float ch2_g = 4;
+    float ch1_std_g = 5;
+    float ch2_std_g = 6;
+    uint32 health_bits = 7;
+    uint32 sample_seq = 8;
+}
+
+message ScaleOffsets {
+    int32 offset1 = 1;
+    int32 offset2 = 2;
+}
+
+message ScaleCalibrationResult {
+    uint32 channel = 1;
+    float calibration = 2;
 }

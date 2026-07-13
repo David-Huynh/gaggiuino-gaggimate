@@ -96,6 +96,12 @@ Settings::Settings() {
         rlTargetOutputMinG.initDefault(defaults.targetOutputMinG);
         rlTargetOutputMaxG.initDefault(defaults.targetOutputMaxG);
     }
+    if (!preferences.isKey("ssc_br")) {
+        savedBrewScale.initDefault(savedScale.get());
+    }
+    if (!preferences.isKey("ssc_gr")) {
+        savedGrindScale.initDefault(savedScale.get());
+    }
     if (!preferences.isKey("sg_m")) {
         smartGrindMode.initDefault(smartGrindToggle.get() ? 1 : 0);
     }
@@ -136,6 +142,10 @@ void Settings::setTargetGrindDuration(const int target_duration) { targetGrindDu
 
 void Settings::setBrewDelay(double brew_Delay) { brewDelay.set(std::clamp(brew_Delay, 0.0, 4000.0)); }
 
+void Settings::setHardwareBrewDelay(double hardware_brew_delay) {
+    hardwareBrewDelay.set(std::clamp(hardware_brew_delay, 0.0, 4000.0));
+}
+
 void Settings::setGrindDelay(double grind_Delay) { grindDelay.set(std::clamp(grind_Delay, 0.0, 4000.0)); }
 
 void Settings::setDelayAdjust(bool delay_adjust) { delayAdjust.set(delay_adjust); }
@@ -164,7 +174,15 @@ void Settings::setVolumetricTarget(bool volumetric_target) { volumetricTarget.se
 
 void Settings::setOTAChannel(const String &otaChannel) { this->otaChannel.set(otaChannel); }
 
-void Settings::setSavedScale(const String &savedScale) { this->savedScale.set(savedScale); }
+void Settings::setSavedScale(const String &savedScale) {
+    this->savedScale.set(savedScale);
+    savedBrewScale.set(savedScale);
+    savedGrindScale.set(savedScale);
+}
+
+void Settings::setSavedBrewScale(const String &savedScale) { this->savedBrewScale.set(savedScale); }
+
+void Settings::setSavedGrindScale(const String &savedScale) { this->savedGrindScale.set(savedScale); }
 
 void Settings::setBoilerFillActive(bool boiler_fill_active) { boilerFillActive.set(boiler_fill_active); }
 
@@ -379,6 +397,43 @@ bool Settings::setRLRecipeDomain(AutoTuning::RecipeDomain const &domain) {
     rlTargetOutputMaxG.set(domain.targetOutputMaxG);
     return true;
 }
+
+int Settings::getScaleSource() const {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (scaleSource.get() == 2) {
+        return 3;
+    }
+#endif
+    return scaleSource.get();
+}
+
+void Settings::setScaleSource(int scale_source) {
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (scale_source == 2) {
+        scale_source = 3;
+    }
+#endif
+    scaleSource.set(scale_source);
+    if (onScaleSourceChange) {
+        onScaleSourceChange(scale_source);
+    }
+}
+
+void Settings::setScaleCalibration1(float calibration1) { scaleCalibration1.set(calibration1); }
+
+void Settings::setScaleCalibration2(float calibration2) { scaleCalibration2.set(calibration2); }
+
+void Settings::setScaleOffset1(long offset1) { scaleOffset1.set(offset1); }
+
+void Settings::setScaleOffset2(long offset2) { scaleOffset2.set(offset2); }
+
+void Settings::setScaleCalTimestamp1(long timestamp) { scaleCalTimestamp1.set(timestamp); }
+
+void Settings::setScaleCalTimestamp2(long timestamp) { scaleCalTimestamp2.set(timestamp); }
+
+void Settings::setScaleCalStddev1(float stddev) { scaleCalStddev1.set(stddev); }
+
+void Settings::setScaleCalStddev2(float stddev) { scaleCalStddev2.set(stddev); }
 
 void Settings::setCommutationGain(float commutation_gain) { commutationGain.set(commutation_gain); }
 

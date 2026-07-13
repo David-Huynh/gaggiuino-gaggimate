@@ -31,6 +31,9 @@ constexpr int16_t FLOW_MAX_VALUE = 2000;  //  20.00 ml/s
 // folded into the flow EMA, where a single bad reading would otherwise pin vf at
 // the ±20 floor for seconds while the EMA bleeds off. See GM-110.
 constexpr float MAX_PLAUSIBLE_WEIGHT_DELTA = 5.0f; // grams per sample
+constexpr float SHOT_HISTORY_TARGET_ACTIVE_EPSILON = 0.001f;
+constexpr uint8_t SHOT_HISTORY_FINISH_SETTLE_SAMPLES = 2;
+constexpr float SHOT_HISTORY_FINISH_SETTLE_MAX_DELTA_G = 1.0f;
 
 uint16_t encodeUnsigned(float value, float scale, uint16_t maxValue) {
     if (!std::isfinite(value)) {
@@ -94,6 +97,10 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
            [this](Event const &event) { currentEstimatedWeight = event.getFloat("value"); });
     pm->on("controller:volumetric-measurement:bluetooth:change",
            [this](Event const &event) { currentBluetoothWeight = event.getFloat("value"); });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pm->on("controller:volumetric-measurement:hardware:change",
+           [this](Event const &event) { currentHardwareWeight = event.getFloat("value"); });
+#endif
     pm->on("boiler:currentTemperature:change", [this](Event const &event) { currentTemperature = event.getFloat("value"); });
     pm->on("pump:puck-resistance:change", [this](Event const &event) { currentPuckResistance = event.getFloat("value"); });
     // Initialize rebuild state
@@ -107,6 +114,8 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
 
 float ShotHistoryPlugin::sourceWeight(VolumetricMeasurementSource source) const {
     switch (source) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
+        return currentHardwareWeight;
     case VolumetricMeasurementSource::FLOW_ESTIMATION:
         return currentEstimatedWeight;
     case VolumetricMeasurementSource::BLUETOOTH:
@@ -121,6 +130,31 @@ void ShotHistoryPlugin::record() {
     const float scaleWeight = sourceWeight(shotSource);
 
     bool shouldRecord = recording || extendedRecording;
+    if (shouldRecord && recording && shotSource == VolumetricMeasurementSource::HARDWARE_SCALE && controller) {
+        const bool targetActive = fabsf(controller->getTargetPressure()) > SHOT_HISTORY_TARGET_ACTIVE_EPSILON ||
+                                  fabsf(controller->getTargetFlow()) > SHOT_HISTORY_TARGET_ACTIVE_EPSILON;
+        if (targetActive) {
+            sawShotHistoryControlTarget = true;
+            hardwareScaleFinishSettleSamples = 0;
+        } else if (sawShotHistoryControlTarget) {
+            Process *process = controller->getProcess();
+            const bool brewActive = process != nullptr && process->getType() == MODE_BREW && process->isActive();
+            if (!brewActive) {
+                bool includeSettleSample = false;
+                if (sampleCount > 0 && hardwareScaleFinishSettleSamples < SHOT_HISTORY_FINISH_SETTLE_SAMPLES &&
+                    std::isfinite(scaleWeight) && std::isfinite(lastScaleWeight)) {
+                    includeSettleSample = fabsf(scaleWeight - lastScaleWeight) <= SHOT_HISTORY_FINISH_SETTLE_MAX_DELTA_G;
+                }
+                if (includeSettleSample) {
+                    hardwareScaleFinishSettleSamples++;
+                } else {
+                    recording = false;
+                    extendedRecording = false;
+                    shouldRecord = false;
+                }
+            }
+        }
+    }
 
     if (shouldRecord && (controller->getMode() == MODE_BREW || extendedRecording)) {
         if (!isFileOpen) {
@@ -350,12 +384,15 @@ void ShotHistoryPlugin::startRecording() {
     lastWeightChangeTime = 0;
     extendedRecordingStart = 0;
     currentBluetoothWeight = 0.0f;
+    currentHardwareWeight = 0.0f;
     lastStableWeight = 0.0f;
     lastScaleWeight = 0.0f;
     lastBluetoothWeight = 0.0f;
     currentEstimatedWeight = 0.0f;
     currentScaleFlow = 0.0f;
     currentBluetoothFlow = 0.0f;
+    sawShotHistoryControlTarget = false;
+    hardwareScaleFinishSettleSamples = 0;
     lastLoggedElapsedMs = 0;
     currentProfileName = controller->getProfileManager()->getSelectedProfile().label;
     // Latch the source the brew controller resolved for this shot (set in
@@ -399,7 +436,7 @@ void ShotHistoryPlugin::endRecording() {
         }
     }
 
-    if (recording && controller && controller->isVolumetricAvailable()) {
+    if (recording && shotSource != VolumetricMeasurementSource::HARDWARE_SCALE && controller && controller->isVolumetricAvailable()) {
         const float scaleWeight = sourceWeight(shotSource);
         if (scaleWeight > 0) {
             // Start extended recording for any shot with active weight data

@@ -2,11 +2,14 @@
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
 #include "esp_sntp.h"
+#include "esp_task_wdt.h"
 #include <LittleFS.h>
 #include <SD_MMC.h>
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 #include <display/config.h>
+#include <display/core/PredictiveDelayPolicy.h>
 #include <display/core/constants.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
@@ -37,6 +40,9 @@
 #include <display/plugins/WifiStaWatchdogPlugin.h>
 #include <display/plugins/mDNSPlugin.h>
 #endif
+#if defined(GAGGIMATE_UART_COMMS) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE) && !defined(GAGGIMATE_SIM)
+#include <display/plugins/HWScalePlugin.h>
+#endif
 #include <display/util/PsramAllocator.h>
 #ifndef GAGGIMATE_HEADLESS
 #ifdef GAGGIMATE_SIM
@@ -51,8 +57,83 @@
 
 const String LOG_TAG = F("Controller");
 
+namespace {
+// Only genuine safety/runtime faults latch the controller into an error state
+// (which blocks brewing until cleared). The STM32 reports exactly one such fault
+// today: thermal runaway. Everything else arriving via EVT,ERR (framing/transport
+// glitches, an unknown/garbled command line) is a transient comms hiccup and must
+// not stop the machine — see registerRemoteErrorCallback.
+inline bool isLatchingError(int code) { return code == static_cast<int>(ERROR_CODE_RUNAWAY); }
+} // namespace
+
+struct CtrlCmdMsg {
+    CtrlCmd type;
+    int32_t arg;
+};
+
+void Controller::postCommand(CtrlCmd cmd, int32_t arg) {
+    if (cmdQueue == nullptr) {
+        return;
+    }
+    CtrlCmdMsg msg{cmd, arg};
+    if (xQueueSend(cmdQueue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(LOG_TAG.c_str(), "Controller cmdQueue full, dropped cmd=%u", static_cast<unsigned>(cmd));
+    }
+}
+
+void Controller::drainCommandQueue() {
+    if (cmdQueue == nullptr) {
+        return;
+    }
+    CtrlCmdMsg msg;
+    while (xQueueReceive(cmdQueue, &msg, 0) == pdTRUE) {
+        switch (msg.type) {
+        case CtrlCmd::ACTIVATE:
+            activate();
+            break;
+        case CtrlCmd::DEACTIVATE:
+            deactivate();
+            break;
+        case CtrlCmd::CLEAR:
+            clear();
+            break;
+        case CtrlCmd::ACTIVATE_GRIND:
+            activateGrind();
+            break;
+        case CtrlCmd::DEACTIVATE_GRIND:
+            deactivateGrind();
+            break;
+        case CtrlCmd::ACTIVATE_STANDBY:
+            activateStandby();
+            break;
+        case CtrlCmd::DEACTIVATE_STANDBY:
+            deactivateStandby();
+            break;
+        case CtrlCmd::SET_MODE:
+            setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::RAISE_TEMP:
+            raiseTemp();
+            break;
+        case CtrlCmd::LOWER_TEMP:
+            lowerTemp();
+            break;
+        case CtrlCmd::RAISE_GRIND_TARGET:
+            raiseGrindTarget();
+            break;
+        case CtrlCmd::LOWER_GRIND_TARGET:
+            lowerGrindTarget();
+            break;
+        }
+    }
+}
+
 void Controller::setup() {
-    mode = MODE_STANDBY;
+    mode = settings.getStartupMode();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    scaleSampleMutex = xSemaphoreCreateMutex();
+#endif
+    cmdQueue = xQueueCreate(16, sizeof(CtrlCmdMsg));
 
     // Web assets are served from this partition. LittleFS (not SPIFFS): SPIFFS
     // has no directory tree, so stat()/exists() is O(whole filesystem) and a
@@ -119,6 +200,9 @@ void Controller::setup() {
     pluginManager->registerPlugin(&ShotHistory);
 #ifndef GAGGIMATE_SIM
     pluginManager->registerPlugin(&BLEScales);
+#if defined(GAGGIMATE_UART_COMMS) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+    pluginManager->registerPlugin(&HWScale);
+#endif
 #endif
     pluginManager->registerPlugin(new LedControlPlugin());
     pluginManager->registerPlugin(new AutoWakeupPlugin());
@@ -133,6 +217,16 @@ void Controller::setup() {
 
     pluginManager->on("profiles:profile:select", [this](Event const &event) { this->handleProfileUpdate(); });
 
+    // When the user cycles the brew scale source from the UI/WebUI we tear down
+    // any in-flight process so the next start resolves the source cleanly.
+    // Without this, Controller::currentVolumetricSource can hold a value that no
+    // longer matches the selected source ("brew button does nothing" after
+    // cycling away from Predictive).
+    settings.setOnScaleSourceChange([this](int) {
+        postCommand(CtrlCmd::DEACTIVATE);
+        postCommand(CtrlCmd::CLEAR);
+    });
+
 #ifndef GAGGIMATE_HEADLESS
     ui->init();
 #endif
@@ -140,6 +234,7 @@ void Controller::setup() {
 
     updateLastAction();
     xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", configMINIMAL_STACK_SIZE * 6, this, 3, &logicTaskHandle, 0);
+    esp_task_wdt_add(logicTaskHandle);
 }
 
 void Controller::onScreenReady() { screenReady = true; }
@@ -238,6 +333,25 @@ static void parseFloatCsv(const String &csv, float *out, size_t count, float def
 }
 
 void Controller::setupBluetooth() {
+#ifdef GAGGIMATE_UART_COMMS
+#ifndef GAGGIMATE_UART_BAUD
+#define GAGGIMATE_UART_BAUD 115200
+#endif
+#ifndef GAGGIMATE_UART_RX_PIN
+#define GAGGIMATE_UART_RX_PIN 44
+#endif
+#ifndef GAGGIMATE_UART_TX_PIN
+#define GAGGIMATE_UART_TX_PIN 43
+#endif
+
+    // Size the RX ring generously: the display can be busy with WebUI/MQTT/plugin
+    // work between UART drains, so the default 256 B buffer is too easy to
+    // overflow during STM32 telemetry bursts. Must be called before begin().
+    Serial2.setRxBufferSize(2048);
+    Serial2.begin(GAGGIMATE_UART_BAUD, SERIAL_8N1, GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
+    ESP_LOGI(LOG_TAG, "UART controller link initialized at %d baud (RX=%d, TX=%d)", GAGGIMATE_UART_BAUD,
+             GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
+#endif
     comms.init("GPBLC");
     comms.onConnectionChanged([this](bool connected) {
         // Force a full control resend after any (re)connect -- the controller
@@ -254,8 +368,8 @@ void Controller::setupBluetooth() {
         }
     });
     comms.onSystemInfo([this](const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
-                              bool ledControl, bool tof, vector<uint32_t> addons) {
-        onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof, addons);
+                              bool ledControl, bool tof, bool scale, std::vector<uint32_t> addons) {
+        onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof, scale, addons);
     });
     comms.onIncompatibleController([this](const String &info) { onIncompatibleController(info); });
     // A controller OTA streams the firmware over this BLE link; the relaxed idle
@@ -277,9 +391,9 @@ void Controller::setupBluetooth() {
     comms.onSensorData([this](float temp, float pressure, float puckFlow, float pumpFlow, float puckResistance, float pumpPower,
                               float heaterPower) {
         onTempRead(temp);
-        this->pressure = pressure;
+        this->pressure.store(pressure, std::memory_order_relaxed);
         this->currentPuckFlow = puckFlow;
-        this->currentPumpFlow = pumpFlow;
+        this->currentPumpFlow.store(pumpFlow, std::memory_order_relaxed);
         this->currentPumpPower = pumpPower;
         this->currentHeaterPower = heaterPower;
         this->currentPuckResistance = puckResistance;
@@ -344,7 +458,24 @@ void Controller::setupBluetooth() {
             pluginManager->trigger("controller:autotune:failed");
             return;
         }
-        if (error != ERROR_CODE_TIMEOUT && error != this->error) {
+        // Liveness timeouts are handled by the ping logic and never latch.
+        if (error == static_cast<int>(ERROR_CODE_TIMEOUT)) {
+            return;
+        }
+        // Transport/protocol glitches (framing errors, an unknown/garbled command
+        // line — far more frequent on hardware-scale builds because of the HX711
+        // bus timing) must NOT be treated as a latching safety fault. Historically
+        // EVT,ERR,UNKNOWN_CMD shared code 4 with RUNAWAY, so one bad command would
+        // wedge brewing until a power cycle. Log + count for visibility; do not
+        // stop the machine.
+        if (!isLatchingError(error)) {
+            static uint32_t transportErrCount = 0;
+            ++transportErrCount;
+            ESP_LOGW(LOG_TAG, "Ignoring non-latching remote error %d (transport glitch; count=%lu)", error,
+                     static_cast<unsigned long>(transportErrCount));
+            return;
+        }
+        if (error != this->error) {
             this->error = error;
             deactivate();
             setMode(MODE_STANDBY);
@@ -372,16 +503,79 @@ void Controller::setupBluetooth() {
     });
     comms.onVolumetricMeasurement(
         [this](float value) { onVolumetricMeasurement(value, VolumetricMeasurementSource::FLOW_ESTIMATION); });
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    comms.onScaleSample([this](const ScaleSample &sample) { onHardwareScaleSample(sample); });
+    comms.onWeightMeasurement([this](float weight) {
+        ScaleSample sample{};
+        sample.weightG = weight;
+        sample.stddevG = 0.0f;
+        sample.ch1G = weight;
+        sample.ch2G = 0.0f;
+        sample.ch1StdG = 0.0f;
+        sample.ch2StdG = 0.0f;
+        sample.healthBits = SCALE_HEALTH_OK;
+        onHardwareScaleSample(sample);
+    });
+    comms.onScaleOffsets([this](long offset1, long offset2) {
+        settings.setScaleOffset1(offset1);
+        settings.setScaleOffset2(offset2);
+        ESP_LOGI(LOG_TAG, "Scale offsets received and saved: %ld, %ld", offset1, offset2);
+        Event ev;
+        ev.id = "controller:scale:tare:done";
+        ev.setInt("success", 1);
+        ev.setFloat("offset1", static_cast<float>(offset1));
+        ev.setFloat("offset2", static_cast<float>(offset2));
+        ev.setFloat("std1", 0.0f);
+        ev.setFloat("std2", 0.0f);
+        ev.setInt("healthBits", SCALE_HEALTH_OK);
+        pluginManager->trigger(ev);
+        markHardwareScaleBrewTareDone();
+    });
+    comms.onScaleCalibrationResult([this](uint8_t channel, float calibration) {
+        const long now = static_cast<long>(time(nullptr));
+        if (channel == 1) {
+            settings.setScaleCalibration1(calibration);
+            settings.setScaleCalTimestamp1(now);
+            settings.setScaleCalStddev1(0.0f);
+        } else if (channel == 2) {
+            settings.setScaleCalibration2(calibration);
+            settings.setScaleCalTimestamp2(now);
+            settings.setScaleCalStddev2(0.0f);
+        }
+        pluginManager->trigger("controller:scale:calibrated", "channel", static_cast<int>(channel));
+        Event ev;
+        ev.id = "controller:scale:cal:done";
+        ev.setInt("channel", static_cast<int>(channel));
+        ev.setFloat("factor", calibration);
+        ev.setFloat("stddevG", 0.0f);
+        ev.setInt("success", 1);
+        ev.setInt("errorCode", 0);
+        pluginManager->trigger(ev);
+        ESP_LOGI(LOG_TAG, "Scale ch%d calibration result: %.6f", channel, calibration);
+    });
+#endif
     comms.onTofMeasurement([this](uint32_t value) {
         tofDistance = static_cast<int>(value);
         ESP_LOGV(LOG_TAG, "Received new TOF distance: %d", tofDistance);
         pluginManager->trigger("controller:tof:change", "value", tofDistance);
     });
+    pluginManager->on("settings:changed", [this](Event const &) {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        if (comms.isConnected() && systemInfo.capabilities.scale) {
+            comms.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(), settings.getScaleOffset1(),
+                                       settings.getScaleOffset2());
+        }
+#endif
+    });
+#ifdef GAGGIMATE_UART_COMMS
+    pluginManager->trigger("controller:uart:init");
+#else
     pluginManager->trigger("controller:bluetooth:init");
+#endif
 }
 
 void Controller::onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
-                              bool ledControl, bool tof, vector<uint32_t> addons) {
+                              bool ledControl, bool tof, bool scale, std::vector<uint32_t> addons) {
     const bool mismatch = protocolVersion != gm_proto::PROTOCOL_VERSION;
     systemInfo = SystemInfo{.hardware = String(hardware),
                             .version = String(version),
@@ -391,12 +585,18 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
                                     .pressure = pressure,
                                     .ledControl = ledControl,
                                     .tof = tof,
+                                    .scale = scale,
                                     .addons = addons,
                                 },
                             .protocolVersion = protocolVersion,
                             .protocolMismatch = mismatch};
-    ESP_LOGI(LOG_TAG, "System info: %s %s (proto=%u local=%u dm=%d ps=%d led=%d tof=%d)", hardware, version, protocolVersion,
-             gm_proto::PROTOCOL_VERSION, dimming, pressure, ledControl, tof);
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    hardwareScalePresent = false;
+#else
+    hardwareScalePresent = scale;
+#endif
+    ESP_LOGI(LOG_TAG, "System info: %s %s (proto=%u local=%u dm=%d ps=%d led=%d tof=%d scale=%d)", hardware, version,
+             protocolVersion, gm_proto::PROTOCOL_VERSION, dimming, pressure, ledControl, tof, scale);
     if (mismatch) {
         ESP_LOGW(LOG_TAG, "Protocol version mismatch: controller=%u display=%u -- control inhibited, OTA only", protocolVersion,
                  gm_proto::PROTOCOL_VERSION);
@@ -407,7 +607,16 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
         setPumpModelCoeffs();
         configResendUntil = millis() + CONFIG_RESEND_WINDOW_MS;
         lastConfigResend = millis();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        if (scale) {
+            comms.sendScaleCalibration(settings.getScaleCalibration1(), settings.getScaleCalibration2(), settings.getScaleOffset1(),
+                                       settings.getScaleOffset2());
+        }
+#endif
     }
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    systemInfo.capabilities.scale = false;
+#endif
 
     if (!loaded) {
         loaded = true;
@@ -426,7 +635,7 @@ void Controller::onIncompatibleController(const String &infoJson) {
     DeserializationError err = deserializeJson(doc, infoJson);
     if (err) {
         ESP_LOGW(LOG_TAG, "Incompatible controller, no readable info (%s)", err.c_str());
-        onSystemInfo("Legacy controller", "0.0.0", 0, false, false, false, false, {});
+        onSystemInfo("Legacy controller", "0.0.0", 0, false, false, false, false, false, {});
         return;
     }
     String hardware = doc["hw"].as<String>();
@@ -436,7 +645,7 @@ void Controller::onIncompatibleController(const String &infoJson) {
     if (version.isEmpty())
         version = "0.0.0";
     onSystemInfo(hardware.c_str(), version.c_str(), 0, doc["cp"]["dm"].as<bool>(), doc["cp"]["ps"].as<bool>(),
-                 doc["cp"]["led"].as<bool>(), doc["cp"]["tof"].as<bool>(), {});
+                 doc["cp"]["led"].as<bool>(), doc["cp"]["tof"].as<bool>(), doc["cp"]["sc"].as<bool>(), {});
 }
 
 void Controller::setupWifi() {
@@ -548,6 +757,10 @@ void Controller::setupWifi() {
 }
 
 void Controller::loop() {
+    // Drain external commands first so any pending activate/deactivate/setMode
+    // from WebUI / LVGL / plugins runs on this task, not on AsyncTCP or LVGL.
+    drainCommandQueue();
+
     // Act on WiFi link-state changes flagged by the (small-stack) event task here
     // on the main loop. Disconnect before connect so a flap is ordered correctly.
     if (wifiDisconnectedPending) {
@@ -568,6 +781,10 @@ void Controller::loop() {
     if (initialized) {
         comms.loop(); // drive the comms send pump + retransmit
     }
+
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pollHardwareScaleBrewTare();
+#endif
 
     unsigned long now = millis();
 
@@ -599,14 +816,16 @@ void Controller::loopLogic() {
         return;
     }
 
-    // Check if steam is ready
-    if (mode == MODE_STEAM && !steamReady && currentTemp + 5.f > getTargetTemp()) {
+    // Check if steam is ready.
+    if (mode == MODE_STEAM && !steamReady &&
+        currentTemp.load(std::memory_order_relaxed) + 5.f > getTargetTemp()) {
         activate();
         steamReady = true;
     }
 
     // Process lifecycle under the lock (GM-147); events and NVS writes deferred past unlock.
-    std::vector<const char *> events;
+    DeferredProcessEvents events;
+    bool processEnded = false;
     double newBrewDelay = -1.0;
     double newGrindDelay = -1.0;
     {
@@ -617,12 +836,12 @@ void Controller::loopLogic() {
             updateLastAction();
             if (currentProcess->getType() == MODE_BREW) {
                 auto brewProcess = static_cast<BrewProcess *>(currentProcess);
-                brewProcess->updatePressure(pressure);
-                brewProcess->updateFlow(currentPumpFlow);
+                brewProcess->updatePressure(pressure.load(std::memory_order_relaxed));
+                brewProcess->updateFlow(currentPumpFlow.load(std::memory_order_relaxed));
             }
             currentProcess->progress();
             if (!isActiveLocked()) {
-                deactivateLocked(events);
+                processEnded = deactivateLocked(events);
             }
         }
 
@@ -635,7 +854,9 @@ void Controller::loopLogic() {
             if (lastProcess->getType() == MODE_BREW) {
                 if (auto *brewProcess = static_cast<BrewProcess *>(lastProcess);
                     brewProcess->target == ProcessTarget::VOLUMETRIC) {
-                    newBrewDelay = brewProcess->getNewDelayTime();
+                    if (PredictiveDelayPolicy::supportsPostStopLearning(lastVolumetricSource)) {
+                        newBrewDelay = brewProcess->getNewDelayTime();
+                    }
                 }
             } else if (lastProcess->getType() == MODE_GRIND) {
                 if (auto *grindProcess = static_cast<GrindProcess *>(lastProcess);
@@ -644,6 +865,10 @@ void Controller::loopLogic() {
                 }
             }
         }
+    }
+    if (processEnded) {
+        loopControl();
+        applyConnectionPriority();
     }
     dispatchEvents(events);
     if (newBrewDelay >= 0) {
@@ -654,7 +879,6 @@ void Controller::loopLogic() {
     }
 
     unsigned long now = millis();
-
     if (grindActiveUntil != 0 && now > grindActiveUntil)
         deactivateGrind();
     if (mode != MODE_STANDBY && settings.getStandbyTimeout() > 0 && now > lastAction + settings.getStandbyTimeout())
@@ -686,13 +910,41 @@ bool Controller::isAutotuning() const { return autotuning; }
 
 bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !isAutotuning(); }
 
-bool Controller::isVolumetricAvailable() const {
-#ifdef NIGHTLY_BUILD
-    return isBluetoothScaleHealthy() || systemInfo.capabilities.dimming;
+ScaleAvailability Controller::scaleAvailability() const {
+    ScaleAvailability a;
+    a.bluetoothConnected = isBluetoothScaleHealthy();
+    a.brewBluetoothConnected = isBluetoothScaleHealthy(ScaleRole::BREW);
+    a.grindBluetoothConnected = isBluetoothScaleHealthy(ScaleRole::GRIND);
+    a.hardwarePresent = hardwareScalePresent;
+    a.predictiveAvailable = true;
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    a.hardwareCapable = false;
 #else
-    return isBluetoothScaleHealthy();
+    // The hardware scale physically lives on the STM32 controller; capability is
+    // advertised in its INFO payload (false for BLE-connected controllers).
+    a.hardwareCapable = systemInfo.capabilities.scale;
 #endif
+    return a;
 }
+
+bool Controller::isVolumetricAvailable() const {
+    return ScaleSourceResolver::brewVolumetricAvailable(settings.getScaleSource(), scaleAvailability());
+}
+
+bool Controller::isGrindVolumetricAvailable() const {
+    return ScaleSourceResolver::grindVolumetricAvailable(scaleAvailability());
+}
+
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+bool Controller::isHardwareScaleSampleHealthy(const ScaleSample &sample) const {
+    static constexpr uint16_t BLOCKING_HEALTH =
+        SCALE_HEALTH_NOT_CALIBRATED | SCALE_HEALTH_STALE | SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_SAT_CH1 |
+        SCALE_HEALTH_SAT_CH2 | SCALE_HEALTH_TARING | SCALE_HEALTH_CALIBRATING;
+    return hardwareScalePresent && std::isfinite(sample.weightG) && std::isfinite(sample.stddevG) &&
+           std::fabs(sample.weightG) <= HARDWARE_SCALE_MAX_ABS_G && sample.stddevG <= HARDWARE_SCALE_MAX_STDDEV_G &&
+           (sample.healthBits & BLOCKING_HEALTH) == 0;
+}
+#endif
 
 void Controller::autotune(int testTime, int samples, int heaterWattage) {
     if (isActive() || !isReady()) {
@@ -707,7 +959,7 @@ void Controller::autotune(int testTime, int samples, int heaterWattage) {
 }
 
 void Controller::startProcess(Process *process) {
-    std::vector<const char *> events;
+    DeferredProcessEvents events;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
         startProcessLocked(process, events);
@@ -715,7 +967,7 @@ void Controller::startProcess(Process *process) {
     dispatchEvents(events);
 }
 
-void Controller::startProcessLocked(Process *process, std::vector<const char *> &events) {
+void Controller::startProcessLocked(Process *process, DeferredProcessEvents &events) {
     if (isActiveLocked() || !isReady()) {
         delete process;
         return;
@@ -723,13 +975,17 @@ void Controller::startProcessLocked(Process *process, std::vector<const char *> 
     processCompleted = false;
     this->currentProcess = process;
     applyConnectionPriority(); // shot started -> tight BLE interval
-    events.push_back("controller:process:start");
+    events.push_back({"controller:process:start"});
     updateLastAction();
 }
 
-void Controller::dispatchEvents(const std::vector<const char *> &events) {
-    for (const auto *eventId : events) {
-        pluginManager->trigger(eventId);
+void Controller::dispatchEvents(const DeferredProcessEvents &events) {
+    for (const auto &event : events) {
+        if (event.utility >= 0) {
+            pluginManager->trigger(event.id, "utility", event.utility);
+        } else {
+            pluginManager->trigger(event.id);
+        }
     }
 }
 
@@ -748,22 +1004,142 @@ void Controller::applyConnectionPriority(bool force) {
         // the chronic coex failure mode is WiFi getting starved and the whole
         // IP stack wedging. Default coex preference is BALANCE; nobody set this
         // before. Best-effort: ignore the return (no-op if coex inactive). [GM-90]
+#ifndef GAGGIMATE_UART_COMMS
         esp_coex_preference_set(lowLatency ? ESP_COEX_PREFER_BT : ESP_COEX_PREFER_WIFI);
+#endif
     }
 }
 
-float Controller::getTargetTemp() const {
-    switch (mode) {
-    case MODE_BREW:
-    case MODE_GRIND: {
+void Controller::startBrewProcess() {
+    if (mode != MODE_BREW) {
+        return;
+    }
+
+    // Fire immediately before the process is created so plugins can pre-arm
+    // shot capture. Hardware-scale tare is already complete when this helper is
+    // called for hardware-scale brews.
+    pluginManager->trigger("controller:brew:prestart");
+    const double predictiveDelayMs = PredictiveDelayPolicy::brewDelayForSource(
+        currentVolumetricSource, settings.getBrewDelay(), settings.getHardwareBrewDelay());
+    startProcess(new BrewProcess(profileManager->getSelectedProfile(),
+                                 profileManager->getSelectedProfile().isVolumetric() &&
+                                         currentVolumetricSource != VolumetricMeasurementSource::INACTIVE
+                                     ? ProcessTarget::VOLUMETRIC
+                                     : ProcessTarget::TIME,
+                                 predictiveDelayMs));
+
+    bool startedBrew = false;
+    bool startedUtility = false;
+    int procType = -1;
+    {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
         Process *proc = currentProcess;
-        if (proc != nullptr && proc->isActive() && proc->getType() == MODE_BREW) {
-            auto brewProcess = static_cast<BrewProcess *>(proc);
-            return brewProcess->getTemperature();
-        }
-        return profileManager->getSelectedProfile().temperature;
+        startedBrew = proc != nullptr && proc->getType() == MODE_BREW;
+        startedUtility = proc != nullptr && proc->isUtility();
+        procType = proc != nullptr ? proc->getType() : -1;
     }
+    ESP_LOGI(LOG_TAG, "startBrewProcess: procType=%d startedBrew=%d", procType, startedBrew);
+    if (startedBrew) {
+        pluginManager->trigger("controller:brew:start", "utility", startedUtility ? 1 : 0);
+    }
+}
+
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+bool Controller::armHardwareScaleBrewTare() {
+    if (pendingHardwareScaleBrewStart) {
+        return true;
+    }
+
+    pendingHardwareScaleBrewStart = true;
+    pendingHardwareScaleBrewStartReady = false;
+    pendingHardwareScaleBrewTareStartedAt = millis();
+
+    const ScaleSample sample = getScaleSample();
+    ESP_LOGI(LOG_TAG, "Waiting for hardware scale tare before brew start: seq=%lu health=0x%04x",
+             static_cast<unsigned long>(sample.sampleSeq), sample.healthBits);
+    pluginManager->trigger("controller:brew:scale-tare:start");
+
+    if ((sample.healthBits & SCALE_HEALTH_TARING) == 0) {
+        scaleTare();
+    }
+    return true;
+}
+
+void Controller::markHardwareScaleBrewTareDone() {
+    if (pendingHardwareScaleBrewStart) {
+        pendingHardwareScaleBrewStartReady = true;
+    }
+}
+
+void Controller::cancelHardwareScaleBrewTare(const char *reason) {
+    if (!pendingHardwareScaleBrewStart) {
+        return;
+    }
+    pendingHardwareScaleBrewStart = false;
+    pendingHardwareScaleBrewStartReady = false;
+    pendingHardwareScaleBrewTareStartedAt = 0;
+    currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+
+    ESP_LOGW(LOG_TAG, "Cancelled hardware-scale brew start: %s", reason != nullptr ? reason : "unknown");
+    Event ev;
+    ev.id = "controller:brew:scale-tare:failed";
+    ev.setString("reason", reason != nullptr ? String(reason) : String("unknown"));
+    pluginManager->trigger(ev);
+}
+
+void Controller::pollHardwareScaleBrewTare() {
+    if (!pendingHardwareScaleBrewStart) {
+        return;
+    }
+
+    if (mode != MODE_BREW) {
+        cancelHardwareScaleBrewTare("mode_changed");
+        return;
+    }
+    if (isActive()) {
+        cancelHardwareScaleBrewTare("process_started_elsewhere");
+        return;
+    }
+    if (pendingHardwareScaleBrewStartReady) {
+        pendingHardwareScaleBrewStart = false;
+        pendingHardwareScaleBrewStartReady = false;
+        pendingHardwareScaleBrewTareStartedAt = 0;
+        ESP_LOGI(LOG_TAG, "Hardware scale tare complete; starting brew");
+        startBrewProcess();
+        return;
+    }
+
+    const ScaleSample sample = getScaleSample();
+    if (sample.healthBits & SCALE_HEALTH_TARE_FAILED) {
+        cancelHardwareScaleBrewTare("tare_failed");
+        return;
+    }
+    if (millis() - pendingHardwareScaleBrewTareStartedAt > HARDWARE_SCALE_BREW_TARE_TIMEOUT_MS) {
+        cancelHardwareScaleBrewTare("tare_timeout");
+        return;
+    }
+}
+#endif
+
+float Controller::getTargetTemp() const {
+    std::lock_guard<std::recursive_mutex> guard(processMutex);
+    Process *proc = currentProcess;
+    if (proc != nullptr && proc->isActive()) {
+        switch (proc->getType()) {
+        case MODE_BREW:
+            return static_cast<BrewProcess *>(proc)->getTemperature();
+        case MODE_STEAM:
+            return settings.getTargetSteamTemp();
+        case MODE_WATER:
+            return settings.getTargetWaterTemp();
+        default:
+            break;
+        }
+    }
+    switch (mode) {
+    case MODE_BREW:
+    case MODE_GRIND:
+        return profileManager->getSelectedProfile().temperature;
     case MODE_STEAM:
         return settings.getTargetSteamTemp();
     case MODE_WATER:
@@ -771,6 +1147,14 @@ float Controller::getTargetTemp() const {
     default:
         return 0;
     }
+}
+
+UartDiagnostics Controller::getUartDiagnostics() const {
+#ifdef GAGGIMATE_UART_COMMS
+    return comms.getDiagnostics();
+#else
+    return {};
+#endif
 }
 
 void Controller::setTargetTemp(float temperature) {
@@ -868,7 +1252,7 @@ void Controller::lowerBrewTarget() {
 }
 
 void Controller::raiseGrindTarget() {
-    if (settings.isVolumetricTarget() && isVolumetricAvailable()) {
+    if (settings.isVolumetricTarget() && isGrindVolumetricAvailable()) {
         double newTarget = settings.getTargetGrindVolume() + 0.5;
         if (newTarget > BREW_MAX_VOLUMETRIC) {
             newTarget = BREW_MAX_VOLUMETRIC;
@@ -884,7 +1268,7 @@ void Controller::raiseGrindTarget() {
 }
 
 void Controller::lowerGrindTarget() {
-    if (settings.isVolumetricTarget() && isVolumetricAvailable()) {
+    if (settings.isVolumetricTarget() && isGrindVolumetricAvailable()) {
         double newTarget = settings.getTargetGrindVolume() - 0.5;
         if (newTarget < BREW_MIN_VOLUMETRIC) {
             newTarget = BREW_MIN_VOLUMETRIC;
@@ -899,6 +1283,22 @@ void Controller::lowerGrindTarget() {
     }
 }
 
+LiveBrewTargetApplyStatus Controller::applyLiveBrewTargetUpdate(const LiveBrewTargetUpdate &update) {
+    std::lock_guard<std::recursive_mutex> guard(processMutex);
+    Process *proc = currentProcess;
+    if (proc == nullptr || proc->getType() != MODE_BREW || !proc->isActive()) {
+        return LiveBrewTargetApplyStatus::NOT_ACTIVE_BREW;
+    }
+
+    auto *brewProcess = static_cast<BrewProcess *>(proc);
+    if (!update.stopRequested && update.hasYieldStopTarget && brewProcess->target != ProcessTarget::VOLUMETRIC) {
+        return LiveBrewTargetApplyStatus::YIELD_REQUIRES_VOLUMETRIC;
+    }
+
+    brewProcess->applyLiveTargetUpdate(update);
+    return LiveBrewTargetApplyStatus::APPLIED;
+}
+
 void Controller::updateControl() {
     // Never drive a controller whose protocol version we don't match -- the
     // commands could be misinterpreted (OTA recovery still works; see onSystemInfo).
@@ -906,22 +1306,54 @@ void Controller::updateControl() {
         return;
     }
 
-    // Hold the process lock across the deref: deactivate()/clear() on other tasks
-    // can delete the process mid-computation (GM-147). comms sends are queued
-    // (pumped from comms.loop()), so no cross-task blocking happens under the lock.
-    std::lock_guard<std::recursive_mutex> guard(processMutex);
-    Process *proc = currentProcess;
-    bool active = isActiveLocked();
-
-    float targetTemp = getTargetTemp();
-    if (targetTemp > .0f) {
-        targetTemp = targetTemp + static_cast<float>(settings.getTemperatureOffset());
-    }
-
     bool altRelayActive = false;
-    if (active && proc->isAltRelayActive()) {
-        if (proc->getType() == MODE_GRIND && settings.getAltRelayFunction() == ALT_RELAY_GRIND) {
-            altRelayActive = true;
+    bool useAdvancedOutput = false;
+    bool outputValve = false;
+    bool pressureTarget = false;
+    float pumpSetpoint = 0.0f;
+    float advancedPressure = 0.0f;
+    float advancedFlow = 0.0f;
+    float targetTemp = 0.0f;
+
+    // Snapshot everything that needs currentProcess while the mutex is held.
+    // UART writes happen after the lock is released, so process start/stop is
+    // not blocked behind a potentially slow serial send.
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        Process *proc = currentProcess;
+        const bool active = (proc != nullptr) && proc->isActive();
+
+        targetTemp = getTargetTemp();
+        if (targetTemp > .0f) {
+            targetTemp = targetTemp + static_cast<float>(settings.getTemperatureOffset());
+        }
+
+        if (active && proc->isAltRelayActive()) {
+            if (proc->getType() == MODE_GRIND && settings.getAltRelayFunction() == ALT_RELAY_GRIND) {
+                altRelayActive = true;
+            }
+        }
+
+        if (active && systemInfo.capabilities.pressure) {
+            if (proc->getType() == MODE_STEAM) {
+                useAdvancedOutput = true;
+                advancedPressure = settings.getSteamPumpCutoff();
+                advancedFlow = proc->getPumpValue() * 0.1f;
+            } else if (proc->getType() == MODE_BREW) {
+                auto *brewProcess = static_cast<BrewProcess *>(proc);
+                if (brewProcess->isAdvancedPump()) {
+                    useAdvancedOutput = true;
+                    outputValve = brewProcess->isRelayActive();
+                    pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
+                    advancedPressure = brewProcess->getPumpPressure();
+                    advancedFlow = brewProcess->getPumpFlow();
+                }
+            }
+        }
+
+        if (!useAdvancedOutput) {
+            outputValve = active && proc->isRelayActive();
+            pumpSetpoint = active ? proc->getPumpValue() : 0.0f;
         }
     }
 
@@ -931,42 +1363,25 @@ void Controller::updateControl() {
     BoilerCommand boiler;
     boiler.index = 0;
     boiler.setpoint = targetTemp;
+
     PumpCommand pump;
     pump.index = 0;
-    RelayCommand relay; // index 0 = brew valve
-    relay.index = 0;
 
-    bool handled = false;
-    if (active && systemInfo.capabilities.pressure) {
-        if (proc->getType() == MODE_STEAM) {
-            targetPressure = settings.getSteamPumpCutoff();
-            targetFlow = proc->getPumpValue() * 0.1f;
-            relay.open = false;
-            pump.mode = PumpControlMode::Flow; // flow target, pressure as the limit
-            pump.flow = targetFlow;
-            pump.pressure = targetPressure;
-            handled = true;
-        } else if (proc->getType() == MODE_BREW) {
-            auto *brewProcess = static_cast<BrewProcess *>(proc);
-            if (brewProcess->isAdvancedPump()) {
-                const bool pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
-                relay.open = brewProcess->isRelayActive();
-                pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
-                pump.pressure = brewProcess->getPumpPressure();
-                pump.flow = brewProcess->getPumpFlow();
-                targetPressure = brewProcess->getPumpPressure();
-                targetFlow = brewProcess->getPumpFlow();
-                handled = true;
-            }
-        }
-    }
+    RelayCommand relay;
+    relay.index = 0; // brew valve
+    relay.open = outputValve;
 
-    if (!handled) {
+    if (useAdvancedOutput) {
+        targetPressure = advancedPressure;
+        targetFlow = advancedFlow;
+        pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
+        pump.pressure = advancedPressure;
+        pump.flow = advancedFlow;
+    } else {
         targetPressure = 0.0f;
         targetFlow = 0.0f;
-        relay.open = active && proc->isRelayActive();
         pump.mode = PumpControlMode::Power;
-        pump.power = active ? proc->getPumpValue() : 0;
+        pump.power = pumpSetpoint;
     }
 
     // Only send components that changed since the last update. The controller is
@@ -996,76 +1411,111 @@ void Controller::updateControl() {
 }
 
 void Controller::activate() {
-    if (isActive())
+    const bool wasActive = isActive();
+    ESP_LOGI(LOG_TAG, "activate entry: mode=%d isActive=%d src=%d volumetricAvailable=%d hwScalePresent=%d", mode, wasActive,
+             settings.getScaleSource(), isVolumetricAvailable(), hardwareScalePresent);
+    if (wasActive)
         return;
     clear();
-    comms.tare();
-    if (isVolumetricAvailable()) {
-#ifdef NIGHTLY_BUILD
-        currentVolumetricSource =
-            isBluetoothScaleHealthy() ? VolumetricMeasurementSource::BLUETOOTH : VolumetricMeasurementSource::FLOW_ESTIMATION;
-#else
-        currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
-#endif
-        if (mode == MODE_BREW) {
-            pluginManager->trigger("controller:brew:prestart");
-        }
+    // clear() already resets this under the process lock, but state in activate()
+    // is the operative invariant for the rest of this function — keep it explicit.
+    currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+
+    // Resolve which source this brew will use. Explicit selection wins when
+    // available; otherwise fall back predictably (selected → hardware →
+    // predictive) so a brew never blocks on an unavailable scale. Only an
+    // explicit OFF (or a non-brew mode) leaves the source INACTIVE → timed brew.
+    const int brewSrcSetting = settings.getScaleSource();
+    VolumetricMeasurementSource resolved = VolumetricMeasurementSource::INACTIVE;
+    if (mode == MODE_BREW) {
+        resolved = ScaleSourceResolver::resolveBrewSource(brewSrcSetting, scaleAvailability());
     }
-    delay(200);
+
+    // TARE resets the pump/pressure controller and predictive volumetric
+    // estimator. It does not tare the HX711 hardware scale; hardware scale tare
+    // is a separate scale command path. Always reset pump control at brew start
+    // so hardware-scale brews do not inherit stale pressure-controller state.
+    comms.tare();
+    currentVolumetricSource = resolved;
+    ESP_LOGI(LOG_TAG, "activate: mode=%d brewSrcSetting=%d resolvedSource=%d", mode, brewSrcSetting, static_cast<int>(resolved));
+
     switch (mode) {
     case MODE_BREW:
-        startProcess(new BrewProcess(profileManager->getSelectedProfile(),
-                                     profileManager->getSelectedProfile().isVolumetric() && isVolumetricAvailable()
-                                         ? ProcessTarget::VOLUMETRIC
-                                         : ProcessTarget::TIME,
-                                     settings.getBrewDelay()));
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        if (resolved == VolumetricMeasurementSource::HARDWARE_SCALE && armHardwareScaleBrewTare()) {
+            return;
+        }
+#endif
+        startBrewProcess();
         break;
     case MODE_STEAM:
+        delay(200);
         startProcess(new SteamProcess(STEAM_SAFETY_DURATION_MS, settings.getSteamPumpPercentage()));
         break;
     case MODE_WATER:
+        delay(200);
         startProcess(new PumpProcess());
         break;
     default:;
     }
-    bool brewStarted;
-    {
-        std::lock_guard<std::recursive_mutex> guard(processMutex);
-        brewStarted = currentProcess != nullptr && currentProcess->getType() == MODE_BREW;
-    }
-    if (brewStarted) {
-        pluginManager->trigger("controller:brew:start");
-    }
 }
 
 void Controller::deactivate() {
-    std::vector<const char *> events;
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (pendingHardwareScaleBrewStart) {
+        cancelHardwareScaleBrewTare("deactivated");
+        return;
+    }
+#endif
+    DeferredProcessEvents events;
+    bool processEnded = false;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
-        deactivateLocked(events);
+        processEnded = deactivateLocked(events);
     }
+    if (!processEnded) {
+        return;
+    }
+
+    // Drive the stopped process state to the controller before any brew-end
+    // observer can serialize, persist, or transmit shot data. sendBatch() pumps
+    // the reliable control frame immediately; later loop iterations handle its
+    // acknowledgement and retransmission without putting network work in the
+    // physical shutdown path.
+    loopControl();
+    applyConnectionPriority(); // shot ended -> relaxed BLE interval
     dispatchEvents(events);
 }
 
-void Controller::deactivateLocked(std::vector<const char *> &events) {
+bool Controller::deactivateLocked(DeferredProcessEvents &events) {
     if (currentProcess == nullptr) {
-        return;
+        return false;
     }
     delete lastProcess;
     lastProcess = currentProcess;
+    lastVolumetricSource = currentVolumetricSource;
     currentProcess = nullptr;
-    applyConnectionPriority(); // shot ended -> relaxed BLE interval
-    if (lastProcess->getType() == MODE_BREW) {
-        events.push_back("controller:brew:end");
-    } else if (lastProcess->getType() == MODE_GRIND) {
-        events.push_back("controller:grind:end");
+
+    const int swappedType = lastProcess->getType();
+    const bool brewWasUtility = lastProcess->isUtility();
+    currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+    if (swappedType == MODE_BREW) {
+        events.push_back({"controller:brew:end", brewWasUtility ? 1 : 0});
+    } else if (swappedType == MODE_GRIND) {
+        events.push_back({"controller:grind:end"});
     }
-    events.push_back("controller:process:end");
+    events.push_back({"controller:process:end"});
     updateLastAction();
+    return true;
 }
 
 void Controller::clear() {
-    std::vector<const char *> events;
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (pendingHardwareScaleBrewStart) {
+        cancelHardwareScaleBrewTare("cleared");
+    }
+#endif
+    DeferredProcessEvents events;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
         clearLocked(events);
@@ -1073,28 +1523,34 @@ void Controller::clear() {
     dispatchEvents(events);
 }
 
-void Controller::clearLocked(std::vector<const char *> &events) {
+void Controller::clearLocked(DeferredProcessEvents &events) {
     processCompleted = true;
     if (lastProcess != nullptr && lastProcess->getType() == MODE_BREW) {
-        events.push_back("controller:brew:clear");
+        events.push_back({"controller:brew:clear"});
     }
     delete lastProcess;
     lastProcess = nullptr;
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+    lastVolumetricSource = VolumetricMeasurementSource::INACTIVE;
 }
 
 void Controller::activateGrind() {
-    pluginManager->trigger("controller:grind:start");
     if (isGrindActive())
         return;
     clear();
-    if (settings.isVolumetricTarget() && isVolumetricAvailable()) {
-        currentVolumetricSource = VolumetricMeasurementSource::BLUETOOTH;
+    // Grind-by-weight can only use a movable Bluetooth scale. The hardware scale
+    // is fixed in the brew path, and predictive pump-flow is meaningless while
+    // grinding.
+    VolumetricMeasurementSource resolved = ScaleSourceResolver::resolveGrindSource(scaleAvailability());
+    if (settings.isVolumetricTarget() && resolved != VolumetricMeasurementSource::INACTIVE) {
+        currentVolumetricSource = resolved;
         startProcess(new GrindProcess(ProcessTarget::VOLUMETRIC, 0, settings.getTargetGrindVolume(), settings.getGrindDelay()));
     } else {
+        currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
         startProcess(
             new GrindProcess(ProcessTarget::TIME, settings.getTargetGrindDuration(), settings.getTargetGrindVolume(), 0.0));
     }
+    pluginManager->trigger("controller:grind:start");
 }
 
 void Controller::deactivateGrind() {
@@ -1137,7 +1593,7 @@ void Controller::setMode(int newMode) {
 void Controller::onTempRead(float temperature) {
     float temp = temperature - static_cast<float>(settings.getTemperatureOffset());
     Event event = pluginManager->trigger("boiler:currentTemperature:change", "value", temp);
-    currentTemp = event.getFloat("value");
+    currentTemp.store(event.getFloat("value"), std::memory_order_relaxed);
 }
 
 void Controller::updateLastAction() { lastAction = millis(); }
@@ -1159,41 +1615,107 @@ void Controller::onProfileSaveAsNew() {
 }
 
 void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source) {
-    if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
-        currentCoffeeVolume = static_cast<float>(measurement);
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        return;
     }
-    pluginManager->trigger(source == VolumetricMeasurementSource::FLOW_ESTIMATION
-                               ? F("controller:volumetric-measurement:estimation:change")
-                               : F("controller:volumetric-measurement:bluetooth:change"),
-                           "value", static_cast<float>(measurement));
+#endif
+    const __FlashStringHelper *eventName = F("controller:volumetric-measurement:bluetooth:change");
     if (source == VolumetricMeasurementSource::BLUETOOTH) {
         lastBluetoothMeasurement = millis();
     }
-
-    if (currentVolumetricSource != source) {
-        ESP_LOGD(LOG_TAG, "Ignoring volumetric measurement, source does not match");
-        return;
+    if (source == VolumetricMeasurementSource::FLOW_ESTIMATION) {
+        currentCoffeeVolume = static_cast<float>(measurement);
+        eventName = F("controller:volumetric-measurement:estimation:change");
+    } else if (source == VolumetricMeasurementSource::HARDWARE_SCALE) {
+        eventName = F("controller:volumetric-measurement:hardware:change");
     }
+    pluginManager->trigger(eventName, "value", static_cast<float>(measurement));
+
     // This callback fires from the NimBLE task on core 0; deactivate()/clear() on
     // other tasks can delete the processes, so hold the lock across the deref (GM-147).
     std::lock_guard<std::recursive_mutex> guard(processMutex);
-    if (currentProcess != nullptr) {
-        currentProcess->updateVolume(measurement);
+    Process *proc = currentProcess;
+    Process *last = lastProcess;
+    bool consumed = false;
+    if (proc != nullptr && currentVolumetricSource == source) {
+        proc->updateVolume(measurement);
+        consumed = true;
     }
-    if (lastProcess != nullptr && !lastProcess->isComplete()) {
-        lastProcess->updateVolume(measurement);
+    if (last != nullptr && lastVolumetricSource == source && PredictiveDelayPolicy::supportsPostStopLearning(source) &&
+        !last->isComplete()) {
+        last->updateVolume(measurement);
+        consumed = true;
+    }
+    if (!consumed) {
+        ESP_LOGD(LOG_TAG, "Ignoring volumetric measurement, source does not match an eligible process");
     }
 }
 
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+void Controller::scaleTare() {
+    comms.scaleTare();
+}
+
+void Controller::sendScaleCalibration(float c1, float c2) {
+    comms.sendScaleCalibration(c1, c2, settings.getScaleOffset1(), settings.getScaleOffset2());
+}
+
+void Controller::onHardwareScaleSample(const ScaleSample &sample) {
+    ScaleSample stored = sample;
+    if (scaleSampleMutex && xSemaphoreTake(scaleSampleMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (stored.sampleSeq == 0) {
+            stored.sampleSeq = lastScaleSample.sampleSeq + 1;
+        }
+        lastScaleSample = stored;
+        xSemaphoreGive(scaleSampleMutex);
+    }
+
+    const float eventWeight = std::isfinite(stored.weightG) ? stored.weightG : 0.0f;
+    pluginManager->trigger("controller:scale:sample", "value", eventWeight);
+    pluginManager->trigger("controller:weight:change", "value", eventWeight);
+}
+
+ScaleSample Controller::getScaleSample() const {
+    ScaleSample s{};
+    if (scaleSampleMutex && xSemaphoreTake(scaleSampleMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        s = lastScaleSample;
+        xSemaphoreGive(scaleSampleMutex);
+    }
+    return s;
+}
+#endif
+
 bool Controller::isBluetoothScaleHealthy() const {
-    unsigned long timeSinceLastBluetooth = millis() - lastBluetoothMeasurement;
-    return (timeSinceLastBluetooth < BLUETOOTH_GRACE_PERIOD_MS) || volumetricOverride;
+    // BLE is usable for weight-based routines only while it is actively
+    // publishing measurements; a stale connected scale should fall back.
+    const unsigned long now = millis();
+    return BLEScales.isConnected() && lastBluetoothMeasurement != 0 &&
+           now - lastBluetoothMeasurement <= BLUETOOTH_MEASUREMENT_GRACE_MS;
+}
+
+bool Controller::isBluetoothScaleHealthy(ScaleRole role) const {
+    const unsigned long now = millis();
+    const unsigned long lastMeasurement =
+        role == ScaleRole::BREW ? lastBrewBluetoothMeasurement : lastGrindBluetoothMeasurement;
+    return BLEScales.isConnected(role) && lastMeasurement != 0 &&
+           now - lastMeasurement <= BLUETOOTH_MEASUREMENT_GRACE_MS;
+}
+
+void Controller::noteBluetoothScaleMeasurement(ScaleRole role) {
+    const unsigned long now = millis();
+    lastBluetoothMeasurement = now;
+    if (role == ScaleRole::BREW) {
+        lastBrewBluetoothMeasurement = now;
+    } else {
+        lastGrindBluetoothMeasurement = now;
+    }
 }
 
 void Controller::onFlush() {
     // Allocate outside the lock; reachable from the UI, AsyncTCP and BLE tasks (GM-147).
     auto *flush = new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay());
-    std::vector<const char *> events;
+    DeferredProcessEvents events;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
         if (isActiveLocked()) {
@@ -1202,7 +1724,7 @@ void Controller::onFlush() {
         }
         clearLocked(events);
         startProcessLocked(flush, events);
-        events.push_back("controller:brew:start");
+        events.push_back({"controller:brew:start", 1});
     }
     dispatchEvents(events);
 }
@@ -1214,6 +1736,8 @@ void Controller::onVolumetricDelete() {
 }
 
 void Controller::handleBrewButton(int brewButtonStatus) {
+    ESP_LOGI(LOG_TAG, "handleBrewButton: mode=%d status=%d isActive=%d src=%d", getMode(), brewButtonStatus, isActive(),
+             settings.getScaleSource());
     if (brewButtonStatus) {
         switch (getMode()) {
         case MODE_STANDBY:
@@ -1253,6 +1777,14 @@ void Controller::handleBrewButton(int brewButtonStatus) {
 }
 
 void Controller::handleSteamButton(int steamButtonStatus) {
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        Process *proc = currentProcess;
+        if (proc != nullptr && proc->isActive() && proc->getType() == MODE_BREW) {
+            ESP_LOGW(LOG_TAG, "Ignoring steam button state %d while brew process is active", steamButtonStatus);
+            return;
+        }
+    }
     if (steamButtonStatus) {
         if (getMode() != MODE_STEAM) {
             setMode(MODE_STEAM);
@@ -1316,6 +1848,7 @@ void Controller::loopLogicTask(void *arg) {
     TickType_t lastWake = xTaskGetTickCount();
     auto *controller = static_cast<Controller *>(arg);
     while (true) {
+        esp_task_wdt_reset();
         controller->loopLogic();
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
     }

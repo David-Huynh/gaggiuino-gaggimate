@@ -1,7 +1,15 @@
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include "Heater.h"
+#include "logging.h"
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>
+#ifdef ARDUINO_ARCH_STM32
+// On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
+#define xTaskDelayUntil vTaskDelayUntil
+#endif
 
 Heater::Heater(TemperatureSensor *sensor, uint8_t heaterPin, const heater_error_callback_t &error_callback,
                const pid_result_callback_t &pid_callback, const heater_autotune_fail_callback_t &autotune_fail_callback)
@@ -15,7 +23,7 @@ Heater::Heater(TemperatureSensor *sensor, uint8_t heaterPin, const heater_error_
 void Heater::setup() {
     pinMode(heaterPin, OUTPUT);
     setupPid();
-    xTaskCreate(loopTask, "Heater::loop", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle);
+    xTaskCreate(loopTask, "Heater::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
 }
 
 void Heater::setupPid() {
@@ -23,6 +31,9 @@ void Heater::setupPid() {
     simplePid->setCtrlOutputLimits(0.0f, TUNER_OUTPUT_SPAN);
     simplePid->activateSetPointFilter(false);
     simplePid->activateFeedForward(false);
+    // Initialize with default gains so heater works even before CMD,PID arrives.
+    // The ESP32 will override these with user-configured values once connected.
+    simplePid->setControllerPIDGains(Kp, Ki, Kd, 0.0f);
     simplePid->reset();
 }
 

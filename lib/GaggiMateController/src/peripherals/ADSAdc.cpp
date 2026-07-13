@@ -1,11 +1,20 @@
 #include "ADSAdc.h"
+#include "logging.h"
+#include "wire_compatibility.h"
 #include "Wire.h"
+
+#ifdef ARDUINO_ARCH_STM32
+// On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
+#define xTaskDelayUntil vTaskDelayUntil
+#endif
 
 ADSAdc::ADSAdc(uint8_t sda_pin, uint8_t scl_pin, uint8_t numChannels)
     : _sda_pin(sda_pin), _scl_pin(scl_pin), _numChannels(numChannels), taskHandle(nullptr) {}
 
 void ADSAdc::setup() {
-    Wire1.begin(_sda_pin, _scl_pin);
+    if (!initI2CBus(Wire1, _sda_pin, _scl_pin, 400000)) {
+        ESP_LOGE(LOG_TAG, "Failed to initialize I2C bus for ADS1115");
+    }
     ESP_LOGV(LOG_TAG, "Initializing ADS1115 on SDA: %d, SCL: %d", _sda_pin, _scl_pin);
     delay(100);
     ads = new ADS1115(0x48, &Wire1);

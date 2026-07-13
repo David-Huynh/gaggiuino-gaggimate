@@ -54,6 +54,7 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     void publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed);
     bool publishShotCorrection(Event const &event);
     void publishLocalReset(Event const &event);
+    void addUartDiagnostics(JsonDocument &doc) const;
     bool isAutoTuningEnabled() const;
     bool isAutoTuningParticipating() const;
     bool canApplyGrindByWeightTarget() const;

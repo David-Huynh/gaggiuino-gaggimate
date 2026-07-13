@@ -3,6 +3,12 @@
 
 #include <ADS1X15.h>
 #include <Arduino.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 constexpr int ADC_READ_INTERVAL_MS = 30;
 constexpr float ADC_STEP = 6.144f / 32767.0f;
@@ -31,7 +37,7 @@ class ADSAdc {
     xTaskHandle taskHandle;
 
     const char *LOG_TAG = "ADSAdc";
-    static void loopTask(void *arg);
+    [[noreturn]] static void loopTask(void *arg);
 };
 
 #endif // ADS_ADC_H

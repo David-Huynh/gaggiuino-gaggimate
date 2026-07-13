@@ -1,5 +1,6 @@
 import './style.css';
 import { initializeTheme } from './utils/themeManager.js';
+import { hardwareScaleDisabled } from './config/features.js';
 
 if (import.meta.env.DEV) {
   // Dev-only Preact warnings; stripped from production builds.
@@ -35,6 +36,9 @@ const DashboardSettings = lazy(() =>
   import('./pages/DashboardSettings/index.jsx').then(m => m.DashboardSettings),
 );
 const AutoTuning = lazy(() => import('./pages/AutoTuning/index.jsx').then(m => m.AutoTuning));
+const ScaleCalibration = hardwareScaleDisabled
+  ? null
+  : lazy(() => import('./pages/ScaleCalibration/index.jsx').then(m => m.ScaleCalibration));
 
 const apiService = new ApiService();
 const DESKTOP_NAV_COLLAPSED_STORAGE_KEY = 'gaggimate.desktopNavCollapsed';
@@ -107,6 +111,9 @@ export function App() {
                       <Route path='/profiles/:id' component={ProfileEdit} />
                       <Route path='/settings/:tab?' component={Settings} />
                       <Route path='/autotuning' component={AutoTuning} />
+                      {ScaleCalibration && (
+                        <Route path='/scale-calibration' component={ScaleCalibration} />
+                      )}
                       {/* Legacy routes now live in settings tabs */}
                       <Route path='/ota' component={RedirectTo('/settings/system')} />
                       <Route path='/scales' component={RedirectTo('/settings/bluetooth')} />

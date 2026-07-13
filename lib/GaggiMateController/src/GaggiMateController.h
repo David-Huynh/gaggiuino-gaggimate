@@ -6,7 +6,14 @@
 #include <peripherals/DistanceSensor.h>
 #include <peripherals/FlowSensor.h>
 #include <peripherals/Heater.h>
+#ifdef ARDUINO_ARCH_STM32
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+#include <peripherals/HX711Scale.h>
+#endif
+#include <peripherals/LedController2.h>
+#else
 #include <peripherals/LedController.h>
+#endif
 #include <peripherals/Max31855Thermocouple.h>
 #include <peripherals/PressureSensor.h>
 #include <peripherals/Pump.h>
@@ -37,6 +44,9 @@ class GaggiMateController {
     void stopPidAutotune(void);
     void sendSensorData(void);
     void handleSerialCommand(char c);
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    ControllerDiagnostics buildControllerDiagnostics(void);
+#endif
 
     ControllerConfig _config = ControllerConfig{};
     GaggiMateServer _comms;
@@ -49,6 +59,9 @@ class GaggiMateController {
     DigitalInput *brewBtn = nullptr;
     DigitalInput *steamBtn = nullptr;
     PressureSensor *pressureSensor = nullptr;
+#if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
+    HX711Scale *scale = nullptr;
+#endif
     LedController *ledController = nullptr;
     DistanceSensor *distanceSensor = nullptr;
     ADSAdc *adc = nullptr;
@@ -56,13 +69,25 @@ class GaggiMateController {
 
     GearpumpAddon *gearpumpAddon = nullptr;
 
+#ifndef ARDUINO_ARCH_STM32
     SoftWire *albaComms = nullptr;
+#endif
 
     std::vector<ControllerConfig> configs;
 
     String _version;
     unsigned long lastPingTime = 0;
     size_t errorState = ERROR_CODE_NONE;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    uint32_t boilerCommandCount = 0;
+    uint32_t pumpCommandCount = 0;
+    uint32_t relayCommandCount = 0;
+    uint32_t pingCommandCount = 0;
+    uint32_t tareCommandCount = 0;
+    float lastBoilerSetpoint = 0.0f;
+    float lastPumpPower = 0.0f;
+    bool lastRelayOpen = false;
+#endif
 
     const char *LOG_TAG = "GaggiMateController";
 };

@@ -63,11 +63,28 @@ export function BluetoothTab() {
   });
 
   useEffect(() => {
-    if (!connectedScale || fetchedScales.length === 0) {
+    if (!connectedScale) {
       return;
     }
-    const scales = connectedScale.connected ? [connectedScale] : fetchedScales;
-    setScaleData(scales);
+    const byUuid = new Map(fetchedScales.map(scale => [scale.uuid, { ...scale }]));
+    const upsertConnected = (uuid, patch) => {
+      if (!uuid) return;
+      const existing = byUuid.get(uuid) || { uuid, name: patch.name || '', rssi: patch.rssi || 0 };
+      byUuid.set(uuid, { ...existing, ...patch, connected: true });
+    };
+    upsertConnected(connectedScale.brewUuid || connectedScale.uuid, {
+      name: connectedScale.brewName || connectedScale.name,
+      rssi: connectedScale.rssi,
+      brewConnected: connectedScale.brewConnected,
+      brewAssigned: true,
+    });
+    upsertConnected(connectedScale.grindUuid || connectedScale.uuid, {
+      name: connectedScale.grindName || connectedScale.name,
+      rssi: connectedScale.rssi,
+      grindConnected: connectedScale.grindConnected,
+      grindAssigned: true,
+    });
+    setScaleData([...byUuid.values()]);
   }, [connectedScale, fetchedScales]);
 
   const onScan = useCallback(async () => {
@@ -84,10 +101,11 @@ export function BluetoothTab() {
     }
   }, [setIsScanning]);
 
-  const onConnect = useCallback(async uuid => {
+  const onConnect = useCallback(async (uuid, role = 'both') => {
     try {
       const data = new FormData();
       data.append('uuid', uuid);
+      data.append('role', role);
       await fetch('/api/scales/connect', {
         method: 'post',
         body: data,
@@ -147,8 +165,8 @@ export function BluetoothTab() {
             <div className='mt-4'>
               <div className='alert alert-warning text-xs'>
                 <span>
-                  Scales are automatically refreshed every 10 seconds. Use the scan button to
-                  discover new devices.
+                  Scales are automatically refreshed every 10 seconds. Assign one scale to both
+                  roles, or separate Bluetooth scales for brew and grind.
                 </span>
               </div>
             </div>
@@ -212,17 +230,33 @@ function ScaleList(props) {
                 </div>
               </div>
               <div className='flex items-center space-x-3'>
-                {scale.connected ? (
-                  <div className='badge badge-success gap-2'>Connected</div>
-                ) : (
-                  <button
-                    type='button'
-                    className='btn btn-primary btn-sm'
-                    onClick={() => onConnect(scale.uuid)}
-                  >
-                    Connect
-                  </button>
+                {(scale.brewAssigned || scale.brewConnected) && (
+                  <div className='badge badge-success gap-2'>Brew</div>
                 )}
+                {(scale.grindAssigned || scale.grindConnected) && (
+                  <div className='badge badge-info gap-2'>Grind</div>
+                )}
+                <button
+                  type='button'
+                  className='btn btn-outline btn-sm'
+                  onClick={() => onConnect(scale.uuid, 'brew')}
+                >
+                  Brew
+                </button>
+                <button
+                  type='button'
+                  className='btn btn-outline btn-sm'
+                  onClick={() => onConnect(scale.uuid, 'grind')}
+                >
+                  Grind
+                </button>
+                <button
+                  type='button'
+                  className='btn btn-primary btn-sm'
+                  onClick={() => onConnect(scale.uuid, 'both')}
+                >
+                  Both
+                </button>
               </div>
             </div>
           ))}

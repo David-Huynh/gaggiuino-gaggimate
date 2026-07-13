@@ -1,4 +1,6 @@
+#ifndef ARDUINO_ARCH_STM32
 #include "LedController.h"
+#include "logging.h"
 
 LedController::LedController(SoftWire *i2c) { this->pca9634 = new PCA9634(0x00, i2c); }
 
@@ -44,3 +46,4 @@ bool LedController::initialize() {
     ESP_LOGI("LedController", "Mode2: %d", this->pca9634->getMode2());
     return retval;
 }
+#endif

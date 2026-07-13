@@ -14,6 +14,9 @@
 #include <display/core/process/GrindProcess.h>
 #include <display/models/profile.h>
 #include <display/plugins/BLEScalePlugin.h>
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+#include <display/plugins/HWScalePlugin.h>
+#endif
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
@@ -905,9 +908,61 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     // Subscribe to Bluetooth scale weight updates
     pluginManager->on("controller:volumetric-measurement:bluetooth:change",
                       [this](Event const &event) { this->currentBluetoothWeight = event.getFloat("value"); });
-    // Predictive flow estimate is tracked alongside BLE for the active shot.
+    // Hardware scale and predictive flow estimate are tracked alongside BLE so
+    // the WebUI 'cw' field can mirror whichever source the user has selected.
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pluginManager->on("controller:volumetric-measurement:hardware:change",
+                      [this](Event const &event) { this->currentHardwareWeight = event.getFloat("value"); });
+#endif
     pluginManager->on("controller:volumetric-measurement:estimation:change",
                       [this](Event const &event) { this->currentEstimatedWeight = event.getFloat("value"); });
+
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    // Forward async scale events as WebSocket messages so the calibration page can
+    // drive its live progress bars and result toasts directly.
+    pluginManager->on("controller:scale:tare:progress", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:tare:progress";
+        doc["samples"] = ev.getInt("samples");
+        doc["stddevG"] = ev.getFloat("stddevG");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:tare:done", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:tare:done";
+        doc["success"] = ev.getInt("success");
+        doc["offset1"] = ev.getFloat("offset1");
+        doc["offset2"] = ev.getFloat("offset2");
+        doc["std1"] = ev.getFloat("std1");
+        doc["std2"] = ev.getFloat("std2");
+        doc["healthBits"] = ev.getInt("healthBits");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:cal:progress", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:cal:progress";
+        doc["channel"] = ev.getInt("channel");
+        doc["samples"] = ev.getInt("samples");
+        doc["stddevG"] = ev.getFloat("stddevG");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:cal:done", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:cal:done";
+        doc["channel"] = ev.getInt("channel");
+        doc["factor"] = ev.getFloat("factor");
+        doc["stddevG"] = ev.getFloat("stddevG");
+        doc["success"] = ev.getInt("success");
+        doc["errorCode"] = ev.getInt("errorCode");
+        ws.textAll(doc.as<String>());
+    });
+    pluginManager->on("controller:scale:not-ready", [this](Event const &ev) {
+        JsonDocument doc;
+        doc["tp"] = "evt:scale:not-ready";
+        doc["source"] = ev.getInt("source");
+        ws.textAll(doc.as<String>());
+    });
+#endif
 
     setupServer();
 }
@@ -960,8 +1015,8 @@ void WebUIPlugin::loop() {
         statusDoc["led"] = controller->getSystemInfo().capabilities.ledControl;
         statusDoc["gtd"] = controller->getTargetGrindDuration();
         statusDoc["gtv"] = controller->getSettings().getTargetGrindVolume();
-        statusDoc["gta"] = controller->isVolumetricAvailable() ? 1 : 0;
-        statusDoc["gt"] = controller->isVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
+        statusDoc["gta"] = controller->isGrindVolumetricAvailable() ? 1 : 0;
+        statusDoc["gt"] = controller->isGrindVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
         statusDoc["gact"] = controller->isGrindActive() ? 1 : 0;
         statusDoc["wl"] = controller->getWaterLevel();
         statusDoc["tof"] = controller->getTofDistance();
@@ -978,7 +1033,60 @@ void WebUIPlugin::loop() {
         }
 
         const bool bleConnected = BLEScales.isConnected();
-        const VolumetricMeasurementSource brewSource = controller->getCurrentVolumetricSource();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        const ScaleSample sc = controller->getScaleSample();
+        const bool hwScalePresent = controller->isHardwareScalePresent();
+        const bool hwHealthy = controller->isHardwareScaleSampleHealthy(sc);
+
+        const float displayHwG = sc.weightG;
+
+        // 'cw' (currentWeight) mirrors the source the brew controller is acting
+        // on (or would, when idle), so the WebUI chart and Process Controls card
+        // show the same weight the brew targets against. 'bw' keeps its raw
+        // BLE-only meaning.
+        const VolumetricMeasurementSource brewSource =
+            controller->isActive() ? controller->getCurrentVolumetricSource() : controller->getResolvedBrewSource();
+        float cw = 0.0f;
+        switch (brewSource) {
+        case VolumetricMeasurementSource::HARDWARE_SCALE:
+            cw = hwHealthy ? displayHwG : 0.0f;
+            break;
+        case VolumetricMeasurementSource::BLUETOOTH:
+            cw = bleConnected ? this->currentBluetoothWeight : 0.0f;
+            break;
+        case VolumetricMeasurementSource::FLOW_ESTIMATION:
+            cw = this->currentEstimatedWeight;
+            break;
+        default:
+            cw = 0.0f;
+            break;
+        }
+
+        statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // raw BLE weight
+        statusDoc["hw"] = hwHealthy ? displayHwG : 0.0f;
+        statusDoc["hwc"] = hwScalePresent;
+        statusDoc["cw"] = cw;                                              // active-source weight
+        statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
+
+        // Hardware scale: structured snapshot. Flat hw/hwc stay for existing UI.
+        auto sObj = statusDoc["scale"].to<JsonObject>();
+        // Never surface an implausible headline weight: an uncalibrated/un-tared
+        // controller emits raw counts (tens of thousands of grams). Show 0 when
+        // the sample is unhealthy or out of range; raw per-channel c1/c2 below
+        // stay unclamped for diagnostics.
+        sObj["w"] = (hwHealthy && std::isfinite(displayHwG)) ? displayHwG : 0.0f;
+        sObj["sd"] = sc.stddevG;
+        sObj["c1"] = sc.ch1G;
+        sObj["c2"] = sc.ch2G;
+        sObj["sd1"] = sc.ch1StdG;
+        sObj["sd2"] = sc.ch2StdG;
+        sObj["h"] = sc.healthBits;
+        sObj["seq"] = sc.sampleSeq;
+        sObj["pr"] = hwScalePresent;
+        sObj["bl"] = 0.0f;
+#else
+        const VolumetricMeasurementSource brewSource =
+            controller->isActive() ? controller->getCurrentVolumetricSource() : controller->getResolvedBrewSource();
         float cw = 0.0f;
         switch (brewSource) {
         case VolumetricMeasurementSource::BLUETOOTH:
@@ -993,8 +1101,22 @@ void WebUIPlugin::loop() {
         }
 
         statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // raw BLE weight
+        statusDoc["hw"] = 0.0f;
+        statusDoc["hwc"] = false;
         statusDoc["cw"] = cw;                                              // active-source weight
         statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
+        auto sObj = statusDoc["scale"].to<JsonObject>();
+        sObj["w"] = 0.0f;
+        sObj["sd"] = 0.0f;
+        sObj["c1"] = 0.0f;
+        sObj["c2"] = 0.0f;
+        sObj["sd1"] = 0.0f;
+        sObj["sd2"] = 0.0f;
+        sObj["h"] = 0;
+        sObj["seq"] = 0;
+        sObj["pr"] = false;
+        sObj["bl"] = 0.0f;
+#endif
         // Scale battery â€” only surfaced when the driver reports one and the
         // value isn't the UNKNOWN sentinel (255). UI omits the battery pill
         // entirely when `sbat` is absent, so disconnected/unknown scales don't
@@ -1006,7 +1128,58 @@ void WebUIPlugin::loop() {
             }
         }
 
-        // Deref under the process lock — other tasks delete the process at any time (GM-147).
+        // Scale source routing, so the UI can show which source each role uses
+        // (enum: 0=none/INACTIVE, 1=predictive, 2=bluetooth, 3=hardware).
+        statusDoc["brewSource"] = static_cast<int>(controller->getResolvedBrewSource());
+        statusDoc["grindSource"] = static_cast<int>(controller->getResolvedGrindSource());
+        statusDoc["activeSource"] = static_cast<int>(controller->getCurrentVolumetricSource());
+        statusDoc["scaleCapable"] = controller->scaleAvailability().hardwareCapable;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        statusDoc["err"] = controller->getError();
+        statusDoc["ready"] = controller->isReady();
+        const ControllerDiagnostics controllerDiagnostics = controller->getControllerDiagnostics();
+        auto ctrlObj = statusDoc["ctrl"].to<JsonObject>();
+        ctrlObj["e"] = controllerDiagnostics.errorCode;
+        ctrlObj["te"] = controllerDiagnostics.thermocoupleError;
+        ctrlObj["ts"] = controllerDiagnostics.thermocoupleStatus;
+        ctrlObj["tec"] = controllerDiagnostics.thermocoupleErrorCount;
+        ctrlObj["trc"] = controllerDiagnostics.thermocoupleReadCount;
+        ctrlObj["traw"] = controllerDiagnostics.thermocoupleRawTemperature;
+        ctrlObj["tf"] = controllerDiagnostics.thermocoupleTemperature;
+        ctrlObj["ttask"] = controllerDiagnostics.thermocoupleTaskRunning;
+        ctrlObj["hsp"] = controllerDiagnostics.heaterSetpoint;
+        ctrlObj["hout"] = controllerDiagnostics.heaterOutput;
+        ctrlObj["hr"] = controllerDiagnostics.heaterRelay;
+        ctrlObj["bcmd"] = controllerDiagnostics.boilerCommandCount;
+        ctrlObj["pcmd"] = controllerDiagnostics.pumpCommandCount;
+        ctrlObj["rcmd"] = controllerDiagnostics.relayCommandCount;
+        ctrlObj["ping"] = controllerDiagnostics.pingCommandCount;
+        ctrlObj["tare"] = controllerDiagnostics.tareCommandCount;
+        ctrlObj["lbsp"] = controllerDiagnostics.lastBoilerSetpoint;
+        ctrlObj["lpp"] = controllerDiagnostics.lastPumpPower;
+        ctrlObj["lro"] = controllerDiagnostics.lastRelayOpen;
+        ctrlObj["urx"] = controllerDiagnostics.uartRxBytes;
+        ctrlObj["utx"] = controllerDiagnostics.uartTxBytes;
+        ctrlObj["uvf"] = controllerDiagnostics.uartValidFrames;
+        ctrlObj["upe"] = controllerDiagnostics.uartParsedPayloads;
+        ctrlObj["heap"] = controllerDiagnostics.freeHeap;
+#if defined(GAGGIMATE_UART_COMMS)
+        const UartDiagnostics uartDiagnostics = controller->getUartDiagnostics();
+        statusDoc["uc"] = controller->getClientController()->isConnected();
+        statusDoc["upe"] = uartDiagnostics.displayParsedEventCount;
+        statusDoc["uro"] = uartDiagnostics.displayRxOverflowCount;
+        statusDoc["utd"] = uartDiagnostics.displayTxDropCount;
+        statusDoc["utb"] = uartDiagnostics.displayTxByteCount;
+        statusDoc["urb"] = uartDiagnostics.displayRxByteCount;
+        statusDoc["uvf"] = uartDiagnostics.displayValidFrameCount;
+        statusDoc["umf"] = uartDiagnostics.displayMalformedFrameCount;
+        statusDoc["ucrc"] = uartDiagnostics.displayCrcErrorCount;
+        statusDoc["ulu"] = uartDiagnostics.displayLinkUpCount;
+        statusDoc["uld"] = uartDiagnostics.displayLinkDownCount;
+#endif
+#endif
+
+        // Deref under the process lock; other tasks can delete the process at any time (GM-147).
         // Released before broadcastJson so the ws send never runs under the lock.
         std::unique_lock<std::recursive_mutex> processGuard(controller->getProcessLock());
         Process *process = controller->getProcess();
@@ -1042,7 +1215,7 @@ void WebUIPlugin::loop() {
                 pObj["s"] = "grind";
                 pObj["l"] = grind->isActive() ? "Grinding" : "Finished";
                 pObj["e"] = ts - grind->started;
-                const bool isVolumetric = grind->target == ProcessTarget::VOLUMETRIC && controller->isVolumetricAvailable();
+                const bool isVolumetric = grind->target == ProcessTarget::VOLUMETRIC && controller->isGrindVolumetricAvailable();
                 pObj["tt"] = isVolumetric ? "volumetric" : "time";
                 if (isVolumetric) {
                     pObj["pt"] = grind->grindVolume;
@@ -1592,29 +1765,29 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         }
                     }
                 } else if (msgType == "req:process:activate") {
-                    controller->activate();
+                    controller->postCommand(CtrlCmd::ACTIVATE);
                 } else if (msgType == "req:process:deactivate") {
-                    controller->deactivate();
-                    controller->clear();
+                    controller->postCommand(CtrlCmd::DEACTIVATE);
+                    controller->postCommand(CtrlCmd::CLEAR);
                 } else if (msgType == "req:process:clear") {
-                    controller->clear();
+                    controller->postCommand(CtrlCmd::CLEAR);
                 } else if (msgType == "req:grind:activate") {
-                    controller->activateGrind();
+                    controller->postCommand(CtrlCmd::ACTIVATE_GRIND);
                 } else if (msgType == "req:grind:deactivate") {
-                    controller->deactivateGrind();
+                    controller->postCommand(CtrlCmd::DEACTIVATE_GRIND);
                 } else if (msgType == "req:change-grind-target") {
                     if (doc["target"].is<uint8_t>()) {
                         auto target = doc["target"].as<uint8_t>();
                         controller->getSettings().setVolumetricTarget(target);
                     }
                 } else if (msgType == "req:raise-temp") {
-                    controller->raiseTemp();
+                    controller->postCommand(CtrlCmd::RAISE_TEMP);
                 } else if (msgType == "req:lower-temp") {
-                    controller->lowerTemp();
+                    controller->postCommand(CtrlCmd::LOWER_TEMP);
                 } else if (msgType == "req:raise-grind-target") {
-                    controller->raiseGrindTarget();
+                    controller->postCommand(CtrlCmd::RAISE_GRIND_TARGET);
                 } else if (msgType == "req:lower-grind-target") {
-                    controller->lowerGrindTarget();
+                    controller->postCommand(CtrlCmd::LOWER_GRIND_TARGET);
                 } else if (msgType == "req:raise-brew-target") {
                     controller->raiseBrewTarget();
                 } else if (msgType == "req:lower-brew-target") {
@@ -1622,9 +1795,9 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                 } else if (msgType == "req:change-mode") {
                     if (doc["mode"].is<uint8_t>()) {
                         auto mode = doc["mode"].as<uint8_t>();
-                        controller->deactivate();
-                        controller->clear();
-                        controller->setMode(mode);
+                        controller->postCommand(CtrlCmd::DEACTIVATE);
+                        controller->postCommand(CtrlCmd::CLEAR);
+                        controller->postCommand(CtrlCmd::SET_MODE, mode);
                     }
                 } else if (msgType == "req:change-brew-target") {
                     if (doc["target"].is<uint8_t>()) {
@@ -1647,6 +1820,16 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     client->text(toWsBuffer(resp));
                 } else if (msgType == "req:flush:start") {
                     handleFlushStart(client->id(), doc);
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+                } else if (msgType == "req:scale:tare") {
+                    controller->scaleTare();
+                } else if (msgType == "req:scale:cal:start") {
+                    uint8_t channel = doc["channel"] | 0;
+                    float refWeight = doc["refWeight"] | 0.0f;
+                    if ((channel == 1 || channel == 2) && refWeight > 0.0f) {
+                        controller->getClientController()->startScaleCalibration(channel, refWeight);
+                    }
+#endif
                 }
             }
         }
@@ -2218,6 +2401,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             settings->setDelayAdjust(request->hasArg("delayAdjust"));
             if (request->hasArg("brewDelay"))
                 settings->setBrewDelay(request->arg("brewDelay").toDouble());
+            if (request->hasArg("hardwareBrewDelay"))
+                settings->setHardwareBrewDelay(request->arg("hardwareBrewDelay").toDouble());
             if (request->hasArg("grindDelay"))
                 settings->setGrindDelay(request->arg("grindDelay").toDouble());
             if (request->hasArg("timezone"))
@@ -2265,6 +2450,22 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setMaxPumpPower(request->arg("maxPumpPower").toFloat());
             if (request->hasArg("savedScale"))
                 settings->setSavedScale(request->arg("savedScale"));
+            if (request->hasArg("savedBrewScale"))
+                settings->setSavedBrewScale(request->arg("savedBrewScale"));
+            if (request->hasArg("savedGrindScale"))
+                settings->setSavedGrindScale(request->arg("savedGrindScale"));
+            if (request->hasArg("scaleSource"))
+                settings->setScaleSource(request->arg("scaleSource").toInt());
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+            if (request->hasArg("scaleCalibration1"))
+                settings->setScaleCalibration1(request->arg("scaleCalibration1").toFloat());
+            if (request->hasArg("scaleCalibration2"))
+                settings->setScaleCalibration2(request->arg("scaleCalibration2").toFloat());
+            if (request->hasArg("scaleOffset1"))
+                settings->setScaleOffset1(request->arg("scaleOffset1").toInt());
+            if (request->hasArg("scaleOffset2"))
+                settings->setScaleOffset2(request->arg("scaleOffset2").toInt());
+#endif
             settings->setAutoWakeupEnabled(request->hasArg("autowakeupEnabled"));
             if (request->hasArg("autowakeupSchedules")) {
                 // Handle schedule format with days
@@ -2455,6 +2656,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();
     doc["brewDelay"] = settings.getBrewDelay();
+    doc["hardwareBrewDelay"] = settings.getHardwareBrewDelay();
     doc["grindDelay"] = settings.getGrindDelay();
     doc["delayAdjust"] = settings.isDelayAdjust();
     doc["timezone"] = settings.getTimezone();
@@ -2474,6 +2676,25 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["emptyTankDistance"] = settings.getEmptyTankDistance();
     doc["fullTankDistance"] = settings.getFullTankDistance();
     doc["altRelayFunction"] = settings.getAltRelayFunction();
+    doc["scaleSource"] = settings.getScaleSource();
+    doc["scaleCalibration1"] = settings.getScaleCalibration1();
+    doc["scaleCalibration2"] = settings.getScaleCalibration2();
+    doc["scaleOffset1"] = settings.getScaleOffset1();
+    doc["scaleOffset2"] = settings.getScaleOffset2();
+    doc["scaleCalTimestamp1"] = settings.getScaleCalTimestamp1();
+    doc["scaleCalTimestamp2"] = settings.getScaleCalTimestamp2();
+    doc["scaleCalStddev1"] = settings.getScaleCalStddev1();
+    doc["scaleCalStddev2"] = settings.getScaleCalStddev2();
+    doc["hardwareScaleDisabled"] =
+#ifdef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        true;
+#else
+        false;
+#endif
+    // Runtime truth for whether the connected controller actually has a hardware
+    // scale (STM32 + HX711 over UART). The web UI gates the "Hardware" source
+    // option on this rather than only the build-time hardwareScaleDisabled flag.
+    doc["scaleCapable"] = controller->scaleAvailability().hardwareCapable;
     // Add auto-wakeup settings to response
     doc["autowakeupEnabled"] = settings.isAutoWakeupEnabled();
     doc["buttonBehavior"] = implode(settings.getButtonBehaviorList(), ",");
@@ -2482,6 +2703,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["integralGain"] = settings.getIntegralGain();
     doc["maxPumpPower"] = settings.getMaxPumpPower();
     doc["savedScale"] = settings.getSavedScale();
+    doc["savedBrewScale"] = settings.getSavedBrewScale();
+    doc["savedGrindScale"] = settings.getSavedGrindScale();
 
     // Add schedule format with days
     std::vector<AutoWakeupSchedule> autowakeupSchedules = settings.getAutoWakeupSchedules();
@@ -2507,11 +2730,19 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
 void WebUIPlugin::handleBLEScaleList(AsyncWebServerRequest *request) {
     JsonDocument doc(&psramAllocator);
     JsonArray scalesArray = doc.to<JsonArray>();
+    const String brewUuid = BLEScales.getUUID(ScaleRole::BREW).c_str();
+    const String grindUuid = BLEScales.getUUID(ScaleRole::GRIND).c_str();
     for (const DiscoveredDevice &device : BLEScales.getDiscoveredScales()) {
+        const std::string address = device.getAddress().toString();
+        const String uuid = address.c_str();
         JsonDocument scale(&psramAllocator);
-        scale["uuid"] = device.getAddress().toString();
+        scale["uuid"] = uuid;
         scale["name"] = device.getName();
         scale["rssi"] = device.getRSSI();
+        scale["brewAssigned"] = uuid == controller->getSettings().getSavedBrewScale();
+        scale["grindAssigned"] = uuid == controller->getSettings().getSavedGrindScale();
+        scale["brewConnected"] = BLEScales.isConnected(ScaleRole::BREW) && uuid == brewUuid;
+        scale["grindConnected"] = BLEScales.isConnected(ScaleRole::GRIND) && uuid == grindUuid;
         scalesArray.add(scale);
     }
     AsyncResponseStream *response = request->beginResponseStream("application/json");
@@ -2537,7 +2768,15 @@ void WebUIPlugin::handleBLEScaleConnect(AsyncWebServerRequest *request) {
         request->send(404);
         return;
     }
-    BLEScales.connect(request->arg("uuid").c_str());
+    const String uuid = request->arg("uuid");
+    const String role = request->hasArg("role") ? request->arg("role") : "both";
+    if (role == "brew") {
+        BLEScales.connect(uuid.c_str(), ScaleRole::BREW);
+    } else if (role == "grind") {
+        BLEScales.connect(uuid.c_str(), ScaleRole::GRIND);
+    } else {
+        BLEScales.connect(uuid.c_str());
+    }
     JsonDocument doc(&psramAllocator);
     doc["success"] = true;
     AsyncResponseStream *response = request->beginResponseStream("application/json");
@@ -2548,8 +2787,16 @@ void WebUIPlugin::handleBLEScaleConnect(AsyncWebServerRequest *request) {
 void WebUIPlugin::handleBLEScaleInfo(AsyncWebServerRequest *request) {
     JsonDocument doc(&psramAllocator);
     doc["connected"] = BLEScales.isConnected();
+    doc["brewConnected"] = BLEScales.isConnected(ScaleRole::BREW);
+    doc["grindConnected"] = BLEScales.isConnected(ScaleRole::GRIND);
     doc["name"] = BLEScales.getName();
     doc["uuid"] = BLEScales.getUUID();
+    doc["brewName"] = BLEScales.getName(ScaleRole::BREW);
+    doc["brewUuid"] = BLEScales.getUUID(ScaleRole::BREW);
+    doc["grindName"] = BLEScales.getName(ScaleRole::GRIND);
+    doc["grindUuid"] = BLEScales.getUUID(ScaleRole::GRIND);
+    doc["savedBrewScale"] = controller->getSettings().getSavedBrewScale();
+    doc["savedGrindScale"] = controller->getSettings().getSavedGrindScale();
     doc["rssi"] = BLEScales.getRSSI();
     doc["hasBattery"] = BLEScales.hasBatteryLevel();
     // Only surface the numeric when the scale reports one â€” a 255 sentinel

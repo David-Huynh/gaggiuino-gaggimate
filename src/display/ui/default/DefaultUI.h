@@ -126,6 +126,10 @@ class DefaultUI {
     int volumetricAvailable = false;
     int grindVolumetricAvailable = false;
     int bluetoothScales = false;
+    int hardwareScalePresent = false;
+    int hardwareShotBaselineActive = false;
+    int scaleSource = 0;
+    int brewVolumetricSource = 0;
     int grindVolumetricTarget = false;
     int volumetricMode = false;
     int brewVolumetric = false;
@@ -149,6 +153,7 @@ class DefaultUI {
     float currentTemp = 0.0f;
     float targetTemp = 0.0f;
     double bluetoothWeight = 0.0;
+    double hardwareWeight = 0.0;
     double estimatedWeight = 0.0;
     BrewScreenState brewScreenState = BrewScreenState::Brew;
 

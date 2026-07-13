@@ -1,3 +1,4 @@
+#if !defined(ARDUINO_ARCH_STM32)
 #include "BleClientTransport.h"
 
 void BleClientTransport::init(const String &deviceName) {
@@ -162,3 +163,4 @@ void BleClientTransport::notifyCallback(NimBLERemoteCharacteristic *characterist
     (void)characteristic;
     emitData(data, length);
 }
+#endif

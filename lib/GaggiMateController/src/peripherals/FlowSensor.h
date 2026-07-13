@@ -1,6 +1,13 @@
 #ifndef FLOWSENSOR_H
 #define FLOWSENSOR_H
 #include <Arduino.h>
+#include <logging.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 constexpr float ML_PER_PULSE = 0.19;
 

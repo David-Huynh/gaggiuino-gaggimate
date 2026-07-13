@@ -1,6 +1,13 @@
 #include "GaggiMateClient.h"
 
-GaggiMateClient::GaggiMateClient() : _endpoint(_transport) {}
+GaggiMateClient::GaggiMateClient()
+#ifdef GAGGIMATE_UART_COMMS
+    : _transport(Serial2), _endpoint(_transport) {
+}
+#else
+    : _endpoint(_transport) {
+}
+#endif
 
 void GaggiMateClient::init(const String &deviceName) {
     registerHandlers();
@@ -8,16 +15,27 @@ void GaggiMateClient::init(const String &deviceName) {
         if (_connCb)
             _connCb(connected);
     });
+#ifndef GAGGIMATE_UART_COMMS
     _transport.onIncompatible([this](const String &info) {
         if (_incompatibleCb)
             _incompatibleCb(info);
     });
+#endif
     _endpoint.begin();
+#ifdef GAGGIMATE_UART_COMMS
+    (void)deviceName;
+    _transport.begin();
+#else
     _transport.init(deviceName);
+#endif
 }
 
 void GaggiMateClient::loop() {
+#ifdef GAGGIMATE_UART_COMMS
+    _transport.loop();
+#else
     _transport.maintain();
+#endif
     _endpoint.loop();
 }
 
@@ -107,6 +125,30 @@ gm::Payload GaggiMateClient::buildTare() {
     return p;
 }
 
+gm::Payload GaggiMateClient::buildScaleTare() {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_scale_tare_tag;
+    return p;
+}
+
+gm::Payload GaggiMateClient::buildScaleCalibration(float calibration1, float calibration2, long offset1, long offset2) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_scale_calibration_tag;
+    p.content.scale_calibration.calibration1 = calibration1;
+    p.content.scale_calibration.calibration2 = calibration2;
+    p.content.scale_calibration.offset1 = static_cast<int32_t>(offset1);
+    p.content.scale_calibration.offset2 = static_cast<int32_t>(offset2);
+    return p;
+}
+
+gm::Payload GaggiMateClient::buildScaleCalibrationStart(uint8_t channel, float referenceWeight) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_scale_calibration_start_tag;
+    p.content.scale_calibration_start.channel = channel;
+    p.content.scale_calibration_start.reference_weight = referenceWeight;
+    return p;
+}
+
 gm::Payload GaggiMateClient::buildLedControl(const LedChannelCommand *channels, size_t count) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_led_tag;
@@ -153,6 +195,16 @@ void GaggiMateClient::sendPressureScale(float scale) { _endpoint.send(buildPress
 
 void GaggiMateClient::tare() { _endpoint.send(buildTare()); }
 
+void GaggiMateClient::scaleTare() { _endpoint.send(buildScaleTare()); }
+
+void GaggiMateClient::sendScaleCalibration(float calibration1, float calibration2, long offset1, long offset2) {
+    _endpoint.send(buildScaleCalibration(calibration1, calibration2, offset1, offset2));
+}
+
+void GaggiMateClient::startScaleCalibration(uint8_t channel, float referenceWeight) {
+    _endpoint.send(buildScaleCalibrationStart(channel, referenceWeight));
+}
+
 void GaggiMateClient::sendLedControl(const LedChannelCommand *channels, size_t count) {
     _endpoint.send(buildLedControl(channels, count));
 }
@@ -168,7 +220,8 @@ void GaggiMateClient::registerHandlers() {
             }
             _systemInfoCb(p.content.system_info.hardware, p.content.system_info.version, p.content.system_info.protocol_version,
                           p.content.system_info.capabilities.dimming, p.content.system_info.capabilities.pressure,
-                          p.content.system_info.capabilities.led_control, p.content.system_info.capabilities.tof, addonList);
+                          p.content.system_info.capabilities.led_control, p.content.system_info.capabilities.tof,
+                          p.content.system_info.capabilities.scale, addonList);
         }
     });
     _endpoint.on(gaggimate_Payload_sensor_tag, [this](const gm::Payload &p) {
@@ -181,6 +234,35 @@ void GaggiMateClient::registerHandlers() {
             temperature = p.content.sensor.boilers[0].temperature;
             pressure = p.content.sensor.boilers[0].pressure;
         }
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        if (p.content.sensor.has_diagnostics) {
+            const gm::ControllerDiagnostics &d = p.content.sensor.diagnostics;
+            _controllerDiagnostics.errorCode = d.error_code;
+            _controllerDiagnostics.thermocoupleError = d.thermocouple_error;
+            _controllerDiagnostics.thermocoupleStatus = d.thermocouple_status;
+            _controllerDiagnostics.thermocoupleErrorCount = d.thermocouple_error_count;
+            _controllerDiagnostics.thermocoupleReadCount = d.thermocouple_read_count;
+            _controllerDiagnostics.thermocoupleRawTemperature = d.thermocouple_raw_temperature;
+            _controllerDiagnostics.thermocoupleTemperature = d.thermocouple_temperature;
+            _controllerDiagnostics.thermocoupleTaskRunning = d.thermocouple_task_running;
+            _controllerDiagnostics.heaterSetpoint = d.heater_setpoint;
+            _controllerDiagnostics.heaterOutput = d.heater_output;
+            _controllerDiagnostics.heaterRelay = d.heater_relay;
+            _controllerDiagnostics.boilerCommandCount = d.boiler_command_count;
+            _controllerDiagnostics.pumpCommandCount = d.pump_command_count;
+            _controllerDiagnostics.relayCommandCount = d.relay_command_count;
+            _controllerDiagnostics.pingCommandCount = d.ping_command_count;
+            _controllerDiagnostics.tareCommandCount = d.tare_command_count;
+            _controllerDiagnostics.lastBoilerSetpoint = d.last_boiler_setpoint;
+            _controllerDiagnostics.lastPumpPower = d.last_pump_power;
+            _controllerDiagnostics.lastRelayOpen = d.last_relay_open;
+            _controllerDiagnostics.uartRxBytes = d.uart_rx_bytes;
+            _controllerDiagnostics.uartTxBytes = d.uart_tx_bytes;
+            _controllerDiagnostics.uartValidFrames = d.uart_valid_frames;
+            _controllerDiagnostics.uartParsedPayloads = d.uart_parsed_payloads;
+            _controllerDiagnostics.freeHeap = d.free_heap;
+        }
+#endif
         _sensorCb(temperature, pressure, p.content.sensor.puck_flow, p.content.sensor.pump_flow,
                   p.content.sensor.puck_resistance, p.content.sensor.pump_power, p.content.sensor.heater_power);
     });
@@ -204,5 +286,32 @@ void GaggiMateClient::registerHandlers() {
     _endpoint.on(gaggimate_Payload_error_tag, [this](const gm::Payload &p) {
         if (_errorCb)
             _errorCb(static_cast<int>(p.content.error.code));
+    });
+    _endpoint.on(gaggimate_Payload_weight_tag, [this](const gm::Payload &p) {
+        if (_weightCb)
+            _weightCb(p.content.weight.weight);
+    });
+    _endpoint.on(gaggimate_Payload_scale_sample_tag, [this](const gm::Payload &p) {
+        if (!_scaleSampleCb)
+            return;
+        ScaleSample sample{};
+        sample.weightG = p.content.scale_sample.weight_g;
+        sample.stddevG = p.content.scale_sample.stddev_g;
+        sample.ch1G = p.content.scale_sample.ch1_g;
+        sample.ch2G = p.content.scale_sample.ch2_g;
+        sample.ch1StdG = p.content.scale_sample.ch1_std_g;
+        sample.ch2StdG = p.content.scale_sample.ch2_std_g;
+        sample.healthBits = static_cast<uint16_t>(p.content.scale_sample.health_bits);
+        sample.sampleSeq = p.content.scale_sample.sample_seq;
+        _scaleSampleCb(sample);
+    });
+    _endpoint.on(gaggimate_Payload_scale_offsets_tag, [this](const gm::Payload &p) {
+        if (_scaleOffsetsCb)
+            _scaleOffsetsCb(p.content.scale_offsets.offset1, p.content.scale_offsets.offset2);
+    });
+    _endpoint.on(gaggimate_Payload_scale_calibration_result_tag, [this](const gm::Payload &p) {
+        if (_scaleCalibrationResultCb)
+            _scaleCalibrationResultCb(static_cast<uint8_t>(p.content.scale_calibration_result.channel),
+                                      p.content.scale_calibration_result.calibration);
     });
 }

@@ -114,6 +114,10 @@ void GearpumpAddon::loopTask(void *arg) {
     TickType_t lastWake = xTaskGetTickCount();
     while (true) {
         pump->loop();
+#ifdef ARDUINO_ARCH_STM32
+        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(30));
+#else
         xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(30));
+#endif
     }
 }

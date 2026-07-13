@@ -109,6 +109,18 @@ The Auto Tuning page remains unchanged while delivery is healthy. Pending,
 retrying, or rejected local shots replace the compact runtime summary and are
 shown inside its existing details disclosure.
 
+## Hardware-Scale Output
+
+The hardware scale measures the drip tray. Its usable beverage observation ends
+at control cutoff so OPV discharge cannot be mistaken for espresso output.
+
+- `beverage_out_g` is the measured cutoff value.
+- `predicted_final_beverage_out_g` is the separately predicted final value.
+- `predictive_stop_delay_ms`, `predictive_stop_rate_g_per_s`, and
+  `predictive_stop_lead_g` describe the prediction.
+- A difference between measured cutoff, predicted final output, and target
+  output is not itself a rejection reason.
+
 ## Dose Confirmation
 
 Grind-by-weight measurements set `dose_observed`. For optimizer-bound shots,

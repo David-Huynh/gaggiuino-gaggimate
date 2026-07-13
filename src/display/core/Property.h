@@ -30,6 +30,11 @@ template <> struct PreferencesCodec<double> {
     static bool write(Preferences &prefs, const char *key, const double &value) { return prefs.putDouble(key, value) > 0; }
 };
 
+template <> struct PreferencesCodec<long> {
+    static long read(Preferences &prefs, const char *key, const long &def) { return prefs.getLong(key, def); }
+    static bool write(Preferences &prefs, const char *key, const long &value) { return prefs.putLong(key, value) > 0; }
+};
+
 template <> struct PreferencesCodec<String> {
     static String read(Preferences &prefs, const char *key, const String &def) { return prefs.getString(key, def); }
     static bool write(Preferences &prefs, const char *key, const String &value) {

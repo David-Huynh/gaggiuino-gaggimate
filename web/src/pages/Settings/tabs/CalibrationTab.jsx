@@ -5,6 +5,7 @@ import { Spinner } from '../../../components/Spinner.jsx';
 import Section from '../../../components/Card.jsx';
 import PumpFlowCalibration from '../../../components/PumpFlowCalibration/index.jsx';
 import { SettingsFormField } from '../../../components/SettingsFormField.jsx';
+import { hardwareScaleDisabled } from '../../../config/features.js';
 
 export function CalibrationTab({ formData, onChange }) {
   const apiService = useContext(ApiServiceContext);
@@ -203,6 +204,19 @@ export function CalibrationTab({ formData, onChange }) {
       <Section title='Pump Flow Calibration'>
         <PumpFlowCalibration currentCoeffs={formData.pumpModelCoeffs} />
       </Section>
+
+      {!hardwareScaleDisabled && (
+        <Section title='Hardware Scale Calibration'>
+          <div className='flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between'>
+            <span className='text-base-content/70 text-sm'>
+              Calibrate both load-cell channels and verify combined drip-tray weight.
+            </span>
+            <a href='/scale-calibration' className='btn btn-primary btn-sm'>
+              Open Calibration
+            </a>
+          </div>
+        </Section>
+      )}
     </div>
   );
 }

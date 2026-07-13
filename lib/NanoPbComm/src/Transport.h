@@ -29,6 +29,11 @@ class Transport {
     // Whether the link is currently usable.
     virtual bool isConnected() const = 0;
 
+    // Optional transport lifecycle capabilities. UART has no OTA operation,
+    // while disconnecting it resets the logical link until another valid frame.
+    virtual bool isUpdating() const { return false; }
+    virtual void disconnect() {}
+
     void onData(DataCallback cb) { _dataCb = std::move(cb); }
     void onConnectionChange(ConnectionCallback cb) { _connCb = std::move(cb); }
 

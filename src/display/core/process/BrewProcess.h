@@ -2,6 +2,8 @@
 #define BREWPROCESS_H
 
 #include <algorithm>
+#include <cmath>
+#include <display/core/LiveBrewTargetUpdate.h>
 #include <display/core/constants.h>
 #include <display/core/predictive.h>
 #include <display/core/process/Process.h>
@@ -202,6 +204,51 @@ class BrewProcess : public Process {
 
     bool isActive() override { return processPhase == ProcessPhase::RUNNING; }
 
+    void applyLiveTargetUpdate(const LiveBrewTargetUpdate &update) {
+        if (processPhase == ProcessPhase::FINISHED) {
+            return;
+        }
+
+        if (update.stopRequested) {
+            processPhase = ProcessPhase::FINISHED;
+            finished = millis();
+            return;
+        }
+
+        if (update.hasValvePosition) {
+            currentPhase.valve = update.valvePosition >= 0.5f ? 1 : 0;
+        }
+        if (update.hasTemperatureTarget) {
+            currentPhase.temperature = update.temperatureTargetC;
+        }
+
+        if (update.hasPressureTarget) {
+            currentPhase.pumpIsSimple = false;
+            currentPhase.pumpAdvanced.target = PumpTarget::PUMP_TARGET_PRESSURE;
+            currentPhase.pumpAdvanced.pressure = update.pressureTargetBar;
+            currentPhase.pumpAdvanced.flow = 0.0f;
+            phaseStartPressure = currentPressure;
+            phaseStartFlow = currentFlow;
+            computeEffectiveTargetsForCurrentPhase();
+        } else if (update.hasFlowTarget) {
+            currentPhase.pumpIsSimple = false;
+            currentPhase.pumpAdvanced.target = PumpTarget::PUMP_TARGET_FLOW;
+            currentPhase.pumpAdvanced.pressure = 0.0f;
+            currentPhase.pumpAdvanced.flow = update.flowTargetMlS;
+            phaseStartPressure = currentPressure;
+            phaseStartFlow = currentFlow;
+            computeEffectiveTargetsForCurrentPhase();
+        } else if (update.hasPumpDuty) {
+            currentPhase.pumpIsSimple = true;
+            currentPhase.pumpSimple = static_cast<int>(std::clamp(std::round(update.pumpDuty * 100.0f), 0.0f, 100.0f));
+            computeEffectiveTargetsForCurrentPhase();
+        }
+
+        if (update.hasYieldStopTarget) {
+            setVolumetricStopTarget(update.yieldStopTargetG);
+        }
+    }
+
     bool isComplete() override {
         if (target == ProcessTarget::TIME) {
             return !isActive();
@@ -217,6 +264,21 @@ class BrewProcess : public Process {
 
     float effectivePressure = 0.0f;
     float effectiveFlow = 0.0f;
+
+    void setVolumetricStopTarget(float targetG) {
+        for (auto &target : currentPhase.targets) {
+            if (target.type == TargetType::TARGET_TYPE_VOLUMETRIC) {
+                target.operator_ = TargetOperator::GTE;
+                target.value = targetG;
+                return;
+            }
+        }
+        currentPhase.targets.push_back(Target{
+            .type = TargetType::TARGET_TYPE_VOLUMETRIC,
+            .operator_ = TargetOperator::GTE,
+            .value = targetG,
+        });
+    }
 
     static float easeLinear(float t) { return t; }
     static float easeIn(float t) { return t * t; }

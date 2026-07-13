@@ -1,3 +1,4 @@
+#if !defined(ARDUINO_ARCH_STM32)
 #include "BleServerTransport.h"
 
 void BleServerTransport::init(const String &deviceName) {
@@ -89,3 +90,4 @@ void BleServerTransport::onWrite(NimBLECharacteristic *characteristic) {
 void BleServerTransport::onSubscribe(NimBLECharacteristic *pCharacteristic, ble_gap_conn_desc *desc, uint16_t subValue) {
     emitConnection(true);
 }
+#endif

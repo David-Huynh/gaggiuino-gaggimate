@@ -3,7 +3,11 @@
 
 #include "Endpoint.h"
 #include "GaggiMateComm.h"
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+#include "uart/UartTransport.h"
+#else
 #include "ble/BleServerTransport.h"
+#endif
 #include <Arduino.h>
 #include <functional>
 
@@ -26,15 +30,33 @@ class GaggiMateServer {
     using PressureScaleCallback = std::function<void(float scale)>;
     using TareCallback = std::function<void()>;
     using LedCallback = std::function<void(uint8_t channel, uint8_t brightness)>;
+    using ScaleTareCallback = std::function<void()>;
+    using ScaleCalibrationCallback = std::function<void(float calibration1, float calibration2, long offset1, long offset2)>;
+    using ScaleCalibrationStartCallback = std::function<void(uint8_t channel, float referenceWeight)>;
 
     GaggiMateServer();
 
     void init(const String &deviceName, const String &hardware, const String &version,
               const gm::DeviceCapabilities &capabilities);
+    void loop();
     bool isConnected() const { return _endpoint.isConnected(); }
     bool isUpdating() const { return _transport.isUpdating(); }
 
     void setSystemInfo(const String &hardware, const String &version, const gm::DeviceCapabilities &capabilities);
+    void setControllerDiagnostics(const ControllerDiagnostics &diagnostics) {
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+        _controllerDiagnostics = diagnostics;
+#else
+        (void)diagnostics;
+#endif
+    }
+    UartDiagnostics getDiagnostics() const {
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+        return _transport.getDiagnostics();
+#else
+        return {};
+#endif
+    }
 
     // Build a payload without sending (compose your own batch, then send()).
     // sendSensorData reports boiler 0; the wire format supports several boilers.
@@ -45,6 +67,10 @@ class GaggiMateServer {
     gm::Payload buildVolumetricMeasurement(float volume);
     gm::Payload buildTofMeasurement(uint32_t distance);
     gm::Payload buildError(int code);
+    gm::Payload buildWeightMeasurement(float weight);
+    gm::Payload buildScaleSample(const ScaleSample &sample);
+    gm::Payload buildScaleOffsets(long offset1, long offset2);
+    gm::Payload buildScaleCalibrationResult(uint8_t channel, float calibration);
 
     // Responses (controller -> display)
     void sendSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance,
@@ -54,6 +80,10 @@ class GaggiMateServer {
     void sendVolumetricMeasurement(float volume);
     void sendTofMeasurement(uint32_t distance);
     void sendError(int code);
+    void sendWeightMeasurement(float weight);
+    void sendScaleSample(const ScaleSample &sample);
+    void sendScaleOffsets(long offset1, long offset2);
+    void sendScaleCalibrationResult(uint8_t channel, float calibration);
 
     // Drop the current BLE link. The ping watchdog calls this so the display
     // sees a real disconnect instead of having to interpret an in-band error.
@@ -78,11 +108,24 @@ class GaggiMateServer {
     void onPressureScale(PressureScaleCallback cb) { _pressureScaleCb = std::move(cb); }
     void onTare(TareCallback cb) { _tareCb = std::move(cb); }
     void onLedControl(LedCallback cb) { _ledCb = std::move(cb); }
+    void onScaleTare(ScaleTareCallback cb) { _scaleTareCb = std::move(cb); }
+    void onScaleCalibration(ScaleCalibrationCallback cb) { _scaleCalibrationCb = std::move(cb); }
+    void onScaleCalibrationStart(ScaleCalibrationStartCallback cb) { _scaleCalibrationStartCb = std::move(cb); }
 
   private:
+#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+    UartTransport _transport;
+#else
     BleServerTransport _transport;
+#endif
     Endpoint _endpoint;
     gm::SystemInfo _systemInfo = gaggimate_SystemInfo_init_zero;
+#if defined(GAGGIMATE_UART_DIAGNOSTICS)
+    ControllerDiagnostics _controllerDiagnostics{};
+#endif
+    bool _systemInfoAcknowledged = false;
+    unsigned long _lastSystemInfoPushMs = 0;
+    static constexpr unsigned long SYSTEM_INFO_RETRY_MS = 1000;
 
     PingCallback _pingCb;
     BoilerCallback _boilerCb;
@@ -94,9 +137,13 @@ class GaggiMateServer {
     PressureScaleCallback _pressureScaleCb;
     TareCallback _tareCb;
     LedCallback _ledCb;
+    ScaleTareCallback _scaleTareCb;
+    ScaleCalibrationCallback _scaleCalibrationCb;
+    ScaleCalibrationStartCallback _scaleCalibrationStartCb;
 
     void registerHandlers();
     void pushSystemInfo();
+    void acknowledgeSystemInfo();
 
     // Drives the endpoint send pump / retransmit independently of the
     // controller's (slow, 250ms) main loop, on the NimBLE core.

@@ -1,8 +1,19 @@
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#endif
 #include "DistanceSensor.h"
-
+#include "logging.h"
+#ifdef ARDUINO_ARCH_STM32
+// On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
+#define xTaskDelayUntil vTaskDelayUntil
+DistanceSensor::DistanceSensor(TwoWire *wire, distance_callback_t callback) : i2c(wire), _callback(callback) {
+    this->tof = new VL53L0X();
+}
+#else
 DistanceSensor::DistanceSensor(SoftWire *wire, distance_callback_t callback) : i2c(wire), _callback(callback) {
     this->tof = new VL53L0X(i2c);
 }
+#endif
 
 void DistanceSensor::setup() {
     this->tof->setAddress(0x7E);
@@ -12,7 +23,7 @@ void DistanceSensor::setup() {
     } else {
         ESP_LOGI("DistanceSensor", "Initialized VL53L0X");
         this->tof->startContinuous(250);
-        xTaskCreate(loopTask, "DistanceSensor::loop", configMINIMAL_STACK_SIZE * 4, this, 1, &taskHandle);
+        xTaskCreate(loopTask, "DistanceSensor::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
     }
 }
 

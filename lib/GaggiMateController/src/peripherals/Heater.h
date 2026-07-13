@@ -1,11 +1,15 @@
 #ifndef HEATER_H
 #define HEATER_H
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 #include "Autotune/Autotune.h"
 #include "Max31855Thermocouple.h"
 #include "TemperatureSensor.h"
 #include <SimplePID/SimplePID.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 
 constexpr float MAX_AUTOTUNE_TEMP = 125.0f;
 constexpr float TUNER_OUTPUT_SPAN = 1000.0f;
@@ -27,6 +31,8 @@ class Heater {
     void setSetpoint(float setpoint);
     float getSetpoint() { return setpoint; };
     float getDutyCycle() const { return output / TUNER_OUTPUT_SPAN * 100.0f; }
+    float getOutput() const { return output; }
+    bool isRelayOn() const { return relayStatus; }
     void setTunings(float Kp, float Ki, float Kd);
     void autotune(int testTimeSec, int windowSize, int heaterWattage);
 

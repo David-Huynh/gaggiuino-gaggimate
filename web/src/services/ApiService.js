@@ -162,6 +162,10 @@ export default class ApiService {
   }
 
   _onStatus(message) {
+    // The STM32-side hardware-scale snapshot. message.scale is the structured
+    // object replacing the flat hw/hwc/(stddev/health) fields. Older firmware
+    // never shipped — clean cut on the protocol so we don't carry the flat keys.
+    const sc = message.scale || {};
     const newStatus = {
       currentTemperature: message.ct,
       targetTemperature: message.tt,
@@ -179,9 +183,26 @@ export default class ApiService {
       volumetricAvailable: message.bta || false,
       grindTargetDuration: message.gtd || 0,
       grindTargetVolume: message.gtv || 0,
+      grindVolumetricAvailable: !!message.gta,
       grindTarget: message.gt || 0,
       grindActive: message.gact || false,
       currentWeight: message.cw || 0,
+      scale: {
+        weightG: sc.w,
+        stddevG: sc.sd,
+        ch1G: sc.c1,
+        ch2G: sc.c2,
+        ch1StdG: sc.sd1,
+        ch2StdG: sc.sd2,
+        healthBits: sc.h ?? 0,
+        sampleSeq: sc.seq ?? 0,
+        present: !!sc.pr,
+      },
+      // Backwards-compat shims for any UI still reading flat fields. These
+      // mirror the new structured snapshot.
+      hardwareWeight: sc.w ?? 0,
+      hardwareScalePresent: !!sc.pr,
+      waterLevel: message.wl ?? 0,
       bluetoothConnected: message.bc || false,
       process: message.process || null,
       timestamp: new Date(),
@@ -208,6 +229,7 @@ export default class ApiService {
         dimming: message.cd,
         pressure: message.cp,
         ledControl: message.led,
+        tof: !!message.ctof,
         gearpumpAddon: !!message.gp,
       },
       history: [...machine.value.history, historyEntry],
@@ -233,13 +255,27 @@ export const machine = signal({
     brewTargetVolume: 0,
     grindTargetDuration: 0,
     grindTargetVolume: 0,
+    grindVolumetricAvailable: false,
     grindTarget: 0,
     grindActive: false,
+    waterLevel: 0,
     process: null,
+    scale: {
+      weightG: 0,
+      stddevG: 0,
+      ch1G: 0,
+      ch2G: 0,
+      ch1StdG: 0,
+      ch2StdG: 0,
+      healthBits: 0,
+      sampleSeq: 0,
+      present: false,
+    },
   },
   capabilities: {
     pressure: false,
     dimming: false,
+    tof: false,
   },
   history: [],
 });

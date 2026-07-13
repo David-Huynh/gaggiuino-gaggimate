@@ -24,6 +24,7 @@ import {
   getPhaseWeightRate,
   getSampleInstantWeightRate,
   isPositiveFiniteRate,
+  isWeightTelemetryAvailable,
 } from './weightRate';
 import {
   getBrewModeLabel,
@@ -586,7 +587,7 @@ export function analyzeExecutedPhase({
   const sysInfo = getPhaseEndSample(samples).systemInfo || {};
   const sysAnomalies = getPhaseSysAnomalies(samples, sysInfo);
   const scaleLostInThisPhase =
-    isBrewByWeight && samples.some(s => s.systemInfo?.bluetoothScaleConnected === false);
+    isBrewByWeight && samples.some(sample => !isWeightTelemetryAvailable(sample));
   const nextScaleConnectionBroken = scaleConnectionBrokenPermanently || scaleLostInThisPhase;
   const delayTracker = createPhaseDelayTracker(isLastPhase);
   const exitState = createExitState();

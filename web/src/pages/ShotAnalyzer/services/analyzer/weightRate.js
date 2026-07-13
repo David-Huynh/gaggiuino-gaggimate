@@ -74,6 +74,18 @@ export function getSampleInstantWeightRate(sample) {
   return 0;
 }
 
+export function isWeightTelemetryAvailable(sample) {
+  const systemInfo = sample?.systemInfo;
+  if (!systemInfo) return true;
+  if (typeof systemInfo.volumetricAvailable === 'boolean') {
+    return systemInfo.volumetricAvailable;
+  }
+  if (typeof systemInfo.bluetoothScaleConnected === 'boolean') {
+    return systemInfo.bluetoothScaleConnected;
+  }
+  return true;
+}
+
 export function getLastNonExtendedIndex(samples) {
   if (!Array.isArray(samples) || samples.length === 0) return -1;
   for (let i = samples.length - 1; i >= 0; i--) {

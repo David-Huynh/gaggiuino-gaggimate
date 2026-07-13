@@ -1,15 +1,32 @@
 #include "PressureController.h"
 #include "SimpleKalmanFilter/SimpleKalmanFilter.h"
+#include "logging.h"
 #include <algorithm>
-#include <math.h>
-
+#include <cmath>
 // Helper function to return the sign of a float
 inline float sign(float x) { return (x > 0.0f) - (x < 0.0f); }
+
+constexpr float MAX_REASONABLE_PUMP_FLOW_ML_S = 25.0f;
+constexpr float MIN_REASONABLE_CAL_FLOW_ML_S = 0.1f;
+
+static bool validAvailableFlow(float flow) {
+    return std::isfinite(flow) && flow >= 0.0f && flow <= MAX_REASONABLE_PUMP_FLOW_ML_S;
+}
 
 // Static utility function for first-order low-pass filtering
 void PressureController::applyLowPassFilter(float *filteredValue, float rawValue, float cutoffFreq, float dt) {
     if (filteredValue == nullptr)
         return;
+    if (!std::isfinite(rawValue)) {
+        rawValue = 0.0f;
+    }
+    if (!std::isfinite(*filteredValue)) {
+        *filteredValue = 0.0f;
+    }
+    if (!std::isfinite(cutoffFreq) || cutoffFreq <= 0.0f || !std::isfinite(dt) || dt <= 0.0f) {
+        *filteredValue = rawValue;
+        return;
+    }
 
     float alpha = dt / (1.0f / (2.0f * M_PI * cutoffFreq) + dt);
     *filteredValue = alpha * rawValue + (1.0f - alpha) * (*filteredValue);
@@ -78,9 +95,12 @@ void PressureController::update(ControlMode mode) {
 }
 
 float PressureController::pumpFlowModel(float alpha) const {
+    if (!std::isfinite(alpha)) {
+        return 0.0f;
+    }
     // Positive-displacement model: net = duty * Q_geo - slip (affine in duty).
     // With slip = 0 this reduces to the previous proportional model.
-    const float duty = alpha / 100.0f;
+    const float duty = std::clamp(alpha, 0.0f, 100.0f) / 100.0f;
     const float slip = getSlip();
     return std::max(0.0f, duty * getGeometricFlow() - slip);
 }
@@ -92,7 +112,10 @@ float PressureController::getAvailableFlow() const {
     const float Q =
         _pumpFlowCoefficients[0] * P3 + _pumpFlowCoefficients[1] * P2 + _pumpFlowCoefficients[2] * P + _pumpFlowCoefficients[3];
 
-    return Q;
+    if (!std::isfinite(Q)) {
+        return 0.0f;
+    }
+    return std::clamp(Q, 0.0f, MAX_REASONABLE_PUMP_FLOW_ML_S);
 }
 
 float PressureController::getSlip() const {
@@ -118,6 +141,11 @@ float PressureController::getPumpDutyCycleForFlowRate() const {
 }
 
 void PressureController::setPumpFlowCoeff(float oneBarFlow, float nineBarFlow) {
+    if (!std::isfinite(oneBarFlow) || !std::isfinite(nineBarFlow) || oneBarFlow < MIN_REASONABLE_CAL_FLOW_ML_S ||
+        nineBarFlow < MIN_REASONABLE_CAL_FLOW_ML_S || oneBarFlow > MAX_REASONABLE_PUMP_FLOW_ML_S ||
+        nineBarFlow > MAX_REASONABLE_PUMP_FLOW_ML_S) {
+        return;
+    }
     // Set the affine pump flow model coefficients based on flow measurement at 1 bar and 9 bar
     _pumpFlowCoefficients[0] = 0.0f;
     _pumpFlowCoefficients[1] = 0.0f;
@@ -126,6 +154,15 @@ void PressureController::setPumpFlowCoeff(float oneBarFlow, float nineBarFlow) {
 }
 
 void PressureController::setPumpFlowPolyCoeffs(float a, float b, float c, float d) {
+    const float testPressures[] = {0.0f, 1.0f, 9.0f, 15.0f};
+    for (float P : testPressures) {
+        const float P2 = P * P;
+        const float P3 = P2 * P;
+        const float Q = a * P3 + b * P2 + c * P + d;
+        if (!validAvailableFlow(Q)) {
+            return;
+        }
+    }
     _pumpFlowCoefficients[0] = a;
     _pumpFlowCoefficients[1] = b;
     _pumpFlowCoefficients[2] = c;
@@ -154,6 +191,7 @@ void PressureController::tare() {
     _puckState[2] = false;
     _puckCounter = 0;
     _pumpFlowRate = 0.0f;
+    exportPumpFlowRate = 0.0f;
     _puckConductanceDerivative = 0.0f;
     _coffeeFlowRate = 0.0f;
     _puckResistance = INFINITY;
@@ -301,6 +339,7 @@ void PressureController::reset() {
     initSetpointFilter(_filteredPressureSensor);
     _errorIntegral = 0.0f;
     _pumpFlowRate = 0.0f;
+    exportPumpFlowRate = 0.0f;
     _puckSaturationVolume = 0.0f;
     _puckState[0] = false;
     _puckState[1] = false;

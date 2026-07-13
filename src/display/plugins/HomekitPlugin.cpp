@@ -95,9 +95,9 @@ void HomekitPlugin::loop() {
     if (!actionRequired || controller == nullptr || accessory == nullptr)
         return;
     if (accessory->getState() && controller->getMode() == MODE_STANDBY) {
-        controller->deactivateStandby();
+        controller->postCommand(CtrlCmd::DEACTIVATE_STANDBY);
     } else if (!accessory->getState() && controller->getMode() != MODE_STANDBY) {
-        controller->activateStandby();
+        controller->postCommand(CtrlCmd::ACTIVATE_STANDBY);
     }
     controller->setTargetTemp(accessory->getTargetTemperature());
     actionRequired = false;

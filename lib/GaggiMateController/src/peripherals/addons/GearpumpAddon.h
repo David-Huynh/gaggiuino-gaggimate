@@ -4,6 +4,13 @@
 #include "MCP4725.h"
 #include <Arduino.h>
 #include <SoftWire.h>
+#include <logging.h>
+#ifdef ARDUINO_ARCH_STM32
+#include <STM32FreeRTOS.h>
+#else
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 
 class GearpumpAddon {
   public:
