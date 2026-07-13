@@ -137,8 +137,12 @@ void ShotHistoryPlugin::record() {
             sawShotHistoryControlTarget = true;
             hardwareScaleFinishSettleSamples = 0;
         } else if (sawShotHistoryControlTarget) {
-            Process *process = controller->getProcess();
-            const bool brewActive = process != nullptr && process->getType() == MODE_BREW && process->isActive();
+            bool brewActive = false;
+            {
+                std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
+                Process *process = controller->getProcess();
+                brewActive = process != nullptr && process->getType() == MODE_BREW && process->isActive();
+            }
             if (!brewActive) {
                 bool includeSettleSample = false;
                 if (sampleCount > 0 && hardwareScaleFinishSettleSamples < SHOT_HISTORY_FINISH_SETTLE_SAMPLES &&
