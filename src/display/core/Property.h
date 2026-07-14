@@ -84,7 +84,11 @@ template <typename T> class Property : public PropertyBase {
 
     bool isDirty() const override { return dirty; }
 
-    void load(Preferences &prefs) override { value = PreferencesCodec<T>::read(prefs, key, value); }
+    void load(Preferences &prefs) override {
+        if (prefs.isKey(key)) {
+            value = PreferencesCodec<T>::read(prefs, key, value);
+        }
+    }
 
     void store(Preferences &prefs) override {
         if (!dirty)

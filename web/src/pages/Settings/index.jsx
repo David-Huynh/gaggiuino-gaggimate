@@ -19,9 +19,12 @@ import {
 import { downloadJson } from '../../utils/download.js';
 import {
   mergeAutoTuningRuntimeStatus,
-  recordCommunityUploadConsent,
   selectAutoTuningProvider,
 } from '../../utils/autoTuningSettings.js';
+import {
+  mergeCommunityUploadRuntimeStatus,
+  recordCommunityUploadConsent,
+} from '../../utils/communityUploadSettings.js';
 import { getStoredTheme, handleThemeChange } from '../../utils/themeManager.js';
 
 import PageLayout from '../../components/PageLayout.jsx';
@@ -259,10 +262,16 @@ export function Settings() {
 
   useEffect(() => {
     if (!apiService) return undefined;
-    const listenerId = apiService.on('evt:rl:status', message => {
+    const autoTuningListener = apiService.on('evt:rl:status', message => {
       setFormData(current => mergeAutoTuningRuntimeStatus(current, message));
     });
-    return () => apiService.off('evt:rl:status', listenerId);
+    const communityUploadListener = apiService.on('evt:community-upload:status', message => {
+      setFormData(current => mergeCommunityUploadRuntimeStatus(current, message));
+    });
+    return () => {
+      apiService.off('evt:rl:status', autoTuningListener);
+      apiService.off('evt:community-upload:status', communityUploadListener);
+    };
   }, [apiService]);
 
   const onChange = key => {
@@ -276,9 +285,6 @@ export function Settings() {
             : 'off_board'
           : 'disabled';
         setFormData(current => selectAutoTuningProvider(current, providerMode));
-        if (enabled && !formData.rlCommunityUploadPrompted) {
-          setCommunityUploadPromptOpen(true);
-        }
         return;
       }
       if (key === 'rlProviderMode') {
@@ -286,8 +292,13 @@ export function Settings() {
         return;
       }
       if (key === 'rlCommunityUploadEnabled') {
+        const enabled = !formData.rlCommunityUploadEnabled;
+        if (enabled && !formData.rlCommunityUploadPrompted) {
+          setCommunityUploadPromptOpen(true);
+          return;
+        }
         setFormData(current =>
-          recordCommunityUploadConsent(current, !current.rlCommunityUploadEnabled),
+          recordCommunityUploadConsent(current, enabled),
         );
         return;
       }
@@ -551,8 +562,8 @@ export function Settings() {
               Enable anonymous community upload?
             </h3>
             <p className='text-base-content/70 mt-2 text-sm'>
-              Share anonymized shot data and, when Auto Tuning is enabled, recommendation feedback
-              to improve EspressoRL community research. You can turn this off later in Settings.
+              Share anonymized shot records for community research. Community upload works whether
+              Auto Tuning is enabled or disabled, and you can turn it off later in Settings.
             </p>
             <div className='mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2'>
               <button

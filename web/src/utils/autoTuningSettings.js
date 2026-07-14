@@ -23,12 +23,9 @@ const AUTO_TUNING_RUNTIME_FIELDS = [
   'rlOptimizerConfiguredMode',
   'rlOptimizerEffectiveMode',
   'rlOptimizerFallbackReason',
+  'rlCPBOEffectiveProfileName',
+  'rlCPBOEffectiveComparisonMode',
   'rlLocalShotCount',
-  'rlUploadQueueCount',
-  'rlCommunityUploadEffective',
-  'rlRuntimeHealthPendingUploadCount',
-  'rlRuntimeHealthFailedUploadCount',
-  'rlRuntimeHealthRejectedUploadCount',
 ];
 
 export function mergeAutoTuningRuntimeStatus(formData, status) {
@@ -52,13 +49,5 @@ export function selectAutoTuningProvider(formData, providerMode) {
     ...formData,
     rlProviderMode: providerMode,
     rlAutoTuningEnabled: enabled,
-  };
-}
-
-export function recordCommunityUploadConsent(formData, enabled) {
-  return {
-    ...formData,
-    rlCommunityUploadEnabled: enabled,
-    rlCommunityUploadPrompted: true,
   };
 }

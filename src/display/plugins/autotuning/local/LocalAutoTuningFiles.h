@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace LocalAutoTuningFiles {
 
@@ -18,6 +19,7 @@ String recordPath(const char *directory, const String &recordId);
 bool readJson(const String &path, JsonDocument &document);
 bool writeJson(const String &path, const JsonDocument &document);
 void recoverDirectory(const char *directory);
+bool listRecordPaths(const char *directory, std::vector<String> &paths);
 DirectoryStats directoryStats(const char *directory);
 std::int64_t fileTimestamp(const String &path);
 bool findOldestFile(const char *directory, String &oldestPath, std::int64_t &oldestTimestamp);

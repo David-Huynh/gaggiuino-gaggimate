@@ -224,7 +224,7 @@ bool writeShotRecord(AutoTuning::ShotRecord const &record, JsonDocument &documen
 
     output["bean_context_id"] = record.recipe.beanContextId.c_str();
     output["bean_context_name"] = record.recipe.beanContextName.c_str();
-    AutoTuning::writeTasteGoal(record.recipe.tasteGoal, output["taste_goal"]);
+    AutoTuning::writeTasteGoal(record.recipe.tasteGoal, output["taste_goal"].to<JsonObject>());
     optionalFloat(output, "dose_target_g", record.recipe.doseTargetG);
     optionalFloat(output, "target_yield_g", record.recipe.targetYieldG);
     optionalFloat(output, "target_ratio", record.recipe.targetRatio);
@@ -539,7 +539,7 @@ bool writeShotCompletion(AutoTuning::ShotCompletion const &completion, JsonDocum
     output["optimization_run_id"] = recommendation.optimizationRunId.c_str();
     output["anchor_shot_id"] = recommendation.anchorShotId.c_str();
     output["comparison_mode"] = AutoTuning::comparisonModeKey(recommendation.comparisonMode);
-    AutoTuning::writeTasteGoal(recommendation.tasteGoal, output["taste_goal"]);
+    AutoTuning::writeTasteGoal(recommendation.tasteGoal, output["taste_goal"].to<JsonObject>());
     output["grind_delta_steps_from_current"] = recommendation.grindDeltaStepsFromCurrent;
     output["next_dose_g"] = recommendation.nextDoseG;
     output["target_yield_g"] = recommendation.targetYieldG;
@@ -637,7 +637,7 @@ bool writeRecommendation(AutoTuning::Recommendation const &recommendation, JsonD
     output["grinder_context_id"] = recommendation.grinderContextId.c_str();
     optionalString(output, "profile_id", recommendation.profileId);
     optionalString(output, "raw_profile_hash", recommendation.rawProfileHash);
-    AutoTuning::writeTasteGoal(recommendation.tasteGoal, output["taste_goal"]);
+    AutoTuning::writeTasteGoal(recommendation.tasteGoal, output["taste_goal"].to<JsonObject>());
     output["created_at"] = recommendation.createdAt;
     output["updated_at"] = recommendation.updatedAt;
     optionalTimestamp(output, "expires_at", recommendation.expiresAt);

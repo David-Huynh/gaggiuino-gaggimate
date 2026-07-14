@@ -180,6 +180,8 @@ class Settings {
     String getRLGrinderContextsJson() const { return rlGrinderContextsJson.get(); }
     String getRLTasteGoalsJson() const { return rlTasteGoalsJson.get(); }
     String getRLOptimizerMode() const { return rlOptimizerMode.get(); }
+    String getRLCPBOProfileName() const { return rlCPBOProfileName.get(); }
+    String getRLCPBOComparisonMode() const { return rlCPBOComparisonMode.get(); }
     AutoTuning::OptimizerConfiguration getRLOptimizerConfiguration() const;
     AutoTuning::RecipeDomain getRLRecipeDomain() const;
 
@@ -272,6 +274,8 @@ class Settings {
     void setRLGrinderContextsJson(const String &contextsJson);
     void setRLTasteGoalsJson(const String &tasteGoalsJson);
     void setRLOptimizerMode(const String &optimizerMode);
+    void setRLCPBOProfileName(const String &profileName);
+    void setRLCPBOComparisonMode(const String &comparisonMode);
     bool setRLRecipeDomain(AutoTuning::RecipeDomain const &domain);
 
     void setCommutationGain(float commutationGain);
@@ -370,6 +374,8 @@ class Settings {
     Property<String> rlGrinderContextsJson{registry, "rl_gctxs", "[]"};
     Property<String> rlTasteGoalsJson{registry, "rl_tgoals", "[]"};
     Property<String> rlOptimizerMode{registry, "rl_opt", "cpbo"};
+    Property<String> rlCPBOProfileName{registry, "rl_cpbo_prof", "application"};
+    Property<String> rlCPBOComparisonMode{registry, "rl_cpbo_cmp", "best_incumbent"};
     Property<float> rlGrindRadiusSteps{registry, "rl_gr_rad", 10.0f};
     Property<float> rlDoseMinG{registry, "rl_dose_min", 6.0f};
     Property<float> rlDoseMaxG{registry, "rl_dose_max", 30.0f};

@@ -6,6 +6,7 @@
 #include <display/core/AutoTuningModels.h>
 #include <display/core/AutoTuningPorts.h>
 #include <display/core/EpochTime.h>
+#include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 #include <limits>
 
@@ -113,7 +114,7 @@ bool LocalAutoTuningSummaryStore::removeShot(const String &shotId) const {
         return false;
     }
     const String path = LocalAutoTuningFiles::recordPath(SHOT_DIR, shotId);
-    return LittleFS.exists(path) && LittleFS.remove(path);
+    return LittleFSUtil::existsQuietly(path) && LittleFS.remove(path);
 }
 
 bool LocalAutoTuningSummaryStore::upsertShot(JsonObjectConst raw) {

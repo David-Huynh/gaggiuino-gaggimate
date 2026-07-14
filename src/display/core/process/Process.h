@@ -25,7 +25,7 @@ class Process {
 
     // Utility cycles (e.g. a brew-head flush) are MODE_BREW mechanically but are
     // not real shots: they must be excluded from shot history, EspressoRL/autotune
-    // capture, and the rating prompt. Overridden by processes that can be utility.
+    // capture, and post-shot feedback prompts. Overridden by utility-capable processes.
     virtual bool isUtility() const { return false; }
 
     virtual void updateVolume(double volume) = 0;

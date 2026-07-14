@@ -1,4 +1,5 @@
 #include "AtomicFile.h"
+#include "LittleFSUtil.h"
 
 #include <LittleFS.h>
 
@@ -10,35 +11,37 @@ String backupPath(const String &path) { return path + ".bak"; }
 
 bool restoreBackup(const String &path) {
     const String backup = backupPath(path);
-    if (!LittleFS.exists(backup)) {
+    if (!LittleFSUtil::existsQuietly(backup)) {
         return false;
     }
-    if (LittleFS.exists(path) && !LittleFS.remove(path)) {
+    if (LittleFSUtil::existsQuietly(path) && !LittleFS.remove(path)) {
         return false;
     }
     return LittleFS.rename(backup, path);
 }
 
-void discardBackup(const String &path) { LittleFS.remove(backupPath(path)); }
+void discardBackup(const String &path) { LittleFSUtil::removeIfExists(backupPath(path)); }
 
 bool commit(const String &path) {
     const String temporary = temporaryPath(path);
     const String backup = backupPath(path);
-    if (!LittleFS.exists(temporary)) {
+    if (!LittleFSUtil::existsQuietly(temporary)) {
         return false;
     }
 
-    if (LittleFS.exists(path)) {
-        LittleFS.remove(backup);
+    if (LittleFSUtil::existsQuietly(path)) {
+        if (!LittleFSUtil::removeIfExists(backup)) {
+            return false;
+        }
         if (!LittleFS.rename(path, backup)) {
             return false;
         }
     }
     if (LittleFS.rename(temporary, path)) {
-        LittleFS.remove(backup);
+        LittleFSUtil::removeIfExists(backup);
         return true;
     }
-    if (!LittleFS.exists(path) && LittleFS.exists(backup)) {
+    if (!LittleFSUtil::existsQuietly(path) && LittleFSUtil::existsQuietly(backup)) {
         LittleFS.rename(backup, path);
     }
     return false;
@@ -46,16 +49,16 @@ bool commit(const String &path) {
 
 bool recoverPending(const String &path, bool temporaryFileValid) {
     const String temporary = temporaryPath(path);
-    if (LittleFS.exists(temporary)) {
+    if (LittleFSUtil::existsQuietly(temporary)) {
         if (temporaryFileValid) {
             if (commit(path)) {
                 return true;
             }
         } else {
-            LittleFS.remove(temporary);
+            LittleFSUtil::removeIfExists(temporary);
         }
     }
-    if (LittleFS.exists(path)) {
+    if (LittleFSUtil::existsQuietly(path)) {
         discardBackup(path);
         return true;
     }

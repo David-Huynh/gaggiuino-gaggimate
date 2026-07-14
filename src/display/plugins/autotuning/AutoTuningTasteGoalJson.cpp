@@ -117,12 +117,11 @@ bool parseTasteGoal(JsonVariantConst source, TasteGoal &goal, String &error) {
     return true;
 }
 
-void writeTasteGoal(TasteGoal const &goal, JsonVariant destination) {
+void writeTasteGoal(TasteGoal const &goal, JsonObject destination) {
     destination.clear();
-    JsonObject output = destination.to<JsonObject>();
-    output["schema_version"] = TASTE_GOAL_SCHEMA_VERSION;
-    output["mode"] = goal.mode == TasteGoalMode::Custom ? "custom" : "balanced";
-    JsonObject targets = output["targets"].to<JsonObject>();
+    destination["schema_version"] = TASTE_GOAL_SCHEMA_VERSION;
+    destination["mode"] = goal.mode == TasteGoalMode::Custom ? "custom" : "balanced";
+    JsonObject targets = destination["targets"].to<JsonObject>();
     if (goal.mode != TasteGoalMode::Custom) {
         return;
     }
@@ -140,13 +139,13 @@ bool normalizeTasteGoal(JsonVariantConst source, JsonDocument &normalized, Strin
         return false;
     }
     normalized.clear();
-    writeTasteGoal(goal, normalized.to<JsonVariant>());
+    writeTasteGoal(goal, normalized.to<JsonObject>());
     return true;
 }
 
 void setBalancedTasteGoal(JsonDocument &goal) {
     goal.clear();
-    writeTasteGoal(TasteGoal::balanced(), goal.to<JsonVariant>());
+    writeTasteGoal(TasteGoal::balanced(), goal.to<JsonObject>());
 }
 
 bool activeTasteGoal(const Settings &settings, TasteGoal &goal, String *error) {
@@ -185,7 +184,7 @@ bool activeTasteGoal(const Settings &settings, JsonDocument &goal, String *error
     TasteGoal typedGoal;
     const bool valid = activeTasteGoal(settings, typedGoal, error);
     goal.clear();
-    writeTasteGoal(typedGoal, goal.to<JsonVariant>());
+    writeTasteGoal(typedGoal, goal.to<JsonObject>());
     return valid;
 }
 
@@ -260,7 +259,7 @@ bool setTypedTasteGoalForContext(Settings &settings, const String &beanContextId
         JsonObject entry = entries.add<JsonObject>();
         entry["b"] = beanContextId;
         entry["g"] = grinderContextId;
-        writeTasteGoal(goal, entry["v"]);
+        writeTasteGoal(goal, entry["v"].to<JsonObject>());
     }
 
     String encoded;

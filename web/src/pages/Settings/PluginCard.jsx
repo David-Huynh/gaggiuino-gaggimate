@@ -4,7 +4,10 @@ import homekitImage from '../../assets/homekit.png';
 import { faCalendarDays } from '@fortawesome/free-solid-svg-icons/faCalendarDays';
 import { computed } from '@preact/signals';
 import { machine } from '../../services/ApiService.js';
-import { communityUploadPipelineText } from '../../utils/autoTuningStatus.js';
+import {
+  communityUploadPipelineText,
+  communityUploadQueueText,
+} from '../../utils/communityUploadStatus.js';
 
 const gearpumpAddon = computed(() => machine.value.capabilities.gearpumpAddon);
 const AUTO_TUNING_PROVIDER_OPTIONS = [
@@ -79,48 +82,65 @@ function StatusRow({ label, value }) {
 
 function CommunityUploadSettings({ formData, onChange }) {
   return (
-    <div className='border-base-300 space-y-3 border-t pt-4'>
-      <div className='flex items-center justify-between gap-4'>
-        <div>
-          <span className='block text-base font-medium'>Anonymous Community Upload</span>
-          <span className='text-sm opacity-70'>
-            Share anonymized shot data for community research.
-          </span>
-        </div>
-        <input
-          id='rlCommunityUploadEnabled'
-          name='rlCommunityUploadEnabled'
-          value='rlCommunityUploadEnabled'
-          type='checkbox'
-          className='toggle toggle-primary'
-          checked={!!formData.rlCommunityUploadEnabled}
-          onChange={onChange('rlCommunityUploadEnabled')}
-          aria-label='Enable anonymous community upload'
-        />
-      </div>
-      <StatusRow label='Upload pipeline' value={communityUploadPipelineText(formData)} />
-      {formData.rlCommunityUploadEnabled && (
-        <div className='border-base-300 space-y-3 rounded-md border p-3'>
-          <div className='form-control'>
-            <label htmlFor='rlUploadBaseUrl' className='mb-2 block text-sm font-medium'>
-              Supabase base URL
-            </label>
-            <input
-              id='rlUploadBaseUrl'
-              name='rlUploadBaseUrl'
-              type='url'
-              className='input input-bordered w-full'
-              value={formData.rlUploadBaseUrl || ''}
-              onChange={onChange('rlUploadBaseUrl')}
-              placeholder='https://project-ref.supabase.co'
-            />
+    <div className='bg-base-200 rounded-lg p-4'>
+      <div className='space-y-4'>
+        <div className='flex items-start justify-between gap-4'>
+          <div className='min-w-0'>
+            <span className='block text-xl font-medium'>Anonymous Community Upload</span>
+            <span className='text-sm opacity-70'>
+              Share anonymized shot data for community research.
+            </span>
           </div>
-          <StatusRow
-            label='Device credential'
-            value={formData.rlUploadCredentialConfigured ? 'Registered' : 'Pending'}
+          <input
+            id='rlCommunityUploadEnabled'
+            name='rlCommunityUploadEnabled'
+            value='rlCommunityUploadEnabled'
+            type='checkbox'
+            className='toggle toggle-primary shrink-0'
+            checked={!!formData.rlCommunityUploadEnabled}
+            onChange={onChange('rlCommunityUploadEnabled')}
+            aria-label='Enable anonymous community upload'
           />
         </div>
-      )}
+
+        <div className='border-base-300 space-y-3 border-t pt-4'>
+          <StatusRow label='Upload pipeline' value={communityUploadPipelineText(formData)} />
+          {formData.rlCommunityUploadEnabled && (
+            <>
+              {formData.communityUploadSummary && (
+                <p className='text-base-content/70 text-sm'>{formData.communityUploadSummary}</p>
+              )}
+              <StatusRow label='Queue' value={communityUploadQueueText(formData)} />
+              <StatusRow
+                label='Storage'
+                value={
+                  formData.communityUploadStorageAvailable
+                    ? formData.communityUploadStorageBackend || 'Device'
+                    : 'Unavailable'
+                }
+              />
+              <div className='form-control'>
+                <label htmlFor='rlUploadBaseUrl' className='mb-2 block text-sm font-medium'>
+                  Supabase base URL
+                </label>
+                <input
+                  id='rlUploadBaseUrl'
+                  name='rlUploadBaseUrl'
+                  type='url'
+                  className='input input-bordered w-full'
+                  value={formData.rlUploadBaseUrl || ''}
+                  onChange={onChange('rlUploadBaseUrl')}
+                  placeholder='https://project-ref.supabase.co'
+                />
+              </div>
+              <StatusRow
+                label='Device credential'
+                value={formData.rlUploadCredentialConfigured ? 'Registered' : 'Pending'}
+              />
+            </>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -392,7 +412,7 @@ export function PluginCard({
             <div className='min-w-0'>
               <span className='block text-xl font-medium'>Auto Tuning</span>
               <span className='text-sm opacity-70'>
-                Choose where recommendations are generated and manage community sharing.
+                Choose where recipe recommendations are generated.
               </span>
             </div>
             <input
@@ -406,9 +426,6 @@ export function PluginCard({
               aria-label='Enable Auto Tuning'
             />
           </div>
-
-          <CommunityUploadSettings formData={formData} onChange={onChange} />
-
           {formData.rlAutoTuningEnabled && (
             <div className='border-base-300 space-y-3 border-t pt-4'>
               <div className='form-control'>
@@ -476,10 +493,6 @@ export function PluginCard({
                   label='Local shots'
                   value={(formData.rlLocalShotCount ?? 0).toString()}
                 />
-                <StatusRow
-                  label='Upload queue'
-                  value={(formData.rlUploadQueueCount ?? 0).toString()}
-                />
               </div>
               <a href='/autotuning' className='btn btn-outline btn-sm w-full'>
                 Open Auto Tuning
@@ -488,6 +501,8 @@ export function PluginCard({
           )}
         </div>
       </div>
+
+      <CommunityUploadSettings formData={formData} onChange={onChange} />
 
       <div className='bg-base-200 rounded-lg p-4'>
         <div className='flex items-center justify-between'>
