@@ -10,7 +10,7 @@ class Settings;
 namespace AutoTuning {
 
 bool parseTasteGoal(JsonVariantConst source, TasteGoal &goal, String &error);
-void writeTasteGoal(TasteGoal const &goal, JsonVariant destination);
+void writeTasteGoal(TasteGoal const &goal, JsonObject destination);
 bool normalizeTasteGoal(JsonVariantConst source, JsonDocument &normalized, String &error);
 void setBalancedTasteGoal(JsonDocument &goal);
 

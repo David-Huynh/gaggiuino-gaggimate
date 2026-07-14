@@ -109,6 +109,8 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     String latestStatusOptimizerConfiguredMode;
     String latestStatusOptimizerEffectiveMode;
     String latestStatusOptimizerFallbackReason;
+    String latestStatusCPBOProfileName;
+    String latestStatusCPBOComparisonMode;
     int latestStatusLocalShotCount = 0;
     int latestStatusUploadQueueCount = 0;
     int latestStatusUploadQueueRejectedCount = 0;

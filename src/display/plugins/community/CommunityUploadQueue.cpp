@@ -2,6 +2,7 @@
 
 #include "CommunityPayloadValidator.h"
 #include <display/util/AtomicFile.h>
+#include <display/util/LittleFSUtil.h>
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
@@ -17,6 +18,7 @@ constexpr const char *LEGACY_QUEUE_DIR = "/rlu";
 constexpr const char *QUEUE_DIR = "/rlu2";
 constexpr size_t MAX_QUEUE_ITEMS = 24;
 constexpr size_t MAX_QUEUE_BYTES = 384 * 1024;
+constexpr size_t MAX_QUEUE_FILE_ID_LENGTH = 54;
 
 struct QueueLock {
     SemaphoreHandle_t mutex;
@@ -46,24 +48,41 @@ static String safeIdentifier(String value, size_t maxLength = 220) {
     return output.isEmpty() ? "record" : output;
 }
 
-static String pathFromEntry(const char *directory, String name) {
-    if (name.startsWith("/")) {
-        return name;
-    }
-    return String(directory) + "/" + name;
+static String canonicalPath(const String &uploadId) {
+    return String(QUEUE_DIR) + "/" + safeIdentifier(uploadId, MAX_QUEUE_FILE_ID_LENGTH) + ".upl";
 }
 
-static String pathFromEntry(String name) { return pathFromEntry(QUEUE_DIR, name); }
-
-static String canonicalPath(const String &uploadId) { return String(QUEUE_DIR) + "/" + safeIdentifier(uploadId) + ".upl"; }
-
-static String legacyJsonPath(const String &uploadId) { return String(QUEUE_DIR) + "/" + safeIdentifier(uploadId) + ".json"; }
+static String legacyJsonPath(const String &uploadId) {
+    return String(QUEUE_DIR) + "/" + safeIdentifier(uploadId, MAX_QUEUE_FILE_ID_LENGTH) + ".json";
+}
 
 static bool isQueuePath(const String &path) { return path.endsWith(".upl") || path.endsWith(".json"); }
 
 static bool isTemporaryQueuePath(const String &path) { return path.endsWith(".upl.tmp") || path.endsWith(".json.tmp"); }
 
 static bool isBackupQueuePath(const String &path) { return path.endsWith(".upl.bak") || path.endsWith(".json.bak"); }
+
+static bool listRegularPaths(const char *directory, std::vector<String> &paths) {
+    if (!LittleFSUtil::existsQuietly(directory)) {
+        return false;
+    }
+    File root = LittleFS.open(directory);
+    if (!root || !root.isDirectory()) {
+        return false;
+    }
+    File file = root.openNextFile();
+    while (file) {
+        const String path = LittleFSUtil::pathFromEntry(directory, file.name());
+        const bool regularFile = !file.isDirectory();
+        file.close();
+        if (regularFile) {
+            paths.push_back(path);
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+    return true;
+}
 
 static const char *statusKey(CommunityUploadQueue::Status status) {
     switch (status) {
@@ -126,7 +145,7 @@ bool CommunityUploadQueue::storageAvailable() const {
 }
 
 bool CommunityUploadQueue::ensureDirectoryUnlocked() const {
-    if (LittleFS.exists(QUEUE_DIR)) {
+    if (LittleFSUtil::existsQuietly(QUEUE_DIR)) {
         return true;
     }
     return LittleFS.mkdir(QUEUE_DIR);
@@ -138,25 +157,19 @@ void CommunityUploadQueue::recover() {
         return;
     }
 
-    File root = LittleFS.open(QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
         return;
     }
     std::vector<String> temporaryPaths;
     std::vector<String> backupPaths;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(file.name());
-        const bool regularFile = !file.isDirectory();
-        file.close();
-        if (regularFile && isTemporaryQueuePath(path)) {
+    for (const String &path : paths) {
+        if (isTemporaryQueuePath(path)) {
             temporaryPaths.push_back(path);
-        } else if (regularFile && isBackupQueuePath(path)) {
+        } else if (isBackupQueuePath(path)) {
             backupPaths.push_back(path);
         }
-        file = root.openNextFile();
     }
-    root.close();
 
     for (const String &temporaryPath : temporaryPaths) {
         Item pending;
@@ -167,7 +180,7 @@ void CommunityUploadQueue::recover() {
     }
     for (const String &backup : backupPaths) {
         const String finalPath = backup.substring(0, backup.length() - 4);
-        if (LittleFS.exists(finalPath)) {
+        if (LittleFSUtil::existsQuietly(finalPath)) {
             AtomicFile::discardBackup(finalPath);
         } else {
             AtomicFile::restoreBackup(finalPath);
@@ -218,7 +231,9 @@ bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &pay
     String metadataJson;
     serializeJson(metadata, metadataJson);
     const String temporaryPath = AtomicFile::temporaryPath(item.path);
-    LittleFS.remove(temporaryPath);
+    if (!LittleFSUtil::removeIfExists(temporaryPath)) {
+        return false;
+    }
     File file = LittleFS.open(temporaryPath, FILE_WRITE);
     if (!file) {
         return false;
@@ -228,7 +243,7 @@ bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &pay
     file.flush();
     file.close();
     if (metadataBytes == 0 || payloadBytes != payloadJson.length()) {
-        LittleFS.remove(temporaryPath);
+        LittleFSUtil::removeIfExists(temporaryPath);
         return false;
     }
 
@@ -236,7 +251,7 @@ bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &pay
     String verifiedPayload;
     if (!readItemUnlocked(temporaryPath, verification, &verifiedPayload) || verifiedPayload != payloadJson ||
         verification.uploadId != item.uploadId) {
-        LittleFS.remove(temporaryPath);
+        LittleFSUtil::removeIfExists(temporaryPath);
         return false;
     }
     return AtomicFile::commit(item.path);
@@ -246,24 +261,19 @@ bool CommunityUploadQueue::removeRecordUnlocked(const String &recordType, const 
     if (!ensureDirectoryUnlocked()) {
         return false;
     }
-    File root = LittleFS.open(QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
         return false;
     }
     std::vector<String> matchingPaths;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(file.name());
-        file.close();
+    for (const String &path : paths) {
         if (isQueuePath(path) && path != exceptPath) {
             Item item;
             if (readItemUnlocked(path, item) && item.recordType == recordType && item.recordId == recordId) {
                 matchingPaths.push_back(path);
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
 
     bool removed = true;
     for (const String &path : matchingPaths) {
@@ -283,7 +293,9 @@ bool CommunityUploadQueue::enqueue(const String &uploadId, const String &recordT
 
     const String path = canonicalPath(uploadId);
     const String legacyPath = legacyJsonPath(uploadId);
-    const String existingPath = LittleFS.exists(path) ? path : (LittleFS.exists(legacyPath) ? legacyPath : String());
+    const String existingPath = LittleFSUtil::existsQuietly(path)
+                                    ? path
+                                    : (LittleFSUtil::existsQuietly(legacyPath) ? legacyPath : String());
     if (!existingPath.isEmpty()) {
         Item existing;
         if (!readItemUnlocked(existingPath, existing) || existing.uploadId != uploadId || existing.recordType != recordType ||
@@ -324,15 +336,12 @@ bool CommunityUploadQueue::patchShotCorrection(const String &shotId, bool hasGri
         return false;
     }
 
-    File root = LittleFS.open(QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
         return false;
     }
     bool patched = false;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(file.name());
-        file.close();
+    for (const String &path : paths) {
         Item item;
         String payloadJson;
         if (isQueuePath(path) && readItemUnlocked(path, item, &payloadJson) && item.recordType == "shot" &&
@@ -372,9 +381,7 @@ bool CommunityUploadQueue::patchShotCorrection(const String &shotId, bool hasGri
                 break;
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
     return patched;
 }
 
@@ -383,16 +390,13 @@ bool CommunityUploadQueue::selectReady(const String &endpoint, std::int64_t now,
     if (!lock.locked || !ensureDirectoryUnlocked()) {
         return false;
     }
-    File root = LittleFS.open(QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
         return false;
     }
 
     bool found = false;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(file.name());
-        file.close();
+    for (const String &path : paths) {
         Item candidate;
         if (isQueuePath(path) && readItemUnlocked(path, candidate) && candidate.endpoint == endpoint &&
             (candidate.status == Status::Pending || candidate.status == Status::Failed) && candidate.nextRetryAt <= now &&
@@ -400,9 +404,7 @@ bool CommunityUploadQueue::selectReady(const String &endpoint, std::int64_t now,
             item = candidate;
             found = true;
         }
-        file = root.openNextFile();
     }
-    root.close();
     return found && readItemUnlocked(item.path, item, &payloadJson);
 }
 
@@ -446,14 +448,11 @@ CommunityUploadQueue::Stats CommunityUploadQueue::stats() const {
     if (!lock.locked || !ensureDirectoryUnlocked()) {
         return result;
     }
-    File root = LittleFS.open(QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
         return result;
     }
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(file.name());
-        file.close();
+    for (const String &path : paths) {
         Item item;
         if (isQueuePath(path) && readItemUnlocked(path, item)) {
             result.bytes += item.bytes;
@@ -465,9 +464,7 @@ CommunityUploadQueue::Stats CommunityUploadQueue::stats() const {
                 ++result.pending;
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
     return result;
 }
 
@@ -477,14 +474,11 @@ bool CommunityUploadQueue::discardMismatched(const String &endpoint, bool hasCre
         return false;
     }
     bool removed = false;
-    File root = LittleFS.open(QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
         return false;
     }
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(file.name());
-        file.close();
+    for (const String &path : paths) {
         if (isQueuePath(path)) {
             Item item;
             String payloadJson;
@@ -507,9 +501,7 @@ bool CommunityUploadQueue::discardMismatched(const String &endpoint, bool hasCre
                 removed = true;
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
     return removed;
 }
 
@@ -519,22 +511,18 @@ bool CommunityUploadQueue::pruneUnlocked() {
     }
     std::vector<Item> items;
     size_t totalBytes = 0;
-    File root = LittleFS.open(QUEUE_DIR);
-    if (root && root.isDirectory()) {
-        File file = root.openNextFile();
-        while (file) {
-            const String path = pathFromEntry(file.name());
-            file.close();
-            Item item;
-            if (isQueuePath(path) && readItemUnlocked(path, item)) {
-                items.push_back(item);
-                totalBytes += item.bytes;
-            } else if (isQueuePath(path)) {
-                LittleFS.remove(path);
-            }
-            file = root.openNextFile();
+    std::vector<String> paths;
+    if (!listRegularPaths(QUEUE_DIR, paths)) {
+        return false;
+    }
+    for (const String &path : paths) {
+        Item item;
+        if (isQueuePath(path) && readItemUnlocked(path, item)) {
+            items.push_back(item);
+            totalBytes += item.bytes;
+        } else if (isQueuePath(path)) {
+            LittleFS.remove(path);
         }
-        root.close();
     }
 
     std::sort(items.begin(), items.end(), [](Item const &left, Item const &right) { return left.createdAt < right.createdAt; });
@@ -567,20 +555,9 @@ void CommunityUploadQueue::removeOneLegacyItem() {
     if (!lock.locked) {
         return;
     }
-    File root = LittleFS.open(LEGACY_QUEUE_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(LEGACY_QUEUE_DIR, paths) || paths.empty()) {
         return;
     }
-    File file = root.openNextFile();
-    while (file) {
-        const String path = pathFromEntry(LEGACY_QUEUE_DIR, file.name());
-        const bool directory = file.isDirectory();
-        file.close();
-        if (!directory) {
-            LittleFS.remove(path);
-            break;
-        }
-        file = root.openNextFile();
-    }
-    root.close();
+    LittleFS.remove(paths.front());
 }

@@ -1,6 +1,7 @@
 #include "LocalAutoTuningFiles.h"
 
 #include <display/util/AtomicFile.h>
+#include <display/util/LittleFSUtil.h>
 
 #include <LittleFS.h>
 #include <algorithm>
@@ -25,6 +26,28 @@ static String safeIdentifier(String value, size_t maxLength = 120) {
     return output.isEmpty() ? "record" : output;
 }
 
+static bool listRegularPaths(const char *directory, std::vector<String> &paths) {
+    if (!LittleFSUtil::existsQuietly(directory)) {
+        return false;
+    }
+    File root = LittleFS.open(directory);
+    if (!root || !root.isDirectory()) {
+        return false;
+    }
+    File file = root.openNextFile();
+    while (file) {
+        const String path = LittleFSUtil::pathFromEntry(directory, file.name());
+        const bool regularFile = !file.isDirectory();
+        file.close();
+        if (regularFile) {
+            paths.push_back(path);
+        }
+        file = root.openNextFile();
+    }
+    root.close();
+    return true;
+}
+
 static bool readJsonPath(const String &path, JsonDocument &document) {
     File file = LittleFS.open(path, FILE_READ);
     if (!file) {
@@ -46,7 +69,7 @@ static bool jsonEpoch(JsonVariantConst value, std::int64_t &output) {
 } // namespace
 
 bool ensureDirectory(const char *path) {
-    if (LittleFS.exists(path)) {
+    if (LittleFSUtil::existsQuietly(path)) {
         return true;
     }
     return LittleFS.mkdir(path);
@@ -58,7 +81,9 @@ String recordPath(const char *directory, const String &recordId) {
 
 bool writeJson(const String &path, const JsonDocument &document) {
     const String temporaryPath = AtomicFile::temporaryPath(path);
-    LittleFS.remove(temporaryPath);
+    if (!LittleFSUtil::removeIfExists(temporaryPath)) {
+        return false;
+    }
     File file = LittleFS.open(temporaryPath, FILE_WRITE);
     if (!file) {
         return false;
@@ -70,7 +95,7 @@ bool writeJson(const String &path, const JsonDocument &document) {
 
     JsonDocument verification(&psramAllocator);
     if (written != expected || !readJsonPath(temporaryPath, verification)) {
-        LittleFS.remove(temporaryPath);
+        LittleFSUtil::removeIfExists(temporaryPath);
         return false;
     }
     return AtomicFile::commit(path);
@@ -78,7 +103,7 @@ bool writeJson(const String &path, const JsonDocument &document) {
 
 bool readJson(const String &path, JsonDocument &document) {
     const String temporaryPath = AtomicFile::temporaryPath(path);
-    if (LittleFS.exists(temporaryPath)) {
+    if (LittleFSUtil::existsQuietly(temporaryPath)) {
         JsonDocument pending(&psramAllocator);
         AtomicFile::recoverPending(path, readJsonPath(temporaryPath, pending));
     }
@@ -86,7 +111,8 @@ bool readJson(const String &path, JsonDocument &document) {
         AtomicFile::discardBackup(path);
         return true;
     }
-    if (readJsonPath(AtomicFile::backupPath(path), document)) {
+    const String backupPath = AtomicFile::backupPath(path);
+    if (LittleFSUtil::existsQuietly(backupPath) && readJsonPath(backupPath, document)) {
         AtomicFile::restoreBackup(path);
         return true;
     }
@@ -94,25 +120,19 @@ bool readJson(const String &path, JsonDocument &document) {
 }
 
 void recoverDirectory(const char *directory) {
-    File root = LittleFS.open(directory);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(directory, paths)) {
         return;
     }
     std::vector<String> temporaryPaths;
     std::vector<String> backupPaths;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool regularFile = !file.isDirectory();
-        file.close();
-        if (regularFile && path.endsWith(".json.tmp")) {
+    for (const String &path : paths) {
+        if (path.endsWith(".json.tmp")) {
             temporaryPaths.push_back(path);
-        } else if (regularFile && path.endsWith(".json.bak")) {
+        } else if (path.endsWith(".json.bak")) {
             backupPaths.push_back(path);
         }
-        file = root.openNextFile();
     }
-    root.close();
 
     for (const String &temporaryPath : temporaryPaths) {
         JsonDocument pending(&psramAllocator);
@@ -121,7 +141,7 @@ void recoverDirectory(const char *directory) {
     }
     for (const String &backupPath : backupPaths) {
         const String finalPath = backupPath.substring(0, backupPath.length() - 4);
-        if (LittleFS.exists(finalPath)) {
+        if (LittleFSUtil::existsQuietly(finalPath)) {
             AtomicFile::discardBackup(finalPath);
         } else {
             AtomicFile::restoreBackup(finalPath);
@@ -129,22 +149,33 @@ void recoverDirectory(const char *directory) {
     }
 }
 
+bool listRecordPaths(const char *directory, std::vector<String> &paths) {
+    std::vector<String> allPaths;
+    if (!listRegularPaths(directory, allPaths)) {
+        return false;
+    }
+    for (const String &path : allPaths) {
+        if (path.endsWith(".json")) {
+            paths.push_back(path);
+        }
+    }
+    return true;
+}
+
 DirectoryStats directoryStats(const char *directory) {
     DirectoryStats result;
-    File root = LittleFS.open(directory);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRecordPaths(directory, paths)) {
         return result;
     }
-    File file = root.openNextFile();
-    while (file) {
-        if (!file.isDirectory() && String(file.name()).endsWith(".json")) {
+    for (const String &path : paths) {
+        File file = LittleFS.open(path, FILE_READ);
+        if (file) {
             ++result.count;
             result.bytes += file.size();
+            file.close();
         }
-        file.close();
-        file = root.openNextFile();
     }
-    root.close();
     return result;
 }
 
@@ -163,28 +194,19 @@ std::int64_t fileTimestamp(const String &path) {
 }
 
 bool findOldestFile(const char *directory, String &oldestPath, std::int64_t &oldestTimestamp) {
-    File root = LittleFS.open(directory);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRecordPaths(directory, paths)) {
         return false;
     }
     bool found = false;
-    File file = root.openNextFile();
-    while (file) {
-        if (!file.isDirectory() && String(file.name()).endsWith(".json")) {
-            const String path = file.name();
-            file.close();
-            const std::int64_t timestamp = fileTimestamp(path);
-            if (!found || timestamp < oldestTimestamp) {
-                found = true;
-                oldestPath = path;
-                oldestTimestamp = timestamp;
-            }
-        } else {
-            file.close();
+    for (const String &path : paths) {
+        const std::int64_t timestamp = fileTimestamp(path);
+        if (!found || timestamp < oldestTimestamp) {
+            found = true;
+            oldestPath = path;
+            oldestTimestamp = timestamp;
         }
-        file = root.openNextFile();
     }
-    root.close();
     return found;
 }
 
@@ -195,22 +217,14 @@ bool removeOldestFile(const char *directory) {
 }
 
 bool clearDirectory(const char *directory) {
-    File root = LittleFS.open(directory);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!listRegularPaths(directory, paths)) {
         return true;
     }
     bool success = true;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool directoryEntry = file.isDirectory();
-        file.close();
-        if (!directoryEntry) {
-            success = LittleFS.remove(path) && success;
-        }
-        file = root.openNextFile();
+    for (const String &path : paths) {
+        success = LittleFS.remove(path) && success;
     }
-    root.close();
     return success;
 }
 

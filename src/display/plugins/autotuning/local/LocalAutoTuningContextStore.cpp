@@ -7,6 +7,7 @@
 #include <display/core/AutoTuning.h>
 #include <display/core/EpochTime.h>
 #include <display/core/Settings.h>
+#include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 
 namespace {
@@ -48,6 +49,8 @@ bool LocalAutoTuningContextStore::save(Settings const &settings) const {
     const String providerMode = AutoTuning::normalizeProviderMode(settings.getRLAutoTuningProviderMode().c_str()).c_str();
     root["provider_mode"] = providerMode;
     root["optimizer_mode"] = settings.getRLOptimizerMode();
+    root["cpbo_profile_name"] = settings.getRLCPBOProfileName();
+    root["cpbo_comparison_mode"] = settings.getRLCPBOComparisonMode();
     root["bean_context_id"] = settings.getRLBeanContextId();
     root["bean_context_name"] = settings.getRLBeanContextName();
     root["grinder_context_id"] = settings.getRLGrinderContextId();
@@ -60,7 +63,7 @@ bool LocalAutoTuningContextStore::save(Settings const &settings) const {
 }
 
 bool LocalAutoTuningContextStore::clear() const {
-    if (!LittleFS.exists(CONTEXT_PATH)) {
+    if (!LittleFSUtil::existsQuietly(CONTEXT_PATH)) {
         return true;
     }
     return LittleFS.remove(CONTEXT_PATH);

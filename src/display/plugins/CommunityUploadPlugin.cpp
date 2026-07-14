@@ -395,7 +395,7 @@ bool CommunityUploadPlugin::buildRecommendationPayload(AutoTuning::Recommendatio
     out["install_id"] = configuration.installId;
     out["machine_id"] = recommendation.machineId.empty() ? machineId() : recommendation.machineId.c_str();
     out["source_shot_id"] = recommendation.sourceShotId.c_str();
-    AutoTuning::writeTasteGoal(recommendation.tasteGoal, out["taste_goal"]);
+    AutoTuning::writeTasteGoal(recommendation.tasteGoal, out["taste_goal"].to<JsonObject>());
 
     const auto putString = [&out](const char *key, std::string const &value) {
         if (!value.empty()) {
@@ -489,7 +489,7 @@ bool CommunityUploadPlugin::buildComparisonPayload(AutoTuning::PreferenceFeedbac
     out["install_id"] = configuration.installId;
     out["machine_id"] = machineId();
     out["machine_adapter"] = "gaggimate";
-    AutoTuning::writeTasteGoal(preference.tasteGoal, out["taste_goal"]);
+    AutoTuning::writeTasteGoal(preference.tasteGoal, out["taste_goal"].to<JsonObject>());
     if (!preference.recommendationId.empty()) {
         out["recommendation_id"] = preference.recommendationId.c_str();
     }
@@ -544,7 +544,7 @@ bool CommunityUploadPlugin::buildShotPayload(AutoTuning::ShotRecord const &shot,
     out["target_ratio"] = out["target_yield_g"].as<float>() / out["dose_target_g"].as<float>();
     out["profile_temperature_c"] = roundf(profileTemp * 10.0f) / 10.0f;
     out["final_phase_temperature_c"] = roundf(finalTemp * 10.0f) / 10.0f;
-    AutoTuning::writeTasteGoal(shot.recipe.tasteGoal, out["taste_goal"]);
+    AutoTuning::writeTasteGoal(shot.recipe.tasteGoal, out["taste_goal"].to<JsonObject>());
 
     const auto putString = [&out](const char *key, std::string const &value) {
         if (!value.empty()) {
@@ -918,31 +918,18 @@ void CommunityUploadPlugin::publishStatus() {
 
     String status = "off";
     String summary = "Community upload disabled";
-    String reasons = "[]";
-    String diagnostics =
-        "[{\"key\":\"community_upload\",\"label\":\"Community upload\",\"state\":\"off\",\"detail\":\"Disabled\"}]";
     if (requested && !hasBase) {
         status = "attention";
         summary = "Supabase upload base URL not configured";
-        reasons = "[\"Supabase upload base URL is missing.\"]";
-        diagnostics = "[{\"key\":\"community_upload\",\"label\":\"Community upload\",\"state\":\"attention\","
-                      "\"detail\":\"Set the Supabase base URL in Settings\"}]";
     } else if (requested && !configured) {
         status = "attention";
         summary = "Device upload registration pending";
-        reasons = "[\"Device upload credential has not been registered yet.\"]";
-        diagnostics = "[{\"key\":\"community_upload\",\"label\":\"Community upload\",\"state\":\"waiting\","
-                      "\"detail\":\"Waiting for signed device registration\"}]";
     } else if (effective && stats.failed > 0) {
         status = "attention";
         summary = "Upload queue retrying";
-        diagnostics = "[{\"key\":\"community_upload\",\"label\":\"Community upload\",\"state\":\"attention\","
-                      "\"detail\":\"Some uploads are waiting for retry\"}]";
     } else if (effective) {
         status = "ready";
         summary = "Device upload ready";
-        diagnostics = "[{\"key\":\"community_upload\",\"label\":\"Community upload\",\"state\":\"ready\","
-                      "\"detail\":\"Device-owned signed upload is active\"}]";
     }
 
     Event event;
@@ -958,8 +945,6 @@ void CommunityUploadPlugin::publishStatus() {
     event.setString("status", status);
     const String error = getLastError();
     event.setString("summary", error.isEmpty() ? summary : summary + " (" + error + ")");
-    event.setString("waiting_reasons_json", reasons);
-    event.setString("diagnostic_steps_json", diagnostics);
     pluginManager->trigger(event);
     lastStatusMs = millis();
 }

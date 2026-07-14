@@ -340,6 +340,13 @@ static void addRLRecipeDomain(JsonObject target, Settings const &settings) {
     value["targetOutputMaxG"] = domain.targetOutputMaxG;
 }
 
+static bool sameRLRecipeDomain(AutoTuning::RecipeDomain const &left, AutoTuning::RecipeDomain const &right) {
+    return fabsf(left.grindRadiusSteps - right.grindRadiusSteps) < 0.0001f &&
+           fabsf(left.doseMinG - right.doseMinG) < 0.0001f && fabsf(left.doseMaxG - right.doseMaxG) < 0.0001f &&
+           fabsf(left.targetOutputMinG - right.targetOutputMinG) < 0.0001f &&
+           fabsf(left.targetOutputMaxG - right.targetOutputMaxG) < 0.0001f;
+}
+
 static float boundedRLFloat(JsonVariant value, float fallback, float minValue, float maxValue) {
     if (!isRLNumber(value)) {
         return fallback;
@@ -577,7 +584,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["comparison_anchor_shot_id"] = recommendation->comparisonAnchorShotId.c_str();
         doc["comparison_mode"] = AutoTuning::comparisonModeKey(recommendation->comparisonMode);
         doc["preference_feedback_required"] = recommendation->preferenceFeedbackRequired;
-        AutoTuning::writeTasteGoal(recommendation->tasteGoal, doc["taste_goal"]);
+        AutoTuning::writeTasteGoal(recommendation->tasteGoal, doc["taste_goal"].to<JsonObject>());
         doc["taste_goal_summary"] = AutoTuning::tasteGoalSummary(recommendation->tasteGoal);
         doc["status"] = status;
         doc["mode"] = rlRecommendationMode;
@@ -719,15 +726,20 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlLastShotTimeS = event.getInt("last_shot_time_s_x10") / 10.0f;
         rlLastShotBeverageOutG = event.getInt("last_shot_beverage_out_g_x10") / 10.0f;
         rlLastShotTargetYieldG = event.getInt("last_shot_target_yield_g_x10") / 10.0f;
-        rlLastRecommendationId = event.getString("last_recommendation_id");
         rlLastRecommendationAt = event.getInt64("last_recommendation_at");
-        rlRecommendationApplyStatus = event.getString("recommendation_apply_status");
+        const String statusRecommendationId = event.getString("last_recommendation_id");
+        rlRecommendationApplyStatus =
+            !rlLastRecommendationId.isEmpty() && statusRecommendationId == rlLastRecommendationId
+                ? event.getString("recommendation_apply_status")
+                : String("");
         rlMode = event.getString("mode");
         rlOptimizerProfileId = event.getString("optimizer_profile_id");
         rlOptimizerProfileLabel = event.getString("optimizer_profile_label");
         rlOptimizerConfiguredMode = event.getString("optimizer_configured_mode");
         rlOptimizerEffectiveMode = event.getString("optimizer_effective_mode");
         rlOptimizerFallbackReason = event.getString("optimizer_fallback_reason");
+        rlCPBOEffectiveProfileName = event.getString("cpbo_profile_name");
+        rlCPBOEffectiveComparisonMode = event.getString("cpbo_comparison_mode");
         rlLocalShotCount = event.getInt("local_shot_count");
         rlRuntimeHealthStatus = event.getString("runtime_health_status");
         rlRuntimeHealthSummary = event.getString("runtime_health_summary");
@@ -799,22 +811,16 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlOptimizerProfileId"] = rlOptimizerProfileId;
         doc["rlOptimizerProfileLabel"] = rlOptimizerProfileLabel;
         doc["rlOptimizerMode"] = settings.getRLOptimizerMode();
+        doc["rlCPBOProfileName"] = settings.getRLCPBOProfileName();
+        doc["rlCPBOComparisonMode"] = settings.getRLCPBOComparisonMode();
+        doc["rlCPBOEffectiveProfileName"] = rlCPBOEffectiveProfileName;
+        doc["rlCPBOEffectiveComparisonMode"] = rlCPBOEffectiveComparisonMode;
         doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
         addRLRecipeDomain(doc.as<JsonObject>(), settings);
         doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
         doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
         doc["rlOptimizerFallbackReason"] = rlOptimizerFallbackReason;
         doc["rlLocalShotCount"] = rlLocalShotCount;
-        doc["rlUploadQueueCount"] = rlUploadQueueCount;
-        doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
-        doc["rlUploadQueueLastRejectedId"] = rlUploadQueueLastRejectedId;
-        doc["rlUploadQueueLastRejectedRecordId"] = rlUploadQueueLastRejectedRecordId;
-        doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
-        doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();
-        doc["rlCommunityUploadEffective"] = rlCommunityUploadEnabled;
-        doc["rlCommunityUploadPrompted"] = settings.isRLCommunityUploadPrompted();
-        doc["rlUploadBaseUrl"] = settings.getRLUploadBaseUrl();
-        doc["rlUploadCredentialConfigured"] = settings.hasRLUploadCredentials();
         doc["rlRuntimeHealthStatus"] = rlRuntimeHealthStatus;
         doc["rlRuntimeHealthSummary"] = rlRuntimeHealthSummary;
         copyRLStringArray(doc, "rlRuntimeHealthWarnings", rlRuntimeHealthWarningsJson);
@@ -822,11 +828,6 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         copyRLDiagnosticSteps(doc, rlAutoTuningDiagnosticStepsJson);
         doc["rlRuntimeHealthStorageBackend"] = rlRuntimeHealthStorageBackend;
         doc["rlRuntimeHealthStorageAvailable"] = rlRuntimeHealthStorageAvailable;
-        doc["rlRuntimeHealthUploadConfigured"] = rlRuntimeHealthUploadConfigured;
-        doc["rlRuntimeHealthCommunityUploadRequested"] = rlRuntimeHealthCommunityUploadRequested;
-        doc["rlRuntimeHealthPendingUploadCount"] = rlRuntimeHealthPendingUploadCount;
-        doc["rlRuntimeHealthFailedUploadCount"] = rlRuntimeHealthFailedUploadCount;
-        doc["rlRuntimeHealthRejectedUploadCount"] = rlRuntimeHealthRejectedUploadCount;
         doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
         doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
         doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;
@@ -836,46 +837,34 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
 
     pluginManager->on("rl:community-upload:status", [this](Event const &event) {
-        rlCommunityUploadEnabled = event.getInt("effective") > 0;
-        rlUploadQueueCount = event.getInt("pending_count") + event.getInt("failed_count");
-        rlUploadQueueRejectedCount = event.getInt("rejected_count");
-        rlUploadQueueLastRejectedId = "";
-        rlUploadQueueLastRejectedRecordId = "";
-        rlUploadQueueLastRejectedError = "";
-        rlRuntimeHealthStatus = event.getString("status");
-        rlRuntimeHealthSummary = event.getString("summary");
-        rlRuntimeHealthStorageBackend = event.getString("storage_backend");
-        rlRuntimeHealthStorageAvailable = event.getInt("storage_available") > 0;
-        rlRuntimeHealthWaitingReasonsJson =
-            event.getString("waiting_reasons_json").isEmpty() ? "[]" : event.getString("waiting_reasons_json");
-        rlAutoTuningDiagnosticStepsJson =
-            event.getString("diagnostic_steps_json").isEmpty() ? "[]" : event.getString("diagnostic_steps_json");
-        rlRuntimeHealthUploadConfigured = event.getInt("configured") > 0;
-        rlRuntimeHealthCommunityUploadRequested = event.getInt("requested") > 0;
-        rlRuntimeHealthPendingUploadCount = event.getInt("pending_count");
-        rlRuntimeHealthFailedUploadCount = event.getInt("failed_count");
-        rlRuntimeHealthRejectedUploadCount = event.getInt("rejected_count");
+        communityUploadRequested = event.getInt("requested") > 0;
+        communityUploadEffective = event.getInt("effective") > 0;
+        communityUploadConfigured = event.getInt("configured") > 0;
+        communityUploadStatus = event.getString("status");
+        communityUploadSummary = event.getString("summary");
+        communityUploadStorageBackend = event.getString("storage_backend");
+        communityUploadStorageAvailable = event.getInt("storage_available") > 0;
+        communityUploadPendingCount = event.getInt("pending_count");
+        communityUploadRetryCount = event.getInt("failed_count");
+        communityUploadRejectedCount = event.getInt("rejected_count");
 
         JsonDocument doc(&psramAllocator);
-        doc["tp"] = "evt:rl:status";
-        doc["rlCommunityUploadEnabled"] = controller->getSettings().isRLCommunityUploadEnabled();
-        doc["rlCommunityUploadEffective"] = rlCommunityUploadEnabled;
-        doc["rlUploadCredentialConfigured"] = controller->getSettings().hasRLUploadCredentials();
-        doc["rlUploadQueueCount"] = rlUploadQueueCount;
-        doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
-        doc["rlRuntimeHealthStatus"] = rlRuntimeHealthStatus;
-        doc["rlRuntimeHealthSummary"] = rlRuntimeHealthSummary;
-        doc["rlRuntimeHealthStorageBackend"] = rlRuntimeHealthStorageBackend;
-        doc["rlRuntimeHealthStorageAvailable"] = rlRuntimeHealthStorageAvailable;
-        doc["rlRuntimeHealthUploadConfigured"] = rlRuntimeHealthUploadConfigured;
-        doc["rlRuntimeHealthCommunityUploadRequested"] = rlRuntimeHealthCommunityUploadRequested;
-        doc["rlRuntimeHealthPendingUploadCount"] = rlRuntimeHealthPendingUploadCount;
-        doc["rlRuntimeHealthFailedUploadCount"] = rlRuntimeHealthFailedUploadCount;
-        doc["rlRuntimeHealthRejectedUploadCount"] = rlRuntimeHealthRejectedUploadCount;
-        doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
-        doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
-        doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;
-        doc["rlLocalDeliveryLastError"] = rlLocalDeliveryLastError;
+        Settings const &settings = controller->getSettings();
+        doc["tp"] = "evt:community-upload:status";
+        doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();
+        doc["rlCommunityUploadPrompted"] = settings.isRLCommunityUploadPrompted();
+        doc["rlUploadBaseUrl"] = settings.getRLUploadBaseUrl();
+        doc["rlUploadCredentialConfigured"] = settings.hasRLUploadCredentials();
+        doc["communityUploadRequested"] = communityUploadRequested;
+        doc["communityUploadEffective"] = communityUploadEffective;
+        doc["communityUploadConfigured"] = communityUploadConfigured;
+        doc["communityUploadStatus"] = communityUploadStatus;
+        doc["communityUploadSummary"] = communityUploadSummary;
+        doc["communityUploadStorageBackend"] = communityUploadStorageBackend;
+        doc["communityUploadStorageAvailable"] = communityUploadStorageAvailable;
+        doc["communityUploadPendingCount"] = communityUploadPendingCount;
+        doc["communityUploadRetryCount"] = communityUploadRetryCount;
+        doc["communityUploadRejectedCount"] = communityUploadRejectedCount;
         broadcastJson(doc);
     });
     pluginManager->on("rl:local_store:status", [this](Event const &event) {
@@ -1611,7 +1600,7 @@ void WebUIPlugin::sendPreferencePrompt(AsyncWebSocketClient *client) {
     doc["optimization_run_id"] = _pendPreferenceRunId;
     doc["anchor_shot_id"] = _pendPreferenceAnchorShotId;
     doc["comparison_mode"] = _pendPreferenceComparisonMode;
-    AutoTuning::writeTasteGoal(_pendPreferenceTasteGoal, doc["taste_goal"]);
+    AutoTuning::writeTasteGoal(_pendPreferenceTasteGoal, doc["taste_goal"].to<JsonObject>());
     doc["taste_goal_summary"] = _pendPreferenceTasteGoalSummary;
     const String payload = doc.as<String>();
     if (client) {
@@ -1664,7 +1653,8 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                            msgType.startsWith("req:rl:grinder-context:") || msgType == "req:rl:local-optimization" ||
                            msgType == "req:rl:optimization:pause" || msgType == "req:rl:optimization:resume" ||
                            msgType == "req:rl:taste-goal:set" || msgType == "req:rl:dose-target:set" ||
-                           msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:local-reset") {
+                           msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:cpbo-config:set" ||
+                           msgType == "req:rl:local-reset") {
                     handleRLRequest(client->id(), doc);
                 } else if (msgType == "req:rl:recommendation:use") {
                     if (rlParticipationEnabled(controller)) {
@@ -2008,6 +1998,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
     } else {
         bool changed = false;
         bool tasteGoalChanged = false;
+        bool optimizerConfigurationChanged = false;
         JsonDocument contextsDoc;
         JsonArray contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
         JsonDocument grinderContextsDoc;
@@ -2271,11 +2262,55 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
                     response["error"] = reason.c_str();
                 } else if (currentDose < domain.doseMinG || currentDose > domain.doseMaxG) {
                     response["error"] = F("Recipe domain must include the current dose target");
-                } else if (!settings.setRLRecipeDomain(domain)) {
-                    response["error"] = F("Unable to save recipe domain");
                 } else {
-                    settings.save(true);
-                    changed = true;
+                    const bool configurationChanged = !sameRLRecipeDomain(settings.getRLRecipeDomain(), domain);
+                    if (!settings.setRLRecipeDomain(domain)) {
+                        response["error"] = F("Unable to save recipe domain");
+                    } else if (configurationChanged) {
+                        settings.save(true);
+                        changed = true;
+                        optimizerConfigurationChanged = true;
+                    }
+                }
+            }
+        } else if (type == "req:rl:cpbo-config:set") {
+            const String profileName = request["cpbo_profile_name"].as<String>();
+            const String comparisonMode = request["cpbo_comparison_mode"].as<String>();
+            JsonVariant value = request["recipe_domain"];
+            if (profileName != "application" && profileName != "paper_fidelity") {
+                response["error"] = F("Unsupported CPBO compute profile");
+            } else if (comparisonMode != "best_incumbent" && comparisonMode != "global_previous") {
+                response["error"] = F("Unsupported CPBO comparison policy");
+            } else if (!value.is<JsonObject>() || value.as<JsonObjectConst>().size() != 5 ||
+                       !isRLNumber(value["grind_radius_steps"]) || !isRLNumber(value["dose_min_g"]) ||
+                       !isRLNumber(value["dose_max_g"]) || !isRLNumber(value["target_output_min_g"]) ||
+                       !isRLNumber(value["target_output_max_g"])) {
+                response["error"] = F("Recipe domain must contain five numeric fields");
+            } else {
+                AutoTuning::RecipeDomain domain{value["grind_radius_steps"].as<float>(), value["dose_min_g"].as<float>(),
+                                                value["dose_max_g"].as<float>(), value["target_output_min_g"].as<float>(),
+                                                value["target_output_max_g"].as<float>()};
+                std::string reason;
+                const float currentDose = settings.getTargetGrindVolume();
+                if (!AutoTuning::validateRecipeDomain(domain, reason)) {
+                    response["error"] = reason.c_str();
+                } else if (currentDose < domain.doseMinG || currentDose > domain.doseMaxG) {
+                    response["error"] = F("Recipe domain must include the current dose target");
+                } else {
+                    const bool configurationChanged = !sameRLRecipeDomain(settings.getRLRecipeDomain(), domain) ||
+                                                      settings.getRLCPBOProfileName() != profileName ||
+                                                      settings.getRLCPBOComparisonMode() != comparisonMode;
+                    if (!settings.setRLRecipeDomain(domain)) {
+                        response["error"] = F("Unable to save recipe domain");
+                    } else {
+                        settings.setRLCPBOProfileName(profileName);
+                        settings.setRLCPBOComparisonMode(comparisonMode);
+                        if (configurationChanged) {
+                            settings.save(true);
+                            changed = true;
+                            optimizerConfigurationChanged = true;
+                        }
+                    }
                 }
             }
         } else if (type == "req:rl:dose-target:set") {
@@ -2324,7 +2359,10 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
 
         if (changed) {
             pluginManager->trigger("settings:changed");
-            pluginManager->trigger("rl:settings:changed");
+            Event settingsChanged;
+            settingsChanged.id = "rl:settings:changed";
+            settingsChanged.setInt("optimizer_configuration_changed", optimizerConfigurationChanged ? 1 : 0);
+            pluginManager->trigger(settingsChanged);
             if (tasteGoalChanged) {
                 pluginManager->trigger("rl:taste-goal:changed");
             }
@@ -2353,6 +2391,8 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
         response["active_grinder_context_id"] = settings.getRLGrinderContextId();
         response["active_grinder_context_name"] = settings.getRLGrinderContextName();
         response["optimizer_mode"] = settings.getRLOptimizerMode();
+        response["cpbo_profile_name"] = settings.getRLCPBOProfileName();
+        response["cpbo_comparison_mode"] = settings.getRLCPBOComparisonMode();
         response["dose_target_g"] = settings.getTargetGrindVolume();
         JsonObject responseDomain = response["recipe_domain"].to<JsonObject>();
         AutoTuning::RecipeDomain const recipeDomain = settings.getRLRecipeDomain();
@@ -2645,22 +2685,30 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlOptimizerProfileId"] = rlOptimizerProfileId;
     doc["rlOptimizerProfileLabel"] = rlOptimizerProfileLabel;
     doc["rlOptimizerMode"] = settings.getRLOptimizerMode();
+    doc["rlCPBOProfileName"] = settings.getRLCPBOProfileName();
+    doc["rlCPBOComparisonMode"] = settings.getRLCPBOComparisonMode();
+    doc["rlCPBOEffectiveProfileName"] = rlCPBOEffectiveProfileName;
+    doc["rlCPBOEffectiveComparisonMode"] = rlCPBOEffectiveComparisonMode;
     doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
     addRLRecipeDomain(doc.as<JsonObject>(), settings);
     doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
     doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
     doc["rlOptimizerFallbackReason"] = rlOptimizerFallbackReason;
     doc["rlLocalShotCount"] = rlLocalShotCount;
-    doc["rlUploadQueueCount"] = rlUploadQueueCount;
-    doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
-    doc["rlUploadQueueLastRejectedId"] = rlUploadQueueLastRejectedId;
-    doc["rlUploadQueueLastRejectedRecordId"] = rlUploadQueueLastRejectedRecordId;
-    doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
     doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();
-    doc["rlCommunityUploadEffective"] = rlCommunityUploadEnabled;
     doc["rlCommunityUploadPrompted"] = settings.isRLCommunityUploadPrompted();
     doc["rlUploadBaseUrl"] = settings.getRLUploadBaseUrl();
     doc["rlUploadCredentialConfigured"] = settings.hasRLUploadCredentials();
+    doc["communityUploadRequested"] = settings.isRLCommunityUploadEnabled();
+    doc["communityUploadEffective"] = communityUploadEffective;
+    doc["communityUploadConfigured"] = communityUploadConfigured;
+    doc["communityUploadStatus"] = communityUploadStatus;
+    doc["communityUploadSummary"] = communityUploadSummary;
+    doc["communityUploadStorageBackend"] = communityUploadStorageBackend;
+    doc["communityUploadStorageAvailable"] = communityUploadStorageAvailable;
+    doc["communityUploadPendingCount"] = communityUploadPendingCount;
+    doc["communityUploadRetryCount"] = communityUploadRetryCount;
+    doc["communityUploadRejectedCount"] = communityUploadRejectedCount;
     doc["rlRuntimeHealthStatus"] = rlOffBoardProvider ? rlRuntimeHealthStatus : (rlEnabled ? "attention" : "waiting");
     doc["rlRuntimeHealthSummary"] =
         rlOffBoardProvider && !rlRuntimeHealthSummary.isEmpty() ? rlRuntimeHealthSummary : router.providerSummary();
@@ -2669,11 +2717,6 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     copyRLDiagnosticSteps(doc, rlAutoTuningDiagnosticStepsJson);
     doc["rlRuntimeHealthStorageBackend"] = rlRuntimeHealthStorageBackend;
     doc["rlRuntimeHealthStorageAvailable"] = rlRuntimeHealthStorageAvailable;
-    doc["rlRuntimeHealthUploadConfigured"] = rlRuntimeHealthUploadConfigured;
-    doc["rlRuntimeHealthCommunityUploadRequested"] = rlRuntimeHealthCommunityUploadRequested;
-    doc["rlRuntimeHealthPendingUploadCount"] = rlRuntimeHealthPendingUploadCount;
-    doc["rlRuntimeHealthFailedUploadCount"] = rlRuntimeHealthFailedUploadCount;
-    doc["rlRuntimeHealthRejectedUploadCount"] = rlRuntimeHealthRejectedUploadCount;
     doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
     doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
     doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;

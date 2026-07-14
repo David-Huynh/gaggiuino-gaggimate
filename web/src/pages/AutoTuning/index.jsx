@@ -9,7 +9,6 @@ import { faTrashCan } from '@fortawesome/free-solid-svg-icons/faTrashCan';
 import { Spinner } from '../../components/Spinner.jsx';
 import { ApiServiceContext } from '../../services/ApiService.js';
 import { grindDirectionForStepDelta } from '../../utils/grinderDirection.js';
-import { runtimeCommunityUploadText } from '../../utils/autoTuningStatus.js';
 import {
   TASTE_LEVEL_LABELS,
   TASTE_LEVELS,
@@ -42,6 +41,16 @@ const RECIPE_DOMAIN_ENVELOPE = {
   target_output_min_g: [0.1, 1000],
   target_output_max_g: [0.1, 1000],
 };
+const CPBO_PROFILES = new Set(['application', 'paper_fidelity']);
+const CPBO_COMPARISON_MODES = new Set(['best_incumbent', 'global_previous']);
+
+function cpboProfileName(value) {
+  return CPBO_PROFILES.has(value) ? value : 'application';
+}
+
+function cpboComparisonMode(value) {
+  return CPBO_COMPARISON_MODES.has(value) ? value : 'best_incumbent';
+}
 
 function normalizeTasteGoal(value) {
   if (
@@ -209,6 +218,14 @@ function optionalNumber(value) {
   }
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function optionalText(value) {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized && normalized.toLowerCase() !== 'null' ? normalized : undefined;
 }
 
 function formatNumber(value, digits = 1, suffix = '') {
@@ -390,22 +407,38 @@ function applyGrinderSuggestion(form, suggestion) {
 }
 
 function currentRecommendation(settings, activeGrinder) {
-  if (!settings?.rlLastRecommendationId) {
+  const recommendationId = optionalText(settings?.rlLastRecommendationId);
+  if (!recommendationId) {
     return null;
   }
-  const currentAbsolute = optionalNumber(settings.rlRecommendationCurrentAbsoluteStep);
-  const projectedAbsolute = optionalNumber(settings.rlRecommendationProjectedAbsoluteStep);
+  const grindDeltaStepsFromCurrent = optionalNumber(
+    settings.rlRecommendationGrindDeltaStepsFromCurrent,
+  );
+  const reportedCurrentAbsolute = settings.rlRecommendationHasCurrentAbsoluteStep
+    ? optionalNumber(settings.rlRecommendationCurrentAbsoluteStep)
+    : undefined;
+  const reportedProjectedAbsolute = settings.rlRecommendationHasProjectedAbsoluteStep
+    ? optionalNumber(settings.rlRecommendationProjectedAbsoluteStep)
+    : undefined;
+  const currentAbsolute =
+    reportedCurrentAbsolute ?? optionalNumber(activeGrinder?.current_absolute_step);
+  const projectedRelative = optionalNumber(
+    settings.rlRecommendationProjectedRelativeStepFromReference,
+  );
+  const absoluteReference = optionalNumber(activeGrinder?.absolute_reference_step);
+  const projectedAbsolute =
+    reportedProjectedAbsolute ??
+    (projectedRelative !== undefined && absoluteReference !== undefined
+      ? absoluteReference + projectedRelative
+      : currentAbsolute !== undefined && grindDeltaStepsFromCurrent !== undefined
+        ? currentAbsolute + grindDeltaStepsFromCurrent
+        : undefined);
   return {
-    id: settings.rlLastRecommendationId,
+    id: recommendationId,
     status: settings.rlRecommendationStatus || settings.rlRecommendationApplyStatus || '',
-    grindDeltaStepsFromCurrent: optionalNumber(settings.rlRecommendationGrindDeltaStepsFromCurrent),
-    projectedRelativeStepFromReference: optionalNumber(
-      settings.rlRecommendationProjectedRelativeStepFromReference,
-    ),
-    currentAbsoluteStep:
-      currentAbsolute === undefined
-        ? optionalNumber(activeGrinder?.current_absolute_step)
-        : currentAbsolute,
+    grindDeltaStepsFromCurrent,
+    projectedRelativeStepFromReference: projectedRelative,
+    currentAbsoluteStep: currentAbsolute,
     projectedAbsoluteStep: projectedAbsolute,
     grinderStepDirection: activeGrinder?.step_direction || 'higher_is_finer',
     nextDoseG: optionalNumber(settings.rlRecommendationNextDoseG),
@@ -509,6 +542,7 @@ function RuntimeDetails({ settings }) {
   const localRetry = Number(settings?.rlLocalDeliveryRetryCount || 0);
   const localRejected = Number(settings?.rlLocalDeliveryRejectedCount || 0);
   const localDeliveryAttention = localPending + localRetry + localRejected > 0;
+  const localDeliveryError = optionalText(settings?.rlLocalDeliveryLastError);
   return (
     <details className='border-base-300 mt-4 rounded-md border'>
       <summary className='flex cursor-pointer list-none items-center justify-between gap-3 p-3'>
@@ -519,22 +553,15 @@ function RuntimeDetails({ settings }) {
       </summary>
       <div className='border-base-300 space-y-2 border-t p-3'>
         <InfoRow label='Storage' value={settings?.rlRuntimeHealthStorageBackend || 'Unknown'} />
-        <InfoRow label='Community upload' value={runtimeCommunityUploadText(settings)} />
-        <InfoRow
-          label='Queue'
-          value={`${settings?.rlRuntimeHealthPendingUploadCount ?? 0} pending / ${
-            settings?.rlRuntimeHealthFailedUploadCount ?? 0
-          } retry`}
-        />
         {localDeliveryAttention && (
           <InfoRow
             label='Local delivery'
             value={`${localPending} pending / ${localRetry} retry / ${localRejected} rejected`}
           />
         )}
-        {localDeliveryAttention && settings?.rlLocalDeliveryLastError && (
+        {localDeliveryAttention && localDeliveryError && (
           <div className='text-warning text-sm'>
-            Local delivery: {settings.rlLocalDeliveryLastError}
+            Local delivery: {localDeliveryError}
           </div>
         )}
         {[...warnings, ...waiting].slice(0, 6).map(message => (
@@ -647,6 +674,8 @@ export function AutoTuning() {
   const [grinderSearchLoading, setGrinderSearchLoading] = useState(false);
   const [tasteGoalDraft, setTasteGoalDraft] = useState({ ...BALANCED_TASTE_GOAL, targets: {} });
   const [recipeDomainDraft, setRecipeDomainDraft] = useState(recipeDomainForm());
+  const [cpboProfileDraft, setCpboProfileDraft] = useState('application');
+  const [cpboComparisonDraft, setCpboComparisonDraft] = useState('best_incumbent');
   const [doseTargetDraft, setDoseTargetDraft] = useState('18');
 
   const loadSettings = useCallback(async () => {
@@ -804,7 +833,6 @@ export function AutoTuning() {
     !!recommendation && PROMPTABLE_RECOMMENDATION_STATUSES.has(recommendation.status || '');
   const paused = !!settings.rlOptimizationPaused;
   const localOn = !!settings.rlLocalOptimizationEnabled;
-  const communityOn = !!(settings.rlCommunityUploadEffective ?? settings.rlCommunityUploadEnabled);
   const recipeDomain = settings.rlRecipeDomain || DEFAULT_RECIPE_DOMAIN;
   const doseTarget = optionalNumber(doseTargetDraft);
   const doseTargetValid =
@@ -826,6 +854,8 @@ export function AutoTuning() {
   };
   const openAdvancedDrawer = () => {
     setRecipeDomainDraft(recipeDomainForm(settings.rlRecipeDomain));
+    setCpboProfileDraft(cpboProfileName(settings.rlCPBOProfileName));
+    setCpboComparisonDraft(cpboComparisonMode(settings.rlCPBOComparisonMode));
     setDrawer('advanced');
   };
 
@@ -838,9 +868,6 @@ export function AutoTuning() {
             <StatusPill tone='primary'>{providerLabel(settings.rlProviderMode)}</StatusPill>
             <StatusPill tone={paused ? 'warning' : localOn ? 'success' : 'neutral'}>
               {paused ? 'Paused' : localOn ? 'Optimizing' : 'Observation only'}
-            </StatusPill>
-            <StatusPill tone={communityOn ? 'primary' : 'neutral'}>
-              Community {communityOn ? 'On' : 'Off'}
             </StatusPill>
           </div>
         </div>
@@ -1080,14 +1107,9 @@ export function AutoTuning() {
       </Panel>
 
       <Panel title='Progress'>
-        <div className='grid grid-cols-2 gap-3 lg:grid-cols-4'>
+        <div className='grid grid-cols-1 gap-3 sm:grid-cols-3'>
           <StatCard label='Local shots' value={(settings.rlLocalShotCount ?? 0).toString()} />
           <StatCard label='Optimizer' value='CPBO' tone='primary' />
-          <StatCard
-            label='Community'
-            value={communityOn ? 'On' : 'Off'}
-            tone={communityOn ? 'primary' : 'neutral'}
-          />
           <StatCard label='Provider' value={providerLabel(settings.rlProviderMode)} />
         </div>
       </Panel>
@@ -1095,10 +1117,52 @@ export function AutoTuning() {
       {drawer === 'advanced' && (
         <Drawer
           title='Advanced Optimizer'
-          subtitle='CPBO recipe search space'
+          subtitle='CPBO policy and recipe search space'
           onClose={() => setDrawer(null)}
         >
           <div className='space-y-5'>
+            <section className='space-y-3'>
+              <h3 className='text-sm font-semibold tracking-wide uppercase'>Search policy</h3>
+              <div
+                className='join join-vertical w-full sm:join-horizontal'
+                role='radiogroup'
+                aria-label='CPBO search policy'
+              >
+                {[
+                  ['best_incumbent', 'Best incumbent / local'],
+                  ['global_previous', 'Previous shot / global'],
+                ].map(([value, label]) => {
+                  const selected = cpboComparisonDraft === value;
+                  return (
+                    <button
+                      key={value}
+                      type='button'
+                      role='radio'
+                      aria-checked={selected}
+                      className={`join-item btn btn-sm min-h-12 w-full min-w-0 whitespace-normal sm:flex-1 ${
+                        selected ? 'btn-primary' : 'btn-outline'
+                      }`}
+                      onClick={() => setCpboComparisonDraft(value)}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            <section className='space-y-3'>
+              <h3 className='text-sm font-semibold tracking-wide uppercase'>Compute profile</h3>
+              <select
+                className='select select-bordered w-full'
+                value={cpboProfileDraft}
+                onChange={event => setCpboProfileDraft(event.currentTarget.value)}
+              >
+                <option value='application'>Application</option>
+                <option value='paper_fidelity'>Paper fidelity (slow)</option>
+              </select>
+            </section>
+
             <section className='space-y-3'>
               <h3 className='text-sm font-semibold tracking-wide uppercase'>Grinder</h3>
               <label className='form-control'>
@@ -1181,7 +1245,11 @@ export function AutoTuning() {
                 type='button'
                 className='btn btn-outline'
                 disabled={busy}
-                onClick={() => setRecipeDomainDraft(recipeDomainForm())}
+                onClick={() => {
+                  setRecipeDomainDraft(recipeDomainForm());
+                  setCpboProfileDraft('application');
+                  setCpboComparisonDraft('best_incumbent');
+                }}
               >
                 Restore defaults
               </button>
@@ -1190,7 +1258,9 @@ export function AutoTuning() {
                 className='btn btn-primary'
                 disabled={busy || !validRecipeDomainForm(recipeDomainDraft, settings.rlDoseTargetG)}
                 onClick={async () => {
-                  const saved = await run('req:rl:recipe-domain:set', {
+                  const saved = await run('req:rl:cpbo-config:set', {
+                    cpbo_profile_name: cpboProfileDraft,
+                    cpbo_comparison_mode: cpboComparisonDraft,
                     recipe_domain: recipeDomainPayload(recipeDomainDraft),
                   });
                   if (saved) {

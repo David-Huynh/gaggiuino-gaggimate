@@ -14,6 +14,16 @@ static String normalizeRLOptimizerMode(String optimizerMode) {
     return "cpbo";
 }
 
+static String normalizeRLCPBOProfileName(String profileName) {
+    profileName.trim();
+    return profileName == "paper_fidelity" ? "paper_fidelity" : "application";
+}
+
+static String normalizeRLCPBOComparisonMode(String comparisonMode) {
+    comparisonMode.trim();
+    return comparisonMode == "global_previous" ? "global_previous" : "best_incumbent";
+}
+
 std::vector<AutoWakeupSchedule>
 PreferencesCodec<std::vector<AutoWakeupSchedule>>::read(Preferences &prefs, const char *key,
                                                         const std::vector<AutoWakeupSchedule> &def) {
@@ -87,6 +97,8 @@ Settings::Settings() {
         rlAutoTuningProviderMode.initDefault(providerMode.c_str());
     }
     rlOptimizerMode.initDefault(normalizeRLOptimizerMode(rlOptimizerMode.get()));
+    rlCPBOProfileName.initDefault(normalizeRLCPBOProfileName(rlCPBOProfileName.get()));
+    rlCPBOComparisonMode.initDefault(normalizeRLCPBOComparisonMode(rlCPBOComparisonMode.get()));
     std::string recipeDomainError;
     if (!AutoTuning::validateRecipeDomain(getRLRecipeDomain(), recipeDomainError)) {
         const AutoTuning::RecipeDomain defaults;
@@ -367,6 +379,14 @@ void Settings::setRLGrinderContextsJson(const String &contextsJson) { rlGrinderC
 void Settings::setRLTasteGoalsJson(const String &tasteGoalsJson) { rlTasteGoalsJson.set(tasteGoalsJson); }
 
 void Settings::setRLOptimizerMode(const String &optimizerMode) { rlOptimizerMode.set(normalizeRLOptimizerMode(optimizerMode)); }
+
+void Settings::setRLCPBOProfileName(const String &profileName) {
+    rlCPBOProfileName.set(normalizeRLCPBOProfileName(profileName));
+}
+
+void Settings::setRLCPBOComparisonMode(const String &comparisonMode) {
+    rlCPBOComparisonMode.set(normalizeRLCPBOComparisonMode(comparisonMode));
+}
 
 AutoTuning::OptimizerConfiguration Settings::getRLOptimizerConfiguration() const {
     AutoTuning::OptimizerConfiguration configuration;

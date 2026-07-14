@@ -1,5 +1,6 @@
 #include "LocalAutoTuningStorePlugin.h"
 #include "autotuning/AutoTuningJsonCodec.h"
+#include "autotuning/AutoTuningTasteGoalJson.h"
 #include "autotuning/local/LocalAutoTuningFiles.h"
 
 #include <ArduinoJson.h>
@@ -11,6 +12,7 @@
 #include <display/core/EpochTime.h>
 #include <display/core/PluginManager.h>
 #include <display/core/Settings.h>
+#include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 #include <esp_log.h>
 #include <limits>
@@ -34,6 +36,10 @@ static bool jsonNumber(JsonVariantConst value) {
     return value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>();
 }
 
+static String jsonStringOrEmpty(JsonVariantConst value) {
+    return value.is<const char *>() ? value.as<String>() : String("");
+}
+
 static bool jsonEpoch(JsonVariantConst value, EpochSeconds &out) {
     if (value.is<bool>() || !value.is<std::int64_t>()) {
         return false;
@@ -49,12 +55,12 @@ static EpochSeconds jsonEpochOrZero(JsonVariantConst value) {
 
 static AutoTuning::DeliveryState deliveryState(JsonObjectConst replay) {
     AutoTuning::DeliveryState delivery;
-    String state = replay["local_delivery_state"].as<String>();
+    String state = jsonStringOrEmpty(replay["local_delivery_state"]);
     if (!state.isEmpty()) {
         const auto parsed = AutoTuning::deliveryStatusFromKey(state.c_str());
         delivery.status = parsed.value_or(AutoTuning::DeliveryStatus::Pending);
     } else {
-        const String legacy = replay["dispatch_state"].as<String>();
+        const String legacy = jsonStringOrEmpty(replay["dispatch_state"]);
         if (legacy == "awaiting_dose_confirmation") {
             delivery.status = AutoTuning::DeliveryStatus::AwaitingDoseConfirmation;
         } else if (legacy == "dispatched") {
@@ -73,7 +79,7 @@ static AutoTuning::DeliveryState deliveryState(JsonObjectConst replay) {
     if (jsonEpoch(replay["local_acknowledged_at"], acknowledgedAt)) {
         delivery.acknowledgedAt = acknowledgedAt;
     }
-    delivery.lastError = replay["local_last_error"].as<String>().c_str();
+    delivery.lastError = jsonStringOrEmpty(replay["local_last_error"]).c_str();
     return delivery;
 }
 
@@ -97,78 +103,66 @@ struct DeliveryStats {
 
 static DeliveryStats localDeliveryStats() {
     DeliveryStats stats;
-    File root = LittleFS.open(REPLAY_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return stats;
     }
-    File file = root.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool candidate = !file.isDirectory() && path.endsWith(".json");
-        file.close();
-        if (candidate) {
-            JsonDocument doc(&psramAllocator);
-            if (LocalAutoTuningFiles::readJson(path, doc)) {
-                JsonObjectConst replay = doc.as<JsonObjectConst>();
-                const AutoTuning::DeliveryStatus state = deliveryState(replay).status;
-                const int attempts = jsonNumber(replay["local_attempt_count"]) ? replay["local_attempt_count"].as<int>()
-                                                                               : (replay["dispatch_count"] | 0);
-                if (state == AutoTuning::DeliveryStatus::PermanentRejection) {
-                    stats.rejected += 1;
-                } else if (state == AutoTuning::DeliveryStatus::RetryWait ||
-                           (state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement && attempts > 1)) {
-                    stats.retrying += 1;
-                } else if (state == AutoTuning::DeliveryStatus::Pending ||
-                           state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
-                    stats.pending += 1;
-                }
-                const String error = replay["local_last_error"].as<String>();
-                const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
-                if (!error.isEmpty() && updatedAt >= stats.lastErrorAt) {
-                    stats.lastError = error;
-                    stats.lastErrorAt = updatedAt;
-                }
+    for (const String &path : paths) {
+        JsonDocument doc(&psramAllocator);
+        if (LocalAutoTuningFiles::readJson(path, doc)) {
+            JsonObjectConst replay = doc.as<JsonObjectConst>();
+            const AutoTuning::DeliveryStatus state = deliveryState(replay).status;
+            const int attempts = jsonNumber(replay["local_attempt_count"]) ? replay["local_attempt_count"].as<int>()
+                                                                           : (replay["dispatch_count"] | 0);
+            if (state == AutoTuning::DeliveryStatus::PermanentRejection) {
+                stats.rejected += 1;
+            } else if (state == AutoTuning::DeliveryStatus::RetryWait ||
+                       (state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement && attempts > 1)) {
+                stats.retrying += 1;
+            } else if (state == AutoTuning::DeliveryStatus::Pending ||
+                       state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
+                stats.pending += 1;
+            }
+            String error = jsonStringOrEmpty(replay["local_last_error"]);
+            if (state == AutoTuning::DeliveryStatus::PermanentRejection && error.isEmpty()) {
+                error = "permanent_rejection";
+            }
+            const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
+            const bool deliveryNeedsAttention = state == AutoTuning::DeliveryStatus::PermanentRejection ||
+                                                state == AutoTuning::DeliveryStatus::RetryWait;
+            if (deliveryNeedsAttention && !error.isEmpty() && updatedAt >= stats.lastErrorAt) {
+                stats.lastError = error;
+                stats.lastErrorAt = updatedAt;
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
     return stats;
 }
 
 static bool removeOldestTerminalReplay() {
-    File root = LittleFS.open(REPLAY_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return false;
     }
     bool found = false;
     String oldestPath;
     EpochSeconds oldestTimestamp = std::numeric_limits<EpochSeconds>::max();
-    File file = root.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool candidate = !file.isDirectory() && path.endsWith(".json");
-        file.close();
-        if (candidate) {
-            JsonDocument doc(&psramAllocator);
-            if (LocalAutoTuningFiles::readJson(path, doc)) {
-                JsonObjectConst replay = doc.as<JsonObjectConst>();
-                const bool communityPending = (replay["community_required"] | false) && !(replay["community_dispatched"] | false);
-                if (!deliveryTerminal(replay) || communityPending) {
-                    file = root.openNextFile();
-                    continue;
-                }
-                const EpochSeconds timestamp = LocalAutoTuningFiles::fileTimestamp(path);
-                if (!found || timestamp < oldestTimestamp) {
-                    found = true;
-                    oldestPath = path;
-                    oldestTimestamp = timestamp;
-                }
+    for (const String &path : paths) {
+        JsonDocument doc(&psramAllocator);
+        if (LocalAutoTuningFiles::readJson(path, doc)) {
+            JsonObjectConst replay = doc.as<JsonObjectConst>();
+            const bool communityPending = (replay["community_required"] | false) && !(replay["community_dispatched"] | false);
+            if (!deliveryTerminal(replay) || communityPending) {
+                continue;
+            }
+            const EpochSeconds timestamp = LocalAutoTuningFiles::fileTimestamp(path);
+            if (!found || timestamp < oldestTimestamp) {
+                found = true;
+                oldestPath = path;
+                oldestTimestamp = timestamp;
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
     return found && LittleFS.remove(oldestPath);
 }
 
@@ -288,7 +282,7 @@ bool LocalAutoTuningStorePlugin::reset() {
 
 AutoTuning::LocalStoreStats LocalAutoTuningStorePlugin::stats() const {
     AutoTuning::LocalStoreStats out;
-    out.available = LittleFS.exists(STORE_DIR);
+    out.available = LittleFSUtil::existsQuietly(STORE_DIR);
     const LocalAutoTuningSummaryStore::Stats summaries = summaryStore.stats();
     const LocalAutoTuningFiles::DirectoryStats replays = LocalAutoTuningFiles::directoryStats(REPLAY_DIR);
     out.shotCount = summaries.shotCount;
@@ -302,7 +296,7 @@ bool LocalAutoTuningStorePlugin::loadShotSummary(const String &shotId, JsonDocum
 }
 
 bool LocalAutoTuningStorePlugin::hasShotReplay(const String &shotId) const {
-    return !shotId.isEmpty() && LittleFS.exists(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId));
+    return !shotId.isEmpty() && LittleFSUtil::existsQuietly(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId));
 }
 
 bool LocalAutoTuningStorePlugin::canRemoveShotData(const String &shotId) const {
@@ -310,7 +304,7 @@ bool LocalAutoTuningStorePlugin::canRemoveShotData(const String &shotId) const {
         return false;
     }
     const String replayPath = LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId);
-    if (!LittleFS.exists(replayPath)) {
+    if (!LittleFSUtil::existsQuietly(replayPath)) {
         return true;
     }
     JsonDocument envelope(&psramAllocator);
@@ -332,7 +326,7 @@ bool LocalAutoTuningStorePlugin::removeShotData(const String &shotId, const bool
     bool removed = false;
     const String replayPath = LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId);
     removed = summaryStore.removeShot(shotId) || removed;
-    if (LittleFS.exists(replayPath)) {
+    if (LittleFSUtil::existsQuietly(replayPath)) {
         removed = LittleFS.remove(replayPath) || removed;
     }
     if (removed) {
@@ -391,7 +385,7 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
 void LocalAutoTuningStorePlugin::handleShotReprocess(Event const &event) {
     const String shotId = event.getString("shot_id");
     JsonDocument envelope(&psramAllocator);
-    if (!loadReplaySnapshot(shotId, envelope)) {
+    if (!controller || !loadReplaySnapshot(shotId, envelope)) {
         return;
     }
     JsonObject root = envelope.as<JsonObject>();
@@ -403,6 +397,25 @@ void LocalAutoTuningStorePlugin::handleShotReprocess(Event const &event) {
         confirmation.setFloat("dose_target_g", payload["dose_target_g"] | 0.0f);
         pluginManager->trigger(confirmation);
         return;
+    }
+    JsonObject payload = root["payload"].as<JsonObject>();
+    if (payload.isNull()) {
+        return;
+    }
+    if (payload["taste_goal"].isNull()) {
+        Settings const &settings = controller->getSettings();
+        const bool activeContextMatches =
+            jsonStringOrEmpty(payload["bean_context_id"]) == settings.getRLBeanContextId() &&
+            jsonStringOrEmpty(payload["grinder_context_id"]) == settings.getRLGrinderContextId();
+        AutoTuning::TasteGoal activeGoal;
+        String goalError;
+        if (!activeContextMatches || !AutoTuning::activeTasteGoal(settings, activeGoal, &goalError)) {
+            ESP_LOGW(LOG_TAG, "Cannot restore the missing taste goal for shot %s", shotId.c_str());
+            return;
+        }
+        AutoTuning::writeTasteGoal(activeGoal, payload["taste_goal"].to<JsonObject>());
+        summaryStore.upsertShot(payload);
+        ESP_LOGI(LOG_TAG, "Restored the active taste goal while reprocessing shot %s", shotId.c_str());
     }
     const bool localDeliveryRequired = controller && AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
                                                                         controller->getOptimizerTransport())
@@ -550,37 +563,29 @@ void LocalAutoTuningStorePlugin::dispatchPendingCommunityUploads() {
     if (!pluginManager) {
         return;
     }
-    File directory = LittleFS.open(REPLAY_DIR);
-    if (!directory || !directory.isDirectory()) {
+    std::vector<String> paths;
+    if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return;
     }
-    File file = directory.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool candidate = !file.isDirectory() && path.endsWith(".json");
-        file.close();
-        if (candidate) {
-            JsonDocument envelope(&psramAllocator);
-            if (LocalAutoTuningFiles::readJson(path, envelope)) {
-                JsonObject root = envelope.as<JsonObject>();
-                JsonObjectConst payload = root["payload"].as<JsonObjectConst>();
-                if ((root["community_required"] | false) && !(root["community_dispatched"] | false) &&
-                    deliveryState(root).status != AutoTuning::DeliveryStatus::AwaitingDoseConfirmation && !payload.isNull()) {
-                    AutoTuningJsonCodec::DecodedShotRecord decoded;
-                    String decodeError;
-                    AutoTuning::CommunityUploadPort *upload = controller ? controller->getCommunityUpload() : nullptr;
-                    if (upload && AutoTuningJsonCodec::parseShotRecord(payload, decoded, decodeError) &&
-                        upload->enqueueShot(decoded.record)) {
-                        root["community_dispatched"] = true;
-                        root["updated_at"] = nowEpoch();
-                        LocalAutoTuningFiles::writeJson(path, envelope);
-                    }
+    for (const String &path : paths) {
+        JsonDocument envelope(&psramAllocator);
+        if (LocalAutoTuningFiles::readJson(path, envelope)) {
+            JsonObject root = envelope.as<JsonObject>();
+            JsonObjectConst payload = root["payload"].as<JsonObjectConst>();
+            if ((root["community_required"] | false) && !(root["community_dispatched"] | false) &&
+                deliveryState(root).status != AutoTuning::DeliveryStatus::AwaitingDoseConfirmation && !payload.isNull()) {
+                AutoTuningJsonCodec::DecodedShotRecord decoded;
+                String decodeError;
+                AutoTuning::CommunityUploadPort *upload = controller ? controller->getCommunityUpload() : nullptr;
+                if (upload && AutoTuningJsonCodec::parseShotRecord(payload, decoded, decodeError) &&
+                    upload->enqueueShot(decoded.record)) {
+                    root["community_dispatched"] = true;
+                    root["updated_at"] = nowEpoch();
+                    LocalAutoTuningFiles::writeJson(path, envelope);
                 }
             }
         }
-        file = directory.openNextFile();
     }
-    directory.close();
 }
 
 void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
@@ -636,6 +641,8 @@ void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
         root["local_last_error"] = reason.isEmpty() ? String("permanent_rejection") : reason;
         root["updated_at"] = now;
         LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
+        ESP_LOGW(LOG_TAG, "Shot %s was permanently rejected: %s", shotId.c_str(),
+                 (reason.isEmpty() ? String("permanent_rejection") : reason).c_str());
         deliveryWorkPending = true;
         nextDeliveryCheckAt = 0;
     } else {
@@ -692,8 +699,8 @@ void LocalAutoTuningStorePlugin::processDueDelivery() {
              .routeOffBoardTransport()) {
         return;
     }
-    File root = LittleFS.open(REPLAY_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return;
     }
     String dueShotId;
@@ -701,43 +708,35 @@ void LocalAutoTuningStorePlugin::processDueDelivery() {
     EpochSeconds oldest = std::numeric_limits<EpochSeconds>::max();
     EpochSeconds earliestFutureRetry = std::numeric_limits<EpochSeconds>::max();
     bool activeDeliveryFound = false;
-    File file = root.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool candidate = !file.isDirectory() && path.endsWith(".json");
-        file.close();
-        if (candidate) {
-            JsonDocument envelope(&psramAllocator);
-            if (LocalAutoTuningFiles::readJson(path, envelope)) {
-                JsonObjectConst replay = envelope.as<JsonObjectConst>();
-                const AutoTuning::DeliveryStatus state = deliveryState(replay).status;
-                const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
-                if (state == AutoTuning::DeliveryStatus::Accepted && !(replay["completion_emitted"] | false)) {
-                    dueShotId = replay["shot_id"].as<String>();
-                    completionDue = true;
-                    break;
-                }
-                const EpochSeconds nextRetryAt = jsonEpochOrZero(replay["local_next_retry_at"]);
-                if (state == AutoTuning::DeliveryStatus::Pending || state == AutoTuning::DeliveryStatus::RetryWait ||
-                    state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
-                    activeDeliveryFound = true;
-                    if (nextRetryAt > now) {
-                        earliestFutureRetry = std::min(earliestFutureRetry, nextRetryAt);
-                    }
-                }
-                const bool due =
-                    (state == AutoTuning::DeliveryStatus::Pending || state == AutoTuning::DeliveryStatus::RetryWait ||
-                     state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) &&
-                    (nextRetryAt <= 0 || now >= nextRetryAt);
-                if (due && updatedAt <= oldest) {
-                    dueShotId = replay["shot_id"].as<String>();
-                    oldest = updatedAt;
+    for (const String &path : paths) {
+        JsonDocument envelope(&psramAllocator);
+        if (LocalAutoTuningFiles::readJson(path, envelope)) {
+            JsonObjectConst replay = envelope.as<JsonObjectConst>();
+            const AutoTuning::DeliveryStatus state = deliveryState(replay).status;
+            const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
+            if (state == AutoTuning::DeliveryStatus::Accepted && !(replay["completion_emitted"] | false)) {
+                dueShotId = replay["shot_id"].as<String>();
+                completionDue = true;
+                break;
+            }
+            const EpochSeconds nextRetryAt = jsonEpochOrZero(replay["local_next_retry_at"]);
+            if (state == AutoTuning::DeliveryStatus::Pending || state == AutoTuning::DeliveryStatus::RetryWait ||
+                state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
+                activeDeliveryFound = true;
+                if (nextRetryAt > now) {
+                    earliestFutureRetry = std::min(earliestFutureRetry, nextRetryAt);
                 }
             }
+            const bool due =
+                (state == AutoTuning::DeliveryStatus::Pending || state == AutoTuning::DeliveryStatus::RetryWait ||
+                 state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) &&
+                (nextRetryAt <= 0 || now >= nextRetryAt);
+            if (due && updatedAt <= oldest) {
+                dueShotId = replay["shot_id"].as<String>();
+                oldest = updatedAt;
+            }
         }
-        file = root.openNextFile();
     }
-    root.close();
     deliveryWorkPending = activeDeliveryFound || completionDue;
     nextDeliveryCheckAt = earliestFutureRetry == std::numeric_limits<EpochSeconds>::max() ? 0 : earliestFutureRetry;
     if (dueShotId.isEmpty()) {
@@ -848,35 +847,27 @@ void LocalAutoTuningStorePlugin::recoverPendingDoseConfirmation() {
     if (!pluginManager) {
         return;
     }
-    File root = LittleFS.open(REPLAY_DIR);
-    if (!root || !root.isDirectory()) {
+    std::vector<String> paths;
+    if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return;
     }
     String newestShotId;
     float newestDoseTargetG = 0.0f;
     EpochSeconds newestTimestamp = std::numeric_limits<EpochSeconds>::min();
-    File file = root.openNextFile();
-    while (file) {
-        const String path = file.name();
-        const bool candidate = !file.isDirectory() && path.endsWith(".json");
-        file.close();
-        if (candidate) {
-            JsonDocument envelope(&psramAllocator);
-            if (LocalAutoTuningFiles::readJson(path, envelope)) {
-                JsonObjectConst replay = envelope.as<JsonObjectConst>();
-                const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
-                if (deliveryState(replay).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation &&
-                    updatedAt >= newestTimestamp) {
-                    JsonObjectConst payload = replay["payload"].as<JsonObjectConst>();
-                    newestShotId = replay["shot_id"].as<String>();
-                    newestDoseTargetG = payload["dose_target_g"] | 0.0f;
-                    newestTimestamp = updatedAt;
-                }
+    for (const String &path : paths) {
+        JsonDocument envelope(&psramAllocator);
+        if (LocalAutoTuningFiles::readJson(path, envelope)) {
+            JsonObjectConst replay = envelope.as<JsonObjectConst>();
+            const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
+            if (deliveryState(replay).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation &&
+                updatedAt >= newestTimestamp) {
+                JsonObjectConst payload = replay["payload"].as<JsonObjectConst>();
+                newestShotId = replay["shot_id"].as<String>();
+                newestDoseTargetG = payload["dose_target_g"] | 0.0f;
+                newestTimestamp = updatedAt;
             }
         }
-        file = root.openNextFile();
     }
-    root.close();
     if (newestShotId.isEmpty() || newestDoseTargetG <= 0.0f) {
         return;
     }

@@ -7,18 +7,24 @@
 #include <esp_task_wdt.h>
 
 Controller controller;
+static bool loopTaskWatchdogRegistered = false;
 
 void setup() {
     Serial.begin(115200);
-    // 15s task watchdog: if loopTask or this Arduino loop wedges, reboot cleanly
-    // rather than requiring a power cycle.
+    // Configure the watchdog before Controller creates its watched logic task.
+    // loopTask is added after its first pass because that pass performs bounded,
+    // synchronous hardware and network startup.
     esp_task_wdt_init(15, true);
-    esp_task_wdt_add(NULL);
     controller.setup();
 }
 
 void loop() {
-    esp_task_wdt_reset();
+    if (loopTaskWatchdogRegistered) {
+        esp_task_wdt_reset();
+    }
     controller.loop();
+    if (!loopTaskWatchdogRegistered) {
+        loopTaskWatchdogRegistered = esp_task_wdt_add(NULL) == ESP_OK;
+    }
     delay(50);
 }

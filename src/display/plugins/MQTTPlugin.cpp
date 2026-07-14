@@ -14,6 +14,7 @@
 #include <display/core/ProfileManager.h>
 #include <display/models/profile.h>
 #include <display/util/AtomicFile.h>
+#include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 #include <esp_log.h>
 
@@ -41,6 +42,10 @@ constexpr size_t MAX_MQTT_OUTBOX_BYTES = 128 * 1024;
 static bool mqttJsonNumber(JsonVariantConst value) {
     return !value.is<bool>() &&
            (value.is<int>() || value.is<long>() || value.is<long long>() || value.is<float>() || value.is<double>());
+}
+
+static String mqttJsonString(JsonVariantConst value) {
+    return value.is<const char *>() ? value.as<String>() : String("");
 }
 
 struct ActiveGrinderPosition {
@@ -433,7 +438,7 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
     if (!lock.locked) {
         return false;
     }
-    if (!LittleFS.exists(MQTT_OUTBOX_DIR) && !LittleFS.mkdir(MQTT_OUTBOX_DIR)) {
+    if (!LittleFSUtil::existsQuietly(MQTT_OUTBOX_DIR) && !LittleFS.mkdir(MQTT_OUTBOX_DIR)) {
         return false;
     }
 
@@ -477,7 +482,9 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
     char path[48];
     snprintf(path, sizeof(path), "%s/%020llu.json", MQTT_OUTBOX_DIR, nextSequence);
     const String tempPath = AtomicFile::temporaryPath(path);
-    LittleFS.remove(tempPath);
+    if (!LittleFSUtil::removeIfExists(tempPath)) {
+        return false;
+    }
     File file = LittleFS.open(tempPath, FILE_WRITE);
     if (!file) {
         return false;
@@ -490,7 +497,7 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
     const bool valid = verificationFile && !deserializeJson(verification, verificationFile) && verification.is<JsonObject>();
     verificationFile.close();
     if (written != expected || !valid || !AtomicFile::commit(path)) {
-        LittleFS.remove(tempPath);
+        LittleFSUtil::removeIfExists(tempPath);
         return false;
     }
     return true;
@@ -508,7 +515,7 @@ void MQTTPlugin::flushDurablePublishes() {
     if (recoveryDirectory && recoveryDirectory.isDirectory()) {
         File pending = recoveryDirectory.openNextFile();
         while (pending) {
-            const String tempPath = pending.name();
+            const String tempPath = LittleFSUtil::pathFromEntry(MQTT_OUTBOX_DIR, pending.name());
             pending.close();
             if (tempPath.endsWith(".json.tmp")) {
                 File tempFile = LittleFS.open(tempPath, FILE_READ);
@@ -519,7 +526,7 @@ void MQTTPlugin::flushDurablePublishes() {
                 AtomicFile::recoverPending(finalPath, valid);
             } else if (tempPath.endsWith(".json.bak")) {
                 const String finalPath = tempPath.substring(0, tempPath.length() - 4);
-                if (LittleFS.exists(finalPath)) {
+                if (LittleFSUtil::existsQuietly(finalPath)) {
                     AtomicFile::discardBackup(finalPath);
                 } else {
                     AtomicFile::restoreBackup(finalPath);
@@ -537,7 +544,7 @@ void MQTTPlugin::flushDurablePublishes() {
     String selectedPath;
     File candidate = directory.openNextFile();
     while (candidate) {
-        const String path = candidate.name();
+        const String path = LittleFSUtil::pathFromEntry(MQTT_OUTBOX_DIR, candidate.name());
         candidate.close();
         if (path.endsWith(".json") && (selectedPath.isEmpty() || path.compareTo(selectedPath) < 0)) {
             selectedPath = path;
@@ -622,6 +629,8 @@ void MQTTPlugin::publishOptimizerSettings() {
     doc["machine_id"] = machineId();
     doc["timestamp"] = EpochTime::now();
     doc["optimizer_mode"] = settings.getRLOptimizerMode();
+    doc["cpbo_profile_name"] = settings.getRLCPBOProfileName();
+    doc["cpbo_comparison_mode"] = settings.getRLCPBOComparisonMode();
     AutoTuning::RecipeDomain const recipeDomain = settings.getRLRecipeDomain();
     JsonObject recipeDomainJson = doc["recipe_domain"].to<JsonObject>();
     recipeDomainJson["grind_radius_steps"] = recipeDomain.grindRadiusSteps;
@@ -810,41 +819,43 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusSeen = true;
     latestAddonOnline = doc["addon_online"] | false;
     latestStatusTimestamp = mqttJsonEpochOrZero(doc["timestamp"]);
-    latestStatusLastShotId = doc["last_shot_id"].as<String>();
+    latestStatusLastShotId = mqttJsonString(doc["last_shot_id"]);
     latestStatusLastShotAt = mqttJsonEpochOrZero(doc["last_shot_at"]);
-    latestStatusLastShotType = doc["last_shot_type"].as<String>();
+    latestStatusLastShotType = mqttJsonString(doc["last_shot_type"]);
     latestStatusLastShotTimeS = doc["last_shot_time_s"] | 0.0f;
     latestStatusLastShotBeverageOutG = doc["last_shot_beverage_out_g"] | 0.0f;
     latestStatusLastShotTargetYieldG = doc["last_shot_target_yield_g"] | 0.0f;
-    latestStatusLastRecommendationId = doc["last_recommendation_id"].as<String>();
+    latestStatusLastRecommendationId = mqttJsonString(doc["last_recommendation_id"]);
     latestStatusLastRecommendationAt = mqttJsonEpochOrZero(doc["last_recommendation_at"]);
-    latestStatusRecommendationApplyStatus = doc["recommendation_apply_status"].as<String>();
-    latestStatusMode = doc["mode"].as<String>();
-    latestStatusOptimizerProfileId = doc["optimizer_profile_id"].as<String>();
-    latestStatusOptimizerProfileLabel = doc["optimizer_profile_label"].as<String>();
-    latestStatusOptimizerConfiguredMode = doc["optimizer_configured_mode"].as<String>();
-    latestStatusOptimizerEffectiveMode = doc["optimizer_effective_mode"].as<String>();
-    latestStatusOptimizerFallbackReason = doc["optimizer_fallback_reason"].as<String>();
+    latestStatusRecommendationApplyStatus = mqttJsonString(doc["recommendation_apply_status"]);
+    latestStatusMode = mqttJsonString(doc["mode"]);
+    latestStatusOptimizerProfileId = mqttJsonString(doc["optimizer_profile_id"]);
+    latestStatusOptimizerProfileLabel = mqttJsonString(doc["optimizer_profile_label"]);
+    latestStatusOptimizerConfiguredMode = mqttJsonString(doc["optimizer_configured_mode"]);
+    latestStatusOptimizerEffectiveMode = mqttJsonString(doc["optimizer_effective_mode"]);
+    latestStatusOptimizerFallbackReason = mqttJsonString(doc["optimizer_fallback_reason"]);
+    latestStatusCPBOProfileName = mqttJsonString(doc["cpbo_profile_name"]);
+    latestStatusCPBOComparisonMode = mqttJsonString(doc["cpbo_comparison_mode"]);
     latestStatusLocalShotCount = doc["local_shot_count"] | 0;
     latestStatusUploadQueueCount = doc["upload_queue_count"] | 0;
     latestStatusUploadQueueRejectedCount = doc["upload_queue_rejected_count"] | 0;
-    latestStatusUploadQueueLastRejectedId = doc["upload_queue_last_rejected_id"].as<String>();
-    latestStatusUploadQueueLastRejectedRecordId = doc["upload_queue_last_rejected_record_id"].as<String>();
-    latestStatusUploadQueueLastRejectedError = doc["upload_queue_last_rejected_error"].as<String>();
+    latestStatusUploadQueueLastRejectedId = mqttJsonString(doc["upload_queue_last_rejected_id"]);
+    latestStatusUploadQueueLastRejectedRecordId = mqttJsonString(doc["upload_queue_last_rejected_record_id"]);
+    latestStatusUploadQueueLastRejectedError = mqttJsonString(doc["upload_queue_last_rejected_error"]);
     latestStatusCommunityUploadEnabled = doc["community_upload_enabled"] | false;
-    latestStatusRuntimeHealthStatus = doc["runtime_health_status"].as<String>();
-    latestStatusRuntimeHealthSummary = doc["runtime_health_summary"].as<String>();
+    latestStatusRuntimeHealthStatus = mqttJsonString(doc["runtime_health_status"]);
+    latestStatusRuntimeHealthSummary = mqttJsonString(doc["runtime_health_summary"]);
     latestStatusRuntimeHealthWarningsJson = "[]";
     latestStatusRuntimeHealthWaitingReasonsJson = "[]";
     latestStatusAutoTuningDiagnosticStepsJson = "[]";
-    latestStatusRuntimeHealthStorageBackend = doc["runtime_health_storage_backend"].as<String>();
+    latestStatusRuntimeHealthStorageBackend = mqttJsonString(doc["runtime_health_storage_backend"]);
     latestStatusRuntimeHealthStorageAvailable = doc["runtime_health_storage_available"] | false;
     latestStatusRuntimeHealthUploadConfigured = doc["runtime_health_upload_configured"] | false;
     latestStatusRuntimeHealthCommunityUploadRequested = doc["runtime_health_community_upload_requested"] | false;
     latestStatusRuntimeHealthPendingUploadCount = doc["runtime_health_pending_upload_count"] | 0;
     latestStatusRuntimeHealthFailedUploadCount = doc["runtime_health_failed_upload_count"] | 0;
     latestStatusRuntimeHealthRejectedUploadCount = doc["runtime_health_rejected_upload_count"] | 0;
-    latestStatusGrinderCatalogSearchUrl = doc["grinder_catalog_search_url"].as<String>();
+    latestStatusGrinderCatalogSearchUrl = mqttJsonString(doc["grinder_catalog_search_url"]);
     latestStatusRecentShotsJson = "[]";
     if (doc["runtime_health_warnings"].is<JsonArray>()) {
         String warnings;
@@ -900,6 +911,8 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setString("optimizer_configured_mode", latestStatusOptimizerConfiguredMode);
     event.setString("optimizer_effective_mode", latestStatusOptimizerEffectiveMode);
     event.setString("optimizer_fallback_reason", latestStatusOptimizerFallbackReason);
+    event.setString("cpbo_profile_name", latestStatusCPBOProfileName);
+    event.setString("cpbo_comparison_mode", latestStatusCPBOComparisonMode);
     event.setInt("local_shot_count", latestStatusLocalShotCount);
     event.setInt("upload_queue_count", latestStatusUploadQueueCount);
     event.setInt("upload_queue_rejected_count", latestStatusUploadQueueRejectedCount);
@@ -1350,7 +1363,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         doc["anchor_shot_id"] = preference->anchorShotId.c_str();
         doc["label"] = AutoTuning::preferenceLabelKey(preference->label);
         doc["comparison_mode"] = AutoTuning::comparisonModeKey(preference->comparisonMode);
-        AutoTuning::writeTasteGoal(preference->tasteGoal, doc["taste_goal"]);
+        AutoTuning::writeTasteGoal(preference->tasteGoal, doc["taste_goal"].to<JsonObject>());
         doc["install_id"] = preference->installId.c_str();
         doc["machine_id"] = machineId();
         doc["timestamp"] = EpochTime::now();
@@ -1378,9 +1391,10 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
 
     pm->on("rl:local:reset", [this](Event const &event) { publishLocalReset(event); });
 
-    pm->on("rl:settings:changed", [this](Event const &) {
+    pm->on("rl:settings:changed", [this](Event const &event) {
         String reason;
-        if (!isAutoTuningParticipating() || (hasRecommendation && !validateLatestRecommendation(reason))) {
+        if (event.getInt("optimizer_configuration_changed") > 0 || !isAutoTuningParticipating() ||
+            (hasRecommendation && !validateLatestRecommendation(reason))) {
             clearLatestRecommendationAndNotify();
         }
         refreshAutoTuningSubscriptions();

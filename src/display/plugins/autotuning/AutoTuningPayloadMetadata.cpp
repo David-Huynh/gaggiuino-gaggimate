@@ -165,7 +165,7 @@ void addRecipe(Controller *controller, JsonDocument &document) {
     captureRecipe(controller, recipe);
     document["bean_context_id"] = recipe.beanContextId.c_str();
     document["bean_context_name"] = recipe.beanContextName.c_str();
-    AutoTuning::writeTasteGoal(recipe.tasteGoal, document["taste_goal"]);
+    AutoTuning::writeTasteGoal(recipe.tasteGoal, document["taste_goal"].to<JsonObject>());
     if (!recipe.grinder.contextId.empty()) {
         document["grinder_context_id"] = recipe.grinder.contextId.c_str();
     }
