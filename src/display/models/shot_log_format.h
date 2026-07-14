@@ -32,8 +32,8 @@ static constexpr uint32_t SHOT_LOG_FIELD_CP = 0x0010; // current pressure (bit 4
 static constexpr uint32_t SHOT_LOG_FIELD_FL = 0x0020; // pump flow (bit 5)
 static constexpr uint32_t SHOT_LOG_FIELD_TF = 0x0040; // target flow (bit 6)
 static constexpr uint32_t SHOT_LOG_FIELD_PF = 0x0080; // puck flow (bit 7)
-static constexpr uint32_t SHOT_LOG_FIELD_VF = 0x0100; // volumetric flow (bit 8)
-static constexpr uint32_t SHOT_LOG_FIELD_V = 0x0200;  // volumetric weight (bit 9)
+static constexpr uint32_t SHOT_LOG_FIELD_VF = 0x0100; // measured scale flow (bit 8)
+static constexpr uint32_t SHOT_LOG_FIELD_V = 0x0200;  // measured scale weight (bit 9)
 static constexpr uint32_t SHOT_LOG_FIELD_EV = 0x0400; // estimated weight (bit 10)
 static constexpr uint32_t SHOT_LOG_FIELD_PR = 0x0800; // puck resistance (bit 11)
 static constexpr uint32_t SHOT_LOG_FIELD_SI = 0x1000; // system info (bit 12)
@@ -111,8 +111,8 @@ struct ShotLogSample {
     int16_t fl;  // current pump flow * 100 (allows small negatives)
     int16_t tf;  // target flow * 100
     int16_t pf;  // puck flow * 100
-    int16_t vf;  // bluetooth flow * 100
-    uint16_t v;  // bluetooth weight * 10
+    int16_t vf;  // active measured scale flow * 100
+    uint16_t v;  // active measured scale weight * 10
     uint16_t ev; // estimated weight * 10
     uint16_t pr; // puck resistance * 100
     uint16_t si; // system info bit-packed

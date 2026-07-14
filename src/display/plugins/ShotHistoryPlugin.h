@@ -96,13 +96,10 @@ class ShotHistoryPlugin : public Plugin {
     float currentBluetoothWeight = 0.0f;
     float currentHardwareWeight = 0.0f;
     float lastStableWeight = 0.0f;
-    // Trailing-sample weight + EMA flow on the *active* scale source (BLE or HW),
-    // chosen each tick from settings.getScaleSource(). Generalized from the
-    // previously BLE-only currentBluetoothFlow / lastBluetoothWeight fields.
+    // Trailing-sample weight and EMA flow from the measured source latched for
+    // this shot. Predictive weight is retained separately below.
     float lastScaleWeight = 0.0f;
     float currentScaleFlow = 0.0f;
-    float lastBluetoothWeight = 0.0f;
-    float currentBluetoothFlow = 0.0f;
     float currentEstimatedWeight = 0.0f;
     float currentPuckResistance = 0.0f;
     bool sawShotHistoryControlTarget = false;

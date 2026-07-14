@@ -8,6 +8,15 @@
 #include "semver_extensions.h"
 #include <ArduinoJson.h>
 
+namespace {
+constexpr uint16_t OTA_HTTP_TIMEOUT_MS = 5000;
+
+void configureRequestTimeouts(HTTPClient &client) {
+    client.setConnectTimeout(OTA_HTTP_TIMEOUT_MS);
+    client.setTimeout(OTA_HTTP_TIMEOUT_MS);
+}
+} // namespace
+
 String get_updated_base_url_via_redirect(WiFiClientSecure &wifi_client, String &release_url) {
     const char *TAG = "get_updated_base_url_via_redirect";
 
@@ -33,6 +42,7 @@ String get_redirect_location(WiFiClientSecure &wifi_client, String &initial_url)
 
     HTTPClient https;
     https.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    configureRequestTimeouts(https);
 
     if (!https.begin(wifi_client, initial_url)) {
         ESP_LOGE(TAG, "[HTTPS] Unable to connect\n");
@@ -58,6 +68,7 @@ String get_updated_version_via_txt_file(WiFiClientSecure &wifi_client, String &_
     const char *TAG = "get_updated_version_via_txt_file";
     HTTPClient https;
     https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    configureRequestTimeouts(https);
 
     String url = _release_url + "version.txt";
     ESP_LOGI(TAG, "url: %s\n", url.c_str());

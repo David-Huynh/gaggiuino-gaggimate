@@ -1,6 +1,7 @@
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faEye } from '@fortawesome/free-solid-svg-icons/faEye';
 import { faEyeSlash } from '@fortawesome/free-solid-svg-icons/faEyeSlash';
+import { hardwareScaleDisabled } from '../../../config/features.js';
 import { timezones } from '../../../config/zones.js';
 import { DASHBOARD_LAYOUTS } from '../../../utils/dashboardManager.js';
 import Section from '../../../components/Card.jsx';
@@ -129,8 +130,10 @@ export function GeneralTab({
         <div className='border-base-content/5 mt-6 border-t pt-6'>
           <h3 className='text-md text-base-content mb-2 font-semibold'>Predictive Scale Delay</h3>
           <p className='text-base-content/85 mb-4 text-sm opacity-70'>
-            Shuts off the process ahead of time based on the flow rate to account for any dripping
-            or delays in the control.
+            Stops ahead of the target based on measured flow to account for dripping and control
+            delay.
+            {!hardwareScaleDisabled &&
+              ' Hardware scale delay remains fixed because the drip tray also measures OPV water.'}
           </p>
           <div className='mb-4'>
             <ToggleField
@@ -140,9 +143,13 @@ export function GeneralTab({
               onChange={onChange('delayAdjust')}
             />
           </div>
-          <div className='grid grid-cols-1 gap-4 sm:grid-cols-2'>
+          <div
+            className={`grid grid-cols-1 gap-4 ${
+              hardwareScaleDisabled ? 'sm:grid-cols-2' : 'sm:grid-cols-3'
+            }`}
+          >
             <InputGroupField
-              label='Brew'
+              label='Brew (Bluetooth / predictive)'
               htmlFor='brewDelay'
               unit='ms'
               unitAriaLabel='milliseconds'
@@ -159,6 +166,28 @@ export function GeneralTab({
                 onChange={onChange('brewDelay')}
               />
             </InputGroupField>
+            {!hardwareScaleDisabled && (
+              <InputGroupField
+                label='Brew (hardware)'
+                htmlFor='hardwareBrewDelay'
+                unit='ms'
+                unitAriaLabel='milliseconds'
+                noMargin
+              >
+                <input
+                  id='hardwareBrewDelay'
+                  name='hardwareBrewDelay'
+                  type='number'
+                  min='0'
+                  max='4000'
+                  step='any'
+                  className='grow'
+                  placeholder='800'
+                  value={formData.hardwareBrewDelay ?? 800}
+                  onChange={onChange('hardwareBrewDelay')}
+                />
+              </InputGroupField>
+            )}
             <InputGroupField
               label='Grind'
               htmlFor='grindDelay'

@@ -8,6 +8,7 @@
 #include "GitHubOTA.h"
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <display/core/AutoTuningModels.h>
@@ -65,6 +66,8 @@ class WebUIPlugin : public Plugin {
     void handleBLEScaleInfo(AsyncWebServerRequest *request);
     void updateOTAStatus(const String &version);
     void updateOTAProgress(uint8_t phase, int progress);
+    void startOTAUpdateCheck(unsigned long now);
+    static void otaUpdateCheckTask(void *arg);
     void sendAutotuneResult();
     void sendAutotuneFailed();
 
@@ -86,6 +89,8 @@ class WebUIPlugin : public Plugin {
     long lastCleanup = 0;
     long lastDns = 0;
     bool updating = false;
+    std::atomic_bool otaUpdateCheckInProgress{false};
+    std::atomic_bool otaUpdateCheckComplete{false};
     bool apMode = false;
     bool serverRunning = false;
     String updateComponent = "";

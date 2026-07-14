@@ -9,6 +9,7 @@
 #include <display/core/process/BrewProcess.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
+#include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 
 namespace {
@@ -106,7 +107,9 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     // Initialize rebuild state
     rebuildInProgress = false;
     // Leftover from the abandoned separate recent-shots index; aggregates now live in index.bin.
-    if (fs->exists("/h/recent.bin")) {
+    const bool recentIndexExists =
+        fs == &LittleFS ? LittleFSUtil::existsQuietly("/h/recent.bin") : fs->exists("/h/recent.bin");
+    if (recentIndexExists) {
         fs->remove("/h/recent.bin");
     }
     xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
@@ -125,9 +128,10 @@ float ShotHistoryPlugin::sourceWeight(VolumetricMeasurementSource source) const 
 }
 
 void ShotHistoryPlugin::record() {
-    // Track the source latched at brew start for control/final-yield metadata.
-    // The binary sample's v/vf channels remain Bluetooth-scale-only below.
+    // Track the source latched at brew start for control, history, and final-yield metadata.
     const float scaleWeight = sourceWeight(shotSource);
+    const bool measuredScaleSource = shotSource == VolumetricMeasurementSource::BLUETOOTH ||
+                                     shotSource == VolumetricMeasurementSource::HARDWARE_SCALE;
 
     bool shouldRecord = recording || extendedRecording;
     if (shouldRecord && recording && shotSource == VolumetricMeasurementSource::HARDWARE_SCALE && controller) {
@@ -190,22 +194,14 @@ void ShotHistoryPlugin::record() {
                 currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
             }
         }
-        // Keep the shot-log v/vf channel tied to the Bluetooth scale schema.
-        // Active-source weight is tracked separately for brew control and final yield.
-        const float loggedScaleWeight = scaleWeight > 0.0f ? scaleWeight : 0.0f;
+        // v/vf are measured scale channels. Predictive output remains separate in ev.
+        const float loggedScaleWeight = measuredScaleSource && scaleWeight > 0.0f ? scaleWeight : 0.0f;
         const float scaleDiff = loggedScaleWeight - lastScaleWeight;
         if (fabsf(scaleDiff) <= MAX_PLAUSIBLE_WEIGHT_DELTA) {
             const float scaleFlow = scaleDiff / (SHOT_LOG_SAMPLE_INTERVAL_MS / 1000.0f);
             currentScaleFlow = currentScaleFlow * 0.75f + scaleFlow * 0.25f;
         }
         lastScaleWeight = loggedScaleWeight;
-        const float loggedBluetoothWeight = currentBluetoothWeight > 0.0f ? currentBluetoothWeight : 0.0f;
-        const float bluetoothDiff = loggedBluetoothWeight - lastBluetoothWeight;
-        if (fabsf(bluetoothDiff) <= MAX_PLAUSIBLE_WEIGHT_DELTA) {
-            const float bluetoothFlow = bluetoothDiff / (SHOT_LOG_SAMPLE_INTERVAL_MS / 1000.0f);
-            currentBluetoothFlow = currentBluetoothFlow * 0.75f + bluetoothFlow * 0.25f;
-        }
-        lastBluetoothWeight = loggedBluetoothWeight;
 
         ShotLogSample sample{};
         uint32_t tick = sampleCount <= 0xFFFF ? sampleCount : 0xFFFF;
@@ -217,8 +213,8 @@ void ShotHistoryPlugin::record() {
         sample.fl = encodeSigned(controller->getCurrentPumpFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.tf = encodeSigned(controller->getTargetFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.pf = encodeSigned(controller->getCurrentPuckFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
-        sample.vf = encodeSigned(currentBluetoothFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
-        sample.v = encodeUnsigned(loggedBluetoothWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+        sample.vf = encodeSigned(currentScaleFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+        sample.v = encodeUnsigned(loggedScaleWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.ev = encodeUnsigned(currentEstimatedWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.pr = encodeUnsigned(currentPuckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
         sample.si = getSystemInfo(); // Pack system state information
@@ -391,10 +387,8 @@ void ShotHistoryPlugin::startRecording() {
     currentHardwareWeight = 0.0f;
     lastStableWeight = 0.0f;
     lastScaleWeight = 0.0f;
-    lastBluetoothWeight = 0.0f;
     currentEstimatedWeight = 0.0f;
     currentScaleFlow = 0.0f;
-    currentBluetoothFlow = 0.0f;
     sawShotHistoryControlTarget = false;
     hardwareScaleFinishSettleSamples = 0;
     lastLoggedElapsedMs = 0;

@@ -6,10 +6,19 @@ import { Tooltip } from '../../../components/Tooltip.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faCrosshairs } from '@fortawesome/free-solid-svg-icons/faCrosshairs';
 import { InputGroupField, SettingsFormField } from '../../../components/SettingsFormField.jsx';
+import { hardwareScaleDisabled } from '../../../config/features.js';
 
 const ledControl = computed(() => machine.value.capabilities.ledControl);
 const pressureAvailable = computed(() => machine.value.capabilities.pressure);
 const tofDistance = computed(() => machine.value.status.tofDistance);
+
+const brewWeightSources = [
+  { value: 0, label: 'Auto' },
+  { value: 1, label: 'Bluetooth' },
+  ...(!hardwareScaleDisabled ? [{ value: 2, label: 'Hardware' }] : []),
+  { value: 3, label: 'Predictive' },
+  { value: 4, label: 'Off' },
+];
 
 function SunriseColorField({ id, label, value, fallback, onChange }) {
   return (
@@ -99,6 +108,40 @@ export function MachineTab({ formData, onChange, setField }) {
             />
           </InputGroupField>
         </div>
+      </Section>
+
+      <Section title='Weight Sources'>
+        <SettingsFormField label='Brew weight source' htmlFor='scaleSource' noMargin>
+          <input
+            id='scaleSource'
+            name='scaleSource'
+            type='hidden'
+            value={formData.scaleSource ?? 0}
+          />
+          <div
+            className='join join-vertical w-full sm:join-horizontal'
+            role='radiogroup'
+            aria-label='Brew weight source'
+          >
+            {brewWeightSources.map(({ value, label }) => {
+              const selected = Number(formData.scaleSource ?? 0) === value;
+              return (
+                <button
+                  key={value}
+                  type='button'
+                  role='radio'
+                  aria-checked={selected}
+                  className={`btn btn-sm join-item w-full min-w-0 sm:flex-1 ${
+                    selected ? 'btn-primary' : 'btn-outline'
+                  }`}
+                  onClick={() => setField('scaleSource', value)}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </SettingsFormField>
       </Section>
 
       {/* Machine Hardware Settings */}

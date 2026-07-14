@@ -18,6 +18,7 @@
 #include <display/plugins/HWScalePlugin.h>
 #endif
 #include <display/plugins/ShotHistoryPlugin.h>
+#include <display/util/LittleFSUtil.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
 #include <display/webassets/web_ui_manifest.h>
@@ -991,7 +992,11 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
 }
 
 void WebUIPlugin::loop() {
-    if (updating) {
+    if (otaUpdateCheckComplete.exchange(false, std::memory_order_acquire)) {
+        pluginManager->trigger("ota:update:status", "value", ota->isUpdateAvailable());
+        updateOTAStatus(ota->getCurrentVersion());
+    }
+    if (updating && !otaUpdateCheckInProgress.load(std::memory_order_acquire)) {
         // Pass which component is being flashed: a controller update streams the
         // firmware over BLE (wants a low-latency link), a display update is over
         // Wi-Fi (wants BLE to stay out of the radio's way). "" = both.
@@ -1004,15 +1009,11 @@ void WebUIPlugin::loop() {
         return;
     }
     const unsigned long now = millis();
-    // Skip the (blocking, TLS) update check while a process is active: a brew/steam/grind
-    // must not have the control loop stalled for the duration of the handshake, nor compete
-    // with it for memory. isActive() is the reliable "a process is running" signal. Subtraction
-    // (not now > last + interval) keeps the interval check millis()-rollover-safe.
-    if (!controller->isActive() && (lastUpdateCheck == 0 || now - lastUpdateCheck > UPDATE_CHECK_INTERVAL)) {
-        ota->checkForUpdates();
-        pluginManager->trigger("ota:update:status", "value", ota->isUpdateAvailable());
-        lastUpdateCheck = now;
-        updateOTAStatus(ota->getCurrentVersion());
+    // Run the TLS check on a low-priority worker only while idle so it cannot
+    // block loopTask and does not compete with an active process for memory.
+    // Subtraction keeps the interval check millis()-rollover-safe.
+    if (!updating && !controller->isActive() && (lastUpdateCheck == 0 || now - lastUpdateCheck > UPDATE_CHECK_INTERVAL)) {
+        startOTAUpdateCheck(now);
     }
     if (now > lastStatus + STATUS_PERIOD && !ws.getClients().empty()) {
         lastStatus = now;
@@ -1290,6 +1291,28 @@ void WebUIPlugin::loop() {
     }
 }
 
+void WebUIPlugin::startOTAUpdateCheck(const unsigned long now) {
+    bool expected = false;
+    if (!otaUpdateCheckInProgress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+    otaUpdateCheckComplete.store(false, std::memory_order_release);
+    if (xTaskCreatePinnedToCore(otaUpdateCheckTask, "OTA update check", 12288, this, 1, nullptr, 0) != pdPASS) {
+        otaUpdateCheckInProgress.store(false, std::memory_order_release);
+        ESP_LOGE("WebUIPlugin", "Unable to start OTA update check task");
+        return;
+    }
+    lastUpdateCheck = now;
+}
+
+void WebUIPlugin::otaUpdateCheckTask(void *arg) {
+    auto *plugin = static_cast<WebUIPlugin *>(arg);
+    plugin->ota->checkForUpdates();
+    plugin->otaUpdateCheckComplete.store(true, std::memory_order_release);
+    plugin->otaUpdateCheckInProgress.store(false, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
 // Linear lookup over the embedded asset table (~60 entries) â€” a couple of
 // strcmps per request, negligible next to the network round-trip.
 static const WebAsset *findWebAsset(const String &path) {
@@ -1372,10 +1395,11 @@ void WebUIPlugin::setupServer() {
     if (controller->isSDCard()) {
         fs = &SD_MMC;
     }
-    server.serveStatic("/api/history/", *fs, "/h/").setCacheControl("no-store");
-    server.on("/api/history/index.bin", HTTP_GET, [this, fs](AsyncWebServerRequest *request) {
+    server.on("/api/history/index.bin", HTTP_GET, [fs](AsyncWebServerRequest *request) {
         // Serve the binary index file directly
-        if (fs->exists("/h/index.bin")) {
+        const bool indexExists =
+            fs == &LittleFS ? LittleFSUtil::existsQuietly("/h/index.bin") : fs->exists("/h/index.bin");
+        if (indexExists) {
             request->send(*fs, "/h/index.bin", "application/octet-stream");
         } else {
             request->send(404, "text/plain", "Index not found");
@@ -1412,6 +1436,10 @@ void WebUIPlugin::setupServer() {
         free(entries);
         request->send(response);
     });
+    // Exact generated endpoints must be registered before this broad file route.
+    // Shot logs are raw binary files, so checking a nonexistent .gz sibling only
+    // adds LittleFS opens and error logging for every history request.
+    server.serveStatic("/api/history/", *fs, "/h/").setTryGzipFirst(false).setCacheControl("no-store");
     server.on("/api/core-dump", HTTP_GET, [this](AsyncWebServerRequest *request) { handleCoreDumpDownload(request); });
     // The web UI is embedded in firmware flash and served from the memory-mapped blob (see serveWebAsset). It is no
     // longer in LittleFS, so OTA never touches the partition holding profiles/shots. The catch-all onNotFound handles
