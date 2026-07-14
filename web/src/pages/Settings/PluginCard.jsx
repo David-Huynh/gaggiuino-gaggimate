@@ -4,8 +4,126 @@ import homekitImage from '../../assets/homekit.png';
 import { faCalendarDays } from '@fortawesome/free-solid-svg-icons/faCalendarDays';
 import { computed } from '@preact/signals';
 import { machine } from '../../services/ApiService.js';
+import { communityUploadPipelineText } from '../../utils/autoTuningStatus.js';
 
 const gearpumpAddon = computed(() => machine.value.capabilities.gearpumpAddon);
+const AUTO_TUNING_PROVIDER_OPTIONS = [
+  { value: 'off_board', label: 'Off-board EspressoRL' },
+  { value: 'on_board', label: 'On-board' },
+];
+
+function formatStatusTime(timestamp) {
+  const value = Number(timestamp || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 'Never';
+  }
+  return new Date(value * 1000).toLocaleString();
+}
+
+function lastShotStatusText(formData) {
+  if (!formData.rlLastShotId) {
+    return 'None';
+  }
+  return `${formatStatusTime(formData.rlLastShotAt)} - ${formData.rlLastShotId}`;
+}
+
+function statusText(formData) {
+  if (!formData.rlAutoTuningEnabled) {
+    return 'Disabled';
+  }
+  if (formData.rlProviderMode === 'on_board') {
+    return 'Not implemented';
+  }
+  if (formData.rlProviderMode === 'off_board' && !formData.homeAssistant) {
+    return 'Needs MQTT';
+  }
+  if (!formData.rlStatusSeen) {
+    return 'Add-on not seen';
+  }
+  return formData.rlAddonOnline ? 'Connected' : 'Offline';
+}
+
+function providerLabel(value) {
+  return AUTO_TUNING_PROVIDER_OPTIONS.find(option => option.value === value)?.label || 'Disabled';
+}
+
+function providerStatusTone(formData) {
+  if (!formData.rlAutoTuningEnabled) {
+    return 'badge-neutral';
+  }
+  if (formData.rlProviderMode === 'off_board' && formData.rlAddonOnline) {
+    return 'badge-success';
+  }
+  return 'badge-warning';
+}
+
+function applyStatusText(value) {
+  const statuses = {
+    applied: 'Applied',
+    partially_applied: 'Partially applied',
+    manual_required: 'Manual required',
+    failed: 'Failed',
+    unknown: 'Unknown',
+  };
+  return statuses[value] || 'None';
+}
+
+function StatusRow({ label, value }) {
+  return (
+    <div className='flex items-center justify-between gap-3 text-sm'>
+      <span className='opacity-70'>{label}</span>
+      <span className='max-w-44 truncate text-right font-medium'>{value}</span>
+    </div>
+  );
+}
+
+function CommunityUploadSettings({ formData, onChange }) {
+  return (
+    <div className='border-base-300 space-y-3 border-t pt-4'>
+      <div className='flex items-center justify-between gap-4'>
+        <div>
+          <span className='block text-base font-medium'>Anonymous Community Upload</span>
+          <span className='text-sm opacity-70'>
+            Share anonymized shot data for community research.
+          </span>
+        </div>
+        <input
+          id='rlCommunityUploadEnabled'
+          name='rlCommunityUploadEnabled'
+          value='rlCommunityUploadEnabled'
+          type='checkbox'
+          className='toggle toggle-primary'
+          checked={!!formData.rlCommunityUploadEnabled}
+          onChange={onChange('rlCommunityUploadEnabled')}
+          aria-label='Enable anonymous community upload'
+        />
+      </div>
+      <StatusRow label='Upload pipeline' value={communityUploadPipelineText(formData)} />
+      {formData.rlCommunityUploadEnabled && (
+        <div className='border-base-300 space-y-3 rounded-md border p-3'>
+          <div className='form-control'>
+            <label htmlFor='rlUploadBaseUrl' className='mb-2 block text-sm font-medium'>
+              Supabase base URL
+            </label>
+            <input
+              id='rlUploadBaseUrl'
+              name='rlUploadBaseUrl'
+              type='url'
+              className='input input-bordered w-full'
+              value={formData.rlUploadBaseUrl || ''}
+              onChange={onChange('rlUploadBaseUrl')}
+              placeholder='https://project-ref.supabase.co'
+            />
+          </div>
+          <StatusRow
+            label='Device credential'
+            value={formData.rlUploadCredentialConfigured ? 'Registered' : 'Pending'}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function PluginCard({
   formData,
@@ -269,8 +387,111 @@ export function PluginCard({
       </div>
 
       <div className='bg-base-200 rounded-lg p-4'>
+        <div className='space-y-4'>
+          <div className='flex items-start justify-between gap-4'>
+            <div className='min-w-0'>
+              <span className='block text-xl font-medium'>Auto Tuning</span>
+              <span className='text-sm opacity-70'>
+                Choose where recommendations are generated and manage community sharing.
+              </span>
+            </div>
+            <input
+              id='rlAutoTuningEnabled'
+              name='rlAutoTuningEnabled'
+              value='rlAutoTuningEnabled'
+              type='checkbox'
+              className='toggle toggle-primary shrink-0'
+              checked={!!formData.rlAutoTuningEnabled}
+              onChange={onChange('rlAutoTuningEnabled')}
+              aria-label='Enable Auto Tuning'
+            />
+          </div>
+
+          <CommunityUploadSettings formData={formData} onChange={onChange} />
+
+          {formData.rlAutoTuningEnabled && (
+            <div className='border-base-300 space-y-3 border-t pt-4'>
+              <div className='form-control'>
+                <label htmlFor='rlProviderMode' className='mb-2 block text-sm font-medium'>
+                  Provider
+                </label>
+                <select
+                  id='rlProviderMode'
+                  name='rlProviderMode'
+                  className='select select-bordered w-full'
+                  value={formData.rlProviderMode === 'on_board' ? 'on_board' : 'off_board'}
+                  onChange={onChange('rlProviderMode')}
+                >
+                  {AUTO_TUNING_PROVIDER_OPTIONS.map(option => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className='flex items-center justify-between gap-3'>
+                <span className='text-sm font-medium'>Provider status</span>
+                <span className={`badge ${providerStatusTone(formData)}`}>
+                  {statusText(formData)}
+                </span>
+              </div>
+              <StatusRow
+                label='Provider'
+                value={providerLabel(formData.rlProviderMode || 'disabled')}
+              />
+              <StatusRow
+                label='Details'
+                value={formData.rlProviderSummary || statusText(formData)}
+              />
+              {formData.rlProviderMode === 'off_board' && !formData.homeAssistant && (
+                <div className='alert alert-warning py-2 text-sm'>
+                  Enable MQTT Broker below to use the off-board EspressoRL provider.
+                </div>
+              )}
+
+              <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
+                <StatusRow label='Last status' value={formatStatusTime(formData.rlLastStatusAt)} />
+                <StatusRow label='Last shot stored' value={lastShotStatusText(formData)} />
+                <StatusRow
+                  label='Last recommendation'
+                  value={formData.rlLastRecommendationId || 'None'}
+                />
+                <StatusRow
+                  label='Apply status'
+                  value={applyStatusText(formData.rlRecommendationApplyStatus)}
+                />
+              </div>
+
+              <StatusRow label='Optimizer' value='Preference Optimization' />
+              <div className='grid grid-cols-1 gap-3 sm:grid-cols-2'>
+                <StatusRow
+                  label='Active bean'
+                  value={formData.rlBeanContextName || 'No bean selected'}
+                />
+                <StatusRow
+                  label='Active grinder'
+                  value={formData.rlGrinderContextName || 'No grinder selected'}
+                />
+                <StatusRow
+                  label='Local shots'
+                  value={(formData.rlLocalShotCount ?? 0).toString()}
+                />
+                <StatusRow
+                  label='Upload queue'
+                  value={(formData.rlUploadQueueCount ?? 0).toString()}
+                />
+              </div>
+              <a href='/autotuning' className='btn btn-outline btn-sm w-full'>
+                Open Auto Tuning
+              </a>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className='bg-base-200 rounded-lg p-4'>
         <div className='flex items-center justify-between'>
-          <span className='text-xl font-medium'>Home Assistant over MQTT (Deprecated)</span>
+          <span className='text-xl font-medium'>MQTT Broker</span>
           <input
             id='homeAssistant'
             name='homeAssistant'
@@ -279,23 +500,13 @@ export function PluginCard({
             className='toggle toggle-primary'
             checked={!!formData.homeAssistant}
             onChange={onChange('homeAssistant')}
-            aria-label='Enable Home Assistant'
+            aria-label='Enable MQTT'
           />
         </div>
         {formData.homeAssistant && (
           <div className='border-base-300 mt-4 space-y-4 border-t pt-4'>
             <p className='text-sm opacity-70'>
-              This feature allows connection to a Home Assistant or MQTT installation and push the
-              current state. This feature is deprecated for usage with Home Assistant. Please see
-              the{' '}
-              <a
-                href='https://github.com/gaggimate/ha-integration'
-                target='_blank'
-                rel='noreferrer'
-              >
-                Home Assistant Integration
-              </a>{' '}
-              for a more up-to-date solution.
+              Connect GaggiMate to an MQTT broker for telemetry and off-board integrations.
             </p>
             <div className='form-control'>
               <label htmlFor='haIP' className='mb-2 block text-sm font-medium'>
@@ -358,7 +569,7 @@ export function PluginCard({
             </div>
             <div className='form-control'>
               <label htmlFor='haTopic' className='mb-2 block text-sm font-medium'>
-                Home Assistant Discovery Topic
+                Discovery Topic
               </label>
               <input
                 id='haTopic'

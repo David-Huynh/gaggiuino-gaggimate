@@ -1,6 +1,7 @@
 #ifndef CONTROLLER_H
 #define CONTROLLER_H
 
+#include "AutoTuning.h"
 #include "GaggiMateClient.h"
 #include "PluginManager.h"
 #include "Settings.h"
@@ -70,6 +71,13 @@ class Controller {
     Process *getLastProcess() const { return lastProcess; }
     std::recursive_mutex &getProcessLock() const { return processMutex; }
     Settings &getSettings() { return settings; }
+    void setOptimizerTransport(AutoTuning::OptimizerTransportPort *transport) { optimizerTransport = transport; }
+    AutoTuning::OptimizerTransportPort *getOptimizerTransport() { return optimizerTransport; }
+    AutoTuning::OptimizerTransportPort const *getOptimizerTransport() const { return optimizerTransport; }
+    void setAutoTuningRecordStore(AutoTuning::AutoTuningRecordStorePort *store) { autoTuningRecordStore = store; }
+    AutoTuning::AutoTuningRecordStorePort *getAutoTuningRecordStore() const { return autoTuningRecordStore; }
+    void setCommunityUpload(AutoTuning::CommunityUploadPort *upload) { communityUpload = upload; }
+    AutoTuning::CommunityUploadPort *getCommunityUpload() const { return communityUpload; }
     ProfileManager *getProfileManager() { return profileManager; }
 #ifndef GAGGIMATE_HEADLESS
     DefaultUI *getUI() const { return ui; }
@@ -99,6 +107,7 @@ class Controller {
     void onProfileSave() const;
     void onProfileSaveAsNew();
     void onVolumetricMeasurement(double measurement, VolumetricMeasurementSource source);
+    VolumetricMeasurementSource getCurrentVolumetricSource() const { return currentVolumetricSource; }
     void setVolumetricOverride(bool override) { volumetricOverride = override; }
     bool isBluetoothScaleHealthy() const;
     void onFlush();
@@ -165,6 +174,9 @@ class Controller {
     Settings settings;
     PluginManager *pluginManager{};
     ProfileManager *profileManager{};
+    AutoTuning::OptimizerTransportPort *optimizerTransport{};
+    AutoTuning::AutoTuningRecordStorePort *autoTuningRecordStore{};
+    AutoTuning::CommunityUploadPort *communityUpload{};
 
     int mode = MODE_BREW;
     float currentTemp = 0;

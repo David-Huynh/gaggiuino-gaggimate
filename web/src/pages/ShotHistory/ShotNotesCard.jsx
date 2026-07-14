@@ -4,8 +4,14 @@ import { ApiServiceContext } from '../../services/ApiService.js';
 import { Spinner } from '../../components/Spinner.jsx';
 import { faEdit } from '@fortawesome/free-solid-svg-icons/faEdit';
 import { faSave } from '@fortawesome/free-solid-svg-icons/faSave';
+import {
+  deriveLegacyBalanceTaste,
+  formatTasteTags,
+  normalizeNotesTasteFields,
+  TASTE_TAG_GROUPS,
+} from '../../utils/tasteTags.js';
 
-export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
+export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAutoTuningLoaded }) {
   const apiService = useContext(ApiServiceContext);
 
   const [notes, setNotes] = useState({
@@ -16,7 +22,8 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
     doseOut: '',
     ratio: '',
     grindSetting: '',
-    balanceTaste: 'balanced',
+    balanceTaste: '',
+    tasteTags: [],
     notes: '',
   });
 
@@ -51,7 +58,8 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
           doseOut: '',
           ratio: '',
           grindSetting: '',
-          balanceTaste: 'balanced',
+          balanceTaste: '',
+          tasteTags: [],
           notes: '',
         };
 
@@ -81,11 +89,14 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
           loadedNotes.ratio = calculateRatio(loadedNotes.doseIn, loadedNotes.doseOut);
         }
 
-        setNotes(loadedNotes);
+        setNotes(normalizeNotesTasteFields(loadedNotes));
         setInitialLoaded(true);
         // Pass loaded notes to parent
         if (onNotesLoaded) {
-          onNotesLoaded(loadedNotes);
+          onNotesLoaded(normalizeNotesTasteFields(loadedNotes));
+        }
+        if (onAutoTuningLoaded) {
+          onAutoTuningLoaded(response.auto_tuning || null);
         }
       } catch (error) {
         console.error('Failed to load notes:', error);
@@ -99,7 +110,8 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
           doseOut: shot.volume ? shot.volume.toFixed(1) : '',
           ratio: '',
           grindSetting: '',
-          balanceTaste: 'balanced',
+          balanceTaste: '',
+          tasteTags: [],
           notes: '',
         };
 
@@ -107,6 +119,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
         setInitialLoaded(true);
         if (onNotesLoaded) {
           onNotesLoaded(defaultNotes);
+        }
+        if (onAutoTuningLoaded) {
+          onAutoTuningLoaded(null);
         }
       }
     };
@@ -124,15 +139,20 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
 
   const saveNotes = async () => {
     setLoading(true);
+    const notesToSave = normalizeNotesTasteFields(notes);
     try {
-      await apiService.request({
+      const response = await apiService.request({
         tp: 'req:history:notes:save',
         id: shot.id,
-        notes: notes,
+        notes: notesToSave,
       });
+      setNotes(notesToSave);
       setIsEditing(false);
       if (onNotesUpdate) {
-        onNotesUpdate(notes);
+        onNotesUpdate(notesToSave);
+      }
+      if (onAutoTuningLoaded) {
+        onAutoTuningLoaded(response.auto_tuning || null);
       }
     } catch (error) {
       console.error('Failed to save notes:', error);
@@ -156,6 +176,23 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
     });
   };
 
+  const toggleTasteTag = tag => {
+    setNotes(prev => {
+      const selected = new Set(prev.tasteTags || []);
+      if (selected.has(tag)) {
+        selected.delete(tag);
+      } else {
+        selected.add(tag);
+      }
+      const tasteTags = [...selected];
+      return {
+        ...prev,
+        tasteTags,
+        balanceTaste: deriveLegacyBalanceTaste(tasteTags),
+      };
+    });
+  };
+
   const renderStars = (rating, editable = false) => {
     const stars = [];
     for (let i = 1; i <= 5; i++) {
@@ -174,19 +211,6 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
       );
     }
     return stars;
-  };
-
-  const getTasteColor = taste => {
-    switch (taste) {
-      case 'bitter':
-        return 'text-orange-600';
-      case 'sour':
-        return 'text-yellow-600';
-      case 'balanced':
-        return 'text-green-600';
-      default:
-        return '';
-    }
   };
 
   // Don't render until initial load is complete
@@ -321,24 +345,39 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded }) {
           )}
         </div>
 
-        {/* Balance/Taste */}
-        <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Balance/Taste</label>
+        {/* Taste Tags */}
+        <div className='form-control md:col-span-2'>
+          <label className='mb-2 block text-sm font-medium'>Taste Tags</label>
           {isEditing ? (
-            <select
-              className='select select-bordered w-full'
-              value={notes.balanceTaste}
-              onChange={e => handleInputChange('balanceTaste', e.target.value)}
-            >
-              <option value='bitter'>Bitter</option>
-              <option value='balanced'>Balanced</option>
-              <option value='sour'>Sour</option>
-            </select>
+            <div className='space-y-3'>
+              {TASTE_TAG_GROUPS.map(group => (
+                <section key={group.key} className='space-y-2'>
+                  <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
+                    {group.label}
+                  </div>
+                  <div className='flex flex-wrap gap-2'>
+                    {group.tags.map(tag => {
+                      const selected = notes.tasteTags?.includes(tag.value);
+                      return (
+                        <button
+                          key={tag.value}
+                          type='button'
+                          className={`btn btn-xs h-auto min-h-7 whitespace-normal ${
+                            selected ? 'btn-primary' : 'btn-outline'
+                          }`}
+                          onClick={() => toggleTasteTag(tag.value)}
+                        >
+                          {tag.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
+            </div>
           ) : (
-            <div
-              className={`input input-bordered bg-base-200 w-full cursor-default capitalize ${getTasteColor(notes.balanceTaste)}`}
-            >
-              {notes.balanceTaste}
+            <div className='input input-bordered bg-base-200 h-auto min-h-12 w-full cursor-default whitespace-normal'>
+              {formatTasteTags(notes.tasteTags, '-')}
             </div>
           )}
         </div>

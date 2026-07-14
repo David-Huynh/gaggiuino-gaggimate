@@ -3,6 +3,8 @@
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <display/core/Controller.h>
+#include <display/core/Event.h>
 #include <display/core/Plugin.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
@@ -59,6 +61,12 @@ class ShotHistoryPlugin : public Plugin {
 
     void recordPhaseTransition(uint8_t phaseNumber, uint16_t sampleIndex,
                                uint8_t reason); // Helper for phase transitions
+    void rememberRLShotHistoryMapping(Event const &event);
+    void attachAutoTuningSummary(JsonDocument &response, JsonObjectConst notes) const;
+    uint8_t ratingFromNotes(const String &id);
+
+    // Live weight for a given source from the cached per-source values below.
+    float sourceWeight(VolumetricMeasurementSource source) const;
 
     Controller *controller = nullptr;
     PluginManager *pluginManager = nullptr;
@@ -73,6 +81,10 @@ class ShotHistoryPlugin : public Plugin {
 
     bool recording = false;
     bool extendedRecording = false;
+    // Source the active shot is recording weight from, latched at brew start so
+    // the logged weight stays consistent through the post-shot settling window
+    // (Controller::currentVolumetricSource resets to INACTIVE on brew end).
+    VolumetricMeasurementSource shotSource = VolumetricMeasurementSource::INACTIVE;
     bool indexEntryCreated = false;     // Track if early index entry was created
     bool shotStartedVolumetric = false; // Track initial volumetric mode
     double currentBrewDelay = 0.0;      // Brew delay (ms) the active shot was started with
@@ -82,10 +94,14 @@ class ShotHistoryPlugin : public Plugin {
     float currentTemperature = 0.0f;
     float currentBluetoothWeight = 0.0f;
     float lastStableWeight = 0.0f;
+    // Trailing-sample weight and EMA flow for the active volumetric source.
+    float lastScaleWeight = 0.0f;
+    float currentScaleFlow = 0.0f;
     float lastBluetoothWeight = 0.0f;
     float currentBluetoothFlow = 0.0f;
     float currentEstimatedWeight = 0.0f;
     float currentPuckResistance = 0.0f;
+    unsigned long lastLoggedElapsedMs = 0;
     String currentProfileName;
 
     // Phase transition tracking (v5+)

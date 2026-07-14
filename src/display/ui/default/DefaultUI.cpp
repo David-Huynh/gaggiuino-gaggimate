@@ -1,6 +1,8 @@
 #include "DefaultUI.h"
+#include <display/plugins/autotuning/AutoTuningTasteGoalJson.h>
 
 #include <WiFi.h>
+#include <display/core/AutoTuning.h>
 #include <display/core/Controller.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/Process.h>
@@ -11,6 +13,7 @@
 #include <display/drivers/WaveshareDriver.h>
 #include <display/drivers/common/LV_Helper.h>
 #endif
+#include <cmath>
 #include <display/main.h>
 #include <display/ui/utils/effects.h>
 #include <utility>
@@ -26,6 +29,34 @@ static constexpr uint32_t STARTUP_FADE_MS = 1000; // standby fade-in duration on
 static constexpr int32_t GAUGE_TICK_LONG = 25;      // meter tick length on most screens
 static constexpr int32_t GAUGE_TICK_SHORT = 10;     // shortened tick length on profile / new-menu screens
 static constexpr uint32_t GAUGE_TICK_ANIM_MS = 300; // tick length transition duration
+static constexpr const char *TASTE_GOAL_LEVEL_LABELS[] = {"Any", "Low", "Medium", "High"};
+static constexpr lv_coord_t AUTO_TUNING_CARD_MAX_WIDTH = 360;
+static constexpr lv_coord_t AUTO_TUNING_CARD_MAX_HEIGHT = 410;
+
+static lv_coord_t autoTuningCardWidth() {
+    const lv_coord_t available = LV_HOR_RES - 96;
+    return available < AUTO_TUNING_CARD_MAX_WIDTH ? available : AUTO_TUNING_CARD_MAX_WIDTH;
+}
+
+static lv_coord_t autoTuningCardHeight() {
+    const lv_coord_t available = LV_VER_RES - 48;
+    return available < AUTO_TUNING_CARD_MAX_HEIGHT ? available : AUTO_TUNING_CARD_MAX_HEIGHT;
+}
+
+static uint8_t tasteGoalLevelIndex(const String &level) {
+    if (level == "low")
+        return 1;
+    if (level == "medium")
+        return 2;
+    if (level == "high")
+        return 3;
+    return 0;
+}
+
+static const char *tasteGoalLevelValue(const uint8_t index) {
+    static constexpr const char *VALUES[] = {"", "low", "medium", "high"};
+    return index < 4 ? VALUES[index] : "";
+}
 
 // Profile and the new menu screen show shortened meter ticks.
 static bool isShortTickScreen(ScreensEnum s) {
@@ -45,6 +76,181 @@ static float clampPercentage(float pct) { return pct < 0.0f ? 0.0f : (pct > 100.
 // EEZ string setters allocate a fresh StringRef on the LVGL heap each call; skip unchanged text to cut churn.
 static bool stringChanged(const char *current, const char *next) {
     return current == nullptr || next == nullptr || strcmp(current, next) != 0;
+}
+
+static lv_color_t themeColor(const int index) { return lv_color_hex(theme_colors[eez_flow_get_selected_theme_index()][index]); }
+
+static const char *autoTuningProviderLabel(const String &mode) {
+    if (mode == AutoTuning::PROVIDER_OFF_BOARD) {
+        return "Off-board";
+    }
+    if (mode == AutoTuning::PROVIDER_ON_BOARD) {
+        return "On-board";
+    }
+    return "Disabled";
+}
+
+static uint16_t autoTuningProviderIndex(const String &mode) {
+    if (mode == AutoTuning::PROVIDER_ON_BOARD) {
+        return 1;
+    }
+    return 0;
+}
+
+static String autoTuningProviderModeFromIndex(const uint16_t index) {
+    if (index == 1) {
+        return AutoTuning::PROVIDER_ON_BOARD;
+    }
+    return AutoTuning::PROVIDER_OFF_BOARD;
+}
+
+static lv_obj_t *createAutoTuningLabel(lv_obj_t *parent, const char *text, const lv_coord_t x, const lv_coord_t y,
+                                       const lv_coord_t w, const lv_font_t *font, const lv_color_t color) {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_size(label, w, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_label_set_text(label, text);
+    return label;
+}
+
+static void recipeDomainDecrementClicked(lv_event_t *event) {
+    lv_obj_t *spinbox = static_cast<lv_obj_t *>(lv_event_get_user_data(event));
+    lv_spinbox_decrement(spinbox);
+    lv_event_send(spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+static void recipeDomainIncrementClicked(lv_event_t *event) {
+    lv_obj_t *spinbox = static_cast<lv_obj_t *>(lv_event_get_user_data(event));
+    lv_spinbox_increment(spinbox);
+    lv_event_send(spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
+}
+
+static lv_obj_t *createRecipeDomainSpinbox(lv_obj_t *parent, const char *label, const lv_coord_t y, const lv_coord_t bodyWidth,
+                                           const float value, const float minimum = 0.1f, const float maximum = 1000.0f) {
+    createAutoTuningLabel(parent, label, 4, y + 8, bodyWidth - 184, &lv_font_montserrat_14, themeColor(0));
+
+    lv_obj_t *spinbox = lv_spinbox_create(parent);
+    lv_obj_set_pos(spinbox, bodyWidth - 128, y);
+    lv_obj_set_size(spinbox, 78, 38);
+    lv_spinbox_set_range(spinbox, static_cast<int32_t>(std::lround(minimum * 10.0f)),
+                         static_cast<int32_t>(std::lround(maximum * 10.0f)));
+    const uint8_t digits = maximum >= 1000.0f ? 5 : maximum >= 100.0f ? 4 : maximum >= 10.0f ? 3 : 2;
+    lv_spinbox_set_digit_format(spinbox, digits, 1);
+    lv_spinbox_set_step(spinbox, 1);
+    lv_spinbox_set_value(spinbox, static_cast<int32_t>(std::lround(value * 10.0f)));
+    lv_obj_set_style_text_align(spinbox, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_bg_color(spinbox, themeColor(1), 0);
+    lv_obj_set_style_text_color(spinbox, themeColor(0), 0);
+    lv_obj_set_style_border_color(spinbox, themeColor(0), 0);
+    lv_obj_set_style_radius(spinbox, 6, 0);
+
+    lv_obj_t *minus = lv_btn_create(parent);
+    lv_obj_set_pos(minus, bodyWidth - 176, y);
+    lv_obj_set_size(minus, 40, 38);
+    lv_obj_set_style_radius(minus, 6, 0);
+    lv_obj_add_event_cb(minus, recipeDomainDecrementClicked, LV_EVENT_CLICKED, spinbox);
+    lv_obj_t *minusLabel = lv_label_create(minus);
+    lv_label_set_text(minusLabel, LV_SYMBOL_MINUS);
+    lv_obj_center(minusLabel);
+
+    lv_obj_t *plus = lv_btn_create(parent);
+    lv_obj_set_pos(plus, bodyWidth - 42, y);
+    lv_obj_set_size(plus, 40, 38);
+    lv_obj_set_style_radius(plus, 6, 0);
+    lv_obj_add_event_cb(plus, recipeDomainIncrementClicked, LV_EVENT_CLICKED, spinbox);
+    lv_obj_t *plusLabel = lv_label_create(plus);
+    lv_label_set_text(plusLabel, LV_SYMBOL_PLUS);
+    lv_obj_center(plusLabel);
+    return spinbox;
+}
+
+static void setAutoTuningSwitchState(lv_obj_t *sw, const bool checked, const bool enabled) {
+    if (!sw) {
+        return;
+    }
+    if (checked) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(sw, LV_STATE_CHECKED);
+    }
+    if (enabled) {
+        lv_obj_clear_state(sw, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(sw, LV_STATE_DISABLED);
+    }
+}
+
+static void autoTuningProviderChanged(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->setAutoTuningProviderFromIndex(lv_dropdown_get_selected(lv_event_get_target(event)));
+}
+
+static void autoTuningEnabledChanged(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->setAutoTuningEnabled(lv_obj_has_state(lv_event_get_target(event), LV_STATE_CHECKED));
+}
+
+static void autoTuningLocalChanged(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->setAutoTuningLocalOptimization(lv_obj_has_state(lv_event_get_target(event), LV_STATE_CHECKED));
+}
+
+static void autoTuningCommunityChanged(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->setAutoTuningCommunityUpload(lv_obj_has_state(lv_event_get_target(event), LV_STATE_CHECKED));
+}
+
+static void autoTuningCloseClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->closeAutoTuningSettings();
+}
+
+static void autoTuningTasteGoalClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->showTasteGoalSettings();
+}
+
+static void autoTuningDoseTargetChanged(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->setAutoTuningDoseTarget(lv_spinbox_get_value(lv_event_get_target(event)) / 10.0f);
+}
+
+static void autoTuningAdvancedClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->showRecipeDomainSettings();
+}
+
+static void recipeDomainCloseClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->closeRecipeDomainSettings();
+}
+
+static void recipeDomainSaveClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->saveRecipeDomainSettings();
+}
+
+static void tasteGoalCloseClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->closeTasteGoalSettings();
+}
+
+static void tasteGoalModeChanged(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->setTasteGoalModeFromIndex(lv_dropdown_get_selected(lv_event_get_target(event)));
+}
+
+static void tasteGoalLevelClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->cycleTasteGoalLevel(lv_event_get_target(event));
+}
+
+static void tasteGoalSaveClicked(lv_event_t *event) {
+    auto *ui = static_cast<DefaultUI *>(lv_event_get_user_data(event));
+    ui->saveTasteGoalSettings();
 }
 
 int16_t calculate_angle(int set_temp, int range, int offset) {
@@ -225,7 +431,18 @@ void DefaultUI::init() {
             rerender = true;
         }
     });
-    xTaskCreatePinnedToCore(profileLoopTask, "DefaultUI::loopProfiles", configMINIMAL_STACK_SIZE * 4, this, 1, &profileTaskHandle,
+    pluginManager->on("controller:volumetric-measurement:estimation:change", [=](Event const &event) {
+        double newWeight = event.getFloat("value");
+        if (round(newWeight * 10.0) != round(estimatedWeight * 10.0)) {
+            estimatedWeight = newWeight;
+            rerender = true;
+        }
+    });
+    pluginManager->on("controller:brew:prestart", [=](Event const &) {
+        estimatedWeight = 0.0;
+        rerender = true;
+    });
+    xTaskCreatePinnedToCore(profileLoopTask, "DefaultUI::loopProfiles", configMINIMAL_STACK_SIZE * 8, this, 1, &profileTaskHandle,
                             0);
 }
 
@@ -257,7 +474,14 @@ void DefaultUI::loop() {
         updateProfileInfo();
         updateBoiler();
         updateBrewProcess();
-        currentWeight = FloatValue(bluetoothWeight);
+        const auto weightSource = controller->getCurrentVolumetricSource();
+        double displayWeight = 0.0;
+        if (weightSource == VolumetricMeasurementSource::BLUETOOTH) {
+            displayWeight = bluetoothWeight;
+        } else if (weightSource == VolumetricMeasurementSource::FLOW_ESTIMATION) {
+            displayWeight = estimatedWeight;
+        }
+        currentWeight = FloatValue(displayWeight);
         eez::flow::setGlobalVariable(FLOW_GLOBAL_VARIABLE_SCALE_WEIGHT_CURRENT, currentWeight);
 
         char timeBuf[12];
@@ -365,6 +589,612 @@ void DefaultUI::onProfileSelect() {
 void DefaultUI::onVolumetricDelete() {
     controller->onVolumetricDelete();
     profileDirty = true;
+}
+
+void DefaultUI::showAutoTuningSettings() {
+    if (autoTuningModal != nullptr) {
+        updateAutoTuningSettingsModal();
+        return;
+    }
+
+    const lv_coord_t cardWidth = autoTuningCardWidth();
+    const lv_coord_t cardHeight = autoTuningCardHeight();
+    const lv_coord_t bodyWidth = cardWidth - 40;
+
+    autoTuningModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(autoTuningModal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(autoTuningModal, 0, 0);
+    lv_obj_set_style_bg_color(autoTuningModal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(autoTuningModal, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(autoTuningModal, 0, 0);
+    lv_obj_clear_flag(autoTuningModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(autoTuningModal);
+    lv_obj_set_size(card, cardWidth, cardHeight);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, themeColor(1), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, themeColor(0), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = createAutoTuningLabel(card, "Auto Tuning", 0, 14, cardWidth, &lv_font_montserrat_24, themeColor(0));
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 36, 32);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -28, 12);
+    lv_obj_set_style_radius(closeBtn, 8, 0);
+    lv_obj_set_style_bg_color(closeBtn, themeColor(0), 0);
+    lv_obj_set_style_bg_color(closeBtn, themeColor(2), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(closeBtn, autoTuningCloseClicked, LV_EVENT_CLICKED, this);
+    lv_obj_t *closeLabel = lv_label_create(closeBtn);
+    lv_label_set_text(closeLabel, "X");
+    lv_obj_set_style_text_color(closeLabel, themeColor(1), 0);
+    lv_obj_center(closeLabel);
+
+    lv_obj_t *body = lv_obj_create(card);
+    lv_obj_set_pos(body, 20, 58);
+    lv_obj_set_size(body, bodyWidth, cardHeight - 76);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_set_style_pad_bottom(body, 18, 0);
+
+    createAutoTuningLabel(body, "Auto Tuning", 4, 10, bodyWidth - 84, &lv_font_montserrat_16, themeColor(0));
+    autoTuningEnabledSwitch = lv_switch_create(body);
+    lv_obj_set_pos(autoTuningEnabledSwitch, bodyWidth - 66, 3);
+    lv_obj_set_size(autoTuningEnabledSwitch, 58, 32);
+    lv_obj_add_event_cb(autoTuningEnabledSwitch, autoTuningEnabledChanged, LV_EVENT_VALUE_CHANGED, this);
+
+    createAutoTuningLabel(body, "Provider", 4, 62, 116, &lv_font_montserrat_16, themeColor(0));
+    autoTuningProviderDropdown = lv_dropdown_create(body);
+    lv_obj_set_pos(autoTuningProviderDropdown, 124, 52);
+    lv_obj_set_size(autoTuningProviderDropdown, bodyWidth - 132, 40);
+    lv_dropdown_set_options(autoTuningProviderDropdown, "Off-board\nOn-board");
+    lv_obj_set_style_bg_color(autoTuningProviderDropdown, themeColor(1), 0);
+    lv_obj_set_style_text_color(autoTuningProviderDropdown, themeColor(0), 0);
+    lv_obj_set_style_border_color(autoTuningProviderDropdown, themeColor(0), 0);
+    lv_obj_set_style_radius(autoTuningProviderDropdown, 8, 0);
+    lv_obj_add_event_cb(autoTuningProviderDropdown, autoTuningProviderChanged, LV_EVENT_VALUE_CHANGED, this);
+
+    createAutoTuningLabel(body, "Local optimization", 4, 116, bodyWidth - 84, &lv_font_montserrat_16, themeColor(0));
+    autoTuningLocalSwitch = lv_switch_create(body);
+    lv_obj_set_pos(autoTuningLocalSwitch, bodyWidth - 66, 107);
+    lv_obj_set_size(autoTuningLocalSwitch, 58, 32);
+    lv_obj_add_event_cb(autoTuningLocalSwitch, autoTuningLocalChanged, LV_EVENT_VALUE_CHANGED, this);
+
+    createAutoTuningLabel(body, "Community upload", 4, 166, bodyWidth - 84, &lv_font_montserrat_16, themeColor(0));
+    autoTuningCommunitySwitch = lv_switch_create(body);
+    lv_obj_set_pos(autoTuningCommunitySwitch, bodyWidth - 66, 157);
+    lv_obj_set_size(autoTuningCommunitySwitch, 58, 32);
+    lv_obj_add_event_cb(autoTuningCommunitySwitch, autoTuningCommunityChanged, LV_EVENT_VALUE_CHANGED, this);
+
+    const AutoTuning::RecipeDomain recipeDomain = controller->getSettings().getRLRecipeDomain();
+    autoTuningDoseTarget =
+        createRecipeDomainSpinbox(body, "Dose target (g)", 204, bodyWidth, controller->getSettings().getTargetGrindVolume(),
+                                  recipeDomain.doseMinG, recipeDomain.doseMaxG);
+    lv_obj_add_event_cb(autoTuningDoseTarget, autoTuningDoseTargetChanged, LV_EVENT_VALUE_CHANGED, this);
+
+    createAutoTuningLabel(body, "Taste goal", 4, 266, 116, &lv_font_montserrat_16, themeColor(0));
+    autoTuningTasteGoalButton = lv_btn_create(body);
+    lv_obj_set_pos(autoTuningTasteGoalButton, 124, 254);
+    lv_obj_set_size(autoTuningTasteGoalButton, bodyWidth - 132, 40);
+    lv_obj_set_style_radius(autoTuningTasteGoalButton, 8, 0);
+    lv_obj_set_style_bg_color(autoTuningTasteGoalButton, themeColor(0), 0);
+    lv_obj_add_event_cb(autoTuningTasteGoalButton, autoTuningTasteGoalClicked, LV_EVENT_CLICKED, this);
+    autoTuningTasteGoalButtonLabel = lv_label_create(autoTuningTasteGoalButton);
+    lv_obj_set_width(autoTuningTasteGoalButtonLabel, bodyWidth - 152);
+    lv_label_set_long_mode(autoTuningTasteGoalButtonLabel, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_color(autoTuningTasteGoalButtonLabel, themeColor(1), 0);
+    lv_obj_center(autoTuningTasteGoalButtonLabel);
+
+    createAutoTuningLabel(body, "Optimizer", 4, 316, 116, &lv_font_montserrat_16, themeColor(0));
+    autoTuningAdvancedButton = lv_btn_create(body);
+    lv_obj_set_pos(autoTuningAdvancedButton, 124, 304);
+    lv_obj_set_size(autoTuningAdvancedButton, bodyWidth - 132, 40);
+    lv_obj_set_style_radius(autoTuningAdvancedButton, 8, 0);
+    lv_obj_set_style_bg_color(autoTuningAdvancedButton, themeColor(0), 0);
+    lv_obj_add_event_cb(autoTuningAdvancedButton, autoTuningAdvancedClicked, LV_EVENT_CLICKED, this);
+    lv_obj_t *advancedLabel = lv_label_create(autoTuningAdvancedButton);
+    lv_label_set_text(advancedLabel, "Advanced");
+    lv_obj_set_style_text_color(advancedLabel, themeColor(1), 0);
+    lv_obj_center(advancedLabel);
+
+    autoTuningStatusLabel = createAutoTuningLabel(body, "", 4, 370, bodyWidth - 12, &lv_font_montserrat_16, themeColor(0));
+    autoTuningSummaryLabel = createAutoTuningLabel(body, "", 4, 438, bodyWidth - 12, &lv_font_montserrat_14, themeColor(3));
+
+    updateAutoTuningSettingsModal();
+}
+
+void DefaultUI::closeAutoTuningSettings() {
+    closeTasteGoalSettings();
+    closeRecipeDomainSettings();
+    if (autoTuningModal != nullptr) {
+        lv_obj_del(autoTuningModal);
+    }
+    autoTuningModal = nullptr;
+    autoTuningEnabledSwitch = nullptr;
+    autoTuningProviderDropdown = nullptr;
+    autoTuningLocalSwitch = nullptr;
+    autoTuningCommunitySwitch = nullptr;
+    autoTuningDoseTarget = nullptr;
+    autoTuningTasteGoalButton = nullptr;
+    autoTuningTasteGoalButtonLabel = nullptr;
+    autoTuningAdvancedButton = nullptr;
+    autoTuningStatusLabel = nullptr;
+    autoTuningSummaryLabel = nullptr;
+}
+
+void DefaultUI::setAutoTuningEnabled(const bool enabled) {
+    Settings &settings = controller->getSettings();
+    String mode = settings.getRLAutoTuningProviderMode();
+    if (enabled && mode == AutoTuning::PROVIDER_DISABLED) {
+        mode = AutoTuning::PROVIDER_OFF_BOARD;
+    } else if (!enabled) {
+        mode = AutoTuning::PROVIDER_DISABLED;
+    }
+    settings.batchUpdate([&](Settings *settings) {
+        settings->setRLAutoTuningProviderMode(mode);
+        settings->setRLAutoTuningEnabled(enabled);
+        if (!enabled) {
+            settings->setRLLocalOptimizationEnabled(false);
+        }
+    });
+    if (pluginManager) {
+        pluginManager->trigger("settings:changed");
+        pluginManager->trigger("rl:settings:changed");
+    }
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::setAutoTuningProviderFromIndex(const uint16_t index) {
+    const String mode = autoTuningProviderModeFromIndex(index);
+    Settings &settings = controller->getSettings();
+    settings.batchUpdate([&](Settings *settings) {
+        settings->setRLAutoTuningProviderMode(mode);
+        settings->setRLAutoTuningEnabled(true);
+    });
+    if (pluginManager) {
+        pluginManager->trigger("settings:changed");
+        pluginManager->trigger("rl:settings:changed");
+    }
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::setAutoTuningLocalOptimization(const bool enabled) {
+    Settings &settings = controller->getSettings();
+    const bool providerEnabled = AutoTuning::Router(settings.getRLOptimizerConfiguration()).enabled();
+    settings.setRLLocalOptimizationEnabled(providerEnabled && enabled);
+    if (pluginManager) {
+        pluginManager->trigger("rl:settings:changed");
+    }
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::setAutoTuningCommunityUpload(const bool enabled) {
+    Settings &settings = controller->getSettings();
+    settings.batchUpdate([&](Settings *settings) {
+        settings->setRLCommunityUploadEnabled(enabled);
+        settings->setRLCommunityUploadPrompted(true);
+    });
+    if (pluginManager) {
+        pluginManager->trigger("rl:settings:changed");
+    }
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::setAutoTuningDoseTarget(const float doseG) {
+    Settings &settings = controller->getSettings();
+    const AutoTuning::RecipeDomain domain = settings.getRLRecipeDomain();
+    if (!std::isfinite(doseG) || doseG < domain.doseMinG || doseG > domain.doseMaxG) {
+        return;
+    }
+    controller->setTargetGrindVolume(doseG);
+    settings.save(true);
+    if (pluginManager) {
+        pluginManager->trigger("settings:changed");
+        pluginManager->trigger("rl:settings:changed");
+    }
+    markDirty();
+}
+
+void DefaultUI::showRecipeDomainSettings() {
+    if (recipeDomainModal != nullptr || controller == nullptr) {
+        return;
+    }
+
+    const AutoTuning::RecipeDomain domain = controller->getSettings().getRLRecipeDomain();
+    const lv_coord_t cardWidth = autoTuningCardWidth();
+    const lv_coord_t cardHeight = autoTuningCardHeight();
+    const lv_coord_t bodyWidth = cardWidth - 40;
+
+    recipeDomainModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(recipeDomainModal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(recipeDomainModal, 0, 0);
+    lv_obj_set_style_bg_color(recipeDomainModal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(recipeDomainModal, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(recipeDomainModal, 0, 0);
+    lv_obj_clear_flag(recipeDomainModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(recipeDomainModal);
+    lv_obj_set_size(card, cardWidth, cardHeight);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, themeColor(1), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, themeColor(0), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = createAutoTuningLabel(card, "Recipe Space", 0, 12, cardWidth, &lv_font_montserrat_24, themeColor(0));
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 36, 32);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -28, 10);
+    lv_obj_set_style_radius(closeBtn, 8, 0);
+    lv_obj_set_style_bg_color(closeBtn, themeColor(0), 0);
+    lv_obj_add_event_cb(closeBtn, recipeDomainCloseClicked, LV_EVENT_CLICKED, this);
+    lv_obj_t *closeLabel = lv_label_create(closeBtn);
+    lv_label_set_text(closeLabel, "X");
+    lv_obj_set_style_text_color(closeLabel, themeColor(1), 0);
+    lv_obj_center(closeLabel);
+
+    lv_obj_t *body = lv_obj_create(card);
+    lv_obj_set_pos(body, 20, 58);
+    lv_obj_set_size(body, bodyWidth, cardHeight - 142);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_set_style_pad_bottom(body, 8, 0);
+
+    recipeDomainGrindRadius = createRecipeDomainSpinbox(body, "Grind radius", 4, bodyWidth, domain.grindRadiusSteps,
+                                                        AutoTuning::RECIPE_DOMAIN_GRIND_RADIUS_MIN_STEPS,
+                                                        AutoTuning::RECIPE_DOMAIN_GRIND_RADIUS_MAX_STEPS);
+    recipeDomainDoseMin = createRecipeDomainSpinbox(body, "Dose min (g)", 52, bodyWidth, domain.doseMinG,
+                                                    AutoTuning::RECIPE_DOMAIN_DOSE_MIN_G, AutoTuning::RECIPE_DOMAIN_DOSE_MAX_G);
+    recipeDomainDoseMax = createRecipeDomainSpinbox(body, "Dose max (g)", 100, bodyWidth, domain.doseMaxG,
+                                                    AutoTuning::RECIPE_DOMAIN_DOSE_MIN_G, AutoTuning::RECIPE_DOMAIN_DOSE_MAX_G);
+    recipeDomainOutputMin =
+        createRecipeDomainSpinbox(body, "Output min (g)", 148, bodyWidth, domain.targetOutputMinG,
+                                  AutoTuning::RECIPE_DOMAIN_OUTPUT_MIN_G, AutoTuning::RECIPE_DOMAIN_OUTPUT_MAX_G);
+    recipeDomainOutputMax =
+        createRecipeDomainSpinbox(body, "Output max (g)", 196, bodyWidth, domain.targetOutputMaxG,
+                                  AutoTuning::RECIPE_DOMAIN_OUTPUT_MIN_G, AutoTuning::RECIPE_DOMAIN_OUTPUT_MAX_G);
+
+    recipeDomainStatusLabel =
+        createAutoTuningLabel(card, "", 20, cardHeight - 78, cardWidth - 190, &lv_font_montserrat_14, themeColor(3));
+    lv_obj_t *saveButton = lv_btn_create(card);
+    lv_obj_set_size(saveButton, 140, 40);
+    lv_obj_align(saveButton, LV_ALIGN_BOTTOM_RIGHT, -20, -14);
+    lv_obj_set_style_radius(saveButton, 8, 0);
+    lv_obj_set_style_bg_color(saveButton, themeColor(0), 0);
+    lv_obj_add_event_cb(saveButton, recipeDomainSaveClicked, LV_EVENT_CLICKED, this);
+    lv_obj_t *saveLabel = lv_label_create(saveButton);
+    lv_label_set_text(saveLabel, "Save");
+    lv_obj_set_style_text_color(saveLabel, themeColor(1), 0);
+    lv_obj_center(saveLabel);
+}
+
+void DefaultUI::closeRecipeDomainSettings() {
+    if (recipeDomainModal != nullptr) {
+        lv_obj_del(recipeDomainModal);
+    }
+    recipeDomainModal = nullptr;
+    recipeDomainGrindRadius = nullptr;
+    recipeDomainDoseMin = nullptr;
+    recipeDomainDoseMax = nullptr;
+    recipeDomainOutputMin = nullptr;
+    recipeDomainOutputMax = nullptr;
+    recipeDomainStatusLabel = nullptr;
+}
+
+void DefaultUI::saveRecipeDomainSettings() {
+    if (!recipeDomainGrindRadius || !recipeDomainDoseMin || !recipeDomainDoseMax || !recipeDomainOutputMin ||
+        !recipeDomainOutputMax || controller == nullptr) {
+        return;
+    }
+    const AutoTuning::RecipeDomain domain{
+        lv_spinbox_get_value(recipeDomainGrindRadius) / 10.0f, lv_spinbox_get_value(recipeDomainDoseMin) / 10.0f,
+        lv_spinbox_get_value(recipeDomainDoseMax) / 10.0f,     lv_spinbox_get_value(recipeDomainOutputMin) / 10.0f,
+        lv_spinbox_get_value(recipeDomainOutputMax) / 10.0f,
+    };
+    std::string reason;
+    const float currentDose = controller->getSettings().getTargetGrindVolume();
+    if (!AutoTuning::validateRecipeDomain(domain, reason)) {
+        if (recipeDomainStatusLabel) {
+            lv_label_set_text(recipeDomainStatusLabel, reason.c_str());
+        }
+        return;
+    }
+    if (currentDose < domain.doseMinG || currentDose > domain.doseMaxG) {
+        if (recipeDomainStatusLabel) {
+            lv_label_set_text(recipeDomainStatusLabel, "Range must include current dose");
+        }
+        return;
+    }
+    if (!controller->getSettings().setRLRecipeDomain(domain)) {
+        if (recipeDomainStatusLabel) {
+            lv_label_set_text(recipeDomainStatusLabel, "Unable to save recipe space");
+        }
+        return;
+    }
+    controller->getSettings().save(true);
+    if (pluginManager) {
+        pluginManager->trigger("settings:changed");
+        pluginManager->trigger("rl:settings:changed");
+    }
+    closeRecipeDomainSettings();
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::showTasteGoalSettings() {
+    if (tasteGoalModal != nullptr || controller == nullptr) {
+        updateTasteGoalSettingsModal();
+        return;
+    }
+
+    JsonDocument activeGoal;
+    AutoTuning::activeTasteGoal(controller->getSettings(), activeGoal);
+    tasteGoalCustom = activeGoal["mode"].as<String>() == "custom";
+    JsonObjectConst targets = activeGoal["targets"].as<JsonObjectConst>();
+    for (size_t index = 0; index < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++index) {
+        tasteGoalLevels[index] = tasteGoalLevelIndex(targets[AutoTuning::tasteGoalAttributeKey(index)].as<String>());
+    }
+
+    const lv_coord_t cardWidth = autoTuningCardWidth();
+    const lv_coord_t cardHeight = autoTuningCardHeight();
+    const lv_coord_t bodyWidth = cardWidth - 40;
+    const lv_coord_t rowWidth = bodyWidth - 8;
+
+    tasteGoalModal = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(tasteGoalModal, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(tasteGoalModal, 0, 0);
+    lv_obj_set_style_bg_color(tasteGoalModal, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(tasteGoalModal, LV_OPA_60, 0);
+    lv_obj_set_style_border_width(tasteGoalModal, 0, 0);
+    lv_obj_clear_flag(tasteGoalModal, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(tasteGoalModal);
+    lv_obj_set_size(card, cardWidth, cardHeight);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(card, themeColor(1), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, themeColor(0), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = createAutoTuningLabel(card, "Taste Goal", 0, 12, cardWidth, &lv_font_montserrat_24, themeColor(0));
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *closeBtn = lv_btn_create(card);
+    lv_obj_set_size(closeBtn, 36, 32);
+    lv_obj_align(closeBtn, LV_ALIGN_TOP_RIGHT, -28, 10);
+    lv_obj_set_style_radius(closeBtn, 8, 0);
+    lv_obj_set_style_bg_color(closeBtn, themeColor(0), 0);
+    lv_obj_add_event_cb(closeBtn, tasteGoalCloseClicked, LV_EVENT_CLICKED, this);
+    lv_obj_t *closeLabel = lv_label_create(closeBtn);
+    lv_label_set_text(closeLabel, "X");
+    lv_obj_set_style_text_color(closeLabel, themeColor(1), 0);
+    lv_obj_center(closeLabel);
+
+    createAutoTuningLabel(card, "Mode", 24, 66, 66, &lv_font_montserrat_16, themeColor(0));
+    tasteGoalModeDropdown = lv_dropdown_create(card);
+    lv_obj_set_pos(tasteGoalModeDropdown, 94, 56);
+    lv_obj_set_size(tasteGoalModeDropdown, cardWidth - 122, 40);
+    lv_dropdown_set_options(tasteGoalModeDropdown, "Balanced\nCustom");
+    lv_obj_set_style_bg_color(tasteGoalModeDropdown, themeColor(1), 0);
+    lv_obj_set_style_text_color(tasteGoalModeDropdown, themeColor(0), 0);
+    lv_obj_set_style_border_color(tasteGoalModeDropdown, themeColor(0), 0);
+    lv_obj_set_style_radius(tasteGoalModeDropdown, 8, 0);
+    lv_obj_add_event_cb(tasteGoalModeDropdown, tasteGoalModeChanged, LV_EVENT_VALUE_CHANGED, this);
+
+    lv_obj_t *body = lv_obj_create(card);
+    lv_obj_set_pos(body, 20, 106);
+    lv_obj_set_size(body, bodyWidth, cardHeight - 196);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+
+    for (size_t index = 0; index < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++index) {
+        lv_obj_t *row = lv_obj_create(body);
+        lv_obj_set_pos(row, 0, static_cast<lv_coord_t>(index * 46));
+        lv_obj_set_size(row, rowWidth, 44);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_color(row, themeColor(3), 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        createAutoTuningLabel(row, AutoTuning::tasteGoalAttributeLabel(index), 4, 12, rowWidth - 116, &lv_font_montserrat_14,
+                              themeColor(0));
+        lv_obj_t *levelButton = lv_btn_create(row);
+        lv_obj_set_pos(levelButton, rowWidth - 108, 5);
+        lv_obj_set_size(levelButton, 104, 34);
+        lv_obj_set_style_radius(levelButton, 8, 0);
+        lv_obj_set_style_bg_color(levelButton, themeColor(0), 0);
+        lv_obj_add_event_cb(levelButton, tasteGoalLevelClicked, LV_EVENT_CLICKED, this);
+        lv_obj_t *levelLabel = lv_label_create(levelButton);
+        lv_obj_set_style_text_color(levelLabel, themeColor(1), 0);
+        lv_obj_center(levelLabel);
+        tasteGoalLevelButtons[index] = levelButton;
+    }
+
+    tasteGoalStatusLabel =
+        createAutoTuningLabel(card, "", 20, cardHeight - 82, cardWidth - 40, &lv_font_montserrat_14, themeColor(3));
+    lv_obj_set_style_text_align(tasteGoalStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *saveButton = lv_btn_create(card);
+    lv_obj_set_size(saveButton, 150, 40);
+    lv_obj_align(saveButton, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_set_style_radius(saveButton, 8, 0);
+    lv_obj_set_style_bg_color(saveButton, themeColor(0), 0);
+    lv_obj_add_event_cb(saveButton, tasteGoalSaveClicked, LV_EVENT_CLICKED, this);
+    lv_obj_t *saveLabel = lv_label_create(saveButton);
+    lv_label_set_text(saveLabel, "Save");
+    lv_obj_set_style_text_color(saveLabel, themeColor(1), 0);
+    lv_obj_center(saveLabel);
+
+    updateTasteGoalSettingsModal();
+}
+
+void DefaultUI::closeTasteGoalSettings() {
+    if (tasteGoalModal != nullptr) {
+        lv_obj_del(tasteGoalModal);
+    }
+    tasteGoalModal = nullptr;
+    tasteGoalModeDropdown = nullptr;
+    tasteGoalStatusLabel = nullptr;
+    for (auto &button : tasteGoalLevelButtons) {
+        button = nullptr;
+    }
+}
+
+void DefaultUI::setTasteGoalModeFromIndex(const uint16_t index) {
+    tasteGoalCustom = index == 1;
+    updateTasteGoalSettingsModal();
+}
+
+void DefaultUI::cycleTasteGoalLevel(lv_obj_t *button) {
+    if (!tasteGoalCustom || button == nullptr) {
+        return;
+    }
+    for (size_t index = 0; index < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++index) {
+        if (tasteGoalLevelButtons[index] != button) {
+            continue;
+        }
+        tasteGoalLevels[index] = static_cast<uint8_t>((tasteGoalLevels[index] + 1) % 4);
+        updateTasteGoalSettingsModal();
+        return;
+    }
+}
+
+void DefaultUI::saveTasteGoalSettings() {
+    if (controller == nullptr) {
+        return;
+    }
+    JsonDocument goal;
+    goal["schema_version"] = AutoTuning::TASTE_GOAL_SCHEMA_VERSION;
+    goal["mode"] = tasteGoalCustom ? "custom" : "balanced";
+    JsonObject targets = goal["targets"].to<JsonObject>();
+    if (tasteGoalCustom) {
+        for (size_t index = 0; index < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++index) {
+            if (tasteGoalLevels[index] > 0) {
+                targets[AutoTuning::tasteGoalAttributeKey(index)] = tasteGoalLevelValue(tasteGoalLevels[index]);
+            }
+        }
+    }
+
+    Settings &settings = controller->getSettings();
+    String error;
+    if (!AutoTuning::setTasteGoalForContext(settings, settings.getRLBeanContextId(), settings.getRLGrinderContextId(),
+                                            goal.as<JsonVariantConst>(), error)) {
+        if (tasteGoalStatusLabel != nullptr) {
+            lv_label_set_text(tasteGoalStatusLabel, error.c_str());
+        }
+        return;
+    }
+    if (pluginManager != nullptr) {
+        pluginManager->trigger("settings:changed");
+        pluginManager->trigger("rl:settings:changed");
+        pluginManager->trigger("rl:taste-goal:changed");
+    }
+    closeTasteGoalSettings();
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::updateTasteGoalSettingsModal() {
+    if (tasteGoalModal == nullptr) {
+        return;
+    }
+    if (tasteGoalModeDropdown != nullptr) {
+        lv_dropdown_set_selected(tasteGoalModeDropdown, tasteGoalCustom ? 1 : 0);
+    }
+    size_t selectedCount = 0;
+    for (size_t index = 0; index < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++index) {
+        lv_obj_t *button = tasteGoalLevelButtons[index];
+        if (button == nullptr) {
+            continue;
+        }
+        selectedCount += tasteGoalLevels[index] > 0 ? 1 : 0;
+        lv_obj_t *label = lv_obj_get_child(button, 0);
+        if (label != nullptr) {
+            lv_label_set_text(label, TASTE_GOAL_LEVEL_LABELS[tasteGoalLevels[index]]);
+        }
+        if (tasteGoalCustom) {
+            lv_obj_clear_state(button, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(button, LV_STATE_DISABLED);
+        }
+    }
+    if (tasteGoalStatusLabel != nullptr) {
+        lv_label_set_text(tasteGoalStatusLabel, tasteGoalCustom && selectedCount == 0 ? "Select at least one target" : "");
+    }
+}
+
+void DefaultUI::updateAutoTuningSettingsModal() {
+    if (autoTuningModal == nullptr) {
+        return;
+    }
+    Settings &settings = controller->getSettings();
+    AutoTuning::Router router(settings.getRLOptimizerConfiguration(), controller->getOptimizerTransport());
+    const String mode = settings.getRLAutoTuningProviderMode();
+    const bool providerEnabled = router.enabled();
+
+    setAutoTuningSwitchState(autoTuningEnabledSwitch, providerEnabled, true);
+
+    if (autoTuningProviderDropdown != nullptr) {
+        lv_dropdown_set_selected(autoTuningProviderDropdown, autoTuningProviderIndex(mode));
+        if (providerEnabled) {
+            lv_obj_clear_state(autoTuningProviderDropdown, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(autoTuningProviderDropdown, LV_STATE_DISABLED);
+        }
+    }
+
+    setAutoTuningSwitchState(autoTuningLocalSwitch, settings.isRLLocalOptimizationEnabled(), providerEnabled);
+    setAutoTuningSwitchState(autoTuningCommunitySwitch, settings.isRLCommunityUploadEnabled(), true);
+    if (autoTuningTasteGoalButtonLabel != nullptr) {
+        const String summary = AutoTuning::activeTasteGoalSummary(settings);
+        lv_label_set_text(autoTuningTasteGoalButtonLabel, summary.c_str());
+    }
+    if (autoTuningTasteGoalButton != nullptr) {
+        const bool contextReady =
+            providerEnabled && !settings.getRLBeanContextId().isEmpty() && !settings.getRLGrinderContextId().isEmpty();
+        if (contextReady) {
+            lv_obj_clear_state(autoTuningTasteGoalButton, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(autoTuningTasteGoalButton, LV_STATE_DISABLED);
+        }
+    }
+
+    String status = String(autoTuningProviderLabel(mode)) + " - " + router.providerStatus();
+    if (providerEnabled && settings.isRLLocalOptimizationEnabled() && settings.getRLBeanContextId().isEmpty()) {
+        status += "\nSelect a bean context to optimize";
+    }
+    lv_label_set_text(autoTuningStatusLabel, status.c_str());
+
+    String summary = router.providerSummary();
+    if (mode == AutoTuning::PROVIDER_OFF_BOARD && !settings.isHomeAssistant()) {
+        summary += "\nEnable MQTT Broker for off-board mode";
+    }
+    if (settings.isRLCommunityUploadEnabled()) {
+        summary += "\nUpload waits for device registration";
+    }
+    lv_label_set_text(autoTuningSummaryLabel, summary.c_str());
 }
 
 void DefaultUI::setupPanel() {

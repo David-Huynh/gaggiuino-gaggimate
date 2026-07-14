@@ -126,6 +126,11 @@ export const PANEL_DEFINITIONS = [
       raiseTarget: ds.raiseTarget,
       lowerTarget: ds.lowerTarget,
       volumetricAvailable: ds.volumetricAvailable,
+      autoTuningEnabled: ds.autoTuningEnabled,
+      localOptimizationEnabled: ds.localOptimizationEnabled,
+      beanContextName: ds.beanContextName,
+      hasBeanContext: ds.hasBeanContext,
+      toggleLocalOptimization: ds.toggleLocalOptimization,
     }),
   },
 ];

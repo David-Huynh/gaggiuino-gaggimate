@@ -15,8 +15,13 @@
 #include <display/core/static_profiles.h>
 #include <display/core/zones.h>
 #include <display/plugins/AutoWakeupPlugin.h>
+#ifndef GAGGIMATE_SIM
+#include <display/plugins/AutoTuningCapturePlugin.h>
+#include <display/plugins/CommunityUploadPlugin.h>
+#endif
 #include <display/plugins/BoilerFillPlugin.h>
 #include <display/plugins/LedControlPlugin.h>
+#include <display/plugins/LocalAutoTuningStorePlugin.h>
 #include <display/plugins/ShotHistoryPlugin.h>
 #include <display/plugins/SmartGrindPlugin.h>
 #include <display/plugins/WebUIPlugin.h>
@@ -26,6 +31,9 @@
 #include <display/plugins/ImprovPlugin.h>
 #include <display/plugins/MQTTPlugin.h>
 #include <display/plugins/NetworkWatchdogPlugin.h>
+#ifndef GAGGIMATE_HEADLESS
+#include <display/plugins/AutoTuningPreferencePlugin.h>
+#endif
 #include <display/plugins/WifiStaWatchdogPlugin.h>
 #include <display/plugins/mDNSPlugin.h>
 #endif
@@ -91,8 +99,18 @@ void Controller::setup() {
     if (settings.isHomeAssistant()) {
         pluginManager->registerPlugin(new MQTTPlugin());
     }
+#ifndef GAGGIMATE_HEADLESS
+    pluginManager->registerPlugin(new AutoTuningPreferencePlugin());
+#endif
 #endif
     pluginManager->registerPlugin(new WebUIPlugin());
+#ifndef GAGGIMATE_SIM
+    pluginManager->registerPlugin(&AutoTuningCapture);
+#endif
+    pluginManager->registerPlugin(&LocalAutoTuningStore);
+#ifndef GAGGIMATE_SIM
+    pluginManager->registerPlugin(new CommunityUploadPlugin());
+#endif
 #ifndef GAGGIMATE_SIM // WiFi watchdogs and BLE scales are device-only
     pluginManager->registerPlugin(new NetworkWatchdogPlugin());
     pluginManager->registerPlugin(new WifiStaWatchdogPlugin());

@@ -3,7 +3,7 @@
  *
  * Dual-persistence notes service for Shot Analyzer.
  * Notes JSON format is identical across all backends:
- *   { id, rating, beanType, doseIn, doseOut, ratio, grindSetting, balanceTaste, notes }
+ *   { id, rating, beanType, doseIn, doseOut, ratio, grindSetting, tasteTags, balanceTaste, notes }
  *
  * - GaggiMate shots: Uses the same API as ShotHistory (req:history:notes:get/save)
  * - Browser shots: Dedicated 'notes' store in IndexedDB (same JSON format as API)
@@ -11,6 +11,7 @@
  */
 
 import { indexedDBService } from './IndexedDBService';
+import { normalizeNotesTasteFields } from '../../../utils/tasteTags.js';
 
 const DEFAULT_NOTES = {
   rating: 0,
@@ -19,7 +20,8 @@ const DEFAULT_NOTES = {
   doseOut: '',
   ratio: '',
   grindSetting: '',
-  balanceTaste: 'balanced',
+  tasteTags: [],
+  balanceTaste: '',
   notes: '',
 };
 
@@ -119,14 +121,16 @@ class NotesService {
   async loadNotes(shotId, source) {
     const defaults = this.getDefaults(shotId);
 
-    if (source === 'gaggimate') return this.loadGaggiMateNotes(shotId, defaults);
-    if (source === 'browser') return this.loadBrowserNotes(shotId, defaults);
-    return this.loadTempNotes(shotId, defaults);
+    let notes;
+    if (source === 'gaggimate') notes = await this.loadGaggiMateNotes(shotId, defaults);
+    else if (source === 'browser') notes = await this.loadBrowserNotes(shotId, defaults);
+    else notes = this.loadTempNotes(shotId, defaults);
+    return normalizeNotesTasteFields(notes);
   }
 
   async saveNotes(shotId, source, notes) {
     // Ensure the notes object always has the shot ID
-    const notesWithId = { ...notes, id: String(shotId) };
+    const notesWithId = normalizeNotesTasteFields({ ...notes, id: String(shotId) });
 
     if (source === 'gaggimate') {
       if (!this.apiService) throw new Error('ApiService not available');

@@ -11,6 +11,7 @@ import { useEffect, useState } from 'preact/hooks';
 import { LocationProvider, Router, Route, ErrorBoundary, useLocation } from 'preact-iso';
 import lazy from 'preact-iso/lazy';
 
+import { AutoTuningPromptOverlay } from './components/AutoTuningPromptOverlay.jsx';
 import ApiService, { ApiServiceContext } from './services/ApiService.js';
 import { Navigation } from './components/Navigation.jsx';
 import { Spinner } from './components/Spinner.jsx';
@@ -33,6 +34,7 @@ const StatisticsPage = lazy(() =>
 const DashboardSettings = lazy(() =>
   import('./pages/DashboardSettings/index.jsx').then(m => m.DashboardSettings),
 );
+const AutoTuning = lazy(() => import('./pages/AutoTuning/index.jsx').then(m => m.AutoTuning));
 
 const apiService = new ApiService();
 const DESKTOP_NAV_COLLAPSED_STORAGE_KEY = 'gaggimate.desktopNavCollapsed';
@@ -104,6 +106,7 @@ export function App() {
                       <Route path='/profiles' component={ProfileList} />
                       <Route path='/profiles/:id' component={ProfileEdit} />
                       <Route path='/settings/:tab?' component={Settings} />
+                      <Route path='/autotuning' component={AutoTuning} />
                       {/* Legacy routes now live in settings tabs */}
                       <Route path='/ota' component={RedirectTo('/settings/system')} />
                       <Route path='/scales' component={RedirectTo('/settings/bluetooth')} />
@@ -123,6 +126,7 @@ export function App() {
                 </div>
               </div>
             </div>
+            <AutoTuningPromptOverlay />
           </div>
           {navCollapsed && (
             <div className='fab end-auto left-4 md:hidden landscape:hidden'>

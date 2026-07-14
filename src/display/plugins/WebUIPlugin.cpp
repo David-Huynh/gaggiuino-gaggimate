@@ -1,9 +1,14 @@
 #include "WebUIPlugin.h"
+#include "autotuning/AutoTuningTasteGoalJson.h"
 #include <DNSServer.h>
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <display/core/AutoTuning.h>
 #include <display/core/Controller.h>
+#include <display/core/EpochTime.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
@@ -18,6 +23,7 @@
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_partition.h>
+#include <esp_system.h>
 #include <mbedtls/platform.h>
 #include <string>
 #include <unordered_map>
@@ -30,6 +36,8 @@
 // themselves stay on the default heap (tiny: an id + a string handle).
 using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>>;
 static std::unordered_map<uint32_t, PsramString> rxBuffers;
+static std::unordered_map<uint32_t, unsigned long> rxBufferLastActivity;
+static constexpr unsigned long RXBUFFER_IDLE_EVICT_MS = 5UL * 60UL * 1000UL;
 static WebUIPlugin *g_webUIPlugin = nullptr;
 
 // Serialize a JsonDocument straight into a PSRAM-backed WebSocket message
@@ -50,6 +58,411 @@ static void *mbedtlsPsramCalloc(size_t n, size_t size) { // NOSONAR
     return p;
 }
 static void mbedtlsPsramFree(void *p) { heap_caps_free(p); } // NOSONAR
+
+static String defaultRLContextName() { return String("Bean ") + String(static_cast<long long>(EpochTime::now())); }
+
+static String defaultRLGrinderContextName() { return String("Grinder ") + String(static_cast<long long>(EpochTime::now())); }
+
+static String makeRLContextId(const String &prefix, const String &name) {
+    String id = name;
+    id.toLowerCase();
+    id.replace(" ", "_");
+    id.replace("/", "_");
+    id.replace("\\", "_");
+    id.replace(":", "_");
+    id.replace("\"", "");
+    if (id.isEmpty()) {
+        id = prefix;
+    }
+    return prefix + "_" + id + "_" + String(static_cast<long long>(EpochTime::now())) + "_" +
+           String(static_cast<unsigned long>(millis()));
+}
+
+static JsonArray loadRLContexts(JsonDocument &doc, const String &rawJson) {
+    DeserializationError error = deserializeJson(doc, rawJson);
+    if (error || !doc.is<JsonArray>()) {
+        doc.clear();
+        return doc.to<JsonArray>();
+    }
+    return doc.as<JsonArray>();
+}
+
+static String limitedRLString(JsonVariant value, size_t maxLength) {
+    String text = value.as<String>();
+    text.trim();
+    if (text.length() > maxLength) {
+        text = text.substring(0, maxLength);
+    }
+    return text;
+}
+
+static std::int64_t rlEpochOrZero(JsonVariantConst value) {
+    return !value.is<bool>() && value.is<std::int64_t>() ? value.as<std::int64_t>() : 0;
+}
+
+static void copyRLStringArray(JsonDocument &target, const char *key, const String &rawJson) {
+    JsonArray out = target[key].to<JsonArray>();
+    JsonDocument sourceDoc;
+    DeserializationError error = deserializeJson(sourceDoc, rawJson);
+    if (error || !sourceDoc.is<JsonArray>()) {
+        return;
+    }
+
+    int copied = 0;
+    for (JsonVariant item : sourceDoc.as<JsonArray>()) {
+        String text = limitedRLString(item, 160);
+        if (text.isEmpty()) {
+            continue;
+        }
+        out.add(text);
+        copied++;
+        if (copied >= 8) {
+            break;
+        }
+    }
+}
+
+static void copyRLDiagnosticSteps(JsonDocument &target, const String &rawJson) {
+    JsonArray out = target["rlAutoTuningDiagnosticSteps"].to<JsonArray>();
+    JsonDocument sourceDoc;
+    DeserializationError error = deserializeJson(sourceDoc, rawJson);
+    if (error || !sourceDoc.is<JsonArray>()) {
+        return;
+    }
+
+    int copied = 0;
+    for (JsonVariant item : sourceDoc.as<JsonArray>()) {
+        if (!item.is<JsonObject>()) {
+            continue;
+        }
+        JsonObject src = item.as<JsonObject>();
+        String key = limitedRLString(src["key"], 64);
+        String label = limitedRLString(src["label"], 80);
+        if (key.isEmpty() || label.isEmpty()) {
+            continue;
+        }
+
+        JsonObject step = out.add<JsonObject>();
+        step["key"] = key;
+        step["label"] = label;
+        step["state"] = limitedRLString(src["state"], 32);
+        step["detail"] = limitedRLString(src["detail"], 160);
+        copied++;
+        if (copied >= 8) {
+            break;
+        }
+    }
+}
+
+static void copyRLRecentShots(JsonDocument &target, const String &rawJson) {
+    JsonArray out = target["rlRecentShots"].to<JsonArray>();
+    JsonDocument recentDoc;
+    DeserializationError error = deserializeJson(recentDoc, rawJson);
+    if (error || !recentDoc.is<JsonArray>()) {
+        return;
+    }
+
+    int copied = 0;
+    for (JsonVariant item : recentDoc.as<JsonArray>()) {
+        if (!item.is<JsonObject>()) {
+            continue;
+        }
+        JsonObject src = item.as<JsonObject>();
+        String shotId = limitedRLString(src["shot_id"], 160);
+        if (shotId.isEmpty()) {
+            continue;
+        }
+
+        JsonObject shot = out.add<JsonObject>();
+        shot["shot_id"] = shotId;
+        shot["timestamp"] = rlEpochOrZero(src["timestamp"]);
+        shot["shot_type"] = limitedRLString(src["shot_type"], 40);
+        shot["shot_time_s"] = src["shot_time_s"] | 0.0f;
+        shot["beverage_out_g"] = src["beverage_out_g"] | 0.0f;
+        shot["target_yield_g"] = src["target_yield_g"] | 0.0f;
+        shot["exclude_from_local_optimization"] = src["exclude_from_local_optimization"] | false;
+        shot["optimization_weight"] = src["optimization_weight"] | 0.0f;
+        shot["profile_label"] = limitedRLString(src["profile_label"], 80);
+        shot["profile_type"] = limitedRLString(src["profile_type"], 40);
+        shot["final_phase_index"] = src["final_phase_index"] | 0;
+        shot["final_phase_name"] = limitedRLString(src["final_phase_name"], 80);
+        shot["final_phase_type"] = limitedRLString(src["final_phase_type"], 40);
+        shot["final_phase_elapsed_s"] = src["final_phase_elapsed_s"] | 0.0f;
+        shot["final_pump_target"] = limitedRLString(src["final_pump_target"], 40);
+        shot["shot_end_state"] = limitedRLString(src["shot_end_state"], 40);
+        shot["profile_flow_valid"] = src["profile_flow_valid"] | false;
+        shot["profile_flow_masked"] = src["profile_flow_masked"] | false;
+        copied++;
+        if (copied >= 10) {
+            break;
+        }
+    }
+}
+
+static int currentBagIndex(JsonArray contexts, const String &name) {
+    int bag = 0;
+    for (JsonObject context : contexts) {
+        if (context["name"].as<String>() == name) {
+            bag = std::max(bag, context["bag_index"] | 0);
+        }
+    }
+    return bag;
+}
+
+constexpr size_t MAX_RL_BEAN_CONTEXTS = 16;
+constexpr size_t MAX_RL_GRINDER_CONTEXTS = 8;
+constexpr size_t MAX_RL_CONTEXT_JSON_BYTES = 3500;
+
+static bool makeRoomForRLContext(JsonArray contexts, size_t maxContexts, Settings &settings, bool grinder) {
+    while (contexts.size() >= maxContexts) {
+        bool removed = false;
+        for (size_t i = 0; i < contexts.size(); i++) {
+            JsonObject context = contexts[i];
+            if (context["status"].as<String>() != "active") {
+                const String contextId = context["id"].as<String>();
+                contexts.remove(i);
+                if (grinder) {
+                    AutoTuning::removeTasteGoalsForGrinderContext(settings, contextId);
+                } else {
+                    AutoTuning::removeTasteGoalsForBeanContext(settings, contextId);
+                }
+                removed = true;
+                break;
+            }
+        }
+        if (!removed) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static JsonObject findRLContext(JsonArray contexts, const String &contextId) {
+    for (JsonObject context : contexts) {
+        if (context["id"].as<String>() == contextId) {
+            return context;
+        }
+    }
+    return JsonObject();
+}
+
+static bool removeRLContext(JsonArray contexts, const String &contextId) {
+    for (size_t i = 0; i < contexts.size(); i++) {
+        JsonObject context = contexts[i];
+        if (context["id"].as<String>() == contextId) {
+            contexts.remove(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void markRLOtherContextsAvailable(JsonArray contexts, const String &activeId) {
+    for (JsonObject context : contexts) {
+        if (context["id"].as<String>() != activeId && context["status"].as<String>() == "active") {
+            context["status"] = "available";
+        }
+    }
+}
+
+static JsonObject addRLContext(JsonArray contexts, Settings &settings, const String &id, const String &name, int bagIndex,
+                               const char *status) {
+    if (!makeRoomForRLContext(contexts, MAX_RL_BEAN_CONTEXTS, settings, false)) {
+        return JsonObject();
+    }
+    JsonObject context = contexts.add<JsonObject>();
+    context["id"] = id;
+    context["name"] = name;
+    context["bag_index"] = bagIndex;
+    context["status"] = status;
+    context["created_at"] = EpochTime::now();
+    return context;
+}
+
+static JsonObject addRLGrinderContext(JsonArray contexts, Settings &settings, const String &id, const String &name,
+                                      const char *status) {
+    if (!makeRoomForRLContext(contexts, MAX_RL_GRINDER_CONTEXTS, settings, true)) {
+        return JsonObject();
+    }
+    JsonObject context = contexts.add<JsonObject>();
+    context["id"] = id;
+    context["name"] = name;
+    context["status"] = status;
+    context["created_at"] = EpochTime::now();
+    return context;
+}
+
+static bool isRLNumber(JsonVariant value) { return value.is<int>() || value.is<float>() || value.is<double>(); }
+
+static void addRLRecipeDomain(JsonObject target, Settings const &settings) {
+    AutoTuning::RecipeDomain const domain = settings.getRLRecipeDomain();
+    JsonObject value = target["rlRecipeDomain"].to<JsonObject>();
+    value["grindRadiusSteps"] = domain.grindRadiusSteps;
+    value["doseMinG"] = domain.doseMinG;
+    value["doseMaxG"] = domain.doseMaxG;
+    value["targetOutputMinG"] = domain.targetOutputMinG;
+    value["targetOutputMaxG"] = domain.targetOutputMaxG;
+}
+
+static float boundedRLFloat(JsonVariant value, float fallback, float minValue, float maxValue) {
+    if (!isRLNumber(value)) {
+        return fallback;
+    }
+    float parsed = value.as<float>();
+    if (!std::isfinite(parsed)) {
+        return fallback;
+    }
+    return std::min(std::max(parsed, minValue), maxValue);
+}
+
+static String normalizedStepDirection(JsonVariant value) {
+    String direction = value.as<String>();
+    direction.trim();
+    if (direction != "higher_is_coarser") {
+        direction = "higher_is_finer";
+    }
+    return direction;
+}
+
+static String normalizedGrinderAdjustmentMode(JsonVariant value) {
+    String mode = value.as<String>();
+    mode.trim();
+    if (mode != "stepless") {
+        mode = "stepped";
+    }
+    return mode;
+}
+
+static String grinderCalibrationMode(JsonObject context) {
+    String mode = context["grinder_calibration_mode"].as<String>();
+    if (mode == "absolute_display_calibrated" || mode == "relative_calibrated" || mode == "uncalibrated") {
+        return mode;
+    }
+    if (isRLNumber(context["microns_per_step"])) {
+        return isRLNumber(context["current_absolute_step"]) && isRLNumber(context["absolute_reference_step"])
+                   ? "absolute_display_calibrated"
+                   : "relative_calibrated";
+    }
+    return "uncalibrated";
+}
+
+static void applyRLGrinderCalibration(JsonObject context, JsonDocument &request) {
+    const bool hasMicronsRequest = isRLNumber(request["microns_per_step"]);
+    if (hasMicronsRequest) {
+        context["microns_per_step"] = boundedRLFloat(request["microns_per_step"], 10.0f, 0.1f, 100.0f);
+    }
+    if (request["step_direction"].is<String>() || context["step_direction"].as<String>().isEmpty()) {
+        context["step_direction"] = normalizedStepDirection(request["step_direction"]);
+    }
+    if (request["grinder_adjustment_mode"].is<String>() || context["grinder_adjustment_mode"].as<String>().isEmpty()) {
+        context["grinder_adjustment_mode"] = normalizedGrinderAdjustmentMode(request["grinder_adjustment_mode"]);
+    }
+    String reference = limitedRLString(request["reference_label"], 80);
+    if (!reference.isEmpty()) {
+        context["reference_label"] = reference;
+    } else if (limitedRLString(context["reference_label"], 80).isEmpty()) {
+        context["reference_label"] = "Initial setting";
+    }
+
+    const bool hasRelativeRequest = isRLNumber(request["current_relative_step"]);
+    const bool hasCurrentAbsoluteRequest = isRLNumber(request["current_absolute_step"]);
+
+    if (isRLNumber(request["current_absolute_step"])) {
+        context["current_absolute_step"] = boundedRLFloat(request["current_absolute_step"], 0.0f, -10000.0f, 10000.0f);
+    }
+    if (isRLNumber(request["absolute_reference_step"])) {
+        context["absolute_reference_step"] = boundedRLFloat(request["absolute_reference_step"], 0.0f, -10000.0f, 10000.0f);
+    } else if (hasCurrentAbsoluteRequest && !isRLNumber(context["absolute_reference_step"])) {
+        context["absolute_reference_step"] = context["current_absolute_step"].as<float>();
+    }
+
+    if (isRLNumber(context["current_absolute_step"]) && isRLNumber(context["absolute_reference_step"])) {
+        context["current_relative_step"] =
+            context["current_absolute_step"].as<float>() - context["absolute_reference_step"].as<float>();
+    } else if (hasRelativeRequest) {
+        context["current_relative_step"] = boundedRLFloat(request["current_relative_step"], 0.0f, -10000.0f, 10000.0f);
+    } else if (!isRLNumber(context["current_relative_step"])) {
+        context["current_relative_step"] = 0.0f;
+    }
+
+    const bool hasMicrons = isRLNumber(context["microns_per_step"]);
+    if (!hasMicrons) {
+        context["grinder_calibration_mode"] = "uncalibrated";
+    } else if (isRLNumber(context["current_absolute_step"]) && isRLNumber(context["absolute_reference_step"])) {
+        context["grinder_calibration_mode"] = "absolute_display_calibrated";
+    } else {
+        context["grinder_calibration_mode"] = "relative_calibrated";
+    }
+}
+
+static void copyRLGrinderCalibration(JsonObject out, JsonObject context) {
+    out["grinder_calibration_mode"] = grinderCalibrationMode(context);
+    if (isRLNumber(context["microns_per_step"])) {
+        out["microns_per_step"] = context["microns_per_step"].as<float>();
+    }
+    out["step_direction"] = normalizedStepDirection(context["step_direction"]);
+    out["grinder_adjustment_mode"] = normalizedGrinderAdjustmentMode(context["grinder_adjustment_mode"]);
+    out["reference_label"] = limitedRLString(context["reference_label"], 80);
+    out["current_relative_step"] = context["current_relative_step"] | 0.0f;
+    if (isRLNumber(context["current_absolute_step"])) {
+        out["current_absolute_step"] = context["current_absolute_step"].as<float>();
+    }
+    if (isRLNumber(context["absolute_reference_step"])) {
+        out["absolute_reference_step"] = context["absolute_reference_step"].as<float>();
+    }
+}
+
+static bool trimRLContextsForStorage(JsonDocument &contextsDoc, Settings &settings, size_t maxContexts, bool grinder) {
+    JsonArray contexts = contextsDoc.as<JsonArray>();
+    while (contexts.size() > maxContexts || measureJson(contextsDoc) > MAX_RL_CONTEXT_JSON_BYTES) {
+        bool removed = false;
+        for (size_t i = 0; i < contexts.size(); i++) {
+            JsonObject context = contexts[i];
+            if (context["status"].as<String>() == "active") {
+                continue;
+            }
+            const String contextId = context["id"].as<String>();
+            contexts.remove(i);
+            if (grinder) {
+                AutoTuning::removeTasteGoalsForGrinderContext(settings, contextId);
+            } else {
+                AutoTuning::removeTasteGoalsForBeanContext(settings, contextId);
+            }
+            removed = true;
+            break;
+        }
+        if (!removed) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool persistRLContexts(Settings &settings, JsonDocument &contextsDoc) {
+    if (!trimRLContextsForStorage(contextsDoc, settings, MAX_RL_BEAN_CONTEXTS, false)) {
+        return false;
+    }
+    String contextsJson;
+    serializeJson(contextsDoc, contextsJson);
+    settings.setRLBeanContextsJson(contextsJson);
+    return true;
+}
+
+static bool persistRLGrinderContexts(Settings &settings, JsonDocument &contextsDoc) {
+    if (!trimRLContextsForStorage(contextsDoc, settings, MAX_RL_GRINDER_CONTEXTS, true)) {
+        return false;
+    }
+    String contextsJson;
+    serializeJson(contextsDoc, contextsJson);
+    settings.setRLGrinderContextsJson(contextsJson);
+    return true;
+}
+
+static bool rlParticipationEnabled(Controller *controller) {
+    return controller &&
+           AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), controller->getOptimizerTransport())
+               .acceptActionableRecommendations();
+}
 
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
@@ -90,6 +503,375 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
 
+    pluginManager->on("rl:recommendation:received", [this](Event const &event) {
+        if (!rlParticipationEnabled(controller)) {
+            _pendRecJson = "";
+            return;
+        }
+
+        AutoTuning::Recommendation const *recommendation = event.getPayload<AutoTuning::Recommendation>();
+        if (!recommendation) {
+            return;
+        }
+
+        const String status = AutoTuning::recommendationStatusKey(recommendation->status);
+        rlLastRecommendationId = recommendation->recommendationId.c_str();
+        rlRecommendationStatus = status;
+        rlRecommendationMode = AutoTuning::recommendationModeKey(recommendation->mode);
+        rlMode = rlRecommendationMode;
+        rlRecommendationGrindDeltaStepsFromCurrent = recommendation->grindDeltaStepsFromCurrent;
+        rlRecommendationGrindDeltaUmFromCurrent = recommendation->grindDeltaMicronsFromCurrent;
+        rlRecommendationProjectedRelativeStepFromReference = recommendation->projectedRelativeStepFromReference;
+        rlRecommendationProjectedRelativeGrindUmFromReference = recommendation->projectedRelativeMicronsFromReference;
+        rlRecommendationNextDoseG = recommendation->nextDoseG;
+        rlRecommendationTargetYieldG = recommendation->targetYieldG;
+        rlRecommendationTargetRatio = recommendation->targetRatio;
+        rlRecommendationHasCurrentAbsoluteStep = recommendation->currentAbsoluteStep.has_value();
+        rlRecommendationCurrentAbsoluteStep = recommendation->currentAbsoluteStep.value_or(0.0f);
+        rlRecommendationHasProjectedAbsoluteStep = recommendation->projectedAbsoluteStep.has_value();
+        rlRecommendationProjectedAbsoluteStep = recommendation->projectedAbsoluteStep.value_or(0.0f);
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:recommendation";
+        doc["recommendation_id"] = rlLastRecommendationId;
+        doc["shot_id"] = recommendation->sourceShotId.c_str();
+        doc["install_id"] = recommendation->installId.c_str();
+        doc["optimization_run_id"] = recommendation->optimizationRunId.c_str();
+        doc["comparison_anchor_shot_id"] = recommendation->comparisonAnchorShotId.c_str();
+        doc["comparison_mode"] = AutoTuning::comparisonModeKey(recommendation->comparisonMode);
+        doc["preference_feedback_required"] = recommendation->preferenceFeedbackRequired;
+        AutoTuning::writeTasteGoal(recommendation->tasteGoal, doc["taste_goal"]);
+        doc["taste_goal_summary"] = AutoTuning::tasteGoalSummary(recommendation->tasteGoal);
+        doc["status"] = status;
+        doc["mode"] = rlRecommendationMode;
+        const String stepDirection = recommendation->stepDirection.c_str();
+        doc["step_direction"] = stepDirection == "higher_is_coarser" ? "higher_is_coarser" : "higher_is_finer";
+        doc["grind_delta_steps_from_current"] = rlRecommendationGrindDeltaStepsFromCurrent;
+        doc["grind_delta_um_from_current"] = rlRecommendationGrindDeltaUmFromCurrent;
+        doc["projected_relative_step_from_reference"] = rlRecommendationProjectedRelativeStepFromReference;
+        doc["projected_relative_grind_um_from_reference"] = rlRecommendationProjectedRelativeGrindUmFromReference;
+        doc["next_dose_g"] = rlRecommendationNextDoseG;
+        doc["target_yield_g"] = rlRecommendationTargetYieldG;
+        doc["target_ratio"] = rlRecommendationTargetRatio;
+        doc["has_current_absolute_step"] = rlRecommendationHasCurrentAbsoluteStep;
+        doc["current_absolute_step"] = rlRecommendationCurrentAbsoluteStep;
+        doc["has_projected_absolute_step"] = rlRecommendationHasProjectedAbsoluteStep;
+        doc["projected_absolute_step"] = rlRecommendationProjectedAbsoluteStep;
+        const String payload = doc.as<String>();
+        // Cache as the reopen source of truth only while still promptable; a
+        // resolved status (applied/ignored/etc) clears any pending prompt.
+        const bool promptable = status.isEmpty() || status == "pending" || status == "shown";
+        _pendRecJson = promptable ? payload : String("");
+        ws.textAll(payload);
+    });
+
+    pluginManager->on("rl:recommendation:cleared", [this](Event const &) {
+        rlLastRecommendationId = "";
+        rlLastRecommendationAt = 0;
+        rlRecommendationApplyStatus = "";
+        rlRecommendationStatus = "";
+        rlRecommendationMode = "";
+        rlRecommendationGrindDeltaStepsFromCurrent = 0.0f;
+        rlRecommendationGrindDeltaUmFromCurrent = 0.0f;
+        rlRecommendationProjectedRelativeStepFromReference = 0.0f;
+        rlRecommendationProjectedRelativeGrindUmFromReference = 0.0f;
+        rlRecommendationNextDoseG = 0.0f;
+        rlRecommendationTargetYieldG = 0.0f;
+        rlRecommendationTargetRatio = 0.0f;
+        rlRecommendationHasCurrentAbsoluteStep = false;
+        rlRecommendationCurrentAbsoluteStep = 0.0f;
+        rlRecommendationHasProjectedAbsoluteStep = false;
+        rlRecommendationProjectedAbsoluteStep = 0.0f;
+        _pendRecJson = "";
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:recommendation-clear";
+        ws.textAll(doc.as<String>());
+    });
+
+    pluginManager->on("rl:shot:complete", [this](Event const &event) {
+        if (!rlParticipationEnabled(controller)) {
+            clearPendingPreferencePrompt();
+            _queuedPreferencePrompts.clear();
+            return;
+        }
+
+        if (event.getInt("preference_feedback_required") <= 0) {
+            return;
+        }
+        const String shotId = event.getString("shot_id");
+        if (shotId == _pendingPreferenceShotId) {
+            return;
+        }
+        for (Event const &pending : _queuedPreferencePrompts) {
+            if (pending.getString("shot_id") == shotId) {
+                return;
+            }
+        }
+        if (_pendingPreferenceShotId.isEmpty()) {
+            if (activatePreferencePrompt(event)) {
+                sendPreferencePrompt(nullptr);
+            }
+        } else {
+            _queuedPreferencePrompts.push_back(event);
+        }
+    });
+
+    pluginManager->on("rl:dose-confirmation:required", [this](Event const &event) {
+        if (!rlParticipationEnabled(controller)) {
+            clearPendingDoseConfirmation();
+            _queuedDoseConfirmations.clear();
+            return;
+        }
+        const String shotId = event.getString("shot_id");
+        const float targetG = event.getFloat("dose_target_g");
+        if (shotId.isEmpty() || !std::isfinite(targetG) || targetG <= 0.0f) {
+            return;
+        }
+        if (shotId == _pendingDoseShotId) {
+            return;
+        }
+        for (Event const &pending : _queuedDoseConfirmations) {
+            if (pending.getString("shot_id") == shotId) {
+                return;
+            }
+        }
+        if (_pendingDoseShotId.isEmpty()) {
+            activateDoseConfirmation(event);
+            sendDoseConfirmationPrompt(nullptr);
+        } else {
+            _queuedDoseConfirmations.push_back(event);
+        }
+    });
+
+    pluginManager->on("rl:dose-confirmation:resolved", [this](Event const &event) {
+        if (event.getString("shot_id") == _pendingDoseShotId) {
+            clearPendingDoseConfirmation();
+            advanceDoseConfirmation();
+        }
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:dose-confirmation-resolved";
+        doc["shot_id"] = event.getString("shot_id");
+        doc["followed"] = event.getInt("followed") == 1;
+        ws.textAll(doc.as<String>());
+    });
+
+    pluginManager->on("rl:preference", [this](Event const &event) {
+        if (event.getInt("decision_persisted") == 1 && !_pendingPreferenceShotId.isEmpty() &&
+            event.getString("install_id") == _pendPreferenceInstallId &&
+            event.getString("optimization_run_id") == _pendPreferenceRunId &&
+            event.getString("new_shot_id") == _pendingPreferenceShotId &&
+            event.getString("anchor_shot_id") == _pendPreferenceAnchorShotId) {
+            clearPendingPreferencePrompt();
+            advancePreferencePrompt();
+        }
+    });
+
+    pluginManager->on("rl:status:received", [this](Event const &event) {
+        if (!AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), controller->getOptimizerTransport())
+                 .acceptOffBoardStatus()) {
+            return;
+        }
+
+        rlStatusSeen = event.getInt("seen") > 0;
+        rlAddonOnline = event.getInt("addon_online") > 0;
+        rlLastStatusAt = event.getInt64("timestamp");
+        rlLastShotId = event.getString("last_shot_id");
+        rlLastShotAt = event.getInt64("last_shot_at");
+        rlLastShotType = event.getString("last_shot_type");
+        rlLastShotTimeS = event.getInt("last_shot_time_s_x10") / 10.0f;
+        rlLastShotBeverageOutG = event.getInt("last_shot_beverage_out_g_x10") / 10.0f;
+        rlLastShotTargetYieldG = event.getInt("last_shot_target_yield_g_x10") / 10.0f;
+        rlLastRecommendationId = event.getString("last_recommendation_id");
+        rlLastRecommendationAt = event.getInt64("last_recommendation_at");
+        rlRecommendationApplyStatus = event.getString("recommendation_apply_status");
+        rlMode = event.getString("mode");
+        rlOptimizerProfileId = event.getString("optimizer_profile_id");
+        rlOptimizerProfileLabel = event.getString("optimizer_profile_label");
+        rlOptimizerConfiguredMode = event.getString("optimizer_configured_mode");
+        rlOptimizerEffectiveMode = event.getString("optimizer_effective_mode");
+        rlOptimizerFallbackReason = event.getString("optimizer_fallback_reason");
+        rlLocalShotCount = event.getInt("local_shot_count");
+        rlRuntimeHealthStatus = event.getString("runtime_health_status");
+        rlRuntimeHealthSummary = event.getString("runtime_health_summary");
+        rlRuntimeHealthWarningsJson =
+            event.getString("runtime_health_warnings_json").isEmpty() ? "[]" : event.getString("runtime_health_warnings_json");
+        rlRuntimeHealthWaitingReasonsJson = event.getString("runtime_health_waiting_reasons_json").isEmpty()
+                                                ? "[]"
+                                                : event.getString("runtime_health_waiting_reasons_json");
+        rlAutoTuningDiagnosticStepsJson = event.getString("auto_tuning_diagnostic_steps_json").isEmpty()
+                                              ? "[]"
+                                              : event.getString("auto_tuning_diagnostic_steps_json");
+        rlRuntimeHealthStorageBackend = event.getString("runtime_health_storage_backend");
+        rlRuntimeHealthStorageAvailable = event.getInt("runtime_health_storage_available") > 0;
+        rlGrinderCatalogSearchUrl = event.getString("grinder_catalog_search_url");
+        rlRecentShotsJson = event.getString("recent_shots_json").isEmpty() ? "[]" : event.getString("recent_shots_json");
+
+        JsonDocument doc;
+        Settings const &settings = controller->getSettings();
+        doc["tp"] = "evt:rl:status";
+        AutoTuning::Router router(settings.getRLOptimizerConfiguration(), controller->getOptimizerTransport());
+        doc["rlAutoTuningEnabled"] = router.enabled();
+        doc["rlProviderMode"] = settings.getRLAutoTuningProviderMode();
+        doc["rlProviderStatus"] = router.providerStatus();
+        doc["rlProviderSummary"] = router.providerSummary();
+        doc["rlBeanContextId"] = settings.getRLBeanContextId();
+        doc["rlBeanContextName"] = settings.getRLBeanContextName();
+        doc["rlGrinderContextId"] = settings.getRLGrinderContextId();
+        doc["rlGrinderContextName"] = settings.getRLGrinderContextName();
+        JsonDocument activeTasteGoal;
+        AutoTuning::activeTasteGoal(settings, activeTasteGoal);
+        doc["rlTasteGoal"].set(activeTasteGoal.as<JsonVariantConst>());
+        doc["rlTasteGoalSummary"] = AutoTuning::tasteGoalSummary(activeTasteGoal.as<JsonVariantConst>());
+        doc["rlGrinderCatalogSearchUrl"] = rlGrinderCatalogSearchUrl;
+        JsonDocument grinderContextsDoc;
+        JsonArray grinderContexts = loadRLContexts(grinderContextsDoc, settings.getRLGrinderContextsJson());
+        JsonObject activeGrinderContext = findRLContext(grinderContexts, settings.getRLGrinderContextId());
+        if (!activeGrinderContext.isNull()) {
+            JsonObject calibration = doc["rlActiveGrinderCalibration"].to<JsonObject>();
+            copyRLGrinderCalibration(calibration, activeGrinderContext);
+        }
+        doc["rlOptimizationPaused"] = settings.isRLOptimizationPaused();
+        doc["rlLocalOptimizationEnabled"] = router.optimizationActive();
+        doc["rlStatusSeen"] = rlStatusSeen;
+        doc["rlAddonOnline"] = rlAddonOnline;
+        doc["rlLastStatusAt"] = rlLastStatusAt;
+        doc["rlLastShotId"] = rlLastShotId;
+        doc["rlLastShotAt"] = rlLastShotAt;
+        doc["rlLastShotType"] = rlLastShotType;
+        doc["rlLastShotTimeS"] = rlLastShotTimeS;
+        doc["rlLastShotBeverageOutG"] = rlLastShotBeverageOutG;
+        doc["rlLastShotTargetYieldG"] = rlLastShotTargetYieldG;
+        doc["rlLastRecommendationId"] = rlLastRecommendationId;
+        doc["rlLastRecommendationAt"] = rlLastRecommendationAt;
+        doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
+        doc["rlRecommendationStatus"] = rlRecommendationStatus;
+        doc["rlRecommendationMode"] = rlRecommendationMode;
+        doc["rlRecommendationGrindDeltaStepsFromCurrent"] = rlRecommendationGrindDeltaStepsFromCurrent;
+        doc["rlRecommendationGrindDeltaUmFromCurrent"] = rlRecommendationGrindDeltaUmFromCurrent;
+        doc["rlRecommendationProjectedRelativeStepFromReference"] = rlRecommendationProjectedRelativeStepFromReference;
+        doc["rlRecommendationProjectedRelativeGrindUmFromReference"] = rlRecommendationProjectedRelativeGrindUmFromReference;
+        doc["rlRecommendationNextDoseG"] = rlRecommendationNextDoseG;
+        doc["rlRecommendationTargetYieldG"] = rlRecommendationTargetYieldG;
+        doc["rlRecommendationTargetRatio"] = rlRecommendationTargetRatio;
+        doc["rlRecommendationHasCurrentAbsoluteStep"] = rlRecommendationHasCurrentAbsoluteStep;
+        doc["rlRecommendationCurrentAbsoluteStep"] = rlRecommendationCurrentAbsoluteStep;
+        doc["rlRecommendationHasProjectedAbsoluteStep"] = rlRecommendationHasProjectedAbsoluteStep;
+        doc["rlRecommendationProjectedAbsoluteStep"] = rlRecommendationProjectedAbsoluteStep;
+        doc["rlMode"] = rlMode;
+        doc["rlOptimizerProfileId"] = rlOptimizerProfileId;
+        doc["rlOptimizerProfileLabel"] = rlOptimizerProfileLabel;
+        doc["rlOptimizerMode"] = settings.getRLOptimizerMode();
+        doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
+        addRLRecipeDomain(doc.as<JsonObject>(), settings);
+        doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
+        doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
+        doc["rlOptimizerFallbackReason"] = rlOptimizerFallbackReason;
+        doc["rlLocalShotCount"] = rlLocalShotCount;
+        doc["rlUploadQueueCount"] = rlUploadQueueCount;
+        doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
+        doc["rlUploadQueueLastRejectedId"] = rlUploadQueueLastRejectedId;
+        doc["rlUploadQueueLastRejectedRecordId"] = rlUploadQueueLastRejectedRecordId;
+        doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
+        doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();
+        doc["rlCommunityUploadEffective"] = rlCommunityUploadEnabled;
+        doc["rlCommunityUploadPrompted"] = settings.isRLCommunityUploadPrompted();
+        doc["rlUploadBaseUrl"] = settings.getRLUploadBaseUrl();
+        doc["rlUploadCredentialConfigured"] = settings.hasRLUploadCredentials();
+        doc["rlRuntimeHealthStatus"] = rlRuntimeHealthStatus;
+        doc["rlRuntimeHealthSummary"] = rlRuntimeHealthSummary;
+        copyRLStringArray(doc, "rlRuntimeHealthWarnings", rlRuntimeHealthWarningsJson);
+        copyRLStringArray(doc, "rlRuntimeHealthWaitingReasons", rlRuntimeHealthWaitingReasonsJson);
+        copyRLDiagnosticSteps(doc, rlAutoTuningDiagnosticStepsJson);
+        doc["rlRuntimeHealthStorageBackend"] = rlRuntimeHealthStorageBackend;
+        doc["rlRuntimeHealthStorageAvailable"] = rlRuntimeHealthStorageAvailable;
+        doc["rlRuntimeHealthUploadConfigured"] = rlRuntimeHealthUploadConfigured;
+        doc["rlRuntimeHealthCommunityUploadRequested"] = rlRuntimeHealthCommunityUploadRequested;
+        doc["rlRuntimeHealthPendingUploadCount"] = rlRuntimeHealthPendingUploadCount;
+        doc["rlRuntimeHealthFailedUploadCount"] = rlRuntimeHealthFailedUploadCount;
+        doc["rlRuntimeHealthRejectedUploadCount"] = rlRuntimeHealthRejectedUploadCount;
+        doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
+        doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
+        doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;
+        doc["rlLocalDeliveryLastError"] = rlLocalDeliveryLastError;
+        copyRLRecentShots(doc, rlRecentShotsJson);
+        ws.textAll(doc.as<String>());
+    });
+
+    pluginManager->on("rl:community-upload:status", [this](Event const &event) {
+        rlCommunityUploadEnabled = event.getInt("effective") > 0;
+        rlUploadQueueCount = event.getInt("pending_count") + event.getInt("failed_count");
+        rlUploadQueueRejectedCount = event.getInt("rejected_count");
+        rlUploadQueueLastRejectedId = "";
+        rlUploadQueueLastRejectedRecordId = "";
+        rlUploadQueueLastRejectedError = "";
+        rlRuntimeHealthStatus = event.getString("status");
+        rlRuntimeHealthSummary = event.getString("summary");
+        rlRuntimeHealthStorageBackend = event.getString("storage_backend");
+        rlRuntimeHealthStorageAvailable = event.getInt("storage_available") > 0;
+        rlRuntimeHealthWaitingReasonsJson =
+            event.getString("waiting_reasons_json").isEmpty() ? "[]" : event.getString("waiting_reasons_json");
+        rlAutoTuningDiagnosticStepsJson =
+            event.getString("diagnostic_steps_json").isEmpty() ? "[]" : event.getString("diagnostic_steps_json");
+        rlRuntimeHealthUploadConfigured = event.getInt("configured") > 0;
+        rlRuntimeHealthCommunityUploadRequested = event.getInt("requested") > 0;
+        rlRuntimeHealthPendingUploadCount = event.getInt("pending_count");
+        rlRuntimeHealthFailedUploadCount = event.getInt("failed_count");
+        rlRuntimeHealthRejectedUploadCount = event.getInt("rejected_count");
+
+        JsonDocument doc(&psramAllocator);
+        doc["tp"] = "evt:rl:status";
+        doc["rlCommunityUploadEnabled"] = controller->getSettings().isRLCommunityUploadEnabled();
+        doc["rlCommunityUploadEffective"] = rlCommunityUploadEnabled;
+        doc["rlUploadCredentialConfigured"] = controller->getSettings().hasRLUploadCredentials();
+        doc["rlUploadQueueCount"] = rlUploadQueueCount;
+        doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
+        doc["rlRuntimeHealthStatus"] = rlRuntimeHealthStatus;
+        doc["rlRuntimeHealthSummary"] = rlRuntimeHealthSummary;
+        doc["rlRuntimeHealthStorageBackend"] = rlRuntimeHealthStorageBackend;
+        doc["rlRuntimeHealthStorageAvailable"] = rlRuntimeHealthStorageAvailable;
+        doc["rlRuntimeHealthUploadConfigured"] = rlRuntimeHealthUploadConfigured;
+        doc["rlRuntimeHealthCommunityUploadRequested"] = rlRuntimeHealthCommunityUploadRequested;
+        doc["rlRuntimeHealthPendingUploadCount"] = rlRuntimeHealthPendingUploadCount;
+        doc["rlRuntimeHealthFailedUploadCount"] = rlRuntimeHealthFailedUploadCount;
+        doc["rlRuntimeHealthRejectedUploadCount"] = rlRuntimeHealthRejectedUploadCount;
+        doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
+        doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
+        doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;
+        doc["rlLocalDeliveryLastError"] = rlLocalDeliveryLastError;
+        broadcastJson(doc);
+    });
+    pluginManager->on("rl:local_store:status", [this](Event const &event) {
+        rlLocalDeliveryPendingCount = event.getInt("delivery_pending_count");
+        rlLocalDeliveryRetryCount = event.getInt("delivery_retry_count");
+        rlLocalDeliveryRejectedCount = event.getInt("delivery_rejected_count");
+        rlLocalDeliveryLastError = event.getString("delivery_last_error");
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:status";
+        doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
+        doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
+        doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;
+        doc["rlLocalDeliveryLastError"] = rlLocalDeliveryLastError;
+        broadcastJson(doc);
+    });
+    auto clearRLPromptsIfInactive = [this](Event const &) {
+        if (rlParticipationEnabled(controller)) {
+            return;
+        }
+        clearPendingPreferencePrompt();
+        clearPendingDoseConfirmation();
+        _queuedPreferencePrompts.clear();
+        _queuedDoseConfirmations.clear();
+        _pendRecJson = "";
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:prompts-clear";
+        ws.textAll(doc.as<String>());
+    };
+    pluginManager->on("settings:changed", clearRLPromptsIfInactive);
+    pluginManager->on("rl:settings:changed", clearRLPromptsIfInactive);
+
     // Forward shot history rebuild progress events to WebSocket clients
     pluginManager->on("evt:history-rebuild-progress", [this](Event const &event) {
         JsonDocument doc(&psramAllocator);
@@ -123,6 +905,9 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     // Subscribe to Bluetooth scale weight updates
     pluginManager->on("controller:volumetric-measurement:bluetooth:change",
                       [this](Event const &event) { this->currentBluetoothWeight = event.getFloat("value"); });
+    // Predictive flow estimate is tracked alongside BLE for the active shot.
+    pluginManager->on("controller:volumetric-measurement:estimation:change",
+                      [this](Event const &event) { this->currentEstimatedWeight = event.getFloat("value"); });
 
     setupServer();
 }
@@ -165,6 +950,7 @@ void WebUIPlugin::loop() {
         statusDoc["puid"] = controller->getProfileManager()->getSelectedProfile().id;
         statusDoc["cp"] = controller->getSystemInfo().capabilities.pressure;
         statusDoc["cd"] = controller->getSystemInfo().capabilities.dimming;
+        statusDoc["ctof"] = controller->getSystemInfo().capabilities.tof;
         statusDoc["gp"] = controller->getSystemInfo().capabilities.hasAddon(7);
         statusDoc["tw"] = profileManager->getSelectedProfile().getTotalVolume(); // total target weight for the process
         statusDoc["bta"] = controller->isVolumetricAvailable() ? 1 : 0;
@@ -174,6 +960,7 @@ void WebUIPlugin::loop() {
         statusDoc["led"] = controller->getSystemInfo().capabilities.ledControl;
         statusDoc["gtd"] = controller->getTargetGrindDuration();
         statusDoc["gtv"] = controller->getSettings().getTargetGrindVolume();
+        statusDoc["gta"] = controller->isVolumetricAvailable() ? 1 : 0;
         statusDoc["gt"] = controller->isVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
         statusDoc["gact"] = controller->isGrindActive() ? 1 : 0;
         statusDoc["wl"] = controller->getWaterLevel();
@@ -190,12 +977,25 @@ void WebUIPlugin::loop() {
             statusDoc["lat"] = controller->getClientController()->getLatencyMs();
         }
 
-        bool bleConnected = BLEScales.isConnected();
-        // Add Bluetooth scale weight information
-        statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // current bluetooth weight
-        statusDoc["cw"] = bleConnected ? this->currentBluetoothWeight : 0; // Use 'currentWeight' for forward compatbility
+        const bool bleConnected = BLEScales.isConnected();
+        const VolumetricMeasurementSource brewSource = controller->getCurrentVolumetricSource();
+        float cw = 0.0f;
+        switch (brewSource) {
+        case VolumetricMeasurementSource::BLUETOOTH:
+            cw = bleConnected ? this->currentBluetoothWeight : 0.0f;
+            break;
+        case VolumetricMeasurementSource::FLOW_ESTIMATION:
+            cw = this->currentEstimatedWeight;
+            break;
+        default:
+            cw = 0.0f;
+            break;
+        }
+
+        statusDoc["bw"] = bleConnected ? this->currentBluetoothWeight : 0; // raw BLE weight
+        statusDoc["cw"] = cw;                                              // active-source weight
         statusDoc["bc"] = bleConnected;                                    // bluetooth scale connected status
-        // Scale battery — only surfaced when the driver reports one and the
+        // Scale battery â€” only surfaced when the driver reports one and the
         // value isn't the UNKNOWN sentinel (255). UI omits the battery pill
         // entirely when `sbat` is absent, so disconnected/unknown scales don't
         // render a stale stub.
@@ -255,11 +1055,36 @@ void WebUIPlugin::loop() {
         }
         processGuard.unlock();
 
+        // Diagnostics for hang triage: heap usage, largest free block, historical
+        // minimum, uptime in seconds. Watch for hl falling while hf stays high
+        // (fragmentation) vs steady hf decline (leak).
+        statusDoc["hf"] = ESP.getFreeHeap();
+        statusDoc["hl"] = ESP.getMaxAllocHeap();
+        statusDoc["hm"] = ESP.getMinFreeHeap();
+        statusDoc["up"] = millis() / 1000;
+
         broadcastJson(statusDoc);
     }
     if (now > lastCleanup + CLEANUP_PERIOD) {
         lastCleanup = now;
         ws.cleanupClients();
+        // Evict rxBuffers from clients that dropped TCP without a clean WS close
+        // (mobile screen-lock, OS killing background tab). Otherwise these leak
+        // until reboot.
+        const unsigned long nowMs = millis();
+        size_t evicted = 0;
+        for (auto it = rxBufferLastActivity.begin(); it != rxBufferLastActivity.end();) {
+            if (nowMs - it->second > RXBUFFER_IDLE_EVICT_MS) {
+                rxBuffers.erase(it->first);
+                it = rxBufferLastActivity.erase(it);
+                ++evicted;
+            } else {
+                ++it;
+            }
+        }
+        if (evicted > 0) {
+            ESP_LOGI("WebUIPlugin", "Evicted %u idle rxBuffers", static_cast<unsigned>(evicted));
+        }
     }
     if (now > lastDns + DNS_PERIOD && dnsServer != nullptr) {
         lastDns = now;
@@ -267,7 +1092,7 @@ void WebUIPlugin::loop() {
     }
 }
 
-// Linear lookup over the embedded asset table (~60 entries) — a couple of
+// Linear lookup over the embedded asset table (~60 entries) â€” a couple of
 // strcmps per request, negligible next to the network round-trip.
 static const WebAsset *findWebAsset(const String &path) {
     for (size_t i = 0; i < WEB_ASSETS_COUNT; i++) {
@@ -286,7 +1111,7 @@ void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
 
     const WebAsset *asset = findWebAsset(path);
     if (asset == nullptr && !path.startsWith("/assets/")) {
-        // SPA client-side routes (e.g. /settings, /profiles) aren't real files —
+        // SPA client-side routes (e.g. /settings, /profiles) aren't real files â€”
         // fall back to index.html. A miss under /assets/ is a genuine 404, not a
         // route, so it is not rewritten.
         asset = findWebAsset(WEB_UI_INDEX_PATH);
@@ -296,14 +1121,14 @@ void WebUIPlugin::serveWebAsset(AsyncWebServerRequest *request) {
         return;
     }
 
-    // Serve straight from the memory-mapped flash blob — no copy into RAM, no
+    // Serve straight from the memory-mapped flash blob â€” no copy into RAM, no
     // filesystem read. AsyncProgmemResponse streams from the pointer in chunks.
     AsyncWebServerResponse *response =
         request->beginResponse(200, asset->contentType, gWebUiBlobStart + asset->offset, asset->length);
     if (asset->gzip) {
         response->addHeader("Content-Encoding", "gzip");
     }
-    // Content-hashed build assets (/assets/<hash>.js) never change for a given URL — cache them forever. index.html and
+    // Content-hashed build assets (/assets/<hash>.js) never change for a given URL â€” cache them forever. index.html and
     // other unhashed files must revalidate so a new build is picked up after an update. [GM-83]
     if (path.startsWith("/assets/")) {
         response->addHeader("Cache-Control", "public, max-age=31536000, immutable");
@@ -325,6 +1150,8 @@ void WebUIPlugin::setupServer() {
               [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // android captive portal redirect
     server.on("/redirect", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); });            // microsoft redirect
     server.on("/hotspot-detect.html", [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // apple call home
+    server.on("/library/test/success.html",
+              [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); }); // apple call home (newer iOS)
     server.on("/canonical.html",
               [](AsyncWebServerRequest *request) { request->redirect(LOCAL_URL); });       // firefox captive portal call home
     server.on("/success.txt", [](AsyncWebServerRequest *request) { request->send(200); }); // firefox captive portal call home
@@ -397,14 +1224,32 @@ void WebUIPlugin::setupServer() {
             if (type == WS_EVT_CONNECT) {
                 // Close (and let the browser reconnect) a client whose send
                 // queue backs up, instead of keeping it open. With it kept open
-                // (false), a client that stalls under load — e.g. while the UI
-                // is fetching many shot files for statistics — never has its
+                // (false), a client that stalls under load â€” e.g. while the UI
+                // is fetching many shot files for statistics â€” never has its
                 // queued frames / AsyncTCP buffers reclaimed, so they accumulate
                 // in internal DRAM until the whole IP stack starves (web + ICMP
                 // die, no recovery). Reclaiming via close is the safer failure
                 // mode. (Was the v1.8.1 behaviour.)
                 client->setCloseClientOnQueueFull(true);
                 ESP_LOGI("WebUIPlugin", "WebSocket client connected (%d open connections)", server->getClients().size());
+                // Replay pending RL prompts so a reloaded/reconnected client restores
+                // its reopen affordance (the WebUI dedupes/minimizes by id).
+                if (!rlParticipationEnabled(controller)) {
+                    clearPendingPreferencePrompt();
+                    clearPendingDoseConfirmation();
+                    _queuedPreferencePrompts.clear();
+                    _queuedDoseConfirmations.clear();
+                    _pendRecJson = "";
+                }
+                if (!_pendingDoseShotId.isEmpty()) {
+                    sendDoseConfirmationPrompt(client);
+                }
+                if (!_pendingPreferenceShotId.isEmpty()) {
+                    sendPreferencePrompt(client);
+                }
+                if (!_pendRecJson.isEmpty()) {
+                    client->text(_pendRecJson);
+                }
             } else if (type == WS_EVT_DISCONNECT) {
                 ESP_LOGI("WebUIPlugin", "WebSocket client disconnected (%d open connections)", server->getClients().size());
                 rxBuffers.erase(client->id());
@@ -449,11 +1294,131 @@ void WebUIPlugin::stop() {
     ESP_LOGI("WebUIPlugin", "WebUIPlugin stopped (wifi disconnected)");
 }
 
+void WebUIPlugin::clearPendingPreferencePrompt() {
+    _pendingPreferenceShotId = "";
+    _pendingPreferenceRecommendationId = "";
+    _pendPreferenceInstallId = "";
+    _pendPreferenceRunId = "";
+    _pendPreferenceAnchorShotId = "";
+    _pendPreferenceComparisonMode = "";
+    _pendPreferenceTasteGoal = AutoTuning::TasteGoal::balanced();
+    _pendPreferenceTasteGoalSummary = "Balanced";
+}
+
+bool WebUIPlugin::activatePreferencePrompt(Event const &event) {
+    AutoTuning::ShotCompletion const *completion = event.getPayload<AutoTuning::ShotCompletion>();
+    if (!completion || !completion->recommendation.preferenceFeedbackRequired) {
+        return false;
+    }
+    AutoTuning::RecommendationReference const &recommendation = completion->recommendation;
+    const String shotId = completion->shotId.c_str();
+    const String installId = recommendation.installId.c_str();
+    const String runId = recommendation.optimizationRunId.c_str();
+    const String anchorShotId = recommendation.anchorShotId.c_str();
+    const String comparisonMode = AutoTuning::comparisonModeKey(recommendation.comparisonMode);
+    const bool validMode = comparisonMode == "global_previous" || comparisonMode == "best_incumbent";
+    if (shotId.isEmpty() || installId.isEmpty() || runId.isEmpty() || anchorShotId.isEmpty() || anchorShotId == shotId ||
+        !validMode) {
+        return false;
+    }
+    _pendingPreferenceShotId = shotId;
+    _pendingPreferenceRecommendationId = recommendation.recommendationId.c_str();
+    _pendPreferenceInstallId = installId;
+    _pendPreferenceRunId = runId;
+    _pendPreferenceAnchorShotId = anchorShotId;
+    _pendPreferenceComparisonMode = comparisonMode;
+    _pendPreferenceTasteGoal = recommendation.tasteGoal;
+    _pendPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(recommendation.tasteGoal);
+    if (_pendPreferenceTasteGoalSummary.isEmpty()) {
+        _pendPreferenceTasteGoalSummary = "Balanced";
+    }
+    return true;
+}
+
+void WebUIPlugin::advancePreferencePrompt() {
+    while (_pendingPreferenceShotId.isEmpty() && !_queuedPreferencePrompts.empty()) {
+        Event event = _queuedPreferencePrompts.front();
+        _queuedPreferencePrompts.pop_front();
+        if (activatePreferencePrompt(event)) {
+            sendPreferencePrompt(nullptr);
+            return;
+        }
+    }
+}
+
+void WebUIPlugin::clearPendingDoseConfirmation() {
+    _pendingDoseShotId = "";
+    _pendingDoseTargetG = 0.0f;
+}
+
+bool WebUIPlugin::activateDoseConfirmation(Event const &event) {
+    const String shotId = event.getString("shot_id");
+    const float targetG = event.getFloat("dose_target_g");
+    if (shotId.isEmpty() || !std::isfinite(targetG) || targetG <= 0.0f) {
+        return false;
+    }
+    _pendingDoseShotId = shotId;
+    _pendingDoseTargetG = targetG;
+    return true;
+}
+
+void WebUIPlugin::advanceDoseConfirmation() {
+    while (_pendingDoseShotId.isEmpty() && !_queuedDoseConfirmations.empty()) {
+        Event event = _queuedDoseConfirmations.front();
+        _queuedDoseConfirmations.pop_front();
+        if (activateDoseConfirmation(event)) {
+            sendDoseConfirmationPrompt(nullptr);
+            return;
+        }
+    }
+}
+
+void WebUIPlugin::sendDoseConfirmationPrompt(AsyncWebSocketClient *client) {
+    if (_pendingDoseShotId.isEmpty() || _pendingDoseTargetG <= 0.0f) {
+        return;
+    }
+    JsonDocument doc;
+    doc["tp"] = "evt:rl:dose-confirmation";
+    doc["shot_id"] = _pendingDoseShotId;
+    doc["dose_target_g"] = _pendingDoseTargetG;
+    const String payload = doc.as<String>();
+    if (client) {
+        client->text(payload);
+    } else {
+        ws.textAll(payload);
+    }
+}
+
+void WebUIPlugin::sendPreferencePrompt(AsyncWebSocketClient *client) {
+    if (_pendingPreferenceShotId.isEmpty()) {
+        return;
+    }
+    JsonDocument doc;
+    doc["tp"] = "evt:rl:shot-complete";
+    doc["shot_id"] = _pendingPreferenceShotId;
+    doc["recommendation_id"] = _pendingPreferenceRecommendationId;
+    doc["preference_feedback_required"] = true;
+    doc["install_id"] = _pendPreferenceInstallId;
+    doc["optimization_run_id"] = _pendPreferenceRunId;
+    doc["anchor_shot_id"] = _pendPreferenceAnchorShotId;
+    doc["comparison_mode"] = _pendPreferenceComparisonMode;
+    AutoTuning::writeTasteGoal(_pendPreferenceTasteGoal, doc["taste_goal"]);
+    doc["taste_goal_summary"] = _pendPreferenceTasteGoalSummary;
+    const String payload = doc.as<String>();
+    if (client) {
+        client->text(payload);
+    } else {
+        ws.textAll(payload);
+    }
+}
+
 void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg,
                                       uint8_t *data, size_t len) {
 
     auto *info = static_cast<AwsFrameInfo *>(arg);
     const uint32_t cid = client->id();
+
+    rxBufferLastActivity[cid] = millis();
 
     if (info->index == 0) {
         auto &buf = rxBuffers[cid];
@@ -483,6 +1448,149 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     handleOTAStart(client->id(), doc);
                 } else if (msgType == "req:autotune-start") {
                     handleAutotuneStart(client->id(), doc);
+                } else if (msgType == "req:rl:status:refresh" || msgType == "req:rl:context:list" ||
+                           msgType == "req:rl:context:switch" || msgType == "req:rl:context:start-bean" ||
+                           msgType == "req:rl:context:start-bag" || msgType == "req:rl:context:update" ||
+                           msgType == "req:rl:context:retire" || msgType == "req:rl:context:delete" ||
+                           msgType.startsWith("req:rl:grinder-context:") || msgType == "req:rl:local-optimization" ||
+                           msgType == "req:rl:optimization:pause" || msgType == "req:rl:optimization:resume" ||
+                           msgType == "req:rl:taste-goal:set" || msgType == "req:rl:dose-target:set" ||
+                           msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:local-reset") {
+                    handleRLRequest(client->id(), doc);
+                } else if (msgType == "req:rl:recommendation:use") {
+                    if (rlParticipationEnabled(controller)) {
+                        String recommendationId = doc["recommendation_id"].as<String>();
+                        if (!recommendationId.isEmpty()) {
+                            Event event;
+                            event.id = "rl:recommendation:apply";
+                            event.setString("recommendation_id", recommendationId);
+                            pluginManager->trigger(event);
+                            if (event.getInt("decision_persisted") == 1) {
+                                _pendRecJson = ""; // Resolved; drop the reopen affordance.
+                            }
+                        }
+                    }
+                } else if (msgType == "req:rl:recommendation:ignore") {
+                    if (rlParticipationEnabled(controller)) {
+                        String recommendationId = doc["recommendation_id"].as<String>();
+                        if (!recommendationId.isEmpty()) {
+                            Event event;
+                            event.id = "rl:recommendation:ignore";
+                            event.setString("recommendation_id", recommendationId);
+                            pluginManager->trigger(event);
+                            if (event.getInt("decision_persisted") == 1) {
+                                _pendRecJson = ""; // Resolved; drop the reopen affordance.
+                            }
+                        }
+                    }
+                } else if (msgType == "req:rl:shot:correction") {
+                    JsonDocument resp;
+                    resp["tp"] = "res:rl:shot:correction";
+                    resp["rid"] = doc["rid"];
+                    if (!rlParticipationEnabled(controller)) {
+                        resp["error"] = F("Auto Tuning is disabled");
+                    } else {
+                        String shotId = doc["shot_id"].as<String>();
+                        if (shotId.isEmpty()) {
+                            shotId = rlLastShotId;
+                        }
+                        if (shotId.isEmpty()) {
+                            resp["error"] = F("No shot available to correct");
+                        } else {
+                            AutoTuning::ShotCorrection correction;
+                            correction.shotId = shotId.c_str();
+                            correction.source = "gaggimate_webui";
+                            if (doc["exclude_from_local_optimization"].is<bool>()) {
+                                correction.excludeFromLocalOptimization = doc["exclude_from_local_optimization"].as<bool>();
+                            }
+                            if (doc["shot_type"].is<String>()) {
+                                correction.shotType = doc["shot_type"].as<String>().c_str();
+                            }
+                            if (doc["grind_followed"].is<bool>()) {
+                                correction.grindFollowed = doc["grind_followed"].as<bool>();
+                            }
+                            if (doc["dose_followed"].is<bool>()) {
+                                correction.doseFollowed = doc["dose_followed"].as<bool>();
+                            }
+                            if (doc["yield_followed"].is<bool>()) {
+                                correction.yieldFollowed = doc["yield_followed"].as<bool>();
+                            }
+                            if (doc["correction_tags"].is<JsonArray>()) {
+                                for (JsonVariant tag : doc["correction_tags"].as<JsonArray>()) {
+                                    String value = tag.as<String>();
+                                    value.trim();
+                                    if (!value.isEmpty() && value.length() <= 64 && correction.tags.size() < 16) {
+                                        correction.tags.emplace_back(value.c_str());
+                                    }
+                                }
+                            }
+                            Event event;
+                            event.id = "rl:shot:correction";
+                            event.setString("shot_id", shotId);
+                            event.setPayload(correction);
+                            pluginManager->trigger(event);
+                            resp["success"] = event.getInt("optimizer_persisted") == 1;
+                            if (event.getInt("optimizer_persisted") != 1) {
+                                resp["error"] = "Unable to persist optimizer correction";
+                            }
+                            resp["shot_id"] = shotId;
+                        }
+                    }
+                    String msg;
+                    serializeJson(resp, msg);
+                    client->text(msg);
+                } else if (msgType == "req:rl:dose-confirmation") {
+                    const String shotId = doc["shot_id"].as<String>();
+                    if (rlParticipationEnabled(controller) && !_pendingDoseShotId.isEmpty() && shotId == _pendingDoseShotId &&
+                        doc["followed"].is<bool>()) {
+                        Event event;
+                        event.id = "rl:dose-confirmation";
+                        event.setString("shot_id", shotId);
+                        event.setInt("has_followed", 1);
+                        event.setInt("followed", doc["followed"].as<bool>() ? 1 : 0);
+                        pluginManager->trigger(event);
+                    }
+                } else if (msgType == "req:rl:preference") {
+                    if (rlParticipationEnabled(controller) && !_pendingPreferenceShotId.isEmpty()) {
+                        const String installId = doc["install_id"].as<String>();
+                        const String runId = doc["optimization_run_id"].as<String>();
+                        const String newShotId = doc["new_shot_id"].as<String>();
+                        const String anchorShotId = doc["anchor_shot_id"].as<String>();
+                        const String comparisonMode = doc["comparison_mode"].as<String>();
+                        const String label = doc["label"].as<String>();
+                        const bool validLabel = label == "new_better" || label == "anchor_better" || label == "tie";
+                        const bool matchesPending = installId == _pendPreferenceInstallId && runId == _pendPreferenceRunId &&
+                                                    newShotId == _pendingPreferenceShotId &&
+                                                    anchorShotId == _pendPreferenceAnchorShotId &&
+                                                    comparisonMode == _pendPreferenceComparisonMode;
+                        if (validLabel && matchesPending && newShotId != anchorShotId) {
+                            const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
+                            const auto parsedMode = AutoTuning::comparisonModeFromKey(comparisonMode.c_str());
+                            if (!parsedLabel || !parsedMode) {
+                                return;
+                            }
+                            AutoTuning::PreferenceFeedback feedback;
+                            feedback.installId = installId.c_str();
+                            feedback.optimizationRunId = runId.c_str();
+                            feedback.newShotId = newShotId.c_str();
+                            feedback.anchorShotId = anchorShotId.c_str();
+                            feedback.label = *parsedLabel;
+                            feedback.comparisonMode = *parsedMode;
+                            feedback.tasteGoal = _pendPreferenceTasteGoal;
+                            feedback.recommendationId = _pendingPreferenceRecommendationId.c_str();
+                            Event event;
+                            event.id = "rl:preference";
+                            event.setString("install_id", installId);
+                            event.setString("optimization_run_id", runId);
+                            event.setString("new_shot_id", newShotId);
+                            event.setString("anchor_shot_id", anchorShotId);
+                            event.setString("label", label);
+                            event.setString("comparison_mode", comparisonMode);
+                            event.setString("recommendation_id", _pendingPreferenceRecommendationId);
+                            event.setPayload(feedback);
+                            pluginManager->trigger(event);
+                        }
+                    }
                 } else if (msgType == "req:process:activate") {
                     controller->activate();
                 } else if (msgType == "req:process:deactivate") {
@@ -544,6 +1652,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
         }
         // Done with this message
         rxBuffers.erase(cid);
+        rxBufferLastActivity.erase(cid);
     }
 }
 
@@ -571,7 +1680,7 @@ void WebUIPlugin::handleAutotuneStart(uint32_t clientId, JsonDocument &request) 
     int testTime = request["time"].as<int>();
     int samples = request["samples"].as<int>();
     // Heater wattage drives combinedKff = TUNER_OUTPUT_SPAN / wattage on the
-    // controller. 0 = "skip combinedKff derivation" — happens when older Web
+    // controller. 0 = "skip combinedKff derivation" â€” happens when older Web
     // UI builds omit the field. WebUI form default is 680 W (Gaggia Classic
     // Pro 2019 / E24, 230 V boiler).
     int heaterWattage = request["wattage"] | 0;
@@ -579,7 +1688,7 @@ void WebUIPlugin::handleAutotuneStart(uint32_t clientId, JsonDocument &request) 
 }
 
 void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request) {
-    // Allocate the response node pool from PSRAM — list responses can be tens
+    // Allocate the response node pool from PSRAM â€” list responses can be tens
     // of KB and would otherwise fragment the ~300 KB internal heap.
     JsonDocument response(&psramAllocator);
     auto type = request["tp"].as<String>();
@@ -594,7 +1703,7 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
             // Skip entries whose JSON couldn't be opened or failed validation
             // (parseProfile returns false for missing label/type/phases). Without
             // this, corrupt or partial profile files surface as blank cards in
-            // the UI — the user reported "blank Simple cards" originating here.
+            // the UI â€” the user reported "blank Simple cards" originating here.
             if (!profileManager->loadProfile(id, profile)) {
                 ESP_LOGW("WebUIPlugin", "Skipping unreadable profile %s in list response", id.c_str());
                 continue;
@@ -658,6 +1767,386 @@ void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request)
     ws.text(clientId, toWsBuffer(response));
 }
 
+void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
+    JsonDocument response;
+    auto type = request["tp"].as<String>();
+    response["tp"] = String("res:") + type.substring(4);
+    response["rid"] = request["rid"].as<String>();
+
+    Settings &settings = controller->getSettings();
+    if (!AutoTuning::Router(settings.getRLOptimizerConfiguration()).acceptUserCommands()) {
+        response["error"] = F("Auto Tuning is disabled");
+    } else {
+        bool changed = false;
+        bool tasteGoalChanged = false;
+        JsonDocument contextsDoc;
+        JsonArray contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
+        JsonDocument grinderContextsDoc;
+        JsonArray grinderContexts = loadRLContexts(grinderContextsDoc, settings.getRLGrinderContextsJson());
+
+        if (type == "req:rl:status:refresh") {
+            pluginManager->trigger("rl:status:refresh");
+        } else if (type == "req:rl:context:start-bean") {
+            String name = limitedRLString(request["name"], 80);
+            name.trim();
+            if (name.isEmpty()) {
+                name = defaultRLContextName();
+            }
+            JsonObject current = findRLContext(contexts, settings.getRLBeanContextId());
+            if (!current.isNull()) {
+                current["status"] = "retired";
+                current["retired_at"] = EpochTime::now();
+            }
+            const int bagIndex = currentBagIndex(contexts, name) + 1;
+            const String id = makeRLContextId("bean", name);
+            markRLOtherContextsAvailable(contexts, id);
+            addRLContext(contexts, settings, id, name, bagIndex, "active");
+            persistRLContexts(settings, contextsDoc);
+            settings.setRLBeanContextId(id);
+            settings.setRLBeanContextName(name);
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:context:start-bag") {
+            String name = settings.getRLBeanContextName();
+            name.trim();
+            if (name.length() > 80) {
+                name.remove(80);
+            }
+            if (name.isEmpty()) {
+                name = defaultRLContextName();
+            }
+            JsonObject current = findRLContext(contexts, settings.getRLBeanContextId());
+            if (!current.isNull()) {
+                current["status"] = "retired";
+                current["retired_at"] = EpochTime::now();
+            }
+            const int bagIndex = currentBagIndex(contexts, name) + 1;
+            const String id = makeRLContextId("bean", name);
+            markRLOtherContextsAvailable(contexts, id);
+            addRLContext(contexts, settings, id, name, bagIndex, "active");
+            persistRLContexts(settings, contextsDoc);
+            settings.setRLBeanContextId(id);
+            settings.setRLBeanContextName(name);
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:context:switch") {
+            const String id = request["id"].as<String>();
+            JsonObject context = findRLContext(contexts, id);
+            if (context.isNull()) {
+                response["error"] = F("Context not found");
+            } else {
+                markRLOtherContextsAvailable(contexts, id);
+                context["status"] = "active";
+                settings.setRLBeanContextId(id);
+                settings.setRLBeanContextName(limitedRLString(context["name"], 80));
+                persistRLContexts(settings, contextsDoc);
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:context:update") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLBeanContextId();
+            }
+            JsonObject context = findRLContext(contexts, id);
+            String name = limitedRLString(request["name"], 80);
+            name.trim();
+            if (context.isNull()) {
+                response["error"] = F("Context not found");
+            } else if (name.isEmpty()) {
+                response["error"] = F("Bean name is required");
+            } else {
+                context["name"] = name;
+                if (settings.getRLBeanContextId() == id) {
+                    settings.setRLBeanContextName(name);
+                }
+                persistRLContexts(settings, contextsDoc);
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:context:retire") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLBeanContextId();
+            }
+            JsonObject context = findRLContext(contexts, id);
+            if (!context.isNull()) {
+                context["status"] = "retired";
+                context["retired_at"] = EpochTime::now();
+                persistRLContexts(settings, contextsDoc);
+            }
+            if (settings.getRLBeanContextId() == id) {
+                settings.setRLBeanContextId("");
+                settings.setRLBeanContextName("");
+                settings.setRLLocalOptimizationEnabled(false);
+            }
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:context:delete") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLBeanContextId();
+            }
+            if (!removeRLContext(contexts, id)) {
+                response["error"] = F("Context not found");
+            } else {
+                AutoTuning::removeTasteGoalsForBeanContext(settings, id);
+                persistRLContexts(settings, contextsDoc);
+                if (settings.getRLBeanContextId() == id) {
+                    settings.setRLBeanContextId("");
+                    settings.setRLBeanContextName("");
+                    settings.setRLLocalOptimizationEnabled(false);
+                }
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:grinder-context:create") {
+            String name = limitedRLString(request["name"], 80);
+            name.trim();
+            if (name.isEmpty()) {
+                name = defaultRLGrinderContextName();
+            }
+            const String id = makeRLContextId("grinder", name);
+            markRLOtherContextsAvailable(grinderContexts, id);
+            JsonObject context = addRLGrinderContext(grinderContexts, settings, id, name, "active");
+            applyRLGrinderCalibration(context, request);
+            persistRLGrinderContexts(settings, grinderContextsDoc);
+            settings.setRLGrinderContextId(id);
+            settings.setRLGrinderContextName(name);
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:grinder-context:update") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLGrinderContextId();
+            }
+            JsonObject context = findRLContext(grinderContexts, id);
+            String name = limitedRLString(request["name"], 80);
+            name.trim();
+            if (context.isNull()) {
+                response["error"] = F("Grinder context not found");
+            } else if (name.isEmpty()) {
+                response["error"] = F("Grinder name is required");
+            } else {
+                context["name"] = name;
+                applyRLGrinderCalibration(context, request);
+                if (settings.getRLGrinderContextId() == id) {
+                    settings.setRLGrinderContextName(name);
+                }
+                persistRLGrinderContexts(settings, grinderContextsDoc);
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:grinder-context:update-calibration") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLGrinderContextId();
+            }
+            JsonObject context = findRLContext(grinderContexts, id);
+            if (context.isNull()) {
+                response["error"] = F("Grinder context not found");
+            } else {
+                applyRLGrinderCalibration(context, request);
+                persistRLGrinderContexts(settings, grinderContextsDoc);
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:grinder-context:switch") {
+            const String id = request["id"].as<String>();
+            JsonObject context = findRLContext(grinderContexts, id);
+            if (context.isNull()) {
+                response["error"] = F("Grinder context not found");
+            } else {
+                markRLOtherContextsAvailable(grinderContexts, id);
+                context["status"] = "active";
+                settings.setRLGrinderContextId(id);
+                settings.setRLGrinderContextName(limitedRLString(context["name"], 80));
+                persistRLGrinderContexts(settings, grinderContextsDoc);
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:grinder-context:retire") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLGrinderContextId();
+            }
+            JsonObject context = findRLContext(grinderContexts, id);
+            if (!context.isNull()) {
+                context["status"] = "retired";
+                context["retired_at"] = EpochTime::now();
+                persistRLGrinderContexts(settings, grinderContextsDoc);
+            }
+            if (settings.getRLGrinderContextId() == id) {
+                settings.setRLGrinderContextId("");
+                settings.setRLGrinderContextName("");
+            }
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:grinder-context:delete") {
+            String id = request["id"].as<String>();
+            if (id.isEmpty()) {
+                id = settings.getRLGrinderContextId();
+            }
+            if (!removeRLContext(grinderContexts, id)) {
+                response["error"] = F("Grinder context not found");
+            } else {
+                AutoTuning::removeTasteGoalsForGrinderContext(settings, id);
+                persistRLGrinderContexts(settings, grinderContextsDoc);
+                if (settings.getRLGrinderContextId() == id) {
+                    settings.setRLGrinderContextId("");
+                    settings.setRLGrinderContextName("");
+                }
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:grinder-context:clear") {
+            JsonObject current = findRLContext(grinderContexts, settings.getRLGrinderContextId());
+            if (!current.isNull() && current["status"].as<String>() == "active") {
+                current["status"] = "available";
+                persistRLGrinderContexts(settings, grinderContextsDoc);
+            }
+            settings.setRLGrinderContextId("");
+            settings.setRLGrinderContextName("");
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:local-optimization") {
+            settings.setRLLocalOptimizationEnabled(request["enabled"] | true);
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:taste-goal:set") {
+            String goalError;
+            if (!AutoTuning::setTasteGoalForContext(settings, settings.getRLBeanContextId(), settings.getRLGrinderContextId(),
+                                                    request["taste_goal"], goalError)) {
+                response["error"] = goalError;
+            } else {
+                changed = true;
+                tasteGoalChanged = true;
+            }
+        } else if (type == "req:rl:recipe-domain:set") {
+            JsonVariant value = request["recipe_domain"];
+            if (!value.is<JsonObject>() || value.as<JsonObjectConst>().size() != 5 || !isRLNumber(value["grind_radius_steps"]) ||
+                !isRLNumber(value["dose_min_g"]) || !isRLNumber(value["dose_max_g"]) ||
+                !isRLNumber(value["target_output_min_g"]) || !isRLNumber(value["target_output_max_g"])) {
+                response["error"] = F("Recipe domain must contain five numeric fields");
+            } else {
+                AutoTuning::RecipeDomain domain{value["grind_radius_steps"].as<float>(), value["dose_min_g"].as<float>(),
+                                                value["dose_max_g"].as<float>(), value["target_output_min_g"].as<float>(),
+                                                value["target_output_max_g"].as<float>()};
+                std::string reason;
+                const float currentDose = settings.getTargetGrindVolume();
+                if (!AutoTuning::validateRecipeDomain(domain, reason)) {
+                    response["error"] = reason.c_str();
+                } else if (currentDose < domain.doseMinG || currentDose > domain.doseMaxG) {
+                    response["error"] = F("Recipe domain must include the current dose target");
+                } else if (!settings.setRLRecipeDomain(domain)) {
+                    response["error"] = F("Unable to save recipe domain");
+                } else {
+                    settings.save(true);
+                    changed = true;
+                }
+            }
+        } else if (type == "req:rl:dose-target:set") {
+            JsonVariant value = request["dose_target_g"];
+            const AutoTuning::RecipeDomain domain = settings.getRLRecipeDomain();
+            if (!isRLNumber(value) || !std::isfinite(value.as<float>())) {
+                response["error"] = F("Dose target must be numeric and finite");
+            } else if (value.as<float>() < domain.doseMinG || value.as<float>() > domain.doseMaxG) {
+                response["error"] = F("Dose target is outside the configured recipe domain");
+            } else {
+                controller->setTargetGrindVolume(value.as<float>());
+                settings.save(true);
+                changed = true;
+            }
+        } else if (type == "req:rl:optimization:pause") {
+            settings.setRLOptimizationPaused(true);
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:optimization:resume") {
+            settings.setRLOptimizationPaused(false);
+            settings.setRLLocalOptimizationEnabled(true);
+            settings.save(true);
+            changed = true;
+        } else if (type == "req:rl:local-reset") {
+            settings.setRLBeanContextId("");
+            settings.setRLBeanContextName("");
+            settings.setRLBeanContextsJson("[]");
+            settings.setRLGrinderContextId("");
+            settings.setRLGrinderContextName("");
+            settings.setRLGrinderContextsJson("[]");
+            AutoTuning::clearTasteGoals(settings);
+            settings.setRLLocalOptimizationEnabled(false);
+            settings.setRLOptimizationPaused(false);
+            settings.save(true);
+            Event event;
+            event.id = "rl:local:reset";
+            const bool dryRun = request["dry_run"] | false;
+            event.setInt("dry_run", dryRun ? 1 : 0);
+            pluginManager->trigger(event);
+            contextsDoc.clear();
+            grinderContextsDoc.clear();
+            contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
+            grinderContexts = loadRLContexts(grinderContextsDoc, settings.getRLGrinderContextsJson());
+            changed = true;
+        }
+
+        if (changed) {
+            pluginManager->trigger("settings:changed");
+            pluginManager->trigger("rl:settings:changed");
+            if (tasteGoalChanged) {
+                pluginManager->trigger("rl:taste-goal:changed");
+            }
+        }
+
+        JsonArray arr = response["contexts"].to<JsonArray>();
+        for (JsonObject context : contexts) {
+            JsonObject out = arr.add<JsonObject>();
+            out["id"] = context["id"].as<String>();
+            out["name"] = context["name"].as<String>();
+            out["bag_index"] = context["bag_index"] | 1;
+            out["status"] = context["status"].as<String>();
+            out["active"] = context["id"].as<String>() == settings.getRLBeanContextId();
+        }
+        response["active_context_id"] = settings.getRLBeanContextId();
+        response["active_context_name"] = settings.getRLBeanContextName();
+        JsonArray grinderArr = response["grinder_contexts"].to<JsonArray>();
+        for (JsonObject context : grinderContexts) {
+            JsonObject out = grinderArr.add<JsonObject>();
+            out["id"] = context["id"].as<String>();
+            out["name"] = context["name"].as<String>();
+            out["status"] = context["status"].as<String>();
+            out["active"] = context["id"].as<String>() == settings.getRLGrinderContextId();
+            copyRLGrinderCalibration(out, context);
+        }
+        response["active_grinder_context_id"] = settings.getRLGrinderContextId();
+        response["active_grinder_context_name"] = settings.getRLGrinderContextName();
+        response["optimizer_mode"] = settings.getRLOptimizerMode();
+        response["dose_target_g"] = settings.getTargetGrindVolume();
+        JsonObject responseDomain = response["recipe_domain"].to<JsonObject>();
+        AutoTuning::RecipeDomain const recipeDomain = settings.getRLRecipeDomain();
+        responseDomain["grind_radius_steps"] = recipeDomain.grindRadiusSteps;
+        responseDomain["dose_min_g"] = recipeDomain.doseMinG;
+        responseDomain["dose_max_g"] = recipeDomain.doseMaxG;
+        responseDomain["target_output_min_g"] = recipeDomain.targetOutputMinG;
+        responseDomain["target_output_max_g"] = recipeDomain.targetOutputMaxG;
+        JsonDocument activeTasteGoal;
+        AutoTuning::activeTasteGoal(settings, activeTasteGoal);
+        response["taste_goal"].set(activeTasteGoal.as<JsonVariantConst>());
+        response["taste_goal_summary"] = AutoTuning::tasteGoalSummary(activeTasteGoal.as<JsonVariantConst>());
+        response["local_optimization_enabled"] = settings.isRLLocalOptimizationEnabled() && !settings.isRLOptimizationPaused() &&
+                                                 !settings.getRLBeanContextId().isEmpty();
+        response["optimization_paused"] = settings.isRLOptimizationPaused();
+    }
+
+    size_t bufferSize = measureJson(response);
+    auto *buffer = ws.makeBuffer(bufferSize);
+    serializeJson(response, buffer->get(), bufferSize);
+    ws.text(clientId, buffer);
+}
+
 void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     if (request->method() == HTTP_POST) {
         controller->getSettings().batchUpdate([request](Settings *settings) {
@@ -698,7 +2187,23 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setSmartGrindIp(request->arg("smartGrindIp"));
             if (request->hasArg("smartGrindMode"))
                 settings->setSmartGrindMode(request->arg("smartGrindMode").toInt());
-            settings->setHomeAssistant(request->hasArg("homeAssistant"));
+            const bool homeAssistantEnabled = request->hasArg("homeAssistant");
+            settings->setHomeAssistant(homeAssistantEnabled);
+            String rlProviderMode = request->hasArg("rlProviderMode")
+                                        ? request->arg("rlProviderMode")
+                                        : (request->hasArg("rlAutoTuningEnabled") ? String(AutoTuning::PROVIDER_OFF_BOARD)
+                                                                                  : String(AutoTuning::PROVIDER_DISABLED));
+            rlProviderMode = AutoTuning::normalizeProviderMode(rlProviderMode.c_str()).c_str();
+            const bool rlEnabled = rlProviderMode != AutoTuning::PROVIDER_DISABLED;
+            settings->setRLAutoTuningProviderMode(rlProviderMode);
+            settings->setRLAutoTuningEnabled(rlEnabled);
+            settings->setRLCommunityUploadEnabled(request->hasArg("rlCommunityUploadEnabled"));
+            settings->setRLCommunityUploadPrompted(request->arg("rlCommunityUploadPrompted") == "1");
+            if (request->hasArg("rlUploadBaseUrl"))
+                settings->setRLUploadBaseUrl(request->arg("rlUploadBaseUrl"));
+            if (!rlEnabled) {
+                settings->setRLLocalOptimizationEnabled(false);
+            }
             if (request->hasArg("haUser"))
                 settings->setHomeAssistantUser(request->arg("haUser"));
             if (request->hasArg("haPassword"))
@@ -806,6 +2311,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             settings->save(true);
         });
         pluginManager->trigger("settings:changed");
+        pluginManager->trigger("rl:settings:changed");
         controller->setTargetTemp(controller->getTargetTemp());
         controller->setPumpModelCoeffs();
     }
@@ -818,6 +2324,114 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["targetSteamTemp"] = settings.getTargetSteamTemp();
     doc["targetWaterTemp"] = settings.getTargetWaterTemp();
     doc["homekit"] = settings.isHomekit();
+    AutoTuning::Router router(settings.getRLOptimizerConfiguration(), controller->getOptimizerTransport());
+    const bool rlOffBoardProvider = router.routeOffBoardTransport();
+    const bool rlEnabled = router.enabled();
+    doc["rlAutoTuningEnabled"] = rlEnabled;
+    doc["rlProviderMode"] = settings.getRLAutoTuningProviderMode();
+    doc["rlProviderStatus"] = router.providerStatus();
+    doc["rlProviderSummary"] = router.providerSummary();
+    doc["rlBeanContextId"] = settings.getRLBeanContextId();
+    doc["rlBeanContextName"] = settings.getRLBeanContextName();
+    doc["rlGrinderContextId"] = settings.getRLGrinderContextId();
+    doc["rlGrinderContextName"] = settings.getRLGrinderContextName();
+    JsonDocument activeTasteGoal;
+    AutoTuning::activeTasteGoal(settings, activeTasteGoal);
+    doc["rlTasteGoal"].set(activeTasteGoal.as<JsonVariantConst>());
+    doc["rlTasteGoalSummary"] = AutoTuning::tasteGoalSummary(activeTasteGoal.as<JsonVariantConst>());
+    doc["rlGrinderCatalogSearchUrl"] = rlGrinderCatalogSearchUrl;
+    doc["rlOptimizationPaused"] = settings.isRLOptimizationPaused();
+    doc["rlLocalOptimizationEnabled"] = router.optimizationActive();
+    JsonDocument contextsDoc;
+    JsonArray contexts = loadRLContexts(contextsDoc, settings.getRLBeanContextsJson());
+    JsonArray contextsOut = doc["rlBeanContexts"].to<JsonArray>();
+    for (JsonObject context : contexts) {
+        JsonObject out = contextsOut.add<JsonObject>();
+        out["id"] = context["id"].as<String>();
+        out["name"] = context["name"].as<String>();
+        out["bag_index"] = context["bag_index"] | 1;
+        out["status"] = context["status"].as<String>();
+        out["active"] = context["id"].as<String>() == settings.getRLBeanContextId();
+    }
+    JsonDocument grinderContextsDoc;
+    JsonArray grinderContexts = loadRLContexts(grinderContextsDoc, settings.getRLGrinderContextsJson());
+    JsonArray grinderContextsOut = doc["rlGrinderContexts"].to<JsonArray>();
+    for (JsonObject context : grinderContexts) {
+        JsonObject out = grinderContextsOut.add<JsonObject>();
+        out["id"] = context["id"].as<String>();
+        out["name"] = context["name"].as<String>();
+        out["status"] = context["status"].as<String>();
+        out["active"] = context["id"].as<String>() == settings.getRLGrinderContextId();
+        copyRLGrinderCalibration(out, context);
+    }
+    JsonObject activeGrinderContext = findRLContext(grinderContexts, settings.getRLGrinderContextId());
+    if (!activeGrinderContext.isNull()) {
+        JsonObject calibration = doc["rlActiveGrinderCalibration"].to<JsonObject>();
+        copyRLGrinderCalibration(calibration, activeGrinderContext);
+    }
+    doc["rlStatusSeen"] = rlOffBoardProvider ? rlStatusSeen : rlEnabled;
+    doc["rlAddonOnline"] = rlOffBoardProvider ? rlAddonOnline : router.providerAvailable();
+    doc["rlLastStatusAt"] = rlLastStatusAt;
+    doc["rlLastShotId"] = rlLastShotId;
+    doc["rlLastShotAt"] = rlLastShotAt;
+    doc["rlLastShotType"] = rlLastShotType;
+    doc["rlLastShotTimeS"] = rlLastShotTimeS;
+    doc["rlLastShotBeverageOutG"] = rlLastShotBeverageOutG;
+    doc["rlLastShotTargetYieldG"] = rlLastShotTargetYieldG;
+    doc["rlLastRecommendationId"] = rlLastRecommendationId;
+    doc["rlLastRecommendationAt"] = rlLastRecommendationAt;
+    doc["rlRecommendationApplyStatus"] = rlRecommendationApplyStatus;
+    doc["rlRecommendationStatus"] = rlRecommendationStatus;
+    doc["rlRecommendationMode"] = rlRecommendationMode;
+    doc["rlRecommendationGrindDeltaStepsFromCurrent"] = rlRecommendationGrindDeltaStepsFromCurrent;
+    doc["rlRecommendationGrindDeltaUmFromCurrent"] = rlRecommendationGrindDeltaUmFromCurrent;
+    doc["rlRecommendationProjectedRelativeStepFromReference"] = rlRecommendationProjectedRelativeStepFromReference;
+    doc["rlRecommendationProjectedRelativeGrindUmFromReference"] = rlRecommendationProjectedRelativeGrindUmFromReference;
+    doc["rlRecommendationNextDoseG"] = rlRecommendationNextDoseG;
+    doc["rlRecommendationTargetYieldG"] = rlRecommendationTargetYieldG;
+    doc["rlRecommendationTargetRatio"] = rlRecommendationTargetRatio;
+    doc["rlRecommendationHasCurrentAbsoluteStep"] = rlRecommendationHasCurrentAbsoluteStep;
+    doc["rlRecommendationCurrentAbsoluteStep"] = rlRecommendationCurrentAbsoluteStep;
+    doc["rlRecommendationHasProjectedAbsoluteStep"] = rlRecommendationHasProjectedAbsoluteStep;
+    doc["rlRecommendationProjectedAbsoluteStep"] = rlRecommendationProjectedAbsoluteStep;
+    doc["rlMode"] = rlMode;
+    doc["rlOptimizerProfileId"] = rlOptimizerProfileId;
+    doc["rlOptimizerProfileLabel"] = rlOptimizerProfileLabel;
+    doc["rlOptimizerMode"] = settings.getRLOptimizerMode();
+    doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
+    addRLRecipeDomain(doc.as<JsonObject>(), settings);
+    doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
+    doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
+    doc["rlOptimizerFallbackReason"] = rlOptimizerFallbackReason;
+    doc["rlLocalShotCount"] = rlLocalShotCount;
+    doc["rlUploadQueueCount"] = rlUploadQueueCount;
+    doc["rlUploadQueueRejectedCount"] = rlUploadQueueRejectedCount;
+    doc["rlUploadQueueLastRejectedId"] = rlUploadQueueLastRejectedId;
+    doc["rlUploadQueueLastRejectedRecordId"] = rlUploadQueueLastRejectedRecordId;
+    doc["rlUploadQueueLastRejectedError"] = rlUploadQueueLastRejectedError;
+    doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();
+    doc["rlCommunityUploadEffective"] = rlCommunityUploadEnabled;
+    doc["rlCommunityUploadPrompted"] = settings.isRLCommunityUploadPrompted();
+    doc["rlUploadBaseUrl"] = settings.getRLUploadBaseUrl();
+    doc["rlUploadCredentialConfigured"] = settings.hasRLUploadCredentials();
+    doc["rlRuntimeHealthStatus"] = rlOffBoardProvider ? rlRuntimeHealthStatus : (rlEnabled ? "attention" : "waiting");
+    doc["rlRuntimeHealthSummary"] =
+        rlOffBoardProvider && !rlRuntimeHealthSummary.isEmpty() ? rlRuntimeHealthSummary : router.providerSummary();
+    copyRLStringArray(doc, "rlRuntimeHealthWarnings", rlRuntimeHealthWarningsJson);
+    copyRLStringArray(doc, "rlRuntimeHealthWaitingReasons", rlRuntimeHealthWaitingReasonsJson);
+    copyRLDiagnosticSteps(doc, rlAutoTuningDiagnosticStepsJson);
+    doc["rlRuntimeHealthStorageBackend"] = rlRuntimeHealthStorageBackend;
+    doc["rlRuntimeHealthStorageAvailable"] = rlRuntimeHealthStorageAvailable;
+    doc["rlRuntimeHealthUploadConfigured"] = rlRuntimeHealthUploadConfigured;
+    doc["rlRuntimeHealthCommunityUploadRequested"] = rlRuntimeHealthCommunityUploadRequested;
+    doc["rlRuntimeHealthPendingUploadCount"] = rlRuntimeHealthPendingUploadCount;
+    doc["rlRuntimeHealthFailedUploadCount"] = rlRuntimeHealthFailedUploadCount;
+    doc["rlRuntimeHealthRejectedUploadCount"] = rlRuntimeHealthRejectedUploadCount;
+    doc["rlLocalDeliveryPendingCount"] = rlLocalDeliveryPendingCount;
+    doc["rlLocalDeliveryRetryCount"] = rlLocalDeliveryRetryCount;
+    doc["rlLocalDeliveryRejectedCount"] = rlLocalDeliveryRejectedCount;
+    doc["rlLocalDeliveryLastError"] = rlLocalDeliveryLastError;
+    copyRLRecentShots(doc, rlRecentShotsJson);
     doc["homeAssistant"] = settings.isHomeAssistant();
     doc["haUser"] = settings.getHomeAssistantUser();
     doc["haPassword"] = settings.getHomeAssistantPassword();
@@ -893,7 +2507,6 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
 void WebUIPlugin::handleBLEScaleList(AsyncWebServerRequest *request) {
     JsonDocument doc(&psramAllocator);
     JsonArray scalesArray = doc.to<JsonArray>();
-    std::vector<DiscoveredDevice> devices = BLEScales.getDiscoveredScales();
     for (const DiscoveredDevice &device : BLEScales.getDiscoveredScales()) {
         JsonDocument scale(&psramAllocator);
         scale["uuid"] = device.getAddress().toString();
@@ -939,7 +2552,7 @@ void WebUIPlugin::handleBLEScaleInfo(AsyncWebServerRequest *request) {
     doc["uuid"] = BLEScales.getUUID();
     doc["rssi"] = BLEScales.getRSSI();
     doc["hasBattery"] = BLEScales.hasBatteryLevel();
-    // Only surface the numeric when the scale reports one — a 255 sentinel
+    // Only surface the numeric when the scale reports one â€” a 255 sentinel
     // (REMOTE_SCALES_BATTERY_UNKNOWN) would otherwise render as a fake "255%".
     if (BLEScales.hasBatteryLevel()) {
         const uint8_t pct = BLEScales.getBatteryLevel();
@@ -1034,7 +2647,7 @@ void WebUIPlugin::sendAutotuneResult() {
 }
 
 void WebUIPlugin::sendAutotuneFailed() {
-    // Distinct WS event — Autotune page renders "timed out" error card
+    // Distinct WS event â€” Autotune page renders "timed out" error card
     // instead of stuck spinner. Fires on ERROR_CODE_AUTOTUNE_TIMEOUT.
     JsonDocument doc(&psramAllocator);
     doc["tp"] = "evt:autotune-failed";

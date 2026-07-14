@@ -1,5 +1,5 @@
 import { computed } from '@preact/signals';
-import { useContext, useState } from 'preact/hooks';
+import { useContext, useEffect, useState } from 'preact/hooks';
 import { useQuery } from 'preact-fetching';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
 
@@ -9,6 +9,7 @@ const capabilities = computed(() => machine.value.capabilities);
 export function useDashboardState() {
   const apiService = useContext(ApiServiceContext);
   const [isFlushing, setIsFlushing] = useState(false);
+  const [localOptimizationEnabled, setLocalOptimizationEnabled] = useState(true);
 
   const s = status.value;
   const caps = capabilities.value;
@@ -19,6 +20,12 @@ export function useDashboardState() {
     async () => (await fetch('/api/settings')).json(),
     { staleTime: 30000, refetchOnWindowFocus: false },
   );
+
+  useEffect(() => {
+    if (settings?.rlLocalOptimizationEnabled !== undefined) {
+      setLocalOptimizationEnabled(!!settings.rlLocalOptimizationEnabled);
+    }
+  }, [settings?.rlLocalOptimizationEnabled]);
 
   // ── derived ──────────────────────────────────────────────
   const isActive = !!p?.a;
@@ -80,6 +87,11 @@ export function useDashboardState() {
       tp: isGrinding ? 'req:change-grind-target' : 'req:change-brew-target',
       target,
     });
+  const toggleLocalOptimization = () => {
+    const enabled = !localOptimizationEnabled;
+    setLocalOptimizationEnabled(enabled);
+    apiService.send({ tp: 'req:rl:local-optimization', enabled });
+  };
 
   return {
     // raw status
@@ -122,6 +134,10 @@ export function useDashboardState() {
     altRelayFunction,
     emptyTankDistance,
     fullTankDistance,
+    autoTuningEnabled: !!settings?.rlAutoTuningEnabled,
+    localOptimizationEnabled,
+    beanContextName: settings?.rlBeanContextName || '',
+    hasBeanContext: !!settings?.rlBeanContextId,
     // action state
     isFlushing,
     // handlers
@@ -135,5 +151,6 @@ export function useDashboardState() {
     raiseTarget,
     lowerTarget,
     changeTarget,
+    toggleLocalOptimization,
   };
 }

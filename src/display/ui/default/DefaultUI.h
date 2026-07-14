@@ -2,6 +2,7 @@
 #define DEFAULTUI_H
 
 #include <atomic>
+#include <display/core/AutoTuningModels.h>
 #include <display/core/PluginManager.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/constants.h>
@@ -47,6 +48,21 @@ class DefaultUI {
     };
 
     void onVolumetricDelete();
+    void showAutoTuningSettings();
+    void closeAutoTuningSettings();
+    void setAutoTuningEnabled(bool enabled);
+    void setAutoTuningProviderFromIndex(uint16_t index);
+    void setAutoTuningLocalOptimization(bool enabled);
+    void setAutoTuningCommunityUpload(bool enabled);
+    void setAutoTuningDoseTarget(float doseG);
+    void showRecipeDomainSettings();
+    void closeRecipeDomainSettings();
+    void saveRecipeDomainSettings();
+    void showTasteGoalSettings();
+    void closeTasteGoalSettings();
+    void setTasteGoalModeFromIndex(uint16_t index);
+    void cycleTasteGoalLevel(lv_obj_t *button);
+    void saveTasteGoalSettings();
 
     void markDirty() { rerender = true; }
     void markProfileDirty() { profileDirty = true; }
@@ -79,6 +95,8 @@ class DefaultUI {
     void updateBoiler();
     void updateBrewProcess();
     void updateMenuScreen();
+    void updateAutoTuningSettingsModal();
+    void updateTasteGoalSettingsModal();
     String getErrorMessage();
 
     void adjustDials(lv_obj_t *dials);
@@ -105,8 +123,18 @@ class DefaultUI {
     int apActive = false;
     int wifiConnected = false;
     int waitingForController = false;
-    int initialized = false;
+    int volumetricAvailable = false;
+    int grindVolumetricAvailable = false;
+    int bluetoothScales = false;
+    int grindVolumetricTarget = false;
+    int volumetricMode = false;
+    int brewVolumetric = false;
+    int profileVolumetric = false;
+    int grindActive = false;
+    int active = false;
+    int smartGrindActive = false;
     int grindAvailable = false;
+    int initialized = false;
 
     // Seasonal flags
     int christmasMode = false;
@@ -121,6 +149,7 @@ class DefaultUI {
     float currentTemp = 0.0f;
     float targetTemp = 0.0f;
     double bluetoothWeight = 0.0;
+    double estimatedWeight = 0.0;
     BrewScreenState brewScreenState = BrewScreenState::Brew;
 
     // EEZ Structs
@@ -134,6 +163,31 @@ class DefaultUI {
     Value steamReady = BooleanValue(false);
     Value grindWeightTarget = FloatValue(18.0);
     Value grindTimeTarget = StringValue("0:15");
+
+    lv_obj_t *autoTuningModal = nullptr;
+    lv_obj_t *autoTuningEnabledSwitch = nullptr;
+    lv_obj_t *autoTuningProviderDropdown = nullptr;
+    lv_obj_t *autoTuningLocalSwitch = nullptr;
+    lv_obj_t *autoTuningCommunitySwitch = nullptr;
+    lv_obj_t *autoTuningDoseTarget = nullptr;
+    lv_obj_t *autoTuningTasteGoalButton = nullptr;
+    lv_obj_t *autoTuningTasteGoalButtonLabel = nullptr;
+    lv_obj_t *autoTuningAdvancedButton = nullptr;
+    lv_obj_t *autoTuningStatusLabel = nullptr;
+    lv_obj_t *autoTuningSummaryLabel = nullptr;
+    lv_obj_t *recipeDomainModal = nullptr;
+    lv_obj_t *recipeDomainGrindRadius = nullptr;
+    lv_obj_t *recipeDomainDoseMin = nullptr;
+    lv_obj_t *recipeDomainDoseMax = nullptr;
+    lv_obj_t *recipeDomainOutputMin = nullptr;
+    lv_obj_t *recipeDomainOutputMax = nullptr;
+    lv_obj_t *recipeDomainStatusLabel = nullptr;
+    lv_obj_t *tasteGoalModal = nullptr;
+    lv_obj_t *tasteGoalModeDropdown = nullptr;
+    lv_obj_t *tasteGoalStatusLabel = nullptr;
+    lv_obj_t *tasteGoalLevelButtons[AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT] = {};
+    uint8_t tasteGoalLevels[AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT] = {};
+    bool tasteGoalCustom = false;
 
     int profileDirty = 0;
     int currentProfileIdx = 0;

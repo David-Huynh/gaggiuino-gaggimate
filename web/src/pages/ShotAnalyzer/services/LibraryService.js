@@ -11,6 +11,7 @@ import { parseBinaryShot } from '../../ShotHistory/parseBinaryShot';
 import { indexedDBService } from './IndexedDBService';
 import { notesService } from './NotesService';
 import { getProfileDisplayLabel, getShotStorageKey } from '../utils/analyzerUtils';
+import { normalizeNotesTasteFields } from '../../../utils/tasteTags.js';
 
 const HISTORY_NOTES_DEFAULTS = {
   id: '',
@@ -20,7 +21,8 @@ const HISTORY_NOTES_DEFAULTS = {
   doseOut: '',
   ratio: '',
   grindSetting: '',
-  balanceTaste: 'balanced',
+  tasteTags: [],
+  balanceTaste: '',
   notes: '',
 };
 
@@ -55,6 +57,7 @@ function normalizeNotesForHistoryExport(notes, shotId) {
     ...notes,
     id: String(shotId ?? notes?.id ?? ''),
   };
+  const normalized = normalizeNotesTasteFields(merged);
 
   return {
     id: merged.id,
@@ -64,7 +67,8 @@ function normalizeNotesForHistoryExport(notes, shotId) {
     doseOut: merged.doseOut ?? '',
     ratio: merged.ratio ?? '',
     grindSetting: merged.grindSetting ?? '',
-    balanceTaste: merged.balanceTaste ?? 'balanced',
+    tasteTags: normalized.tasteTags,
+    balanceTaste: normalized.balanceTaste,
     notes: merged.notes ?? '',
   };
 }

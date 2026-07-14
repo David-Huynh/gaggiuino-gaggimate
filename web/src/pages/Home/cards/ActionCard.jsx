@@ -5,6 +5,7 @@ import { getPrimaryIcon, getPrimaryLabel } from '../utils.js';
 import { useEffect, useState } from 'preact/hooks';
 import TargetToggle from '../TargetToggle.jsx';
 import Adjuster from '../Adjuster.jsx';
+import { OptimizationStrip } from '../OptimizationStrip.jsx';
 
 export function ActionCard({
   mode,
@@ -28,6 +29,11 @@ export function ActionCard({
   grindTargetVolume,
   raiseTarget,
   lowerTarget,
+  autoTuningEnabled,
+  localOptimizationEnabled,
+  beanContextName,
+  hasBeanContext,
+  toggleLocalOptimization,
 }) {
   const [preheated, setPreheated] = useState(false);
   const showPrimary = mode === 1 || mode === 3 || mode === 4;
@@ -59,6 +65,16 @@ export function ActionCard({
     <div
       className={`grid grid-cols-[1fr_auto_1fr] items-center ${inCard ? '' : 'card bg-base-100 rounded-xl p-3'}`}
     >
+      {isBrewing && autoTuningEnabled && (
+        <div className='col-span-full mb-3 min-w-0'>
+          <OptimizationStrip
+            beanContextName={beanContextName}
+            enabled={localOptimizationEnabled}
+            hasContext={hasBeanContext}
+            onToggle={toggleLocalOptimization}
+          />
+        </div>
+      )}
       {isGrinding && (
         <div className='col-span-full mb-4 flex flex-col gap-4'>
           <div className='flex justify-center'>
@@ -122,4 +138,9 @@ ActionCard.propTypes = {
   clear: PropTypes.func.isRequired,
   startFlush: PropTypes.func.isRequired,
   inCard: PropTypes.bool,
+  autoTuningEnabled: PropTypes.bool.isRequired,
+  localOptimizationEnabled: PropTypes.bool.isRequired,
+  beanContextName: PropTypes.string,
+  hasBeanContext: PropTypes.bool.isRequired,
+  toggleLocalOptimization: PropTypes.func.isRequired,
 };

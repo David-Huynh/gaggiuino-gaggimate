@@ -8,6 +8,7 @@ import { faThermometerHalf } from '@fortawesome/free-solid-svg-icons/faThermomet
 import { faTint } from '@fortawesome/free-solid-svg-icons/faTint';
 import { faWeightScale } from '@fortawesome/free-solid-svg-icons/faWeightScale';
 import { ModeTab } from './ModeTab.jsx';
+import { OptimizationStrip } from './OptimizationStrip.jsx';
 import { useDashboardState } from './useDashboardState.js';
 import {
   fmtElapsed,
@@ -114,6 +115,11 @@ export default function CompactProcessControls() {
     raiseTarget,
     lowerTarget,
     changeTarget,
+    autoTuningEnabled,
+    localOptimizationEnabled,
+    beanContextName,
+    hasBeanContext,
+    toggleLocalOptimization,
   } = ds;
 
   const showPrimary = mode === 1 || mode === 3 || (isGrinding && isGrindAvailable);
@@ -227,6 +233,15 @@ export default function CompactProcessControls() {
           unit=' bar'
         />
       </div>
+
+      {isBrewing && autoTuningEnabled && (
+        <OptimizationStrip
+          beanContextName={beanContextName}
+          enabled={localOptimizationEnabled}
+          hasContext={hasBeanContext}
+          onToggle={toggleLocalOptimization}
+        />
+      )}
 
       <div className='flex min-h-0 w-full min-w-0 flex-1 flex-col items-center justify-center overflow-x-hidden overflow-y-auto'>
         {renderContent()}

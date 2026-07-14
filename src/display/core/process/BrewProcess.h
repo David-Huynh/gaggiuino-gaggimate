@@ -25,6 +25,15 @@ class BrewProcess : public Process {
     float currentPressure = 0.0f;
     float waterPumped = 0.0f;
     VolumetricRateCalculator volumetricRateCalculator{PREDICTIVE_TIME};
+    double currentPredictedAddedVolume = 0.0;
+    double currentPredictedVolume = 0.0;
+    double currentVolumetricRate = 0.0;
+    bool currentPredictionWouldStop = false;
+    double stopMeasuredVolume = 0.0;
+    double stopPredictedAddedVolume = 0.0;
+    double stopPredictedVolume = 0.0;
+    double stopVolumetricRate = 0.0;
+    bool stopPredictionApplied = false;
 
     explicit BrewProcess(Profile profile, ProcessTarget target, double brewDelay = 0.0)
         : profile(profile), target(target), brewDelay(brewDelay) {
@@ -57,11 +66,38 @@ class BrewProcess : public Process {
             return PhaseExitReason::SAFETY;
         }
         double volume = currentVolume;
+        currentPredictedAddedVolume = 0.0;
+        currentPredictedVolume = currentVolume;
+        currentVolumetricRate = 0.0;
         if (volume > 0.0) {
-            double currentRate = volumetricRateCalculator.getRate();
-            double predictedAddedVolume = currentRate * brewDelay;
-            predictedAddedVolume = std::clamp(predictedAddedVolume, 0.0, 8.0);
-            volume = currentVolume + predictedAddedVolume;
+            currentVolumetricRate = volumetricRateCalculator.getRate();
+            currentPredictedAddedVolume = std::clamp(currentVolumetricRate * brewDelay, 0.0, 8.0);
+            currentPredictedVolume = currentVolume + currentPredictedAddedVolume;
+            volume = currentPredictedVolume;
+        }
+        currentPredictionWouldStop = false;
+        for (const auto &phaseTarget : currentPhase.targets) {
+            bool reached = false;
+            switch (phaseTarget.type) {
+            case TargetType::TARGET_TYPE_VOLUMETRIC:
+                reached = target == ProcessTarget::VOLUMETRIC && phaseTarget.isReached(volume);
+                if (reached) {
+                    currentPredictionWouldStop = currentPredictedAddedVolume > 0.0 && !phaseTarget.isReached(currentVolume);
+                }
+                break;
+            case TargetType::TARGET_TYPE_PRESSURE:
+                reached = phaseTarget.isReached(currentPressure);
+                break;
+            case TargetType::TARGET_TYPE_FLOW:
+                reached = phaseTarget.isReached(currentFlow);
+                break;
+            case TargetType::TARGET_TYPE_PUMPED:
+                reached = phaseTarget.isReached(waterPumped);
+                break;
+            }
+            if (reached) {
+                break;
+            }
         }
         float timeInPhase = static_cast<float>(millis() - currentPhaseStarted) / 1000.0f;
         return currentPhase.isFinished(target == ProcessTarget::VOLUMETRIC, volume, timeInPhase, currentFlow, currentPressure,
@@ -153,6 +189,11 @@ class BrewProcess : public Process {
                 currentPhaseStarted = millis();
                 computeEffectiveTargetsForCurrentPhase();
             } else {
+                stopMeasuredVolume = currentVolume;
+                stopPredictedAddedVolume = currentPredictedAddedVolume;
+                stopPredictedVolume = currentPredictedVolume;
+                stopVolumetricRate = currentVolumetricRate;
+                stopPredictionApplied = currentPredictionWouldStop;
                 processPhase = ProcessPhase::FINISHED;
                 finished = millis();
             }

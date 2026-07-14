@@ -5,16 +5,10 @@ import { faPenToSquare } from '@fortawesome/free-solid-svg-icons/faPenToSquare';
 import { faYinYang } from '@fortawesome/free-solid-svg-icons/faYinYang';
 import { faWeightScale } from '@fortawesome/free-solid-svg-icons/faWeightScale';
 import { CardTitle } from '../../../../components/CardTitle';
-import { getNotesTasteStyle } from '../../utils/analyzerUtils';
+import { TASTE_TAG_GROUPS } from '../../../../utils/tasteTags.js';
 import { ShotMainInfoCard } from './ShotMainInfoCard';
 import { MetricValueGrid } from './ShotMetricCards';
 import { ShotRatioCard, useRatioCardState } from './ShotRatioCard';
-
-const tasteOptions = [
-  { value: 'bitter', label: 'Bitter' },
-  { value: 'balanced', label: 'Balanced' },
-  { value: 'sour', label: 'Sour' },
-];
 
 const fieldLabelClass =
   'text-base-content/55 mb-0.5 flex items-center gap-1.5 text-xs leading-tight font-medium';
@@ -22,14 +16,6 @@ const inputClass =
   'border-base-content/10 bg-base-100/80 text-base-content input input-xs min-h-8 w-full rounded-md text-xs lg:min-h-7 xl:min-h-8';
 const textareaClass =
   'border-base-content/10 bg-base-100/80 text-base-content textarea textarea-bordered textarea-xs min-h-[5rem] w-full rounded-md !text-xs leading-relaxed lg:min-h-[4rem] xl:min-h-[5rem]';
-
-function getSelectedTasteButtonStyle(taste) {
-  const tasteStyle = getNotesTasteStyle(taste);
-  if (!tasteStyle) return undefined;
-  return {
-    '--shot-details-taste-selected-bg': tasteStyle.selectedBackground,
-  };
-}
 
 function DetailField({ icon, label, children, className = '', action = null }) {
   return (
@@ -67,6 +53,12 @@ export function ShotDetailsCard({ entry, isCompare }) {
   const duplicateMobileSummaryClass = isCompare ? '' : 'hidden lg:flex';
   const duplicateMobileRatioClass = isCompare ? '' : 'hidden sm:flex';
   const duplicateMobileMetricsClass = isCompare ? 'hidden lg:block' : 'hidden sm:block';
+  const toggleTasteTag = tag => {
+    const selected = new Set(notes.tasteTags || []);
+    if (selected.has(tag)) selected.delete(tag);
+    else selected.add(tag);
+    updateAndSave('tasteTags', [...selected]);
+  };
 
   return (
     <section className='relative flex h-full flex-col gap-3'>
@@ -155,22 +147,30 @@ export function ShotDetailsCard({ entry, isCompare }) {
               placeholder='Single Origin, Blend...'
             />
           </DetailField>
-          <DetailField icon={faYinYang} label='Balance / Taste' className='col-span-2'>
-            <div className='bg-base-200/70 flex w-full min-w-0 rounded-full p-0.5'>
-              {tasteOptions.map(option => (
-                <button
-                  key={option.value}
-                  type='button'
-                  className={`flex min-w-0 flex-1 cursor-pointer items-center justify-center rounded-full px-2 py-1 text-xs transition-all duration-200 ${
-                    notes.balanceTaste === option.value
-                      ? 'text-base-content bg-[var(--shot-details-taste-selected-bg)] font-medium'
-                      : 'text-base-content/60 hover:text-base-content'
-                  }`}
-                  style={getSelectedTasteButtonStyle(option.value)}
-                  onClick={() => updateAndSave('balanceTaste', option.value)}
-                >
-                  <span className='truncate'>{option.label}</span>
-                </button>
+          <DetailField icon={faYinYang} label='Taste Tags' className='col-span-2'>
+            <div className='space-y-2'>
+              {TASTE_TAG_GROUPS.map(group => (
+                <div key={group.key}>
+                  <div className='text-base-content/45 mb-1 text-[0.65rem] font-semibold uppercase'>
+                    {group.label}
+                  </div>
+                  <div className='flex flex-wrap gap-1.5'>
+                    {group.tags.map(option => {
+                      const selected = notes.tasteTags?.includes(option.value);
+                      return (
+                        <button
+                          key={option.value}
+                          type='button'
+                          className={`btn btn-xs ${selected ? 'btn-primary' : 'btn-outline'}`}
+                          aria-pressed={selected}
+                          onClick={() => toggleTasteTag(option.value)}
+                        >
+                          {option.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               ))}
             </div>
           </DetailField>

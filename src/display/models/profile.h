@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <cmath>
 
 enum class TargetType { TARGET_TYPE_VOLUMETRIC, TARGET_TYPE_PRESSURE, TARGET_TYPE_FLOW, TARGET_TYPE_PUMPED };
 enum class TargetOperator { LTE, GTE };
@@ -186,6 +187,22 @@ struct Profile {
             }
         }
         return volume;
+    }
+
+    bool setFinalVolumetricTarget(float targetVolume) {
+        if (!std::isfinite(targetVolume) || targetVolume <= 0.0f) {
+            return false;
+        }
+
+        for (auto phase = phases.rbegin(); phase != phases.rend(); ++phase) {
+            for (auto &target : phase->targets) {
+                if (target.type == TargetType::TARGET_TYPE_VOLUMETRIC && target.value > 0.0f) {
+                    target.value = targetVolume;
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     void adjustDuration(float amount) {

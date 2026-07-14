@@ -1,8 +1,18 @@
 #include "Settings.h"
 
 #include <algorithm>
+#include <display/core/AutoTuning.h>
 #include <display/util/ColorConversion.h>
 #include <utility>
+
+#ifndef ESPRESSORL_SUPABASE_BASE_URL
+#define ESPRESSORL_SUPABASE_BASE_URL ""
+#endif
+
+static String normalizeRLOptimizerMode(String optimizerMode) {
+    optimizerMode.trim();
+    return "cpbo";
+}
 
 std::vector<AutoWakeupSchedule>
 PreferencesCodec<std::vector<AutoWakeupSchedule>>::read(Preferences &prefs, const char *key,
@@ -44,7 +54,7 @@ PreferencesCodec<std::vector<AutoWakeupSchedule>>::read(Preferences &prefs, cons
     return schedules.empty() ? def : schedules;
 }
 
-void PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs, const char *key,
+bool PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs, const char *key,
                                                               const std::vector<AutoWakeupSchedule> &value) {
     String serialized = "";
     for (size_t i = 0; i < value.size(); i++) {
@@ -55,7 +65,8 @@ void PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
             serialized += value[i].days[j] ? "1" : "0";
         }
     }
-    prefs.putString(key, serialized);
+    const size_t written = prefs.putString(key, serialized);
+    return written > 0 || (serialized.isEmpty() && prefs.getString(key, "__write_failed__").isEmpty());
 }
 
 Settings::Settings() {
@@ -64,7 +75,27 @@ Settings::Settings() {
         property->load(preferences);
     }
 
-    // Legacy migrations: derive defaults for keys that were never persisted
+    // Derive defaults for keys that were never persisted.
+    if (!preferences.isKey("rl_up_base")) {
+        rlUploadBaseUrl.initDefault(ESPRESSORL_SUPABASE_BASE_URL);
+    }
+    if (!preferences.isKey("rl_provider")) {
+        rlAutoTuningProviderMode.initDefault(rlAutoTuningEnabled.get() ? AutoTuning::PROVIDER_OFF_BOARD
+                                                                       : AutoTuning::PROVIDER_DISABLED);
+    } else {
+        const std::string providerMode = AutoTuning::normalizeProviderMode(rlAutoTuningProviderMode.get().c_str());
+        rlAutoTuningProviderMode.initDefault(providerMode.c_str());
+    }
+    rlOptimizerMode.initDefault(normalizeRLOptimizerMode(rlOptimizerMode.get()));
+    std::string recipeDomainError;
+    if (!AutoTuning::validateRecipeDomain(getRLRecipeDomain(), recipeDomainError)) {
+        const AutoTuning::RecipeDomain defaults;
+        rlGrindRadiusSteps.initDefault(defaults.grindRadiusSteps);
+        rlDoseMinG.initDefault(defaults.doseMinG);
+        rlDoseMaxG.initDefault(defaults.doseMaxG);
+        rlTargetOutputMinG.initDefault(defaults.targetOutputMinG);
+        rlTargetOutputMaxG.initDefault(defaults.targetOutputMaxG);
+    }
     if (!preferences.isKey("sg_m")) {
         smartGrindMode.initDefault(smartGrindToggle.get() ? 1 : 0);
     }
@@ -258,6 +289,96 @@ void Settings::setButtonBehavior(int index, String behavior) {
 }
 
 void Settings::setButtonBehaviorList(const std::vector<String> &behavior_list) { buttonBehavior.set(behavior_list); }
+
+void Settings::setRLAutoTuningEnabled(const bool enabled) { rlAutoTuningEnabled.set(enabled); }
+
+void Settings::setRLLocalOptimizationEnabled(const bool enabled) { rlLocalOptimizationEnabled.set(enabled); }
+
+void Settings::setRLOptimizationPaused(const bool paused) { rlOptimizationPaused.set(paused); }
+
+void Settings::setRLCommunityUploadEnabled(const bool enabled) { rlCommunityUploadEnabled.set(enabled); }
+
+void Settings::setRLCommunityUploadPrompted(const bool prompted) { rlCommunityUploadPrompted.set(prompted); }
+
+void Settings::setRLUploadBaseUrl(const String &url) {
+    String normalized = url;
+    normalized.trim();
+    if (normalized != rlUploadBaseUrl.get()) {
+        rlUploadInstallId.set("");
+        rlUploadTokenId.set("");
+        rlUploadSecret.set("");
+    }
+    rlUploadBaseUrl.set(normalized);
+}
+
+void Settings::setRLUploadCredentials(const String &installId, const String &tokenId, const String &secret) {
+    String normalizedInstallId = installId;
+    String normalizedTokenId = tokenId;
+    String normalizedSecret = secret;
+    normalizedInstallId.trim();
+    normalizedTokenId.trim();
+    normalizedSecret.trim();
+    rlUploadInstallId.set(normalizedInstallId);
+    rlUploadTokenId.set(normalizedTokenId);
+    rlUploadSecret.set(normalizedSecret);
+}
+
+void Settings::clearRLUploadCredentials() {
+    rlUploadInstallId.set("");
+    rlUploadTokenId.set("");
+    rlUploadSecret.set("");
+}
+
+void Settings::setRLAutoTuningProviderMode(const String &providerMode) {
+    const std::string normalized = AutoTuning::normalizeProviderMode(providerMode.c_str());
+    rlAutoTuningProviderMode.set(normalized.c_str());
+}
+
+void Settings::setRLBeanContextId(const String &contextId) { rlBeanContextId.set(contextId); }
+
+void Settings::setRLBeanContextName(const String &contextName) { rlBeanContextName.set(contextName); }
+
+void Settings::setRLBeanContextsJson(const String &contextsJson) { rlBeanContextsJson.set(contextsJson); }
+
+void Settings::setRLGrinderContextId(const String &contextId) { rlGrinderContextId.set(contextId); }
+
+void Settings::setRLGrinderContextName(const String &contextName) { rlGrinderContextName.set(contextName); }
+
+void Settings::setRLGrinderContextsJson(const String &contextsJson) { rlGrinderContextsJson.set(contextsJson); }
+
+void Settings::setRLTasteGoalsJson(const String &tasteGoalsJson) { rlTasteGoalsJson.set(tasteGoalsJson); }
+
+void Settings::setRLOptimizerMode(const String &optimizerMode) { rlOptimizerMode.set(normalizeRLOptimizerMode(optimizerMode)); }
+
+AutoTuning::OptimizerConfiguration Settings::getRLOptimizerConfiguration() const {
+    AutoTuning::OptimizerConfiguration configuration;
+    configuration.autoTuningEnabled = isRLAutoTuningEnabled();
+    configuration.localOptimizationEnabled = isRLLocalOptimizationEnabled();
+    configuration.optimizationPaused = isRLOptimizationPaused();
+    configuration.providerMode =
+        AutoTuning::providerModeFromKey(getRLAutoTuningProviderMode().c_str()).value_or(AutoTuning::ProviderMode::Disabled);
+    configuration.beanContextSelected = !getRLBeanContextId().isEmpty();
+    return configuration;
+}
+
+AutoTuning::RecipeDomain Settings::getRLRecipeDomain() const {
+    return {
+        rlGrindRadiusSteps.get(), rlDoseMinG.get(), rlDoseMaxG.get(), rlTargetOutputMinG.get(), rlTargetOutputMaxG.get(),
+    };
+}
+
+bool Settings::setRLRecipeDomain(AutoTuning::RecipeDomain const &domain) {
+    std::string reason;
+    if (!AutoTuning::validateRecipeDomain(domain, reason)) {
+        return false;
+    }
+    rlGrindRadiusSteps.set(domain.grindRadiusSteps);
+    rlDoseMinG.set(domain.doseMinG);
+    rlDoseMaxG.set(domain.doseMaxG);
+    rlTargetOutputMinG.set(domain.targetOutputMinG);
+    rlTargetOutputMaxG.set(domain.targetOutputMaxG);
+    return true;
+}
 
 void Settings::setCommutationGain(float commutation_gain) { commutationGain.set(commutation_gain); }
 

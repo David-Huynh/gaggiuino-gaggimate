@@ -17,6 +17,11 @@ import {
   setClock24h,
 } from '../../utils/dashboardManager.js';
 import { downloadJson } from '../../utils/download.js';
+import {
+  mergeAutoTuningRuntimeStatus,
+  recordCommunityUploadConsent,
+  selectAutoTuningProvider,
+} from '../../utils/autoTuningSettings.js';
 import { getStoredTheme, handleThemeChange } from '../../utils/themeManager.js';
 
 import PageLayout from '../../components/PageLayout.jsx';
@@ -126,6 +131,8 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
     'clock24hFormat',
     'autowakeupEnabled',
     'smartGrindToggle',
+    'rlAutoTuningEnabled',
+    'rlCommunityUploadEnabled',
   ];
 
   for (const [key, value] of Object.entries(formData)) {
@@ -159,6 +166,7 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
     .map(schedule => `${schedule.time}|${schedule.days.map(d => (d ? '1' : '0')).join('')}`)
     .join(';');
   formDataToSubmit.set('autowakeupSchedules', schedulesStr);
+  formDataToSubmit.set('rlCommunityUploadPrompted', formData.rlCommunityUploadPrompted ? '1' : '0');
 
   if (!formData.standbyDisplayEnabled) {
     formDataToSubmit.set('standbyBrightness', '0');
@@ -183,6 +191,7 @@ export function Settings() {
   const [currentTheme, setCurrentTheme] = useState('light');
   const [showWifiPassword, setShowWifiPassword] = useState(false);
   const [showApPassword, setShowApPassword] = useState(false);
+  const [communityUploadPromptOpen, setCommunityUploadPromptOpen] = useState(false);
   const [autowakeupSchedules, setAutoWakeupSchedules] = useState([
     { time: '07:00', days: [true, true, true, true, true, true, true] },
   ]);
@@ -248,9 +257,40 @@ export function Settings() {
     setCurrentTheme(getStoredTheme());
   }, []);
 
+  useEffect(() => {
+    if (!apiService) return undefined;
+    const listenerId = apiService.on('evt:rl:status', message => {
+      setFormData(current => mergeAutoTuningRuntimeStatus(current, message));
+    });
+    return () => apiService.off('evt:rl:status', listenerId);
+  }, [apiService]);
+
   const onChange = key => {
     return e => {
       let value = e.currentTarget.value;
+      if (key === 'rlAutoTuningEnabled') {
+        const enabled = !formData.rlAutoTuningEnabled;
+        const providerMode = enabled
+          ? formData.rlProviderMode === 'on_board'
+            ? 'on_board'
+            : 'off_board'
+          : 'disabled';
+        setFormData(current => selectAutoTuningProvider(current, providerMode));
+        if (enabled && !formData.rlCommunityUploadPrompted) {
+          setCommunityUploadPromptOpen(true);
+        }
+        return;
+      }
+      if (key === 'rlProviderMode') {
+        setFormData(current => selectAutoTuningProvider(current, value));
+        return;
+      }
+      if (key === 'rlCommunityUploadEnabled') {
+        setFormData(current =>
+          recordCommunityUploadConsent(current, !current.rlCommunityUploadEnabled),
+        );
+        return;
+      }
       if (
         [
           'homekit',
@@ -499,6 +539,46 @@ export function Settings() {
       {tab === 'calibration' && <LazyCalibrationTab formData={formData} onChange={onChange} />}
       {tab === 'bluetooth' && (isLoading ? <BluetoothTabSkeleton /> : <LazyBluetoothTab />)}
       {tab === 'system' && (isLoading ? <SystemTabSkeleton /> : <LazySystemTab />)}
+      {communityUploadPromptOpen && (
+        <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4'>
+          <div
+            className='bg-base-100 border-base-300 w-full max-w-md rounded-md border p-4 shadow-xl'
+            role='dialog'
+            aria-modal='true'
+            aria-labelledby='community-upload-title'
+          >
+            <h3 id='community-upload-title' className='text-lg font-semibold'>
+              Enable anonymous community upload?
+            </h3>
+            <p className='text-base-content/70 mt-2 text-sm'>
+              Share anonymized shot data and, when Auto Tuning is enabled, recommendation feedback
+              to improve EspressoRL community research. You can turn this off later in Settings.
+            </p>
+            <div className='mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2'>
+              <button
+                type='button'
+                className='btn btn-primary'
+                onClick={() => {
+                  setFormData(current => recordCommunityUploadConsent(current, true));
+                  setCommunityUploadPromptOpen(false);
+                }}
+              >
+                Enable Upload
+              </button>
+              <button
+                type='button'
+                className='btn btn-outline'
+                onClick={() => {
+                  setFormData(current => recordCommunityUploadConsent(current, false));
+                  setCommunityUploadPromptOpen(false);
+                }}
+              >
+                Not Now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </PageLayout>
   );
 }

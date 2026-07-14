@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <display/core/AutoTuning.h>
 #include <display/core/Property.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
@@ -57,7 +58,7 @@ struct AutoWakeupSchedule {
 // Serialized as "time1|days1;time2|days2" where days is a 7-bit string (e.g. "1111100" for weekdays)
 template <> struct PreferencesCodec<std::vector<AutoWakeupSchedule>> {
     static std::vector<AutoWakeupSchedule> read(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &def);
-    static void write(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &value);
+    static bool write(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &value);
 };
 
 class Settings;
@@ -158,6 +159,30 @@ class Settings {
     float getIntegralGain() const { return integralGain.get(); }
     float getMaxPumpPower() const { return maxPumpPower.get(); }
 
+    bool isRLAutoTuningEnabled() const { return rlAutoTuningEnabled.get(); }
+    bool isRLLocalOptimizationEnabled() const { return rlLocalOptimizationEnabled.get(); }
+    bool isRLOptimizationPaused() const { return rlOptimizationPaused.get(); }
+    bool isRLCommunityUploadEnabled() const { return rlCommunityUploadEnabled.get(); }
+    bool isRLCommunityUploadPrompted() const { return rlCommunityUploadPrompted.get(); }
+    String getRLUploadBaseUrl() const { return rlUploadBaseUrl.get(); }
+    String getRLUploadInstallId() const { return rlUploadInstallId.get(); }
+    String getRLUploadTokenId() const { return rlUploadTokenId.get(); }
+    String getRLUploadSecret() const { return rlUploadSecret.get(); }
+    bool hasRLUploadCredentials() const {
+        return !getRLUploadInstallId().isEmpty() && !getRLUploadTokenId().isEmpty() && getRLUploadSecret().length() >= 32;
+    }
+    String getRLAutoTuningProviderMode() const { return rlAutoTuningProviderMode.get(); }
+    String getRLBeanContextId() const { return rlBeanContextId.get(); }
+    String getRLBeanContextName() const { return rlBeanContextName.get(); }
+    String getRLBeanContextsJson() const { return rlBeanContextsJson.get(); }
+    String getRLGrinderContextId() const { return rlGrinderContextId.get(); }
+    String getRLGrinderContextName() const { return rlGrinderContextName.get(); }
+    String getRLGrinderContextsJson() const { return rlGrinderContextsJson.get(); }
+    String getRLTasteGoalsJson() const { return rlTasteGoalsJson.get(); }
+    String getRLOptimizerMode() const { return rlOptimizerMode.get(); }
+    AutoTuning::OptimizerConfiguration getRLOptimizerConfiguration() const;
+    AutoTuning::RecipeDomain getRLRecipeDomain() const;
+
     void setTargetSteamTemp(int target_steam_temp);
     void setTargetWaterTemp(int target_water_temp);
     void setTemperatureOffset(int temperature_offset);
@@ -229,6 +254,25 @@ class Settings {
     void setAutoWakeupSchedules(const std::vector<AutoWakeupSchedule> &schedules);
     void setButtonBehavior(int index, String behavior);
     void setButtonBehaviorList(const std::vector<String> &behavior_list);
+
+    void setRLAutoTuningEnabled(bool enabled);
+    void setRLLocalOptimizationEnabled(bool enabled);
+    void setRLOptimizationPaused(bool paused);
+    void setRLCommunityUploadEnabled(bool enabled);
+    void setRLCommunityUploadPrompted(bool prompted);
+    void setRLUploadBaseUrl(const String &url);
+    void setRLUploadCredentials(const String &installId, const String &tokenId, const String &secret);
+    void clearRLUploadCredentials();
+    void setRLAutoTuningProviderMode(const String &providerMode);
+    void setRLBeanContextId(const String &contextId);
+    void setRLBeanContextName(const String &contextName);
+    void setRLBeanContextsJson(const String &contextsJson);
+    void setRLGrinderContextId(const String &contextId);
+    void setRLGrinderContextName(const String &contextName);
+    void setRLGrinderContextsJson(const String &contextsJson);
+    void setRLTasteGoalsJson(const String &tasteGoalsJson);
+    void setRLOptimizerMode(const String &optimizerMode);
+    bool setRLRecipeDomain(AutoTuning::RecipeDomain const &domain);
 
     void setCommutationGain(float commutationGain);
     void setConvergenceGain(float convergenceGain);
@@ -307,6 +351,30 @@ class Settings {
 
     Property<int> altRelayFunction{registry, "alt_relay", ALT_RELAY_GRIND}; // Default to grind
     Property<std::vector<String>> buttonBehavior{registry, "btnb", {"brew", "steam", "water"}};
+
+    Property<bool> rlAutoTuningEnabled{registry, "rl_enabled", false};
+    Property<bool> rlLocalOptimizationEnabled{registry, "rl_local", true};
+    Property<bool> rlOptimizationPaused{registry, "rl_pause", false};
+    Property<bool> rlCommunityUploadEnabled{registry, "rl_cu", false};
+    Property<bool> rlCommunityUploadPrompted{registry, "rl_cu_ask", false};
+    Property<String> rlUploadBaseUrl{registry, "rl_up_base", ""};
+    Property<String> rlUploadInstallId{registry, "rl_up_iid", ""};
+    Property<String> rlUploadTokenId{registry, "rl_up_tid", ""};
+    Property<String> rlUploadSecret{registry, "rl_up_sec", ""};
+    Property<String> rlAutoTuningProviderMode{registry, "rl_provider", "disabled"};
+    Property<String> rlBeanContextId{registry, "rl_ctx_id", ""};
+    Property<String> rlBeanContextName{registry, "rl_ctx_nm", ""};
+    Property<String> rlBeanContextsJson{registry, "rl_ctxs", "[]"};
+    Property<String> rlGrinderContextId{registry, "rl_gctx_id", ""};
+    Property<String> rlGrinderContextName{registry, "rl_gctx_nm", ""};
+    Property<String> rlGrinderContextsJson{registry, "rl_gctxs", "[]"};
+    Property<String> rlTasteGoalsJson{registry, "rl_tgoals", "[]"};
+    Property<String> rlOptimizerMode{registry, "rl_opt", "cpbo"};
+    Property<float> rlGrindRadiusSteps{registry, "rl_gr_rad", 10.0f};
+    Property<float> rlDoseMinG{registry, "rl_dose_min", 6.0f};
+    Property<float> rlDoseMaxG{registry, "rl_dose_max", 30.0f};
+    Property<float> rlTargetOutputMinG{registry, "rl_out_min", 5.0f};
+    Property<float> rlTargetOutputMaxG{registry, "rl_out_max", 250.0f};
 
     // Pump settings
     Property<String> pumpModelCoeffs{registry, "pmc", DEFAULT_PUMP_MODEL_COEFFS};

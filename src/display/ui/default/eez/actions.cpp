@@ -260,6 +260,9 @@ void action_on_screen_load(lv_event_t *e) {
     applyClickArea(objects.btn_water_1, 15);
     applyClickArea(objects.btn_grind_1, 15);
     applyClickArea(objects.btn_settings_1, 15);
+    if (objects.btn_settings_1) {
+        lv_obj_clear_flag(objects.btn_settings_1, LV_OBJ_FLAG_HIDDEN);
+    }
     applyClickArea(objects.info_btn, 15);
     applyClickArea(objects.menu_dials__standby_icon, 20);
     applyClickArea(objects.standby_btn, 20);
@@ -315,4 +318,10 @@ void action_on_screen_swipe(lv_event_t *e) {
     }
 }
 
-void action_on_info_screen(lv_event_t *e) { controller.getUI()->changeScreen(SCREEN_ID_INFO_SCREEN); }
+void action_on_info_screen(lv_event_t *e) {
+    if (lv_event_get_target(e) == objects.btn_settings_1) {
+        controller.getUI()->showAutoTuningSettings();
+        return;
+    }
+    controller.getUI()->changeScreen(SCREEN_ID_INFO_SCREEN);
+}

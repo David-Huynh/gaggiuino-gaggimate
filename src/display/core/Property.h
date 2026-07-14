@@ -12,27 +12,30 @@ template <typename T> struct PreferencesCodec;
 
 template <> struct PreferencesCodec<int> {
     static int read(Preferences &prefs, const char *key, const int &def) { return prefs.getInt(key, def); }
-    static void write(Preferences &prefs, const char *key, const int &value) { prefs.putInt(key, value); }
+    static bool write(Preferences &prefs, const char *key, const int &value) { return prefs.putInt(key, value) > 0; }
 };
 
 template <> struct PreferencesCodec<bool> {
     static bool read(Preferences &prefs, const char *key, const bool &def) { return prefs.getBool(key, def); }
-    static void write(Preferences &prefs, const char *key, const bool &value) { prefs.putBool(key, value); }
+    static bool write(Preferences &prefs, const char *key, const bool &value) { return prefs.putBool(key, value) > 0; }
 };
 
 template <> struct PreferencesCodec<float> {
     static float read(Preferences &prefs, const char *key, const float &def) { return prefs.getFloat(key, def); }
-    static void write(Preferences &prefs, const char *key, const float &value) { prefs.putFloat(key, value); }
+    static bool write(Preferences &prefs, const char *key, const float &value) { return prefs.putFloat(key, value) > 0; }
 };
 
 template <> struct PreferencesCodec<double> {
     static double read(Preferences &prefs, const char *key, const double &def) { return prefs.getDouble(key, def); }
-    static void write(Preferences &prefs, const char *key, const double &value) { prefs.putDouble(key, value); }
+    static bool write(Preferences &prefs, const char *key, const double &value) { return prefs.putDouble(key, value) > 0; }
 };
 
 template <> struct PreferencesCodec<String> {
     static String read(Preferences &prefs, const char *key, const String &def) { return prefs.getString(key, def); }
-    static void write(Preferences &prefs, const char *key, const String &value) { prefs.putString(key, value); }
+    static bool write(Preferences &prefs, const char *key, const String &value) {
+        const size_t written = prefs.putString(key, value);
+        return written > 0 || (value.isEmpty() && prefs.getString(key, "__write_failed__").isEmpty());
+    }
 };
 
 template <> struct PreferencesCodec<std::vector<String>> {
@@ -41,8 +44,10 @@ template <> struct PreferencesCodec<std::vector<String>> {
             return def;
         return explode(prefs.getString(key, ""), ',');
     }
-    static void write(Preferences &prefs, const char *key, const std::vector<String> &value) {
-        prefs.putString(key, implode(value, ","));
+    static bool write(Preferences &prefs, const char *key, const std::vector<String> &value) {
+        const String serialized = implode(value, ",");
+        const size_t written = prefs.putString(key, serialized);
+        return written > 0 || (serialized.isEmpty() && prefs.getString(key, "__write_failed__").isEmpty());
     }
 };
 
@@ -84,9 +89,10 @@ template <typename T> class Property : public PropertyBase {
     void store(Preferences &prefs) override {
         if (!dirty)
             return;
-        // Clear before writing so a concurrent set() is not lost, only deferred to the next flush.
-        dirty = false;
-        PreferencesCodec<T>::write(prefs, key, value);
+        const T snapshot = value;
+        if (PreferencesCodec<T>::write(prefs, key, snapshot) && value == snapshot) {
+            dirty = false;
+        }
     }
 
   private:

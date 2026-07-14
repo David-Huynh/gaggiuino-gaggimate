@@ -1,4 +1,5 @@
 #include "ShotHistoryPlugin.h"
+#include "LocalAutoTuningStorePlugin.h"
 
 #include <LittleFS.h>
 #include <SD_MMC.h>
@@ -73,6 +74,7 @@ String padId(String id, int length = 6) {
     }
     return id;
 }
+
 } // namespace
 
 ShotHistoryPlugin ShotHistory;
@@ -87,6 +89,7 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     pm->on("controller:brew:start", [this](Event const &) { startRecording(); });
     pm->on("controller:brew:end", [this](Event const &) { endRecording(); });
     pm->on("controller:brew:clear", [this](Event const &) { endExtendedRecording(); });
+    pm->on("rl:shot:captured", [this](Event const &event) { rememberRLShotHistoryMapping(event); });
     pm->on("controller:volumetric-measurement:estimation:change",
            [this](Event const &event) { currentEstimatedWeight = event.getFloat("value"); });
     pm->on("controller:volumetric-measurement:bluetooth:change",
@@ -102,7 +105,21 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
 }
 
+float ShotHistoryPlugin::sourceWeight(VolumetricMeasurementSource source) const {
+    switch (source) {
+    case VolumetricMeasurementSource::FLOW_ESTIMATION:
+        return currentEstimatedWeight;
+    case VolumetricMeasurementSource::BLUETOOTH:
+    default:
+        return currentBluetoothWeight;
+    }
+}
+
 void ShotHistoryPlugin::record() {
+    // Track the source latched at brew start for control/final-yield metadata.
+    // The binary sample's v/vf channels remain Bluetooth-scale-only below.
+    const float scaleWeight = sourceWeight(shotSource);
+
     bool shouldRecord = recording || extendedRecording;
 
     if (shouldRecord && (controller->getMode() == MODE_BREW || extendedRecording)) {
@@ -135,17 +152,22 @@ void ShotHistoryPlugin::record() {
                 currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
             }
         }
-        // Bluetooth weight flow (vf): derive from the same non-negative weight we
-        // store in sample.v so the two can never disagree, and skip the EMA update
-        // on an implausible single-sample jump so one bad scale/BLE reading cannot
-        // saturate vf for seconds. See GM-110.
-        const float btWeight = currentBluetoothWeight > 0.0f ? currentBluetoothWeight : 0.0f;
-        const float btDiff = btWeight - lastBluetoothWeight;
-        if (fabsf(btDiff) <= MAX_PLAUSIBLE_WEIGHT_DELTA) {
-            const float btFlow = btDiff / (SHOT_LOG_SAMPLE_INTERVAL_MS / 1000.0f);
-            currentBluetoothFlow = currentBluetoothFlow * 0.75f + btFlow * 0.25f;
+        // Keep the shot-log v/vf channel tied to the Bluetooth scale schema.
+        // Active-source weight is tracked separately for brew control and final yield.
+        const float loggedScaleWeight = scaleWeight > 0.0f ? scaleWeight : 0.0f;
+        const float scaleDiff = loggedScaleWeight - lastScaleWeight;
+        if (fabsf(scaleDiff) <= MAX_PLAUSIBLE_WEIGHT_DELTA) {
+            const float scaleFlow = scaleDiff / (SHOT_LOG_SAMPLE_INTERVAL_MS / 1000.0f);
+            currentScaleFlow = currentScaleFlow * 0.75f + scaleFlow * 0.25f;
         }
-        lastBluetoothWeight = btWeight;
+        lastScaleWeight = loggedScaleWeight;
+        const float loggedBluetoothWeight = currentBluetoothWeight > 0.0f ? currentBluetoothWeight : 0.0f;
+        const float bluetoothDiff = loggedBluetoothWeight - lastBluetoothWeight;
+        if (fabsf(bluetoothDiff) <= MAX_PLAUSIBLE_WEIGHT_DELTA) {
+            const float bluetoothFlow = bluetoothDiff / (SHOT_LOG_SAMPLE_INTERVAL_MS / 1000.0f);
+            currentBluetoothFlow = currentBluetoothFlow * 0.75f + bluetoothFlow * 0.25f;
+        }
+        lastBluetoothWeight = loggedBluetoothWeight;
 
         ShotLogSample sample{};
         uint32_t tick = sampleCount <= 0xFFFF ? sampleCount : 0xFFFF;
@@ -158,7 +180,7 @@ void ShotHistoryPlugin::record() {
         sample.tf = encodeSigned(controller->getTargetFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.pf = encodeSigned(controller->getCurrentPuckFlow(), FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
         sample.vf = encodeSigned(currentBluetoothFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
-        sample.v = encodeUnsigned(btWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+        sample.v = encodeUnsigned(loggedBluetoothWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.ev = encodeUnsigned(currentEstimatedWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
         sample.pr = encodeUnsigned(currentPuckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
         sample.si = getSystemInfo(); // Pack system state information
@@ -198,6 +220,7 @@ void ShotHistoryPlugin::record() {
                 flowSumScaled += sample.fl;
                 positiveFlowCount++;
             }
+            lastLoggedElapsedMs = millis() - shotStart;
         }
 
         // Check for early index insertion (once per shot after 7.5s)
@@ -220,7 +243,7 @@ void ShotHistoryPlugin::record() {
                 return;
             }
 
-            const float weightDiff = abs(currentBluetoothWeight - lastStableWeight);
+            const float weightDiff = abs(scaleWeight - lastStableWeight);
 
             if (weightDiff < WEIGHT_STABILIZATION_THRESHOLD) {
                 if (lastWeightChangeTime == 0) {
@@ -233,7 +256,7 @@ void ShotHistoryPlugin::record() {
             } else {
                 // Weight changed, reset stabilization timer
                 lastWeightChangeTime = 0;
-                lastStableWeight = currentBluetoothWeight;
+                lastStableWeight = scaleWeight;
             }
 
             // Also stop extended recording after maximum duration
@@ -246,9 +269,9 @@ void ShotHistoryPlugin::record() {
         flushBuffer();
         // Patch header with sampleCount and duration
         header.sampleCount = sampleCount;
-        header.durationMs = millis() - shotStart;
+        header.durationMs = lastLoggedElapsedMs > 0 ? lastLoggedElapsedMs : millis() - shotStart;
         header.finalExitReason = finalExitReason; // why the shot ended (last phase exit or manual abort)
-        float finalWeight = currentBluetoothWeight;
+        float finalWeight = sampleCount > 0 ? lastScaleWeight : scaleWeight;
         header.finalWeight = finalWeight > 0.0f ? encodeUnsigned(finalWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE) : 0;
         currentFile.seek(0, SeekSet);
         currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
@@ -274,8 +297,11 @@ void ShotHistoryPlugin::record() {
             indexEntry.timestamp = header.startEpoch;
             indexEntry.duration = header.durationMs;
             indexEntry.volume = header.finalWeight;
-            indexEntry.rating = 0;
+            indexEntry.rating = ratingFromNotes(String(currentId.toInt(), 10));
             indexEntry.flags = SHOT_FLAG_COMPLETED;
+            if (indexEntry.rating > 0) {
+                indexEntry.flags |= SHOT_FLAG_HAS_NOTES;
+            }
             strncpy(indexEntry.profileId, header.profileId, sizeof(indexEntry.profileId) - 1);
             indexEntry.profileId[sizeof(indexEntry.profileId) - 1] = '\0';
             strncpy(indexEntry.profileName, header.profileName, sizeof(indexEntry.profileName) - 1);
@@ -325,10 +351,16 @@ void ShotHistoryPlugin::startRecording() {
     extendedRecordingStart = 0;
     currentBluetoothWeight = 0.0f;
     lastStableWeight = 0.0f;
-    currentEstimatedWeight = 0.0f;
-    currentBluetoothFlow = 0.0f;
+    lastScaleWeight = 0.0f;
     lastBluetoothWeight = 0.0f;
+    currentEstimatedWeight = 0.0f;
+    currentScaleFlow = 0.0f;
+    currentBluetoothFlow = 0.0f;
+    lastLoggedElapsedMs = 0;
     currentProfileName = controller->getProfileManager()->getSelectedProfile().label;
+    // Latch the source the brew controller resolved for this shot (set in
+    // Controller::activate() before controller:brew:start fires).
+    shotSource = controller ? controller->getCurrentVolumetricSource() : VolumetricMeasurementSource::INACTIVE;
     recording = true;
     extendedRecording = false;
     indexEntryCreated = false; // Reset flag for new shot
@@ -367,12 +399,15 @@ void ShotHistoryPlugin::endRecording() {
         }
     }
 
-    if (recording && controller && controller->isVolumetricAvailable() && currentBluetoothWeight > 0) {
-        // Start extended recording for any shot with active weight data
-        extendedRecording = true;
-        extendedRecordingStart = millis();
-        lastStableWeight = currentBluetoothWeight;
-        lastWeightChangeTime = 0;
+    if (recording && controller && controller->isVolumetricAvailable()) {
+        const float scaleWeight = sourceWeight(shotSource);
+        if (scaleWeight > 0) {
+            // Start extended recording for any shot with active weight data
+            extendedRecording = true;
+            extendedRecordingStart = millis();
+            lastStableWeight = scaleWeight;
+            lastWeightChangeTime = 0;
+        }
     }
 
     // Notify clients immediately, without waiting for the history file write
@@ -425,6 +460,42 @@ void ShotHistoryPlugin::recordPhaseTransition(uint8_t phaseNumber, uint16_t samp
 
     ESP_LOGD("ShotHistoryPlugin", "Recorded phase transition to phase %d (%s) at sample %d", phaseNumber, transition.phaseName,
              sampleIndex);
+}
+
+void ShotHistoryPlugin::rememberRLShotHistoryMapping(Event const &event) {
+    const String shotId = event.getString("shot_id");
+    if (shotId.isEmpty() || currentId.isEmpty())
+        return;
+    const String historyId = String(currentId.toInt(), 10);
+
+    JsonDocument notes(&psramAllocator);
+    loadNotes(historyId, notes);
+    notes["id"] = historyId;
+    notes["rlShotId"] = shotId;
+    const String recommendationId = event.getString("recommendation_id");
+    if (!recommendationId.isEmpty()) {
+        notes["rlRecommendationId"] = recommendationId;
+    }
+    saveNotes(historyId, notes);
+}
+
+void ShotHistoryPlugin::attachAutoTuningSummary(JsonDocument &response, JsonObjectConst notes) const {
+    const String shotId = notes["rlShotId"].as<String>();
+    if (shotId.isEmpty()) {
+        return;
+    }
+    JsonDocument summary(&psramAllocator);
+    if (LocalAutoTuningStore.loadShotSummary(shotId, summary) && summary.is<JsonObject>()) {
+        summary["reprocess_available"] = LocalAutoTuningStore.hasShotReplay(shotId);
+        response["auto_tuning"].set(summary.as<JsonObjectConst>());
+    }
+}
+
+uint8_t ShotHistoryPlugin::ratingFromNotes(const String &id) {
+    JsonDocument notes(&psramAllocator);
+    loadNotes(id, notes);
+    uint8_t rating = notes["rating"].as<uint8_t>();
+    return rating <= 5 ? rating : 0;
 }
 
 uint16_t ShotHistoryPlugin::getSystemInfo() {
@@ -498,9 +569,19 @@ void ShotHistoryPlugin::cleanupHistory() {
         String fname = slogFiles[i];
         int start = fname.lastIndexOf('/') + 1;
         int end = fname.lastIndexOf('.');
+        String rlShotId;
         if (end > start) {
             uint32_t shotId = fname.substring(start, end).toInt();
+            JsonDocument notes(&psramAllocator);
+            loadNotes(String(shotId), notes);
+            rlShotId = notes["rlShotId"].as<String>();
+            if (!rlShotId.isEmpty() && !LocalAutoTuningStore.canRemoveShotData(rlShotId)) {
+                continue;
+            }
             markIndexDeleted(shotId);
+        }
+        if (!rlShotId.isEmpty()) {
+            LocalAutoTuningStore.removeShotData(rlShotId);
         }
 
         // Remove .slog and associated .json notes file
@@ -539,24 +620,45 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         while (paddedId.length() < 6) {
             paddedId = "0" + paddedId;
         }
+        JsonDocument notes(&psramAllocator);
+        loadNotes(id, notes);
+        const String rlShotId = notes["rlShotId"].as<String>();
         fs->remove("/h/" + paddedId + ".slog");
         fs->remove("/h/" + paddedId + ".json");
+        if (!rlShotId.isEmpty()) {
+            LocalAutoTuningStore.removeShotData(rlShotId, true);
+        }
 
         // Mark as deleted in index
         markIndexDeleted(id.toInt());
 
         response["msg"] = "Ok";
+    } else if (type == "req:history:rl:reprocess") {
+        const String id = request["id"].as<String>();
+        JsonDocument notes(&psramAllocator);
+        loadNotes(id, notes);
+        const String shotId = notes["rlShotId"].as<String>();
+        if (shotId.isEmpty() || !LocalAutoTuningStore.hasShotReplay(shotId)) {
+            response["error"] = "Shot replay data is unavailable";
+        } else {
+            Event replay;
+            replay.id = "rl:shot:reprocess";
+            replay.setString("shot_id", shotId);
+            pluginManager->trigger(replay);
+            response["msg"] = "Shot queued for reprocessing";
+            response["shot_id"] = shotId;
+        }
     } else if (type == "req:history:notes:get") {
         auto id = request["id"].as<String>();
         JsonDocument notes(&psramAllocator);
         loadNotes(id, notes);
         response["notes"] = notes;
+        attachAutoTuningSummary(response, notes.as<JsonObjectConst>());
     } else if (type == "req:history:notes:save") {
         auto id = request["id"].as<String>();
         JsonDocument notes; // explicit document: variant->const JsonDocument& is ambiguous on clang
         notes.set(request["notes"]);
         saveNotes(id, notes);
-
         // Update rating and volume in index
         uint8_t rating = notes["rating"].as<uint8_t>();
 
@@ -573,6 +675,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         updateIndexMetadata(id.toInt(), rating, volume);
 
         response["msg"] = "Ok";
+        attachAutoTuningSummary(response, notes.as<JsonObjectConst>());
     } else if (type == "req:history:rebuild") {
         // Rebuild is now handled asynchronously by WebUIPlugin
         // This path shouldn't be reached, but handle it just in case
