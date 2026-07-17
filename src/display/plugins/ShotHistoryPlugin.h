@@ -9,6 +9,9 @@
 #include <display/core/ScaleSourceResolver.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
+#include <atomic>
+#include <deque>
+#include <mutex>
 
 constexpr size_t SHOT_HISTORY_INTERVAL = 100;
 constexpr size_t MIN_FREE_SPACE_BYTES = 500 * 1024;         // 500 KB reserved free space
@@ -21,7 +24,7 @@ class ShotHistoryPlugin : public Plugin {
     ShotHistoryPlugin() = default;
 
     void setup(Controller *controller, PluginManager *pluginManager) override;
-    void loop() override {};
+    void loop() override;
 
     void record();
 
@@ -63,6 +66,7 @@ class ShotHistoryPlugin : public Plugin {
     void recordPhaseTransition(uint8_t phaseNumber, uint16_t sampleIndex,
                                uint8_t reason); // Helper for phase transitions
     void rememberRLShotHistoryMapping(Event const &event);
+    void persistNextRLShotHistoryMapping();
     void attachAutoTuningSummary(JsonDocument &response, JsonObjectConst notes) const;
     uint8_t ratingFromNotes(const String &id);
 
@@ -73,7 +77,14 @@ class ShotHistoryPlugin : public Plugin {
     PluginManager *pluginManager = nullptr;
     FS *fs = &LittleFS;
     String currentId = "";
-    bool isFileOpen = false;
+    struct PendingRLShotHistoryMapping {
+        String historyId;
+        String shotId;
+        String recommendationId;
+    };
+    std::mutex pendingRLMappingMutex;
+    std::deque<PendingRLShotHistoryMapping> pendingRLMappings;
+    std::atomic<bool> isFileOpen{false};
     File currentFile;
     ShotLogHeader header{};
     uint32_t sampleCount = 0;

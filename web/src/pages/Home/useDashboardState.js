@@ -29,6 +29,7 @@ export function useDashboardState() {
 
   // ── derived ──────────────────────────────────────────────
   const isActive = !!p?.a;
+  const isStarting = !!s.brewStartPending;
   const isFinished = !!p?.e && !isActive;
   const isBrewing = s.mode === 1;
   const isGrinding = s.mode === 4;
@@ -120,6 +121,7 @@ export function useDashboardState() {
     tofDistance: s.tofDistance,
     // derived
     isActive,
+    isStarting,
     isFinished,
     isBrewing,
     isGrinding,

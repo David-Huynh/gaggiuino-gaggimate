@@ -11,6 +11,47 @@ import {
   TASTE_TAG_GROUPS,
 } from '../../utils/tasteTags.js';
 
+const optionalNumber = value => {
+  if (value === '' || value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const hydrateShotParameters = (notes, summary) => {
+  const hydrated = { ...notes };
+  if (!summary) return hydrated;
+
+  if (!hydrated.doseIn) {
+    hydrated.doseIn = summary.dose_in_g ?? summary.dose_target_g ?? '';
+  }
+  if (!hydrated.doseOut) {
+    hydrated.doseOut = summary.beverage_out_g ?? '';
+  }
+  if (!hydrated.targetYield) {
+    hydrated.targetYield = summary.target_yield_g ?? '';
+  }
+  if (optionalNumber(summary.current_absolute_step) !== null) {
+    hydrated.grindSettingMode = 'absolute';
+    hydrated.grindSetting = summary.current_absolute_step;
+  } else if (optionalNumber(summary.relative_grind_steps_from_reference) !== null) {
+    hydrated.grindSettingMode = 'relative';
+    hydrated.grindSetting = summary.relative_grind_steps_from_reference;
+  }
+  return hydrated;
+};
+
+const shotParameterBaseline = (notes, summary) => ({
+  doseIn: optionalNumber(summary?.dose_in_g ?? summary?.dose_target_g ?? notes.doseIn),
+  doseOut: optionalNumber(summary?.beverage_out_g ?? notes.doseOut),
+  targetYield: optionalNumber(summary?.target_yield_g ?? notes.targetYield),
+  grindSetting: optionalNumber(
+    notes.grindSettingMode === 'absolute'
+      ? (summary?.current_absolute_step ?? notes.grindSetting)
+      : (summary?.relative_grind_steps_from_reference ?? notes.grindSetting),
+  ),
+  grindSettingMode: notes.grindSettingMode || 'relative',
+});
+
 export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAutoTuningLoaded }) {
   const apiService = useContext(ApiServiceContext);
 
@@ -20,8 +61,10 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
     beanType: '',
     doseIn: '',
     doseOut: '',
+    targetYield: '',
     ratio: '',
     grindSetting: '',
+    grindSettingMode: 'relative',
     balanceTaste: '',
     tasteTags: [],
     notes: '',
@@ -30,6 +73,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
   const [loading, setLoading] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [initialLoaded, setInitialLoaded] = useState(false);
+  const [autoTuningSummary, setAutoTuningSummary] = useState(null);
+  const [parameterBaseline, setParameterBaseline] = useState(null);
+  const [saveError, setSaveError] = useState('');
 
   // Calculate ratio function
   const calculateRatio = useCallback((doseIn, doseOut) => {
@@ -56,8 +102,10 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
           beanType: '',
           doseIn: '',
           doseOut: '',
+          targetYield: '',
           ratio: '',
           grindSetting: '',
+          grindSettingMode: 'relative',
           balanceTaste: '',
           tasteTags: [],
           notes: '',
@@ -79,6 +127,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
           loadedNotes = { ...loadedNotes, ...parsedNotes };
         }
 
+        const autoTuning = response.auto_tuning || null;
+        loadedNotes = hydrateShotParameters(loadedNotes, autoTuning);
+
         // Pre-populate doseOut with shot.volume if it's empty and shot.volume exists
         if (!loadedNotes.doseOut && shot.volume) {
           loadedNotes.doseOut = shot.volume.toFixed(1);
@@ -89,11 +140,14 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
           loadedNotes.ratio = calculateRatio(loadedNotes.doseIn, loadedNotes.doseOut);
         }
 
-        setNotes(normalizeNotesTasteFields(loadedNotes));
+        const normalizedNotes = normalizeNotesTasteFields(loadedNotes);
+        setNotes(normalizedNotes);
+        setAutoTuningSummary(autoTuning);
+        setParameterBaseline(shotParameterBaseline(normalizedNotes, autoTuning));
         setInitialLoaded(true);
         // Pass loaded notes to parent
         if (onNotesLoaded) {
-          onNotesLoaded(normalizeNotesTasteFields(loadedNotes));
+          onNotesLoaded(normalizedNotes);
         }
         if (onAutoTuningLoaded) {
           onAutoTuningLoaded(response.auto_tuning || null);
@@ -108,14 +162,18 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
           beanType: '',
           doseIn: '',
           doseOut: shot.volume ? shot.volume.toFixed(1) : '',
+          targetYield: '',
           ratio: '',
           grindSetting: '',
+          grindSettingMode: 'relative',
           balanceTaste: '',
           tasteTags: [],
           notes: '',
         };
 
         setNotes(defaultNotes);
+        setAutoTuningSummary(null);
+        setParameterBaseline(shotParameterBaseline(defaultNotes, null));
         setInitialLoaded(true);
         if (onNotesLoaded) {
           onNotesLoaded(defaultNotes);
@@ -139,23 +197,59 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
 
   const saveNotes = async () => {
     setLoading(true);
+    setSaveError('');
     const notesToSave = normalizeNotesTasteFields(notes);
     try {
+      let shotCorrection;
+      if (notesToSave.rlShotId && parameterBaseline) {
+        const correction = {};
+        const addChangedNumber = (field, wireKey) => {
+          const rawValue = notesToSave[field];
+          if (rawValue === '' || rawValue === null || rawValue === undefined) return;
+          const parsed = Number(rawValue);
+          if (!Number.isFinite(parsed)) {
+            throw new Error(`${field} must be numeric`);
+          }
+          if (parameterBaseline[field] === null || Math.abs(parsed - parameterBaseline[field]) > 0.0001) {
+            correction[wireKey] = parsed;
+          }
+        };
+        addChangedNumber('doseIn', 'dose_in_g');
+        addChangedNumber('doseOut', 'beverage_out_g');
+        addChangedNumber('targetYield', 'target_yield_g');
+        addChangedNumber(
+          'grindSetting',
+          notesToSave.grindSettingMode === 'absolute'
+            ? 'current_absolute_step'
+            : 'relative_grind_steps_from_reference',
+        );
+        if (Object.keys(correction).length > 0) {
+          shotCorrection = correction;
+        }
+      }
       const response = await apiService.request({
         tp: 'req:history:notes:save',
         id: shot.id,
         notes: notesToSave,
+        ...(shotCorrection ? { shot_correction: shotCorrection } : {}),
       });
+      if (response.error) {
+        throw new Error(response.error);
+      }
       setNotes(notesToSave);
+      const updatedSummary = response.auto_tuning || autoTuningSummary;
+      setAutoTuningSummary(updatedSummary);
+      setParameterBaseline(shotParameterBaseline(notesToSave, updatedSummary));
       setIsEditing(false);
       if (onNotesUpdate) {
         onNotesUpdate(notesToSave);
       }
       if (onAutoTuningLoaded) {
-        onAutoTuningLoaded(response.auto_tuning || null);
+        onAutoTuningLoaded(updatedSummary || null);
       }
     } catch (error) {
       console.error('Failed to save notes:', error);
+      setSaveError(error.message || 'Unable to save shot notes');
     } finally {
       setLoading(false);
     }
@@ -229,14 +323,23 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
       <div className='mb-4 flex items-center justify-between'>
         <h3 className='text-lg font-semibold'>Shot Notes</h3>
         {!isEditing ? (
-          <button onClick={() => setIsEditing(true)} className='btn btn-sm btn-outline'>
+          <button
+            onClick={() => {
+              setSaveError('');
+              setIsEditing(true);
+            }}
+            className='btn btn-sm btn-outline'
+          >
             <FontAwesomeIcon icon={faEdit} />
             Edit
           </button>
         ) : (
           <div className='flex gap-2'>
             <button
-              onClick={() => setIsEditing(false)}
+              onClick={() => {
+                setSaveError('');
+                setIsEditing(false);
+              }}
               className='btn btn-sm btn-ghost'
               disabled={loading}
             >
@@ -255,6 +358,8 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
           </div>
         )}
       </div>
+
+      {saveError && <div className='alert alert-error mb-4 text-sm'>{saveError}</div>}
 
       <div className='grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-4'>
         {/* Rating */}
@@ -319,6 +424,25 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
           )}
         </div>
 
+        {/* Target Yield */}
+        <div className='form-control'>
+          <label className='mb-2 block text-sm font-medium'>Target Yield (g)</label>
+          {isEditing ? (
+            <input
+              type='number'
+              step='0.1'
+              className='input input-bordered w-full'
+              value={notes.targetYield}
+              onChange={e => handleInputChange('targetYield', e.target.value)}
+              placeholder='36.0'
+            />
+          ) : (
+            <div className='input input-bordered bg-base-200 w-full cursor-default'>
+              {notes.targetYield || 'â€”'}
+            </div>
+          )}
+        </div>
+
         {/* Ratio */}
         <div className='form-control'>
           <label className='mb-2 block text-sm font-medium'>Ratio (1:{notes.ratio || '—'})</label>
@@ -329,14 +453,19 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
 
         {/* Grind Setting */}
         <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Grind Setting</label>
+          <label className='mb-2 block text-sm font-medium'>
+            {notes.rlShotId
+              ? `Grind Setting (${notes.grindSettingMode === 'absolute' ? 'absolute steps' : 'steps from reference'})`
+              : 'Grind Setting'}
+          </label>
           {isEditing ? (
             <input
-              type='text'
+              type={notes.rlShotId ? 'number' : 'text'}
+              step={notes.rlShotId ? '0.1' : undefined}
               className='input input-bordered w-full'
               value={notes.grindSetting}
               onChange={e => handleInputChange('grindSetting', e.target.value)}
-              placeholder='e.g., 2.5, Medium-Fine'
+              placeholder={notes.rlShotId ? '2.5' : 'e.g., 2.5, Medium-Fine'}
             />
           ) : (
             <div className='input input-bordered bg-base-200 w-full cursor-default'>

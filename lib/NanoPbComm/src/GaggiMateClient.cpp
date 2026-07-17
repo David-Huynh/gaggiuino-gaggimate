@@ -9,6 +9,15 @@ GaggiMateClient::GaggiMateClient()
 }
 #endif
 
+GaggiMateClient::~GaggiMateClient() {
+#if defined(GAGGIMATE_UART_COMMS) && !defined(ARDUINO_ARCH_STM32)
+    if (_pumpTask != nullptr) {
+        vTaskDelete(_pumpTask);
+        _pumpTask = nullptr;
+    }
+#endif
+}
+
 void GaggiMateClient::init(const String &deviceName) {
     registerHandlers();
     _endpoint.onConnection([this](bool connected) {
@@ -25,6 +34,12 @@ void GaggiMateClient::init(const String &deviceName) {
 #ifdef GAGGIMATE_UART_COMMS
     (void)deviceName;
     _transport.begin();
+#if !defined(ARDUINO_ARCH_STM32)
+    if (xTaskCreatePinnedToCore(pumpTaskFn, "GaggiMateClient", 4096, this, 2, &_pumpTask, 0) != pdPASS) {
+        _pumpTask = nullptr;
+        ESP_LOGE("GaggiMateClient", "Failed to create UART pump task; falling back to Arduino loop");
+    }
+#endif
 #else
     _transport.init(deviceName);
 #endif
@@ -32,12 +47,35 @@ void GaggiMateClient::init(const String &deviceName) {
 
 void GaggiMateClient::loop() {
 #ifdef GAGGIMATE_UART_COMMS
-    _transport.loop();
+#if defined(ARDUINO_ARCH_STM32)
+    pumpOnce();
+#else
+    if (_pumpTask == nullptr)
+        pumpOnce();
+#endif
 #else
     _transport.maintain();
+    _endpoint.loop();
 #endif
+}
+
+#ifdef GAGGIMATE_UART_COMMS
+void GaggiMateClient::pumpOnce() {
+    _transport.loop();
     _endpoint.loop();
 }
+
+#if !defined(ARDUINO_ARCH_STM32)
+void GaggiMateClient::pumpTaskFn(void *arg) {
+    auto *self = static_cast<GaggiMateClient *>(arg);
+    TickType_t lastWake = xTaskGetTickCount();
+    for (;;) {
+        self->pumpOnce();
+        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(10));
+    }
+}
+#endif
+#endif
 
 gm::Payload GaggiMateClient::buildPing() {
     gm::Payload p = gaggimate_Payload_init_zero;

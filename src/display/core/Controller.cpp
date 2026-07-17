@@ -78,7 +78,10 @@ void Controller::postCommand(CtrlCmd cmd, int32_t arg) {
     CtrlCmdMsg msg{cmd, arg};
     if (xQueueSend(cmdQueue, &msg, 0) != pdTRUE) {
         ESP_LOGW(LOG_TAG.c_str(), "Controller cmdQueue full, dropped cmd=%u", static_cast<unsigned>(cmd));
+        return;
     }
+    if (logicTaskHandle != nullptr)
+        xTaskNotifyGive(logicTaskHandle);
 }
 
 void Controller::drainCommandQueue() {
@@ -93,6 +96,10 @@ void Controller::drainCommandQueue() {
             break;
         case CtrlCmd::DEACTIVATE:
             deactivate();
+            break;
+        case CtrlCmd::DEACTIVATE_CLEAR:
+            deactivate();
+            clear();
             break;
         case CtrlCmd::CLEAR:
             clear();
@@ -111,6 +118,17 @@ void Controller::drainCommandQueue() {
             break;
         case CtrlCmd::SET_MODE:
             setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::CHANGE_MODE:
+            deactivate();
+            clear();
+            setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::START_FLUSH:
+            onFlush();
+            break;
+        case CtrlCmd::BUTTON_STATE:
+            handleControllerButton(static_cast<uint8_t>((msg.arg >> 1) & 0xFF), (msg.arg & 1) != 0);
             break;
         case CtrlCmd::RAISE_TEMP:
             raiseTemp();
@@ -177,9 +195,9 @@ void Controller::setup() {
         pluginManager->registerPlugin(new SmartGrindPlugin());
     }
 #ifndef GAGGIMATE_SIM // MQTT/HomeAssistant is device-only
-    if (settings.isHomeAssistant()) {
-        pluginManager->registerPlugin(new MQTTPlugin());
-    }
+    // The optimizer transport must exist even when legacy Home Assistant MQTT
+    // is disabled, including when off-board optimization is enabled at runtime.
+    pluginManager->registerPlugin(new MQTTPlugin());
 #ifndef GAGGIMATE_HEADLESS
     pluginManager->registerPlugin(new AutoTuningPreferencePlugin());
 #endif
@@ -223,8 +241,7 @@ void Controller::setup() {
     // longer matches the selected source ("brew button does nothing" after
     // cycling away from Predictive).
     settings.setOnScaleSourceChange([this](int) {
-        postCommand(CtrlCmd::DEACTIVATE);
-        postCommand(CtrlCmd::CLEAR);
+        postCommand(CtrlCmd::DEACTIVATE_CLEAR);
     });
 
 #ifndef GAGGIMATE_HEADLESS
@@ -403,50 +420,8 @@ void Controller::setupBluetooth() {
         pluginManager->trigger("pump:puck-resistance:change", "value", puckResistance);
     });
     comms.onButtonState([this](uint8_t index, bool pressed) {
-        const int status = pressed ? 1 : 0;
-        String behavior = settings.getButtonBehavior(index);
-        ESP_LOGV("Controller", "Button %d changed to %d, behavior: %s", index, status, behavior);
-        if (behavior == "" || behavior == "none") {
-            return;
-        }
-        if (behavior == "brew") {
-            handleBrewButton(status);
-            return;
-        }
-        if (behavior == "steam") {
-            handleSteamButton(status);
-            return;
-        }
-        if (behavior == "water") {
-            handleWaterButton(status);
-            return;
-        }
-        if (behavior == "flush") {
-            // Flush is a one-shot fixed-duration BrewProcess. Trigger on
-            // press only; release does nothing so the user can't
-            // accidentally cancel mid-flush by letting go (push button)
-            // or flipping the rocker back. onFlush() itself is a no-op
-            // if a process is already active, so rapid presses don't
-            // queue.
-            //
-            // Ensure we land in MODE_BREW so the flush UI renders, but
-            // only when no other process is currently running. Mutating
-            // mode mid-process would orphan the active mode's UI while
-            // onFlush() silently no-ops on the re-entrancy guard. The
-            // setMode guard mirrors the pattern other button handlers
-            // use when they need to switch modes safely.
-            if (status) {
-                if (getMode() == MODE_STANDBY) {
-                    deactivateStandby();
-                }
-                if (getMode() != MODE_BREW && !isActive()) {
-                    setMode(MODE_BREW);
-                }
-                onFlush();
-            }
-            return;
-        }
-        handleProfileButton(status, behavior);
+        const int32_t packed = (static_cast<int32_t>(index) << 1) | (pressed ? 1 : 0);
+        postCommand(CtrlCmd::BUTTON_STATE, packed);
     });
     comms.onError([this](int error) {
         // Autotune timeout = info-level, not runaway. Controller already
@@ -528,8 +503,8 @@ void Controller::setupBluetooth() {
         ev.setFloat("std1", 0.0f);
         ev.setFloat("std2", 0.0f);
         ev.setInt("healthBits", SCALE_HEALTH_OK);
-        pluginManager->trigger(ev);
         markHardwareScaleBrewTareDone();
+        pluginManager->trigger(ev);
     });
     comms.onScaleCalibrationResult([this](uint8_t channel, float calibration) {
         const long now = static_cast<long>(time(nullptr));
@@ -757,10 +732,6 @@ void Controller::setupWifi() {
 }
 
 void Controller::loop() {
-    // Drain external commands first so any pending activate/deactivate/setMode
-    // from WebUI / LVGL / plugins runs on this task, not on AsyncTCP or LVGL.
-    drainCommandQueue();
-
     // Act on WiFi link-state changes flagged by the (small-stack) event task here
     // on the main loop. Disconnect before connect so a flap is ordered correctly.
     if (wifiDisconnectedPending) {
@@ -772,8 +743,6 @@ void Controller::loop() {
         pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
     }
 
-    pluginManager->loop();
-
     if (screenReady && !initialized) {
         connect();
     }
@@ -782,9 +751,7 @@ void Controller::loop() {
         comms.loop(); // drive the comms send pump + retransmit
     }
 
-#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    pollHardwareScaleBrewTare();
-#endif
+    pluginManager->loop();
 
     unsigned long now = millis();
 
@@ -811,6 +778,9 @@ void Controller::loop() {
 }
 
 void Controller::loopLogic() {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    pollHardwareScaleBrewTare();
+#endif
     if (isErrorState()) {
         loopControl();
         return;
@@ -867,7 +837,7 @@ void Controller::loopLogic() {
         }
     }
     if (processEnded) {
-        loopControl();
+        loopControl(true);
         applyConnectionPriority();
     }
     dispatchEvents(events);
@@ -887,7 +857,7 @@ void Controller::loopLogic() {
     loopControl();
 }
 
-void Controller::loopControl() {
+void Controller::loopControl(bool urgent) {
     if (initialized) {
         unsigned long now = millis();
 
@@ -900,7 +870,7 @@ void Controller::loopControl() {
             lastPing = now;
         }
 
-        updateControl();
+        updateControl(urgent);
     }
 }
 
@@ -1046,12 +1016,11 @@ void Controller::startBrewProcess() {
 
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 bool Controller::armHardwareScaleBrewTare() {
-    if (pendingHardwareScaleBrewStart) {
+    if (pendingHardwareScaleBrewStart.exchange(true, std::memory_order_acq_rel)) {
         return true;
     }
 
-    pendingHardwareScaleBrewStart = true;
-    pendingHardwareScaleBrewStartReady = false;
+    pendingHardwareScaleBrewStartReady.store(false, std::memory_order_release);
     pendingHardwareScaleBrewTareStartedAt = millis();
 
     const ScaleSample sample = getScaleSample();
@@ -1066,17 +1035,18 @@ bool Controller::armHardwareScaleBrewTare() {
 }
 
 void Controller::markHardwareScaleBrewTareDone() {
-    if (pendingHardwareScaleBrewStart) {
-        pendingHardwareScaleBrewStartReady = true;
-    }
+    if (!pendingHardwareScaleBrewStart.load(std::memory_order_acquire))
+        return;
+    pendingHardwareScaleBrewStartReady.store(true, std::memory_order_release);
+    if (logicTaskHandle != nullptr)
+        xTaskNotifyGive(logicTaskHandle);
 }
 
 void Controller::cancelHardwareScaleBrewTare(const char *reason) {
-    if (!pendingHardwareScaleBrewStart) {
+    if (!pendingHardwareScaleBrewStart.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
-    pendingHardwareScaleBrewStart = false;
-    pendingHardwareScaleBrewStartReady = false;
+    pendingHardwareScaleBrewStartReady.store(false, std::memory_order_release);
     pendingHardwareScaleBrewTareStartedAt = 0;
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
 
@@ -1088,7 +1058,7 @@ void Controller::cancelHardwareScaleBrewTare(const char *reason) {
 }
 
 void Controller::pollHardwareScaleBrewTare() {
-    if (!pendingHardwareScaleBrewStart) {
+    if (!pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -1100,9 +1070,8 @@ void Controller::pollHardwareScaleBrewTare() {
         cancelHardwareScaleBrewTare("process_started_elsewhere");
         return;
     }
-    if (pendingHardwareScaleBrewStartReady) {
-        pendingHardwareScaleBrewStart = false;
-        pendingHardwareScaleBrewStartReady = false;
+    if (pendingHardwareScaleBrewStartReady.exchange(false, std::memory_order_acq_rel)) {
+        pendingHardwareScaleBrewStart.store(false, std::memory_order_release);
         pendingHardwareScaleBrewTareStartedAt = 0;
         ESP_LOGI(LOG_TAG, "Hardware scale tare complete; starting brew");
         startBrewProcess();
@@ -1299,7 +1268,7 @@ LiveBrewTargetApplyStatus Controller::applyLiveBrewTargetUpdate(const LiveBrewTa
     return LiveBrewTargetApplyStatus::APPLIED;
 }
 
-void Controller::updateControl() {
+void Controller::updateControl(bool urgent) {
     // Never drive a controller whose protocol version we don't match -- the
     // commands could be misinterpreted (OTA recovery still works; see onSystemInfo).
     if (systemInfo.protocolMismatch) {
@@ -1391,17 +1360,21 @@ void Controller::updateControl() {
     // a full resend.
     gm::Payload batch[4];
     size_t count = 0;
-    if (!controlStateSent || boiler != lastBoiler)
+    if (urgent || !controlStateSent || boiler != lastBoiler)
         batch[count++] = comms.buildBoilerControl(boiler.index, boiler.mode, boiler.setpoint);
-    if (!controlStateSent || pump != lastPump)
+    if (urgent || !controlStateSent || pump != lastPump)
         batch[count++] = comms.buildPumpControl(pump.index, pump.mode, pump.power, pump.pressure, pump.flow);
-    if (!controlStateSent || relay != lastRelay)
+    if (urgent || !controlStateSent || relay != lastRelay)
         batch[count++] = comms.buildRelayControl(relay.index, relay.open); // index 0 = brew valve
-    if (!controlStateSent || altRelayActive != lastAlt)
+    if (urgent || !controlStateSent || altRelayActive != lastAlt)
         batch[count++] = comms.buildRelayControl(1, altRelayActive); // index 1 = alt relay
 
-    if (count > 0)
-        comms.sendBatch(batch, count);
+    if (count > 0) {
+        if (urgent)
+            comms.sendUrgentBatch(batch, count);
+        else
+            comms.sendBatch(batch, count);
+    }
 
     lastBoiler = boiler;
     lastPump = pump;
@@ -1416,6 +1389,12 @@ void Controller::activate() {
              settings.getScaleSource(), isVolumetricAvailable(), hardwareScalePresent);
     if (wasActive)
         return;
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+        ESP_LOGI(LOG_TAG, "Ignoring duplicate brew start while hardware scale tare is pending");
+        return;
+    }
+#endif
     clear();
     // clear() already resets this under the process lock, but state in activate()
     // is the operative invariant for the rest of this function — keep it explicit.
@@ -1462,7 +1441,7 @@ void Controller::activate() {
 
 void Controller::deactivate() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    if (pendingHardwareScaleBrewStart) {
+    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
         cancelHardwareScaleBrewTare("deactivated");
         return;
     }
@@ -1478,11 +1457,10 @@ void Controller::deactivate() {
     }
 
     // Drive the stopped process state to the controller before any brew-end
-    // observer can serialize, persist, or transmit shot data. sendBatch() pumps
-    // the reliable control frame immediately; later loop iterations handle its
-    // acknowledgement and retransmission without putting network work in the
-    // physical shutdown path.
-    loopControl();
+    // observer can serialize, persist, or transmit shot data. The urgent batch
+    // supersedes any older in-flight control frame; the transport task handles
+    // its acknowledgement and retransmission outside the physical shutdown path.
+    loopControl(true);
     applyConnectionPriority(); // shot ended -> relaxed BLE interval
     dispatchEvents(events);
 }
@@ -1511,7 +1489,7 @@ bool Controller::deactivateLocked(DeferredProcessEvents &events) {
 
 void Controller::clear() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    if (pendingHardwareScaleBrewStart) {
+    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
         cancelHardwareScaleBrewTare("cleared");
     }
 #endif
@@ -1713,6 +1691,11 @@ void Controller::noteBluetoothScaleMeasurement(ScaleRole role) {
 }
 
 void Controller::onFlush() {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+        cancelHardwareScaleBrewTare("flush_started");
+    }
+#endif
     // Allocate outside the lock; reachable from the UI, AsyncTCP and BLE tasks (GM-147).
     auto *flush = new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay());
     DeferredProcessEvents events;
@@ -1744,6 +1727,12 @@ void Controller::handleBrewButton(int brewButtonStatus) {
             deactivateStandby();
             break;
         case MODE_BREW:
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+            if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+                ESP_LOGI(LOG_TAG, "Ignoring duplicate physical brew start while scale tare is pending");
+                break;
+            }
+#endif
             if (!isActive()) {
                 deactivateStandby();
                 clear();
@@ -1774,6 +1763,37 @@ void Controller::handleBrewButton(int brewButtonStatus) {
             deactivate();
         }
     }
+}
+
+void Controller::handleControllerButton(uint8_t index, bool pressed) {
+    const int status = pressed ? 1 : 0;
+    String behavior = settings.getButtonBehavior(index);
+    ESP_LOGV("Controller", "Button %d changed to %d, behavior: %s", index, status, behavior.c_str());
+    if (behavior.isEmpty() || behavior == "none")
+        return;
+    if (behavior == "brew") {
+        handleBrewButton(status);
+        return;
+    }
+    if (behavior == "steam") {
+        handleSteamButton(status);
+        return;
+    }
+    if (behavior == "water") {
+        handleWaterButton(status);
+        return;
+    }
+    if (behavior == "flush") {
+        if (status) {
+            if (getMode() == MODE_STANDBY)
+                deactivateStandby();
+            if (getMode() != MODE_BREW && !isActive())
+                setMode(MODE_BREW);
+            onFlush();
+        }
+        return;
+    }
+    handleProfileButton(status, behavior);
 }
 
 void Controller::handleSteamButton(int steamButtonStatus) {
@@ -1845,11 +1865,11 @@ void Controller::handleProfileUpdate() {
 }
 
 void Controller::loopLogicTask(void *arg) {
-    TickType_t lastWake = xTaskGetTickCount();
     auto *controller = static_cast<Controller *>(arg);
     while (true) {
         esp_task_wdt_reset();
+        controller->drainCommandQueue();
         controller->loopLogic();
-        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
     }
 }

@@ -62,6 +62,11 @@ static bool isTemporaryQueuePath(const String &path) { return path.endsWith(".up
 
 static bool isBackupQueuePath(const String &path) { return path.endsWith(".upl.bak") || path.endsWith(".json.bak"); }
 
+static bool jsonNumber(JsonVariantConst value) {
+    return !value.is<bool>() &&
+           (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>());
+}
+
 static bool listRegularPaths(const char *directory, std::vector<String> &paths) {
     if (!LittleFSUtil::existsQuietly(directory)) {
         return false;
@@ -328,11 +333,14 @@ bool CommunityUploadQueue::enqueue(const String &uploadId, const String &recordT
     return false;
 }
 
-bool CommunityUploadQueue::patchShotCorrection(const String &shotId, bool hasGrindFollowed, bool grindFollowed,
-                                               bool hasDoseFollowed, bool doseFollowed, bool hasYieldFollowed, bool yieldFollowed,
+bool CommunityUploadQueue::patchShotCorrection(const String &shotId, AutoTuning::ShotCorrection const &correction,
                                                std::int64_t updatedAt, std::int64_t nextRetryAt) {
     QueueLock lock(mutex);
-    if (!lock.locked || !ensureDirectoryUnlocked() || (!hasGrindFollowed && !hasDoseFollowed && !hasYieldFollowed)) {
+    const bool hasCorrection = correction.grindFollowed.has_value() || correction.doseFollowed.has_value() ||
+                               correction.yieldFollowed.has_value() || correction.relativeGrindStepsFromReference.has_value() ||
+                               correction.currentAbsoluteStep.has_value() || correction.doseInG.has_value() ||
+                               correction.targetYieldG.has_value() || correction.beverageOutG.has_value();
+    if (!lock.locked || !ensureDirectoryUnlocked() || !hasCorrection) {
         return false;
     }
 
@@ -352,17 +360,66 @@ bool CommunityUploadQueue::patchShotCorrection(const String &shotId, bool hasGri
                 std::optional<bool> storedGrind = optionalBool(payload["grind_followed"]);
                 std::optional<bool> storedDose = optionalBool(payload["dose_followed"]);
                 std::optional<bool> storedYield = optionalBool(payload["yield_followed"]);
-                if (hasGrindFollowed) {
-                    payload["grind_followed"] = grindFollowed;
-                    storedGrind = grindFollowed;
+                if (correction.grindFollowed.has_value()) {
+                    payload["grind_followed"] = *correction.grindFollowed;
+                    storedGrind = *correction.grindFollowed;
                 }
-                if (hasDoseFollowed) {
-                    payload["dose_followed"] = doseFollowed;
-                    storedDose = doseFollowed;
+                if (correction.doseFollowed.has_value()) {
+                    payload["dose_followed"] = *correction.doseFollowed;
+                    storedDose = *correction.doseFollowed;
                 }
-                if (hasYieldFollowed) {
-                    payload["yield_followed"] = yieldFollowed;
-                    storedYield = yieldFollowed;
+                if (correction.yieldFollowed.has_value()) {
+                    payload["yield_followed"] = *correction.yieldFollowed;
+                    storedYield = *correction.yieldFollowed;
+                }
+                if (correction.relativeGrindStepsFromReference.has_value()) {
+                    const float relative = *correction.relativeGrindStepsFromReference;
+                    payload["relative_grind_steps_from_reference"] = relative;
+                    if (jsonNumber(payload["absolute_reference_step"])) {
+                        payload["current_absolute_step"] = payload["absolute_reference_step"].as<float>() + relative;
+                    }
+                    if (jsonNumber(payload["microns_per_step"])) {
+                        const char *direction = payload["step_direction"] | "higher_is_finer";
+                        const float directionSign = String(direction) == "higher_is_finer" ? 1.0f : -1.0f;
+                        payload["relative_grind_um_from_reference"] =
+                            relative * payload["microns_per_step"].as<float>() * directionSign;
+                    }
+                    payload["grind_observed"] = true;
+                } else if (correction.currentAbsoluteStep.has_value()) {
+                    payload["current_absolute_step"] = *correction.currentAbsoluteStep;
+                    if (jsonNumber(payload["absolute_reference_step"])) {
+                        const float relative = *correction.currentAbsoluteStep - payload["absolute_reference_step"].as<float>();
+                        payload["relative_grind_steps_from_reference"] = relative;
+                        if (jsonNumber(payload["microns_per_step"])) {
+                            const char *direction = payload["step_direction"] | "higher_is_finer";
+                            const float directionSign = String(direction) == "higher_is_finer" ? 1.0f : -1.0f;
+                            payload["relative_grind_um_from_reference"] =
+                                relative * payload["microns_per_step"].as<float>() * directionSign;
+                        }
+                    }
+                    payload["grind_observed"] = true;
+                }
+                if (correction.doseInG.has_value()) {
+                    payload["dose_in_g"] = *correction.doseInG;
+                    payload["dose_target_g"] = *correction.doseInG;
+                    payload["dose_observed"] = true;
+                    payload.remove("dose_target_confirmed");
+                }
+                if (correction.targetYieldG.has_value()) {
+                    payload["target_yield_g"] = *correction.targetYieldG;
+                }
+                if (correction.beverageOutG.has_value()) {
+                    payload["beverage_out_g"] = *correction.beverageOutG;
+                    payload["beverage_out_observation"] = "user_corrected";
+                }
+                if (jsonNumber(payload["dose_target_g"]) && payload["dose_target_g"].as<float>() > 0.0f &&
+                    jsonNumber(payload["target_yield_g"])) {
+                    payload["target_ratio"] =
+                        payload["target_yield_g"].as<float>() / payload["dose_target_g"].as<float>();
+                }
+                if (jsonNumber(payload["dose_in_g"]) && payload["dose_in_g"].as<float>() > 0.0f &&
+                    jsonNumber(payload["beverage_out_g"])) {
+                    payload["brew_ratio"] = payload["beverage_out_g"].as<float>() / payload["dose_in_g"].as<float>();
                 }
                 const AutoTuning::FollowThroughStatus followThrough =
                     AutoTuning::deriveFollowThrough(storedGrind, storedDose, storedYield);

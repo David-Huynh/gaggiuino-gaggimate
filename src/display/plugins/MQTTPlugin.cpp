@@ -101,9 +101,6 @@ static bool loadActiveGrinderPosition(Settings const &settings, ActiveGrinderPos
 
 static bool validateRecommendationGrindProjection(AutoTuning::Recommendation const &recommendation, Settings const &settings,
                                                   String &reason) {
-    if (std::fabs(recommendation.grindDeltaStepsFromCurrent) < 0.001f) {
-        return true;
-    }
     ActiveGrinderPosition position;
     if (!loadActiveGrinderPosition(settings, position) || !position.relativeAvailable) {
         reason = "active grinder position is unavailable";
@@ -125,6 +122,12 @@ static bool validateRecommendationGrindProjection(AutoTuning::Recommendation con
         reason = "recommended absolute grinder position is inconsistent";
         return false;
     }
+    if (recommendation.absoluteReferenceStep.has_value() &&
+        (!position.absoluteStep.has_value() ||
+         !closeEnough(*position.absoluteStep - position.relativeStep, *recommendation.absoluteReferenceStep))) {
+        reason = "recommendation uses an inconsistent absolute grinder reference";
+        return false;
+    }
     if (position.micronsPerStep.has_value()) {
         const float micronScale = *position.micronsPerStep * position.directionSign;
         if (!closeEnough(recommendation.grindDeltaStepsFromCurrent * micronScale, recommendation.grindDeltaMicronsFromCurrent) ||
@@ -136,6 +139,56 @@ static bool validateRecommendationGrindProjection(AutoTuning::Recommendation con
     }
     reason = "";
     return true;
+}
+
+static bool validateAppliedRecommendationGrindProjection(AutoTuning::Recommendation const &recommendation,
+                                                         Settings const &settings, String &reason) {
+    ActiveGrinderPosition position;
+    if (!loadActiveGrinderPosition(settings, position) || !position.relativeAvailable) {
+        reason = "active grinder position is unavailable";
+        return false;
+    }
+    if (!closeEnough(position.relativeStep, recommendation.projectedRelativeStepFromReference)) {
+        reason = "accepted recommendation no longer matches the grinder position";
+        return false;
+    }
+    if (recommendation.projectedAbsoluteStep.has_value() &&
+        (!position.absoluteStep.has_value() || !closeEnough(*position.absoluteStep, *recommendation.projectedAbsoluteStep))) {
+        reason = "accepted recommendation no longer matches the absolute grinder position";
+        return false;
+    }
+    if (recommendation.absoluteReferenceStep.has_value() &&
+        (!position.absoluteStep.has_value() ||
+         !closeEnough(*position.absoluteStep - position.relativeStep, *recommendation.absoluteReferenceStep))) {
+        reason = "accepted recommendation no longer matches the absolute grinder reference";
+        return false;
+    }
+    reason = "";
+    return true;
+}
+
+static void completeRecommendationAbsoluteProjection(AutoTuning::Recommendation &recommendation,
+                                                     Settings const &settings, bool actionableStatus) {
+    ActiveGrinderPosition position;
+    if (!loadActiveGrinderPosition(settings, position) || !position.absoluteStep.has_value()) {
+        return;
+    }
+    const float activeAbsoluteStep = *position.absoluteStep;
+    const float currentAbsoluteStep = actionableStatus
+                                          ? activeAbsoluteStep
+                                          : activeAbsoluteStep - recommendation.grindDeltaStepsFromCurrent;
+    const float projectedAbsoluteStep = actionableStatus
+                                            ? activeAbsoluteStep + recommendation.grindDeltaStepsFromCurrent
+                                            : activeAbsoluteStep;
+    if (!recommendation.currentAbsoluteStep.has_value()) {
+        recommendation.currentAbsoluteStep = currentAbsoluteStep;
+    }
+    if (!recommendation.projectedAbsoluteStep.has_value()) {
+        recommendation.projectedAbsoluteStep = projectedAbsoluteStep;
+    }
+    if (!recommendation.absoluteReferenceStep.has_value() && position.relativeAvailable) {
+        recommendation.absoluteReferenceStep = activeAbsoluteStep - position.relativeStep;
+    }
 }
 
 static bool mqttJsonEpoch(JsonVariantConst value, EpochTime::Seconds &out) {
@@ -152,16 +205,15 @@ static EpochTime::Seconds mqttJsonEpochOrZero(JsonVariantConst value) {
 }
 
 void MQTTPlugin::markConnected() {
-    mqttWasConnected = true;
+    mqttWasConnected.store(true, std::memory_order_release);
     nextReconnectAttemptMs = 0;
     reconnectDelayMs = MQTT_RECONNECT_INITIAL_DELAY_MS;
 }
 
 void MQTTPlugin::markDisconnected() {
-    if (mqttWasConnected) {
+    if (mqttWasConnected.exchange(false, std::memory_order_acq_rel)) {
         ESP_LOGW(LOG_TAG.c_str(), "MQTT disconnected; reconnect will retry in background");
     }
-    mqttWasConnected = false;
     autoTuningSubscribed = false;
     if (reconnectDelayMs == 0) {
         reconnectDelayMs = MQTT_RECONNECT_INITIAL_DELAY_MS;
@@ -169,21 +221,26 @@ void MQTTPlugin::markDisconnected() {
 }
 
 bool MQTTPlugin::connectOnce() {
-    const String ip = pendingConnectionHost;
-    const int haPort = pendingConnectionPort;
+    ConnectionConfiguration configuration;
+    {
+        std::lock_guard<std::mutex> guard(connectionConfigMutex);
+        configuration = connectionConfiguration;
+    }
+    const String ip = configuration.host;
+    const int mqttPort = configuration.port;
     const String clientId = "GaggiMate";
-    const String haUser = pendingConnectionUser;
-    const String haPassword = pendingConnectionPassword;
+    const String mqttUser = configuration.user;
+    const String mqttPassword = configuration.password;
 
     if (ip.isEmpty()) {
         ESP_LOGW(LOG_TAG.c_str(), "MQTT host is empty; skipping connection attempt");
         return false;
     }
 
-    client.begin(ip.c_str(), haPort, net);
+    client.begin(ip.c_str(), mqttPort, net);
     client.setKeepAlive(10);
-    ESP_LOGI(LOG_TAG.c_str(), "Connecting to %s:%d", ip.c_str(), haPort);
-    if (!client.connect(clientId.c_str(), haUser.c_str(), haPassword.c_str())) {
+    ESP_LOGI(LOG_TAG.c_str(), "Connecting to %s:%d", ip.c_str(), mqttPort);
+    if (!client.connect(clientId.c_str(), mqttUser.c_str(), mqttPassword.c_str())) {
         return false;
     }
 
@@ -203,133 +260,155 @@ void MQTTPlugin::requestReconnect() {
     if (!controller || connectionTaskHandle == nullptr) {
         return;
     }
-    bool expected = false;
-    if (!reconnectInProgress.compare_exchange_strong(expected, true)) {
-        return;
-    }
     Settings const &settings = controller->getSettings();
-    pendingConnectionEnabled = settings.isHomeAssistant();
-    pendingConnectionHost = settings.getHomeAssistantIP();
-    pendingConnectionPort = settings.getHomeAssistantPort();
-    pendingConnectionUser = settings.getHomeAssistantUser();
-    pendingConnectionPassword = settings.getHomeAssistantPassword();
+    ConnectionConfiguration next;
+    next.autoTuning = settings.isRLAutoTuningEnabled() &&
+                      settings.getRLAutoTuningProviderMode() == AutoTuning::PROVIDER_OFF_BOARD;
+    next.legacyHomeAssistant = FeatureFlags::legacyHomeAssistantMqtt && settings.isHomeAssistant();
+    next.host = settings.getHomeAssistantIP();
+    next.port = settings.getHomeAssistantPort();
+    next.user = settings.getHomeAssistantUser();
+    next.password = settings.getHomeAssistantPassword();
+    next.enabled = (next.autoTuning || next.legacyHomeAssistant) && !next.host.isEmpty() && next.port > 0 &&
+                   next.port <= 65535;
+    const bool connectionShouldBeEnabled = next.enabled;
+
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> guard(connectionConfigMutex);
+        changed = connectionConfiguration.enabled != next.enabled ||
+                  connectionConfiguration.autoTuning != next.autoTuning ||
+                  connectionConfiguration.legacyHomeAssistant != next.legacyHomeAssistant ||
+                  connectionConfiguration.host != next.host || connectionConfiguration.port != next.port ||
+                  connectionConfiguration.user != next.user || connectionConfiguration.password != next.password;
+        if (changed) {
+            connectionConfiguration = std::move(next);
+        }
+    }
+    if (changed) {
+        connectionConfigRevision.fetch_add(1, std::memory_order_release);
+    }
+    connectionEnabled.store(connectionShouldBeEnabled, std::memory_order_release);
     xTaskNotifyGive(connectionTaskHandle);
 }
 
 void MQTTPlugin::connectionWorkerTask(void *arg) {
     auto *plugin = static_cast<MQTTPlugin *>(arg);
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        bool connected = false;
-        if (plugin->pendingConnectionEnabled && WiFi.status() == WL_CONNECTED && plugin->clientMutex &&
-            xSemaphoreTake(plugin->clientMutex, portMAX_DELAY) == pdTRUE) {
-            connected = plugin->connectOnce();
-            xSemaphoreGive(plugin->clientMutex);
-        }
-        plugin->connectionAttemptSucceeded.store(connected, std::memory_order_relaxed);
-        plugin->connectionAttemptComplete.store(true, std::memory_order_release);
+        plugin->serviceWorker();
+        const TickType_t wait = plugin->connected()
+                                    ? pdMS_TO_TICKS(10)
+                                    : (plugin->connectionEnabled.load(std::memory_order_acquire)
+                                           ? pdMS_TO_TICKS(100)
+                                           : portMAX_DELAY);
+        ulTaskNotifyTake(pdTRUE, wait);
     }
 }
 
-void MQTTPlugin::refreshAutoTuningSubscriptions() {
-    if (!clientMutex || xSemaphoreTake(clientMutex, 0) != pdTRUE) {
-        return;
-    }
+void MQTTPlugin::refreshAutoTuningSubscriptions(ConnectionConfiguration const &configuration) {
     if (!client.connected()) {
         autoTuningSubscribed = false;
-        xSemaphoreGive(clientMutex);
         return;
     }
 
-    const bool shouldSubscribe =
-        AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).routeOffBoardTransport();
     const String prefix = "gaggimate/" + machineTopicId();
-    if (shouldSubscribe && !autoTuningSubscribed) {
+    if (configuration.autoTuning && !autoTuningSubscribed) {
         const bool recommendation = client.subscribe(prefix + "/rl/recommendation", 1);
         const bool status = client.subscribe(prefix + "/rl/status", 1);
         const bool acknowledgement = client.subscribe(prefix + "/rl/shot/ack", 1);
         autoTuningSubscribed = recommendation && status && acknowledgement;
-    } else if (!shouldSubscribe && autoTuningSubscribed) {
+    } else if (!configuration.autoTuning && autoTuningSubscribed) {
         client.unsubscribe(prefix + "/rl/recommendation");
         client.unsubscribe(prefix + "/rl/status");
         client.unsubscribe(prefix + "/rl/shot/ack");
         autoTuningSubscribed = false;
     }
-    xSemaphoreGive(clientMutex);
 }
 
 void MQTTPlugin::handleConnectionReady() {
-    if (!connectionAttemptComplete.exchange(false, std::memory_order_acquire)) {
+    const uint32_t generation = connectionGeneration.load(std::memory_order_acquire);
+    if (generation == handledConnectionGeneration || !mqttWasConnected.load(std::memory_order_acquire)) {
         return;
     }
-    const bool connected = connectionAttemptSucceeded.load(std::memory_order_relaxed);
-    reconnectInProgress.store(false, std::memory_order_release);
-    if (!connected || !configured()) {
-        if (connected && clientMutex && xSemaphoreTake(clientMutex, 0) == pdTRUE) {
-            client.disconnect();
-            xSemaphoreGive(clientMutex);
-        }
-        markDisconnected();
-        return;
+    handledConnectionGeneration = generation;
+
+    ConnectionConfiguration configuration;
+    {
+        std::lock_guard<std::mutex> guard(connectionConfigMutex);
+        configuration = connectionConfiguration;
     }
-    markConnected();
-    refreshAutoTuningSubscriptions();
-    publishDiscovery(controller);
-    publishOptimizerSettings();
-    publishMachineState(controller->getMode() == MODE_STANDBY ? "standby" : "idle", true);
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
+    if (configuration.legacyHomeAssistant) {
+        publishDiscovery(controller);
+    }
+#endif
+    if (configuration.autoTuning) {
+        publishOptimizerSettings();
+        publishMachineState(controller->getMode() == MODE_STANDBY ? "standby" : "idle", true);
+    }
 }
 
-void MQTTPlugin::maintainConnection() {
-    if (!controller) {
-        return;
+void MQTTPlugin::serviceWorker() {
+    ConnectionConfiguration configuration;
+    const uint32_t revision = connectionConfigRevision.load(std::memory_order_acquire);
+    {
+        std::lock_guard<std::mutex> guard(connectionConfigMutex);
+        configuration = connectionConfiguration;
     }
-    if (!configured()) {
-        if (clientMutex && xSemaphoreTake(clientMutex, 0) == pdTRUE) {
-            if (client.connected()) {
-                client.disconnect();
-            }
-            xSemaphoreGive(clientMutex);
+
+    if (revision != appliedConnectionConfigRevision) {
+        appliedConnectionConfigRevision = revision;
+        if (client.connected()) {
+            client.disconnect();
+        }
+        markDisconnected();
+        nextReconnectAttemptMs = 0;
+        reconnectDelayMs = MQTT_RECONNECT_INITIAL_DELAY_MS;
+    }
+
+    if (!configuration.enabled || WiFi.status() != WL_CONNECTED) {
+        if (client.connected()) {
+            client.disconnect();
         }
         markDisconnected();
         nextReconnectAttemptMs = 0;
         return;
     }
-    if (mqttWasConnected) {
-        if (clientMutex && xSemaphoreTake(clientMutex, 0) == pdTRUE) {
-            const bool stillConnected = client.connected();
-            xSemaphoreGive(clientMutex);
-            if (!stillConnected) {
-                markDisconnected();
-            }
-        }
-        if (mqttWasConnected) {
+
+    if (!client.connected()) {
+        markDisconnected();
+        const unsigned long now = millis();
+        if (nextReconnectAttemptMs != 0 && static_cast<long>(now - nextReconnectAttemptMs) < 0) {
             return;
         }
+        const unsigned long delayMs = reconnectDelayMs == 0 ? MQTT_RECONNECT_INITIAL_DELAY_MS : reconnectDelayMs;
+        nextReconnectAttemptMs = now + delayMs;
+        reconnectDelayMs = std::min(delayMs * 2, MQTT_RECONNECT_MAX_DELAY_MS);
+        if (!connectOnce()) {
+            return;
+        }
+        markConnected();
+        refreshAutoTuningSubscriptions(configuration);
+        connectionGeneration.fetch_add(1, std::memory_order_release);
     }
 
-    markDisconnected();
-    if (WiFi.status() != WL_CONNECTED) {
-        nextReconnectAttemptMs = 0;
+    client.loop();
+    if (!client.connected()) {
+        markDisconnected();
         return;
     }
-
-    const unsigned long now = millis();
-    if (nextReconnectAttemptMs != 0 && static_cast<long>(now - nextReconnectAttemptMs) < 0) {
+    refreshAutoTuningSubscriptions(configuration);
+    if (flushDurablePublishes())
         return;
-    }
-
-    if (reconnectInProgress) {
+    if (publishLiveEvent())
         return;
-    }
-
-    const unsigned long delayMs = reconnectDelayMs == 0 ? MQTT_RECONNECT_INITIAL_DELAY_MS : reconnectDelayMs;
-    nextReconnectAttemptMs = now + delayMs;
-    reconnectDelayMs = std::min(delayMs * 2, MQTT_RECONNECT_MAX_DELAY_MS);
-    requestReconnect();
+    publishQueuedMessage();
 }
 
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
 void MQTTPlugin::publishDiscovery(Controller *controller) {
-    if (!mqttWasConnected)
+    if (!mqttWasConnected.load(std::memory_order_acquire) || !controller ||
+        !controller->getSettings().isHomeAssistant())
         return;
     const Settings settings = controller->getSettings();
     const String haTopic = settings.getHomeAssistantTopic();
@@ -400,8 +479,9 @@ void MQTTPlugin::publishDiscovery(Controller *controller) {
     serializeJson(payload, payloadStr);
 
     ESP_LOGD(LOG_TAG.c_str(), "Publishing discovery %s: %s", publishTopic, payloadStr.c_str());
-    publishNow(publishTopic, payloadStr, false, 0);
+    enqueuePublish(publishTopic, payloadStr, false, 0);
 }
+#endif
 
 bool MQTTPlugin::publish(const std::string &topic, const std::string &message, const bool retained, const int qos,
                          const bool durable) {
@@ -415,22 +495,37 @@ bool MQTTPlugin::publish(const std::string &topic, const std::string &message, c
             ESP_LOGE(LOG_TAG.c_str(), "Unable to persist MQTT lifecycle event for %s", publishTopic);
             return false;
         }
+        if (connectionTaskHandle) {
+            xTaskNotifyGive(connectionTaskHandle);
+        }
         return true;
     }
-    return publishNow(publishTopic, message.c_str(), retained, qos);
+    return enqueuePublish(publishTopic, message.c_str(), retained, qos);
+}
+
+bool MQTTPlugin::enqueuePublish(const String &topic, const String &message, const bool retained, const int qos) {
+    if (topic.isEmpty() || message.isEmpty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        if (outboundMessages.size() >= MAX_OUTBOUND_MESSAGES) {
+            outboundMessages.pop_front();
+        }
+        outboundMessages.push_back(OutboundMessage{topic, message, retained, std::clamp(qos, 0, 2)});
+    }
+    if (connectionTaskHandle) {
+        xTaskNotifyGive(connectionTaskHandle);
+    }
+    return true;
 }
 
 bool MQTTPlugin::publishNow(const String &topic, const String &message, const bool retained, const int qos) {
-    if (!clientMutex || xSemaphoreTake(clientMutex, 0) != pdTRUE) {
+    if (!client.connected()) {
         return false;
     }
-    bool published = false;
-    if (client.connected()) {
-        ESP_LOGD(LOG_TAG.c_str(), "Publishing %s: %s", topic.c_str(), message.c_str());
-        published = client.publish(topic, message, retained, std::clamp(qos, 0, 2));
-    }
-    xSemaphoreGive(clientMutex);
-    return published;
+    ESP_LOGD(LOG_TAG.c_str(), "Publishing %s: %s", topic.c_str(), message.c_str());
+    return client.publish(topic, message, retained, std::clamp(qos, 0, 2));
 }
 
 bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &message, const bool retained, const int qos) {
@@ -500,91 +595,207 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
         LittleFSUtil::removeIfExists(tempPath);
         return false;
     }
+    durablePublishPending.store(true, std::memory_order_release);
     return true;
 }
 
-void MQTTPlugin::flushDurablePublishes() {
+void MQTTPlugin::recoverDurablePublishes() {
     MqttOutboxLock lock(outboxMutex);
     if (!lock.locked) {
         return;
     }
-    if (!mqttWasConnected) {
-        return;
-    }
-    File recoveryDirectory = LittleFS.open(MQTT_OUTBOX_DIR);
-    if (recoveryDirectory && recoveryDirectory.isDirectory()) {
-        File pending = recoveryDirectory.openNextFile();
-        while (pending) {
-            const String tempPath = LittleFSUtil::pathFromEntry(MQTT_OUTBOX_DIR, pending.name());
-            pending.close();
-            if (tempPath.endsWith(".json.tmp")) {
-                File tempFile = LittleFS.open(tempPath, FILE_READ);
-                JsonDocument pendingDoc;
-                const bool valid = tempFile && !deserializeJson(pendingDoc, tempFile) && pendingDoc.is<JsonObject>();
-                tempFile.close();
-                const String finalPath = tempPath.substring(0, tempPath.length() - 4);
-                AtomicFile::recoverPending(finalPath, valid);
-            } else if (tempPath.endsWith(".json.bak")) {
-                const String finalPath = tempPath.substring(0, tempPath.length() - 4);
-                if (LittleFSUtil::existsQuietly(finalPath)) {
-                    AtomicFile::discardBackup(finalPath);
-                } else {
-                    AtomicFile::restoreBackup(finalPath);
-                }
-            }
-            pending = recoveryDirectory.openNextFile();
-        }
-        recoveryDirectory.close();
-    }
     File directory = LittleFS.open(MQTT_OUTBOX_DIR);
     if (!directory || !directory.isDirectory()) {
+        durablePublishPending.store(false, std::memory_order_release);
         return;
     }
-
-    String selectedPath;
-    File candidate = directory.openNextFile();
-    while (candidate) {
-        const String path = LittleFSUtil::pathFromEntry(MQTT_OUTBOX_DIR, candidate.name());
-        candidate.close();
-        if (path.endsWith(".json") && (selectedPath.isEmpty() || path.compareTo(selectedPath) < 0)) {
-            selectedPath = path;
+    bool pendingFound = false;
+    File entry = directory.openNextFile();
+    while (entry) {
+        const String path = LittleFSUtil::pathFromEntry(MQTT_OUTBOX_DIR, entry.name());
+        entry.close();
+        if (path.endsWith(".json.tmp")) {
+            File tempFile = LittleFS.open(path, FILE_READ);
+            JsonDocument pendingDoc;
+            const bool valid = tempFile && !deserializeJson(pendingDoc, tempFile) && pendingDoc.is<JsonObject>();
+            tempFile.close();
+            AtomicFile::recoverPending(path.substring(0, path.length() - 4), valid);
+            pendingFound = pendingFound || valid;
+        } else if (path.endsWith(".json.bak")) {
+            const String finalPath = path.substring(0, path.length() - 4);
+            if (LittleFSUtil::existsQuietly(finalPath)) {
+                AtomicFile::discardBackup(finalPath);
+            } else {
+                AtomicFile::restoreBackup(finalPath);
+                pendingFound = true;
+            }
+        } else if (path.endsWith(".json")) {
+            pendingFound = true;
         }
-        candidate = directory.openNextFile();
+        entry = directory.openNextFile();
     }
     directory.close();
-    if (selectedPath.isEmpty()) {
-        return;
-    }
-
-    File file = LittleFS.open(selectedPath, FILE_READ);
-    JsonDocument doc;
-    const DeserializationError error = deserializeJson(doc, file);
-    file.close();
-    const String topic = doc["topic"].as<String>();
-    String message = doc["message"].as<String>();
-    const bool retained = doc["retained"].is<bool>() && doc["retained"].as<bool>();
-    const int qos = doc["qos"] | 0;
-    const String expectedPrefix = "gaggimate/" + machineTopicId() + "/";
-    if (error || !topic.startsWith(expectedPrefix) || message.isEmpty() || qos < 0 || qos > 2) {
-        ESP_LOGE(LOG_TAG.c_str(), "Removing invalid MQTT outbox record %s", selectedPath.c_str());
-        LittleFS.remove(selectedPath);
-        return;
-    }
-    JsonDocument messageDoc;
-    EpochTime::Seconds queuedTimestamp = 0;
-    const EpochTime::Seconds now = EpochTime::now();
-    if (!deserializeJson(messageDoc, message) && messageDoc.is<JsonObject>() &&
-        (!mqttJsonEpoch(messageDoc["timestamp"], queuedTimestamp) || queuedTimestamp < EpochTime::MIN_VALID) &&
-        now >= EpochTime::MIN_VALID) {
-        messageDoc["timestamp"] = now;
-        message = "";
-        serializeJson(messageDoc, message);
-    }
-    if (publishNow(topic, message, retained, qos)) {
-        LittleFS.remove(selectedPath);
-    }
+    durablePublishPending.store(pendingFound, std::memory_order_release);
 }
 
+bool MQTTPlugin::flushDurablePublishes() {
+    if (!mqttWasConnected.load(std::memory_order_acquire) ||
+        !durablePublishPending.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const unsigned long nowMs = millis();
+    if (nextDurablePublishAttemptMs != 0 && static_cast<long>(nowMs - nextDurablePublishAttemptMs) < 0) {
+        return false;
+    }
+    String selectedPath;
+    String topic;
+    String message;
+    bool retained = false;
+    int qos = 0;
+    {
+        MqttOutboxLock lock(outboxMutex);
+        if (!lock.locked) {
+            return false;
+        }
+        File directory = LittleFS.open(MQTT_OUTBOX_DIR);
+        if (!directory || !directory.isDirectory()) {
+            durablePublishPending.store(false, std::memory_order_release);
+            return false;
+        }
+        File candidate = directory.openNextFile();
+        while (candidate) {
+            const String path = LittleFSUtil::pathFromEntry(MQTT_OUTBOX_DIR, candidate.name());
+            candidate.close();
+            if (path.endsWith(".json") && (selectedPath.isEmpty() || path.compareTo(selectedPath) < 0)) {
+                selectedPath = path;
+            }
+            candidate = directory.openNextFile();
+        }
+        directory.close();
+        if (selectedPath.isEmpty()) {
+            durablePublishPending.store(false, std::memory_order_release);
+            nextDurablePublishAttemptMs = 0;
+            return false;
+        }
+
+        File file = LittleFS.open(selectedPath, FILE_READ);
+        JsonDocument doc;
+        const DeserializationError error = deserializeJson(doc, file);
+        file.close();
+        topic = doc["topic"].as<String>();
+        message = doc["message"].as<String>();
+        retained = doc["retained"].is<bool>() && doc["retained"].as<bool>();
+        qos = doc["qos"] | 0;
+        const String expectedPrefix = "gaggimate/" + machineTopicId() + "/";
+        if (error || !topic.startsWith(expectedPrefix) || message.isEmpty() || qos < 0 || qos > 2) {
+            ESP_LOGE(LOG_TAG.c_str(), "Removing invalid MQTT outbox record %s", selectedPath.c_str());
+            LittleFS.remove(selectedPath);
+            return true;
+        }
+        JsonDocument messageDoc;
+        EpochTime::Seconds queuedTimestamp = 0;
+        const EpochTime::Seconds now = EpochTime::now();
+        if (!deserializeJson(messageDoc, message) && messageDoc.is<JsonObject>() &&
+            (!mqttJsonEpoch(messageDoc["timestamp"], queuedTimestamp) || queuedTimestamp < EpochTime::MIN_VALID) &&
+            now >= EpochTime::MIN_VALID) {
+            messageDoc["timestamp"] = now;
+            message = "";
+            serializeJson(messageDoc, message);
+        }
+    }
+    if (!publishNow(topic, message, retained, qos)) {
+        nextDurablePublishAttemptMs = millis() + 1000;
+        return false;
+    }
+    nextDurablePublishAttemptMs = 0;
+    {
+        MqttOutboxLock lock(outboxMutex);
+        if (lock.locked) {
+            LittleFSUtil::removeIfExists(selectedPath);
+        }
+    }
+    return true;
+}
+
+bool MQTTPlugin::publishLiveEvent() {
+    LiveEvent event;
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        const unsigned long now = millis();
+        while (!liveEvents.empty() && now - liveEvents.front().queuedAtMs > MAX_LIVE_EVENT_AGE_MS) {
+            liveEvents.pop_front();
+        }
+        if (liveEvents.empty()) {
+            return false;
+        }
+        event = std::move(liveEvents.front());
+        liveEvents.pop_front();
+    }
+
+    JsonDocument doc(&psramAllocator);
+    doc["schema_version"] = 1;
+    switch (event.kind) {
+    case LiveEventKind::Started:
+        doc["event_type"] = "live_shot_started";
+        doc["shot_id"] = event.started.shotId;
+        doc["machine_id"] = event.started.machineId;
+        doc["timestamp_ms"] = event.started.startedAtMs;
+        doc["sample_interval_ms"] = event.started.sampleIntervalMs;
+        doc["weight_source"] = event.started.weightSource;
+        doc["flow_source"] = event.started.flowSource;
+        break;
+    case LiveEventKind::Sample: {
+        doc["event_type"] = "live_shot_sample";
+        doc["shot_id"] = event.sample.shotId;
+        doc["machine_id"] = event.sample.machineId;
+        doc["timestamp_ms"] = event.sample.timestampMs;
+        doc["sequence"] = event.sample.sequence;
+        doc["elapsed_ms"] = event.sample.sample.elapsedMs;
+        JsonObject sample = doc["sample"].to<JsonObject>();
+        sample["pressure_bar"] = event.sample.sample.pressure;
+        sample["pressure_target_bar"] = event.sample.sample.targetPressure;
+        sample["pump_flow_ml_s"] = event.sample.sample.pumpFlow;
+        sample["pump_flow_target_ml_s"] = event.sample.sample.targetFlow;
+        sample["beverage_flow_g_s"] = event.sample.sample.flow;
+        sample["weight_g"] = event.sample.sample.weight;
+        sample["temperature_c"] = event.sample.sample.temperature;
+        sample["temperature_target_c"] = event.sample.sample.targetTemperature;
+        sample["pump_target_mode"] = static_cast<uint8_t>(event.sample.sample.pumpTargetMode);
+        sample["valve_open"] = event.sample.sample.valveOpen;
+        break;
+    }
+    case LiveEventKind::Ended:
+        doc["event_type"] = "live_shot_ended";
+        doc["shot_id"] = event.ended.shotId;
+        doc["machine_id"] = event.ended.machineId;
+        doc["timestamp_ms"] = event.ended.endedAtMs;
+        doc["final_sequence"] = event.ended.finalSequence;
+        doc["elapsed_ms"] = event.ended.elapsedMs;
+        doc["end_state"] = event.ended.endState;
+        break;
+    }
+    String payload;
+    serializeJson(doc, payload);
+    const String topic = "gaggimate/" + machineTopicId() + "/rl/shot/live";
+    publishNow(topic, payload, false, 0);
+    return true;
+}
+
+bool MQTTPlugin::publishQueuedMessage() {
+    OutboundMessage message;
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        if (outboundMessages.empty()) {
+            return false;
+        }
+        message = std::move(outboundMessages.front());
+        outboundMessages.pop_front();
+    }
+    publishNow(message.topic, message.message, message.retained, message.qos);
+    return true;
+}
+
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
 void MQTTPlugin::publishBrewState(const char *state) {
     JsonDocument doc;
     doc["state"] = state;
@@ -592,6 +803,90 @@ void MQTTPlugin::publishBrewState(const char *state) {
     String json;
     serializeJson(doc, json);
     publish("controller/brew/state", json.c_str());
+}
+#endif
+
+void MQTTPlugin::publishPendingControllerState() {
+    if (!mqttWasConnected.load(std::memory_order_acquire) || !controller)
+        return;
+
+    const PendingMachineState machineState =
+        pendingMachineState.exchange(PendingMachineState::None, std::memory_order_acq_rel);
+    switch (machineState) {
+    case PendingMachineState::Idle:
+        publishMachineState("idle");
+        break;
+    case PendingMachineState::Brewing:
+        publishMachineState("brewing");
+        break;
+    case PendingMachineState::Standby:
+        publishMachineState("standby");
+        break;
+    case PendingMachineState::None:
+        break;
+    }
+
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
+    if (!controller->getSettings().isHomeAssistant()) {
+        pendingMode.store(-1, std::memory_order_release);
+        pendingBrewState.store(-1, std::memory_order_release);
+        temperaturePublishPending.store(false, std::memory_order_release);
+        targetTemperaturePublishPending.store(false, std::memory_order_release);
+        return;
+    }
+
+    const int controllerMode = pendingMode.exchange(-1, std::memory_order_acq_rel);
+    if (controllerMode >= 0) {
+        const char *modeStr = "Unknown";
+        switch (controllerMode) {
+        case MODE_STANDBY:
+            modeStr = "Standby";
+            break;
+        case MODE_BREW:
+            modeStr = "Brew";
+            break;
+        case MODE_STEAM:
+            modeStr = "Steam";
+            break;
+        case MODE_WATER:
+            modeStr = "Water";
+            break;
+        case MODE_GRIND:
+            modeStr = "Grind";
+            break;
+        default:
+            break;
+        }
+        char json[100];
+        snprintf(json, sizeof(json), R"({"mode":%d,"mode_str":"%s"})", controllerMode, modeStr);
+        publish("controller/mode", json);
+    }
+
+    const int brewState = pendingBrewState.exchange(-1, std::memory_order_acq_rel);
+    if (brewState >= 0)
+        publishBrewState(brewState == 1 ? "brewing" : "not brewing");
+
+    const unsigned long now = millis();
+    if (temperaturePublishPending.load(std::memory_order_acquire) &&
+        (lastLegacyTemperaturePublishMs == 0 || now - lastLegacyTemperaturePublishMs >= 1000) &&
+        temperaturePublishPending.exchange(false, std::memory_order_acq_rel)) {
+        const float temperature = pendingTemperature.load(std::memory_order_relaxed);
+        if (temperature != lastTemperature) {
+            char json[50];
+            snprintf(json, sizeof(json), R"({"temperature":%02f})", temperature);
+            publish("boilers/0/temperature", json);
+            lastTemperature = temperature;
+            lastLegacyTemperaturePublishMs = now;
+        }
+    }
+
+    if (targetTemperaturePublishPending.exchange(false, std::memory_order_acq_rel)) {
+        char json[50];
+        snprintf(json, sizeof(json), R"({"temperature":%02f})",
+                 pendingTargetTemperature.load(std::memory_order_relaxed));
+        publish("boilers/0/targetTemperature", json);
+    }
+#endif
 }
 
 void MQTTPlugin::publishMachineState(const char *state, const bool force) {
@@ -656,14 +951,41 @@ void MQTTPlugin::publishOptimizerSettings() {
 }
 
 void MQTTPlugin::loop() {
-    if (clientMutex && xSemaphoreTake(clientMutex, 0) == pdTRUE) {
-        client.loop();
-        xSemaphoreGive(clientMutex);
-    }
-    maintainConnection();
     handleConnectionReady();
-    refreshAutoTuningSubscriptions();
-    flushDurablePublishes();
+    drainInbound();
+    publishPendingControllerState();
+}
+
+void MQTTPlugin::enqueueInbound(const String &topic, const String &payload) {
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        if (inboundMessages.size() >= MAX_INBOUND_MESSAGES) {
+            ESP_LOGW(LOG_TAG.c_str(), "Dropping oldest inbound MQTT message because the controller queue is full");
+            inboundMessages.pop_front();
+        }
+        inboundMessages.push_back(InboundMessage{topic, payload});
+    }
+}
+
+void MQTTPlugin::drainInbound() {
+    for (size_t handled = 0; handled < 4; handled++) {
+        InboundMessage message;
+        {
+            std::lock_guard<std::mutex> guard(queueMutex);
+            if (inboundMessages.empty()) {
+                return;
+            }
+            message = std::move(inboundMessages.front());
+            inboundMessages.pop_front();
+        }
+        if (message.topic.endsWith("/rl/recommendation")) {
+            handleRecommendation(message.payload);
+        } else if (message.topic.endsWith("/rl/status")) {
+            handleStatus(message.payload);
+        } else if (message.topic.endsWith("/rl/shot/ack")) {
+            handleShotDeliveryAck(message.payload);
+        }
+    }
 }
 
 void MQTTPlugin::handleRecommendation(const String &payload) {
@@ -696,6 +1018,8 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     }
     const bool actionableStatus = recommendation.status == AutoTuning::RecommendationStatus::Pending ||
                                   recommendation.status == AutoTuning::RecommendationStatus::Shown;
+    const bool attributionStatus = recommendation.status == AutoTuning::RecommendationStatus::Accepted ||
+                                   recommendation.status == AutoTuning::RecommendationStatus::Edited;
     const bool matchingMode = (recommendation.mode == AutoTuning::RecommendationMode::CpboGlobalPrevious &&
                                recommendation.comparisonMode == AutoTuning::ComparisonMode::GlobalPrevious) ||
                               (recommendation.mode == AutoTuning::RecommendationMode::CpboBestIncumbent &&
@@ -705,7 +1029,8 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
         (recommendation.updatedAt <= 0 || EpochTime::plausible(recommendation.updatedAt, receivedAt)) &&
         (!recommendation.expiresAt.has_value() ||
          (EpochTime::plausible(*recommendation.expiresAt, receivedAt) && *recommendation.expiresAt > receivedAt));
-    if (recommendation.machineId != machineId().c_str() || !actionableStatus || !matchingMode || !timestampsPlausible ||
+    if (recommendation.machineId != machineId().c_str() || (!actionableStatus && !attributionStatus) || !matchingMode ||
+        !timestampsPlausible ||
         (recommendation.preferenceFeedbackRequired && recommendation.sourceShotId != recommendation.comparisonAnchorShotId)) {
         clearLatestRecommendationAndNotify();
         return;
@@ -735,11 +1060,15 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
         return;
     }
     String grindProjectionReason;
-    if (!validateRecommendationGrindProjection(recommendation, settings, grindProjectionReason)) {
+    const bool grindProjectionValid =
+        actionableStatus ? validateRecommendationGrindProjection(recommendation, settings, grindProjectionReason)
+                         : validateAppliedRecommendationGrindProjection(recommendation, settings, grindProjectionReason);
+    if (!grindProjectionValid) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid recommendation: %s", grindProjectionReason.c_str());
         clearLatestRecommendationAndNotify();
         return;
     }
+    completeRecommendationAbsoluteProjection(recommendation, settings, actionableStatus);
     if (recommendation.createdAt <= 0) {
         recommendation.createdAt = receivedAt;
     }
@@ -825,6 +1154,9 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusLastShotTimeS = doc["last_shot_time_s"] | 0.0f;
     latestStatusLastShotBeverageOutG = doc["last_shot_beverage_out_g"] | 0.0f;
     latestStatusLastShotTargetYieldG = doc["last_shot_target_yield_g"] | 0.0f;
+    // Status is diagnostic and can lag or be published for a different machine
+    // state transition. Only the retained recommendation topic may create or
+    // clear the recommendation state used by capture and the UIs.
     latestStatusLastRecommendationId = mqttJsonString(doc["last_recommendation_id"]);
     latestStatusLastRecommendationAt = mqttJsonEpochOrZero(doc["last_recommendation_at"]);
     latestStatusRecommendationApplyStatus = mqttJsonString(doc["recommendation_apply_status"]);
@@ -877,12 +1209,6 @@ void MQTTPlugin::handleStatus(const String &payload) {
         if (steps.length() <= 2048) {
             latestStatusAutoTuningDiagnosticStepsJson = steps;
         }
-    }
-    if (latestStatusLastRecommendationId.isEmpty()) {
-        clearLatestRecommendation();
-        Event cleared;
-        cleared.id = "rl:recommendation:cleared";
-        pluginManager->trigger(cleared);
     }
     if (doc["recent_shots"].is<JsonArray>()) {
         String recent;
@@ -1028,6 +1354,11 @@ bool MQTTPlugin::applyLatestRecommendation() {
     }
 
     publishRecommendationApply(doseApplied, yieldApplied, yieldFailed);
+    latestRecommendation.status = AutoTuning::RecommendationStatus::Accepted;
+    Event accepted;
+    accepted.id = "rl:recommendation:received";
+    accepted.setPayload(latestRecommendation);
+    pluginManager->trigger(accepted);
     publishMachineState("idle");
     return true;
 }
@@ -1039,7 +1370,7 @@ bool MQTTPlugin::ignoreLatestRecommendation() {
         ESP_LOGE(LOG_TAG.c_str(), "Refused recommendation ignore because the decision could not be persisted");
         return false;
     }
-    clearLatestRecommendation();
+    clearLatestRecommendationAndNotify();
     publishMachineState("idle");
     return true;
 }
@@ -1206,6 +1537,21 @@ bool MQTTPlugin::publishShotCorrection(Event const &event) {
     if (correction->yieldFollowed.has_value()) {
         doc["yield_followed"] = *correction->yieldFollowed;
     }
+    if (correction->relativeGrindStepsFromReference.has_value()) {
+        doc["relative_grind_steps_from_reference"] = *correction->relativeGrindStepsFromReference;
+    }
+    if (correction->currentAbsoluteStep.has_value()) {
+        doc["current_absolute_step"] = *correction->currentAbsoluteStep;
+    }
+    if (correction->doseInG.has_value()) {
+        doc["dose_in_g"] = *correction->doseInG;
+    }
+    if (correction->targetYieldG.has_value()) {
+        doc["target_yield_g"] = *correction->targetYieldG;
+    }
+    if (correction->beverageOutG.has_value()) {
+        doc["beverage_out_g"] = *correction->beverageOutG;
+    }
     JsonArray tags = doc["correction_tags"].to<JsonArray>();
     for (std::string const &tag : correction->tags) {
         tags.add(tag.c_str());
@@ -1273,9 +1619,19 @@ bool MQTTPlugin::isAutoTuningParticipating() const {
     return AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).acceptActionableRecommendations();
 }
 
-bool MQTTPlugin::configured() const { return controller && controller->getSettings().isHomeAssistant(); }
+bool MQTTPlugin::configured() const {
+    if (!controller)
+        return false;
+    Settings const &settings = controller->getSettings();
+    const bool offBoardAutoTuning = settings.isRLAutoTuningEnabled() &&
+                                    settings.getRLAutoTuningProviderMode() == AutoTuning::PROVIDER_OFF_BOARD;
+    const int port = settings.getHomeAssistantPort();
+    const bool legacyHomeAssistant = FeatureFlags::legacyHomeAssistantMqtt && settings.isHomeAssistant();
+    return (offBoardAutoTuning || legacyHomeAssistant) && !settings.getHomeAssistantIP().isEmpty() && port > 0 &&
+           port <= 65535;
+}
 
-bool MQTTPlugin::connected() const { return mqttWasConnected; }
+bool MQTTPlugin::connected() const { return mqttWasConnected.load(std::memory_order_acquire); }
 
 bool MQTTPlugin::publishShot(AutoTuning::ShotRecord const &shot, bool) {
     if (!controller ||
@@ -1284,6 +1640,74 @@ bool MQTTPlugin::publishShot(AutoTuning::ShotRecord const &shot, bool) {
     }
     String payload;
     return AutoTuningJsonCodec::serializeShotRecord(shot, payload) && publish("shot/profile", payload.c_str(), false, 1);
+}
+
+bool MQTTPlugin::publishLiveShotStarted(AutoTuning::LiveShotStarted const &event) {
+    if (!isAutoTuningEnabled() || event.shotId.empty() || event.machineId.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        liveEvents.clear();
+        LiveEvent queued;
+        queued.kind = LiveEventKind::Started;
+        queued.started = event;
+        queued.queuedAtMs = millis();
+        liveEvents.push_back(std::move(queued));
+    }
+    if (connectionTaskHandle) {
+        xTaskNotifyGive(connectionTaskHandle);
+    }
+    return true;
+}
+
+bool MQTTPlugin::publishLiveShotSample(AutoTuning::LiveShotSample const &event) {
+    if (!isAutoTuningEnabled() || event.shotId.empty() || event.machineId.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        size_t sampleCount = 0;
+        for (auto const &queued : liveEvents) {
+            sampleCount += queued.kind == LiveEventKind::Sample ? 1 : 0;
+        }
+        if (sampleCount >= MAX_LIVE_SAMPLES) {
+            auto oldestSample = std::find_if(liveEvents.begin(), liveEvents.end(),
+                                             [](LiveEvent const &queued) {
+                                                 return queued.kind == LiveEventKind::Sample;
+                                             });
+            if (oldestSample != liveEvents.end()) {
+                liveEvents.erase(oldestSample);
+            }
+        }
+        LiveEvent queued;
+        queued.kind = LiveEventKind::Sample;
+        queued.sample = event;
+        queued.queuedAtMs = millis();
+        liveEvents.push_back(std::move(queued));
+    }
+    if (connectionTaskHandle) {
+        xTaskNotifyGive(connectionTaskHandle);
+    }
+    return true;
+}
+
+bool MQTTPlugin::publishLiveShotEnded(AutoTuning::LiveShotEnded const &event) {
+    if (!isAutoTuningEnabled() || event.shotId.empty() || event.machineId.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        LiveEvent queued;
+        queued.kind = LiveEventKind::Ended;
+        queued.ended = event;
+        queued.queuedAtMs = millis();
+        liveEvents.push_back(std::move(queued));
+    }
+    if (connectionTaskHandle) {
+        xTaskNotifyGive(connectionTaskHandle);
+    }
+    return true;
 }
 
 bool MQTTPlugin::canApplyGrindByWeightTarget() const {
@@ -1325,19 +1749,17 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     this->controller = ctrl;
     this->pluginManager = pm;
     ctrl->setOptimizerTransport(this);
-    clientMutex = xSemaphoreCreateMutex();
     outboxMutex = xSemaphoreCreateRecursiveMutex();
-    xTaskCreate(connectionWorkerTask, "MQTT connect", 6144, this, 1, &connectionTaskHandle);
-
+    recoverDurablePublishes();
     client.onMessage([this](String &topic, String &payload) {
-        if (topic.endsWith("/rl/recommendation")) {
-            handleRecommendation(payload);
-        } else if (topic.endsWith("/rl/status")) {
-            handleStatus(payload);
-        } else if (topic.endsWith("/rl/shot/ack")) {
-            handleShotDeliveryAck(payload);
-        }
+        enqueueInbound(topic, payload);
     });
+    if (xTaskCreate(connectionWorkerTask, "MQTT worker", 10240, this, 1, &connectionTaskHandle) != pdPASS) {
+        connectionTaskHandle = nullptr;
+        ESP_LOGE(LOG_TAG.c_str(), "Unable to start MQTT worker task");
+    }
+
+    pm->on("settings:changed", [this](Event const &) { requestReconnect(); });
 
     pm->on("rl:preference", [this](Event &event) {
         if (!isAutoTuningParticipating()) {
@@ -1397,7 +1819,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
             (hasRecommendation && !validateLatestRecommendation(reason))) {
             clearLatestRecommendationAndNotify();
         }
-        refreshAutoTuningSubscriptions();
+        requestReconnect();
         publishOptimizerSettings();
         publishMachineState("idle", true);
     });
@@ -1418,63 +1840,38 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
 
     pm->on("controller:wifi:connect", [this, ctrl](const Event &) { connect(ctrl); });
 
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
     pm->on("boiler:currentTemperature:change", [this](Event const &event) {
-        if (!mqttWasConnected)
-            return;
-        char json[50];
-        const float temp = event.getFloat("value");
-        if (temp != lastTemperature) {
-            snprintf(json, sizeof(json), R"***({"temperature":%02f})***", temp);
-            publish("boilers/0/temperature", json);
-        }
-        lastTemperature = temp;
+        pendingTemperature.store(event.getFloat("value"), std::memory_order_relaxed);
+        temperaturePublishPending.store(true, std::memory_order_release);
     });
 
     pm->on("boiler:targetTemperature:change", [this](Event const &event) {
-        if (!mqttWasConnected)
-            return;
-        char json[50];
-        const float temp = event.getFloat("value");
-        snprintf(json, sizeof(json), R"***({"temperature":%02f})***", temp);
-        publish("boilers/0/targetTemperature", json);
+        pendingTargetTemperature.store(event.getFloat("value"), std::memory_order_relaxed);
+        targetTemperaturePublishPending.store(true, std::memory_order_release);
     });
+#endif
 
     pm->on("controller:mode:change", [this](Event const &event) {
-        int newMode = event.getInt("value");
-        const char *modeStr;
-        switch (newMode) {
-        case 0:
-            modeStr = "Standby";
-            break;
-        case 1:
-            modeStr = "Brew";
-            break;
-        case 2:
-            modeStr = "Steam";
-            break;
-        case 3:
-            modeStr = "Water";
-            break;
-        case 4:
-            modeStr = "Grind";
-            break;
-        default:
-            modeStr = "Unknown";
-            break;
-        }
-        char json[100];
-        snprintf(json, sizeof(json), R"({"mode":%d,"mode_str":"%s"})", newMode, modeStr);
-        publish("controller/mode", json);
-        publishMachineState(newMode == MODE_STANDBY ? "standby" : "idle");
+        const int newMode = event.getInt("value");
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
+        pendingMode.store(newMode, std::memory_order_release);
+#endif
+        pendingMachineState.store(newMode == MODE_STANDBY ? PendingMachineState::Standby : PendingMachineState::Idle,
+                                  std::memory_order_release);
     });
 
     pm->on("controller:brew:start", [this](Event const &) {
-        publishBrewState("brewing");
-        publishMachineState("brewing");
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
+        pendingBrewState.store(1, std::memory_order_release);
+#endif
+        pendingMachineState.store(PendingMachineState::Brewing, std::memory_order_release);
     });
 
     pm->on("controller:brew:end", [this](Event const &) {
-        publishBrewState("not brewing");
-        publishMachineState("idle");
+#if GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
+        pendingBrewState.store(0, std::memory_order_release);
+#endif
+        pendingMachineState.store(PendingMachineState::Idle, std::memory_order_release);
     });
 }

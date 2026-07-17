@@ -88,6 +88,7 @@ export default function CompactProcessControls() {
     mode,
     processInfo: p,
     isActive,
+    isStarting,
     isFinished,
     isBrewing,
     isGrinding,
@@ -123,12 +124,12 @@ export default function CompactProcessControls() {
   } = ds;
 
   const showPrimary = mode === 1 || mode === 3 || (isGrinding && isGrindAvailable);
-  const showFlush = isBrewing && !isActive && !isFinished;
+  const showFlush = isBrewing && !isActive && !isStarting && !isFinished;
   const showWeight = volumetricAvailable && (mode === 1 || mode === 3) && brewTarget;
   const processRunning = (isActive || isFinished) && (isBrewing || isGrinding);
 
   const handlePrimary = () => {
-    if (isActive) deactivate();
+    if (isActive || isStarting) deactivate();
     else if (isFinished) clear();
     else activate();
   };
@@ -139,6 +140,7 @@ export default function CompactProcessControls() {
       : `${Math.round(grindTargetDuration / 1000)}s`;
 
   const renderContent = () => {
+    if (isStarting) return <InfoView title='Taring scale' hint='Preparing brew' />;
     if (processRunning && isFinished) return <FinishedView elapsed={fmtElapsed(p?.e)} />;
     if (processRunning) return <ActiveView p={p} grind={isGrinding} />;
     if (mode === 0) return <InfoView title='Standby' hint='Machine is ready' />;
@@ -264,9 +266,9 @@ export default function CompactProcessControls() {
               type='button'
               className='btn btn-circle btn-md btn-primary'
               onClick={handlePrimary}
-              aria-label={getPrimaryLabel(isActive, isFinished)}
+              aria-label={isStarting ? 'Cancel brew start' : getPrimaryLabel(isActive, isFinished)}
             >
-              <FontAwesomeIcon icon={getPrimaryIcon(isActive, isFinished)} className='text-lg' />
+              <FontAwesomeIcon icon={getPrimaryIcon(isActive || isStarting, isFinished)} className='text-lg' />
             </button>
           )}
         </div>

@@ -8,7 +8,7 @@ import { faSave } from '@fortawesome/free-solid-svg-icons/faSave';
 import { faTrashCan } from '@fortawesome/free-solid-svg-icons/faTrashCan';
 import { Spinner } from '../../components/Spinner.jsx';
 import { ApiServiceContext } from '../../services/ApiService.js';
-import { grindDirectionForStepDelta } from '../../utils/grinderDirection.js';
+import { formatGrinderSettingTransition } from '../../utils/grinderRecommendation.js';
 import {
   TASTE_LEVEL_LABELS,
   TASTE_LEVELS,
@@ -440,7 +440,6 @@ function currentRecommendation(settings, activeGrinder) {
     projectedRelativeStepFromReference: projectedRelative,
     currentAbsoluteStep: currentAbsolute,
     projectedAbsoluteStep: projectedAbsolute,
-    grinderStepDirection: activeGrinder?.step_direction || 'higher_is_finer',
     nextDoseG: optionalNumber(settings.rlRecommendationNextDoseG),
     targetYieldG: optionalNumber(settings.rlRecommendationTargetYieldG),
     targetRatio: optionalNumber(settings.rlRecommendationTargetRatio),
@@ -453,6 +452,7 @@ function recommendationStatus(recommendation) {
   }
   const labels = {
     accepted: 'Accepted',
+    edited: 'Edited',
     used: 'Accepted',
     ignored: 'Ignored',
     expired: 'Expired',
@@ -465,22 +465,12 @@ function recommendationGrind(recommendation) {
   if (!recommendation) {
     return '-';
   }
-  if (
-    Number.isFinite(recommendation.currentAbsoluteStep) &&
-    Number.isFinite(recommendation.projectedAbsoluteStep)
-  ) {
-    return `Set ${recommendation.currentAbsoluteStep.toFixed(1)} -> ${recommendation.projectedAbsoluteStep.toFixed(1)}`;
-  }
-  const delta = Number(recommendation.grindDeltaStepsFromCurrent || 0);
-  if (!Number.isFinite(delta) || Math.abs(delta) < 0.001) {
-    return 'Keep grind';
-  }
-  const magnitude = Math.abs(delta);
-  const steps = Number.isInteger(magnitude) ? magnitude.toFixed(0) : magnitude.toFixed(1);
-  return `${steps} step${Math.abs(magnitude - 1) < 0.001 ? '' : 's'} ${grindDirectionForStepDelta(
-    delta,
-    recommendation.grinderStepDirection,
-  )}`;
+  return formatGrinderSettingTransition({
+    currentAbsoluteStep: recommendation.currentAbsoluteStep,
+    projectedAbsoluteStep: recommendation.projectedAbsoluteStep,
+    projectedRelativeStep: recommendation.projectedRelativeStepFromReference,
+    deltaSteps: recommendation.grindDeltaStepsFromCurrent,
+  });
 }
 
 function runtimeHealth(settings) {
@@ -509,7 +499,7 @@ function runtimeHealth(settings) {
   if (providerMode === 'on_board') {
     return { tone: 'warning', summary: 'On-board optimization is not implemented yet.' };
   }
-  if (providerMode === 'off_board' && !settings?.homeAssistant) {
+  if (providerMode === 'off_board' && !settings?.rlMqttConfigured) {
     return { tone: 'warning', summary: 'Configure the MQTT broker to reach EspressoRL.' };
   }
   if (!settings?.rlStatusSeen) {
@@ -560,9 +550,7 @@ function RuntimeDetails({ settings }) {
           />
         )}
         {localDeliveryAttention && localDeliveryError && (
-          <div className='text-warning text-sm'>
-            Local delivery: {localDeliveryError}
-          </div>
+          <div className='text-warning text-sm'>Local delivery: {localDeliveryError}</div>
         )}
         {[...warnings, ...waiting].slice(0, 6).map(message => (
           <div key={message} className='text-base-content/70 text-sm'>
@@ -1077,13 +1065,6 @@ export function AutoTuning() {
                 <StatCard label='Ratio' value={formatNumber(recommendation.targetRatio, 2)} />
               </div>
               <div className='flex min-w-0 flex-col justify-end gap-2 lg:w-56'>
-                <div className='text-base-content/70 text-sm'>
-                  {recommendation.projectedRelativeStepFromReference === undefined
-                    ? 'Relative position unavailable'
-                    : `Projected position ${signedNumber(
-                        recommendation.projectedRelativeStepFromReference,
-                      )} steps from reference`}
-                </div>
                 <button
                   type='button'
                   className='btn btn-primary w-full'
@@ -1124,7 +1105,7 @@ export function AutoTuning() {
             <section className='space-y-3'>
               <h3 className='text-sm font-semibold tracking-wide uppercase'>Search policy</h3>
               <div
-                className='join join-vertical w-full sm:join-horizontal'
+                className='join join-vertical sm:join-horizontal w-full'
                 role='radiogroup'
                 aria-label='CPBO search policy'
               >

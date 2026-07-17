@@ -86,6 +86,71 @@ void Endpoint::sendBatch(const gm::Payload *payloads, size_t count) {
     pump();
 }
 
+void Endpoint::sendUrgentBatch(const gm::Payload *payloads, size_t count) {
+    if (payloads == nullptr || count == 0)
+        return;
+    if (count > MAX_PAYLOADS_PER_FRAME)
+        count = MAX_PAYLOADS_PER_FRAME;
+
+    lock();
+
+    // The transport preserves write order. Abandoning the previous frame means
+    // it cannot be retransmitted after this one; the receiver also rejects any
+    // late lower frame id as a duplicate. Remove queued values for the same
+    // control keys so stale state cannot follow the urgent transition.
+    for (pb_size_t i = 0; i < _inFlightPayloadCount; i++) {
+        const uint16_t oldKey = gm_proto::coalescingKey(_inFlightPayloads[i]);
+        bool superseded = false;
+        for (size_t j = 0; j < count; j++) {
+            if (gm_proto::coalescingKey(payloads[j]) == oldKey) {
+                superseded = true;
+                break;
+            }
+        }
+        if (!superseded) {
+            _queue.upsert(oldKey, gm_proto::defaultPriority(_inFlightPayloads[i].which_content), _inFlightPayloads[i]);
+        }
+    }
+    _inFlight = false;
+    _inFlightPayloadCount = 0;
+    _retries = 0;
+    _txLen = 0;
+    for (size_t i = 0; i < count; i++)
+        _queue.invalidate(gm_proto::coalescingKey(payloads[i]));
+
+    if (!_transport.isConnected()) {
+        for (size_t i = 0; i < count; i++)
+            _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::PRIO_HIGH, payloads[i]);
+        unlock();
+        return;
+    }
+
+    memset(&_txFrame, 0, sizeof(_txFrame));
+    _txFrame.id = _nextId++;
+    if (_nextId == 0)
+        _nextId = 1;
+    _txFrame.payloads_count = static_cast<pb_size_t>(count);
+    for (size_t i = 0; i < count; i++)
+        _txFrame.payloads[i] = payloads[i];
+
+    if (!encodeFrame(_txFrame, _txBuf, BUFFER_SIZE, &_txLen)) {
+        ESP_LOGE(ENDPOINT_TAG, "Failed to encode urgent outbound frame (%u payloads)", static_cast<unsigned>(count));
+        for (size_t i = 0; i < count; i++)
+            _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::PRIO_HIGH, payloads[i]);
+        unlock();
+        return;
+    }
+
+    _transport.send(_txBuf, _txLen);
+    _inFlight = true;
+    _inFlightPayloadCount = static_cast<pb_size_t>(count);
+    for (size_t i = 0; i < count; i++)
+        _inFlightPayloads[i] = payloads[i];
+    _inFlightId = _txFrame.id;
+    _sentAt = millis();
+    unlock();
+}
+
 void Endpoint::sendUnreliable(const gm::Payload &payload) { sendUnreliable(&payload, 1); }
 
 void Endpoint::sendUnreliable(const gm::Payload *payloads, size_t count) {
@@ -144,6 +209,7 @@ void Endpoint::pump() {
             // Give up; coalesced fresh values (or the next periodic update) will
             // resend. The in-flight slot frees up for new traffic.
             _inFlight = false;
+            _inFlightPayloadCount = 0;
         } else {
             _transport.send(_txBuf, _txLen);
             _sentAt = now;
@@ -187,6 +253,9 @@ void Endpoint::pump() {
 
     _transport.send(_txBuf, _txLen);
     _inFlight = true;
+    _inFlightPayloadCount = count;
+    for (pb_size_t i = 0; i < count; i++)
+        _inFlightPayloads[i] = _txFrame.payloads[i];
     _inFlightId = _txFrame.id;
     _sentAt = now;
     _retries = 0;
@@ -216,6 +285,7 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
             _rttValid = true;
         }
         _inFlight = false;
+        _inFlightPayloadCount = 0;
     }
     if (id != 0 && id <= _lastRxId)
         duplicate = true; // retransmit of an already-processed frame
@@ -258,6 +328,7 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
 void Endpoint::handleConnection(bool connected) {
     lock();
     _inFlight = false;
+    _inFlightPayloadCount = 0;
     _retries = 0;
     _txLen = 0;
     _inFlightId = 0;

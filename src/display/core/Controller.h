@@ -28,19 +28,23 @@ const IPAddress WIFI_SUBNET_MASK(255, 255, 255, 0); // no need to change: https:
 // ScaleSourceResolver.h (included above) so the routing logic stays a small,
 // Arduino-free unit.
 
-// Commands posted from any task; drained on the Arduino loop task at the top of
-// Controller::loop(). External callers (WebUI, LVGL, plugins) MUST use
+// Commands posted from any task; drained on the controller logic task. External
+// callers (WebUI, LVGL, plugins, transport callbacks) MUST use
 // postCommand() rather than calling the corresponding mutator directly so that
 // process-state mutation only happens on a single task.
 enum class CtrlCmd : uint8_t {
     ACTIVATE,
     DEACTIVATE,
+    DEACTIVATE_CLEAR,
     CLEAR,
     ACTIVATE_GRIND,
     DEACTIVATE_GRIND,
     ACTIVATE_STANDBY,
     DEACTIVATE_STANDBY,
     SET_MODE,
+    CHANGE_MODE,
+    START_FLUSH,
+    BUTTON_STATE,
     RAISE_TEMP,
     LOWER_TEMP,
     RAISE_GRIND_TARGET,
@@ -58,7 +62,7 @@ class Controller {
     void connect();
     void loop();
     void loopLogic();
-    void loopControl();
+    void loopControl(bool urgent = false);
 
     void setMode(int newMode);
     void setTargetTemp(float temperature);
@@ -75,6 +79,13 @@ class Controller {
     virtual float getCurrentTemp() const { return currentTemp.load(std::memory_order_relaxed); }
     bool isActive() const;
     bool isGrindActive() const;
+    bool isBrewStartPending() const {
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        return pendingHardwareScaleBrewStart.load(std::memory_order_acquire);
+#else
+        return false;
+#endif
+    }
     bool isUpdating() const;
     bool isAutotuning() const;
     bool isReady() const;
@@ -207,7 +218,7 @@ class Controller {
     void setupWifi();
 
     // Functional methods
-    void updateControl();
+    void updateControl(bool urgent = false);
     // Switch the BLE connection interval based on whether a process is running.
     // force re-applies even if the desired state is unchanged (use on connect).
     void applyConnectionPriority(bool force = false);
@@ -239,6 +250,7 @@ class Controller {
     void onTempRead(float temperature);
 
     void handleBrewButton(int brewButtonStatus);
+    void handleControllerButton(uint8_t index, bool pressed);
     void handleSteamButton(int steamButtonStatus);
     void handleWaterButton(int buttonStatus);
     void handleProfileButton(int buttonStatus, String id);
@@ -295,7 +307,7 @@ class Controller {
     Process *currentProcess = nullptr;
     Process *lastProcess = nullptr;
 
-    // External-mutation queue, drained on the Arduino loop task.
+    // External-mutation queue, drained on the controller logic task.
     QueueHandle_t cmdQueue = nullptr;
 
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
@@ -305,8 +317,8 @@ class Controller {
     static constexpr float HARDWARE_SCALE_MAX_ABS_G = 5000.0f;
     static constexpr float HARDWARE_SCALE_MAX_STDDEV_G = 5.0f;
     static constexpr unsigned long HARDWARE_SCALE_BREW_TARE_TIMEOUT_MS = 4000;
-    bool pendingHardwareScaleBrewStart = false;
-    bool pendingHardwareScaleBrewStartReady = false;
+    std::atomic<bool> pendingHardwareScaleBrewStart{false};
+    std::atomic<bool> pendingHardwareScaleBrewStartReady{false};
     unsigned long pendingHardwareScaleBrewTareStartedAt = 0;
 #endif
 
@@ -357,7 +369,7 @@ class Controller {
     static const unsigned long BLUETOOTH_MEASUREMENT_GRACE_MS = 2000;
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
 
-    xTaskHandle logicTaskHandle;
+    xTaskHandle logicTaskHandle = nullptr;
 
     static void loopLogicTask(void *arg);
 };

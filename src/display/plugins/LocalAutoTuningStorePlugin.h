@@ -23,6 +23,8 @@ class LocalAutoTuningStorePlugin : public Plugin,
     bool storeShot(AutoTuning::ShotRecord const &shot, AutoTuning::ShotCompletion const &completion,
                    AutoTuning::ShotCaptureDisposition const &disposition) override;
     bool storeRecommendation(AutoTuning::Recommendation const &recommendation) override;
+    bool correctShot(AutoTuning::ShotCorrection const &correction, AutoTuning::CorrectedShotRecord &corrected,
+                     std::string &reason) override;
     bool loadShotSummary(const String &shotId, JsonDocument &out) const;
     bool hasShotReplay(const String &shotId) const;
     bool canRemoveShotData(const String &shotId) const;

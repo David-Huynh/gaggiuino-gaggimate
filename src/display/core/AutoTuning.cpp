@@ -57,8 +57,8 @@ bool validateRecommendationTargets(RecommendationTargets const &targets, RecipeD
         return false;
     }
     if (!std::isfinite(targets.grindDeltaStepsFromCurrent) ||
-        std::fabs(targets.grindDeltaStepsFromCurrent) > domain.grindRadiusSteps) {
-        reason = "recommended grind change is outside the configured recipe domain";
+        std::fabs(targets.grindDeltaStepsFromCurrent) > RECIPE_DOMAIN_GRIND_RADIUS_MAX_STEPS) {
+        reason = "recommended grind change is outside the integrity envelope";
         return false;
     }
     const float derivedRatio = targets.targetYieldG / targets.nextDoseG;

@@ -15,11 +15,10 @@ class NimBLEClient;
 /**
  * Display-side protocol facade.
  *
- * Owns a BLE client transport + Endpoint and exposes semantic send methods and
- * typed response callbacks. The connect sequence is asynchronous: the link is
- * established via connectToServer(), and the controller's SystemInfo arrives as
- * a pushed message (onSystemInfo) which is when capability-dependent setup
- * should run.
+ * Owns a BLE or UART client transport plus Endpoint and exposes semantic send
+ * methods and typed response callbacks. BLE connects asynchronously through
+ * connectToServer(); UART is pumped by a dedicated task. In either case the
+ * controller's pushed SystemInfo is where capability-dependent setup begins.
  */
 class GaggiMateClient {
   public:
@@ -43,11 +42,13 @@ class GaggiMateClient {
     using ScaleCalibrationResultCallback = std::function<void(uint8_t channel, float calibration)>;
 
     GaggiMateClient();
+    ~GaggiMateClient();
 
     void init(const String &deviceName);
     void loop();
 
-    // Connection lifecycle (driven from the display's main loop).
+    // Connection lifecycle. BLE is driven from the display main loop; UART has
+    // its own receive/retransmit pump.
     bool isReadyForConnection() const {
 #ifdef GAGGIMATE_UART_COMMS
         return false;
@@ -148,6 +149,7 @@ class GaggiMateClient {
     // from build*() helpers -- e.g. the display's delta-based control update.
     void send(const gm::Payload &payload) { _endpoint.send(payload); }
     void sendBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendBatch(payloads, count); }
+    void sendUrgentBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendUrgentBatch(payloads, count); }
 
     // Fired when the connected controller is missing the framed-comms
     // characteristics (old / incompatible firmware); link is kept for OTA.
@@ -170,6 +172,9 @@ class GaggiMateClient {
   private:
 #ifdef GAGGIMATE_UART_COMMS
     UartTransport _transport;
+#if !defined(ARDUINO_ARCH_STM32)
+    TaskHandle_t _pumpTask = nullptr;
+#endif
 #else
     BleClientTransport _transport;
 #endif
@@ -193,6 +198,12 @@ class GaggiMateClient {
     ScaleCalibrationResultCallback _scaleCalibrationResultCb;
 
     void registerHandlers();
+#ifdef GAGGIMATE_UART_COMMS
+    void pumpOnce();
+#if !defined(ARDUINO_ARCH_STM32)
+    static void pumpTaskFn(void *arg);
+#endif
+#endif
 };
 
 #endif // GAGGIMATE_CLIENT_H

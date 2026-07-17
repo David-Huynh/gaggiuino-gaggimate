@@ -5,6 +5,7 @@
 #include "../core/Controller.h"
 #include "../core/PluginManager.h"
 #include "autotuning/AutoTuningTasteGoalJson.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 
@@ -137,6 +138,41 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
         }
     });
 
+    pm->on("rl:prompts:invalidated", [this](Event const &event) {
+        const String shotId = event.getString("shot_id");
+        if (shotId.isEmpty()) {
+            hasPendingRecommendation = false;
+            pendingRecommendationId = "";
+            pendingRecommendationStatus = "";
+            pendingDosePrompts.clear();
+            pendingPreferencePrompts.clear();
+            pendingDoseShotId = "";
+            pendingDoseTargetG = 0.0f;
+            closeOverlay();
+            return;
+        }
+
+        if (pendingDoseShotId == shotId) {
+            pendingDoseShotId = "";
+            pendingDoseTargetG = 0.0f;
+            if (overlayMode == AutoTuningOverlayMode::DOSE_CONFIRMATION) {
+                clearOverlay(false);
+            }
+        }
+        if (pendingShotId == shotId) {
+            clearOverlay(true);
+        }
+        pendingDosePrompts.erase(
+            std::remove_if(pendingDosePrompts.begin(), pendingDosePrompts.end(),
+                           [&shotId](Event const &pending) { return pending.getString("shot_id") == shotId; }),
+            pendingDosePrompts.end());
+        pendingPreferencePrompts.erase(
+            std::remove_if(pendingPreferencePrompts.begin(), pendingPreferencePrompts.end(),
+                           [&shotId](Event const &pending) { return pending.getString("shot_id") == shotId; }),
+            pendingPreferencePrompts.end());
+        showNextPendingOverlay();
+    });
+
     pm->on("controller:brew:start", [this](Event const &) {
         if (!pendingPreferenceRunId.isEmpty()) {
             clearOverlay(false);
@@ -244,8 +280,9 @@ void AutoTuningPreferencePlugin::storeRecommendation(Event const &event) {
         return;
     }
     pendingRecommendationStatus = AutoTuning::recommendationStatusKey(recommendation->status);
-    pendingStepDirection = recommendation->stepDirection.c_str();
-    pendingGrindDeltaStepsFromCurrent = recommendation->grindDeltaStepsFromCurrent;
+    pendingProjectedRelativeStepFromReference = recommendation->projectedRelativeStepFromReference;
+    pendingCurrentRelativeStepFromReference =
+        pendingProjectedRelativeStepFromReference - recommendation->grindDeltaStepsFromCurrent;
     pendingHasCurrentAbsoluteStep = recommendation->currentAbsoluteStep.has_value();
     pendingCurrentAbsoluteStep = recommendation->currentAbsoluteStep.value_or(0.0f);
     pendingHasProjectedAbsoluteStep = recommendation->projectedAbsoluteStep.has_value();
@@ -358,25 +395,17 @@ void AutoTuningPreferencePlugin::showRecommendationOverlay() {
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
 
-    const char *grindText = "Keep grind";
     char grindBuffer[64];
     if (pendingHasCurrentAbsoluteStep && pendingHasProjectedAbsoluteStep) {
-        snprintf(grindBuffer, sizeof(grindBuffer), "Set grinder %.1f -> %.1f", pendingCurrentAbsoluteStep,
+        snprintf(grindBuffer, sizeof(grindBuffer), "Grind %.1f -> %.1f", pendingCurrentAbsoluteStep,
                  pendingProjectedAbsoluteStep);
-        grindText = grindBuffer;
-    } else if (fabsf(pendingGrindDeltaStepsFromCurrent) >= 0.001f) {
-        const float magnitude = fabsf(pendingGrindDeltaStepsFromCurrent);
-        const float finenessDelta =
-            pendingStepDirection == "higher_is_coarser" ? -pendingGrindDeltaStepsFromCurrent : pendingGrindDeltaStepsFromCurrent;
-        char stepText[16];
-        snprintf(stepText, sizeof(stepText), fabsf(magnitude - roundf(magnitude)) < 0.001f ? "%.0f" : "%.1f", magnitude);
-        snprintf(grindBuffer, sizeof(grindBuffer), "Go %s step%s %s", stepText, fabsf(magnitude - 1.0f) < 0.001f ? "" : "s",
-                 finenessDelta > 0 ? "finer" : "coarser");
-        grindText = grindBuffer;
+    } else {
+        snprintf(grindBuffer, sizeof(grindBuffer), "Grind %.1f -> %.1f rel.", pendingCurrentRelativeStepFromReference,
+                 pendingProjectedRelativeStepFromReference);
     }
 
     char recipe[160];
-    snprintf(recipe, sizeof(recipe), "%s\nDose %.1fg  Yield %.1fg\nRatio %.2f", grindText, pendingNextDoseG, pendingTargetYieldG,
+    snprintf(recipe, sizeof(recipe), "%s\nDose %.1fg  Yield %.1fg\nRatio %.2f", grindBuffer, pendingNextDoseG, pendingTargetYieldG,
              pendingTargetRatio);
     lv_obj_t *details = lv_label_create(card);
     lv_label_set_text(details, recipe);

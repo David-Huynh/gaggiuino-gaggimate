@@ -9,6 +9,7 @@
 #include <display/core/AutoTuning.h>
 #include <display/core/Controller.h>
 #include <display/core/EpochTime.h>
+#include <display/core/FeatureFlags.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
@@ -698,6 +699,42 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["tp"] = "evt:rl:dose-confirmation-resolved";
         doc["shot_id"] = event.getString("shot_id");
         doc["followed"] = event.getInt("followed") == 1;
+        doc["persisted"] = event.getInt("persisted") == 1;
+        ws.textAll(doc.as<String>());
+    });
+
+    pluginManager->on("rl:prompts:invalidated", [this](Event const &event) {
+        const String shotId = event.getString("shot_id");
+        if (shotId.isEmpty()) {
+            clearPendingPreferencePrompt();
+            clearPendingDoseConfirmation();
+            _queuedPreferencePrompts.clear();
+            _queuedDoseConfirmations.clear();
+            _pendRecJson = "";
+        } else {
+            if (_pendingPreferenceShotId == shotId) {
+                clearPendingPreferencePrompt();
+                advancePreferencePrompt();
+            }
+            if (_pendingDoseShotId == shotId) {
+                clearPendingDoseConfirmation();
+                advanceDoseConfirmation();
+            }
+            _queuedPreferencePrompts.erase(
+                std::remove_if(_queuedPreferencePrompts.begin(), _queuedPreferencePrompts.end(),
+                               [&shotId](Event const &pending) { return pending.getString("shot_id") == shotId; }),
+                _queuedPreferencePrompts.end());
+            _queuedDoseConfirmations.erase(
+                std::remove_if(_queuedDoseConfirmations.begin(), _queuedDoseConfirmations.end(),
+                               [&shotId](Event const &pending) { return pending.getString("shot_id") == shotId; }),
+                _queuedDoseConfirmations.end());
+        }
+
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:prompts-clear";
+        if (!shotId.isEmpty()) {
+            doc["shot_id"] = shotId;
+        }
         ws.textAll(doc.as<String>());
     });
 
@@ -765,6 +802,10 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlProviderMode"] = settings.getRLAutoTuningProviderMode();
         doc["rlProviderStatus"] = router.providerStatus();
         doc["rlProviderSummary"] = router.providerSummary();
+        const int mqttPort = settings.getHomeAssistantPort();
+        doc["rlMqttConfigured"] = !settings.getHomeAssistantIP().isEmpty() && mqttPort > 0 && mqttPort <= 65535;
+        doc["rlMqttConnected"] = controller->getOptimizerTransport() && controller->getOptimizerTransport()->connected();
+        doc["legacyHomeAssistantMqttAvailable"] = FeatureFlags::legacyHomeAssistantMqtt;
         doc["rlBeanContextId"] = settings.getRLBeanContextId();
         doc["rlBeanContextName"] = settings.getRLBeanContextName();
         doc["rlGrinderContextId"] = settings.getRLGrinderContextId();
@@ -1025,6 +1066,7 @@ void WebUIPlugin::loop() {
         statusDoc["fl"] = controller->getCurrentPumpFlow();
         statusDoc["pt"] = controller->getTargetPressure();
         statusDoc["m"] = controller->getMode();
+        statusDoc["bsp"] = controller->isBrewStartPending() ? 1 : 0;
         statusDoc["p"] = controller->getProfileManager()->getSelectedProfile().label;
         statusDoc["puid"] = controller->getProfileManager()->getSelectedProfile().id;
         statusDoc["cp"] = controller->getSystemInfo().capabilities.pressure;
@@ -1821,8 +1863,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                 } else if (msgType == "req:process:activate") {
                     controller->postCommand(CtrlCmd::ACTIVATE);
                 } else if (msgType == "req:process:deactivate") {
-                    controller->postCommand(CtrlCmd::DEACTIVATE);
-                    controller->postCommand(CtrlCmd::CLEAR);
+                    controller->postCommand(CtrlCmd::DEACTIVATE_CLEAR);
                 } else if (msgType == "req:process:clear") {
                     controller->postCommand(CtrlCmd::CLEAR);
                 } else if (msgType == "req:grind:activate") {
@@ -1849,9 +1890,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                 } else if (msgType == "req:change-mode") {
                     if (doc["mode"].is<uint8_t>()) {
                         auto mode = doc["mode"].as<uint8_t>();
-                        controller->postCommand(CtrlCmd::DEACTIVATE);
-                        controller->postCommand(CtrlCmd::CLEAR);
-                        controller->postCommand(CtrlCmd::SET_MODE, mode);
+                        controller->postCommand(CtrlCmd::CHANGE_MODE, mode);
                     }
                 } else if (msgType == "req:change-brew-target") {
                     if (doc["target"].is<uint8_t>()) {
@@ -2646,6 +2685,10 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlProviderMode"] = settings.getRLAutoTuningProviderMode();
     doc["rlProviderStatus"] = router.providerStatus();
     doc["rlProviderSummary"] = router.providerSummary();
+    const int mqttPort = settings.getHomeAssistantPort();
+    doc["rlMqttConfigured"] = !settings.getHomeAssistantIP().isEmpty() && mqttPort > 0 && mqttPort <= 65535;
+    doc["rlMqttConnected"] = controller->getOptimizerTransport() && controller->getOptimizerTransport()->connected();
+    doc["legacyHomeAssistantMqttAvailable"] = FeatureFlags::legacyHomeAssistantMqtt;
     doc["rlBeanContextId"] = settings.getRLBeanContextId();
     doc["rlBeanContextName"] = settings.getRLBeanContextName();
     doc["rlGrinderContextId"] = settings.getRLGrinderContextId();
@@ -3030,7 +3073,7 @@ void WebUIPlugin::sendAutotuneFailed() {
 }
 
 void WebUIPlugin::handleFlushStart(uint32_t clientId, JsonDocument &request) {
-    controller->onFlush();
+    controller->postCommand(CtrlCmd::START_FLUSH);
 
     JsonDocument response(&psramAllocator);
     response["tp"] = "res:flush:start";

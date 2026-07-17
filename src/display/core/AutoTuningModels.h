@@ -84,6 +84,32 @@ struct ShotSample {
     std::uint16_t elapsedMs = 0;
 };
 
+struct LiveShotStarted {
+    std::string shotId;
+    std::string machineId;
+    Timestamp startedAtMs = 0;
+    std::uint16_t sampleIntervalMs = 250;
+    std::string weightSource;
+    std::string flowSource;
+};
+
+struct LiveShotSample {
+    std::string shotId;
+    std::string machineId;
+    Timestamp timestampMs = 0;
+    std::uint16_t sequence = 0;
+    ShotSample sample;
+};
+
+struct LiveShotEnded {
+    std::string shotId;
+    std::string machineId;
+    Timestamp endedAtMs = 0;
+    std::uint16_t finalSequence = 0;
+    std::uint16_t elapsedMs = 0;
+    std::string endState;
+};
+
 struct GrinderSnapshot {
     std::string contextId;
     std::string contextName;
@@ -129,6 +155,7 @@ enum class RecommendationStatus : std::uint8_t {
     Pending,
     Shown,
     Accepted,
+    Edited,
     Ignored,
     Used,
     Superseded,
@@ -214,6 +241,13 @@ struct ShotRecord {
     ArrayView<const ShotSample> samples;
 
     bool hasUsableDose() const { return (doseObserved && measuredDoseG.has_value()) || doseTargetConfirmed; }
+};
+
+struct CorrectedShotRecord {
+    ShotRecord record;
+    std::vector<ShotSample> samples;
+
+    void bindSamples() { record.samples = ArrayView<const ShotSample>(samples.data(), samples.size()); }
 };
 
 struct ShotCompletion {
@@ -323,6 +357,11 @@ struct ShotCorrection {
     std::optional<bool> grindFollowed;
     std::optional<bool> doseFollowed;
     std::optional<bool> yieldFollowed;
+    std::optional<float> relativeGrindStepsFromReference;
+    std::optional<float> currentAbsoluteStep;
+    std::optional<float> doseInG;
+    std::optional<float> targetYieldG;
+    std::optional<float> beverageOutG;
     std::vector<std::string> tags;
 };
 

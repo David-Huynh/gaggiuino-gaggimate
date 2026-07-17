@@ -5,6 +5,7 @@
 #include "../Transport.h"
 #include "UartFraming.h"
 #include <Arduino.h>
+#include <atomic>
 #if defined(ARDUINO_ARCH_STM32)
 #include <STM32FreeRTOS.h>
 #include <semphr.h>
@@ -36,7 +37,7 @@ class UartTransport : public Transport {
     void loop();  // drain RX, dispatch frames, expire the link, send keepalives
 
     bool send(const uint8_t *data, size_t length) override;
-    bool isConnected() const override { return _connected; }
+    bool isConnected() const override { return _connected.load(std::memory_order_acquire); }
     void disconnect() override;
     UartDiagnostics getDiagnostics() const { return _diagnostics; }
 
@@ -52,7 +53,7 @@ class UartTransport : public Transport {
     Stream &_stream;
     SemaphoreHandle_t _txMutex = nullptr;
 
-    bool _connected = false;
+    std::atomic<bool> _connected{false};
     unsigned long _lastRxMs = 0;
     unsigned long _lastKeepaliveMs = 0;
 

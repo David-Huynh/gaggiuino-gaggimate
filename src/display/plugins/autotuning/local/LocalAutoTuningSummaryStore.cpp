@@ -270,12 +270,8 @@ bool LocalAutoTuningSummaryStore::upsertRecommendation(JsonObjectConst raw) {
     return LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(RECOMMENDATION_DIR, recommendationId), outDoc);
 }
 
-bool LocalAutoTuningSummaryStore::patchShotCorrection(const String &shotId, bool hasGrindFollowed, bool grindFollowed,
-                                                      bool hasDoseFollowed, bool doseFollowed, bool hasYieldFollowed,
-                                                      bool yieldFollowed) {
-    if (!hasGrindFollowed && !hasDoseFollowed && !hasYieldFollowed) {
-        return false;
-    }
+bool LocalAutoTuningSummaryStore::patchShotCorrection(const String &shotId,
+                                                      AutoTuning::ShotCorrection const &correction) {
     JsonDocument doc(&psramAllocator);
     const String path = LocalAutoTuningFiles::recordPath(SHOT_DIR, shotId);
     if (!LocalAutoTuningFiles::readJson(path, doc)) {
@@ -285,17 +281,73 @@ bool LocalAutoTuningSummaryStore::patchShotCorrection(const String &shotId, bool
     std::optional<bool> storedGrind = optionalBool(root["grind_followed"]);
     std::optional<bool> storedDose = optionalBool(root["dose_followed"]);
     std::optional<bool> storedYield = optionalBool(root["yield_followed"]);
-    if (hasGrindFollowed) {
-        root["grind_followed"] = grindFollowed;
-        storedGrind = grindFollowed;
+    if (correction.grindFollowed.has_value()) {
+        root["grind_followed"] = *correction.grindFollowed;
+        storedGrind = *correction.grindFollowed;
     }
-    if (hasDoseFollowed) {
-        root["dose_followed"] = doseFollowed;
-        storedDose = doseFollowed;
+    if (correction.doseFollowed.has_value()) {
+        root["dose_followed"] = *correction.doseFollowed;
+        storedDose = *correction.doseFollowed;
     }
-    if (hasYieldFollowed) {
-        root["yield_followed"] = yieldFollowed;
-        storedYield = yieldFollowed;
+    if (correction.yieldFollowed.has_value()) {
+        root["yield_followed"] = *correction.yieldFollowed;
+        storedYield = *correction.yieldFollowed;
+    }
+    if (correction.excludeFromLocalOptimization.has_value()) {
+        root["exclude_from_local_optimization"] = *correction.excludeFromLocalOptimization;
+    }
+
+    JsonObject observed = root["action_observed"].as<JsonObject>();
+    if (observed.isNull()) {
+        observed = root["action_observed"].to<JsonObject>();
+    }
+    if (correction.relativeGrindStepsFromReference.has_value()) {
+        const float relative = *correction.relativeGrindStepsFromReference;
+        root["relative_grind_steps_from_reference"] = relative;
+        if (jsonNumber(root["absolute_reference_step"])) {
+            root["current_absolute_step"] = root["absolute_reference_step"].as<float>() + relative;
+        }
+        if (jsonNumber(root["microns_per_step"])) {
+            const char *direction = root["step_direction"] | "higher_is_finer";
+            const float directionSign = String(direction) == "higher_is_finer" ? 1.0f : -1.0f;
+            root["relative_grind_um_from_reference"] = relative * root["microns_per_step"].as<float>() * directionSign;
+        }
+        observed["grind"] = true;
+    } else if (correction.currentAbsoluteStep.has_value()) {
+        root["current_absolute_step"] = *correction.currentAbsoluteStep;
+        if (jsonNumber(root["absolute_reference_step"])) {
+            const float relative = *correction.currentAbsoluteStep - root["absolute_reference_step"].as<float>();
+            root["relative_grind_steps_from_reference"] = relative;
+            if (jsonNumber(root["microns_per_step"])) {
+                const char *direction = root["step_direction"] | "higher_is_finer";
+                const float directionSign = String(direction) == "higher_is_finer" ? 1.0f : -1.0f;
+                root["relative_grind_um_from_reference"] =
+                    relative * root["microns_per_step"].as<float>() * directionSign;
+            }
+        }
+        observed["grind"] = true;
+    }
+    if (correction.doseInG.has_value()) {
+        root["dose_in_g"] = *correction.doseInG;
+        root["dose_observed"] = true;
+        root["dose_target_g"] = *correction.doseInG;
+        root.remove("dose_target_confirmed");
+        observed["dose"] = true;
+    }
+    if (correction.targetYieldG.has_value()) {
+        root["target_yield_g"] = *correction.targetYieldG;
+        observed["target_yield"] = true;
+    }
+    if (correction.beverageOutG.has_value()) {
+        root["beverage_out_g"] = *correction.beverageOutG;
+        root["beverage_out_observation"] = "user_corrected";
+    }
+    if (jsonNumber(root["dose_target_g"]) && root["dose_target_g"].as<float>() > 0.0f &&
+        jsonNumber(root["target_yield_g"])) {
+        root["target_ratio"] = root["target_yield_g"].as<float>() / root["dose_target_g"].as<float>();
+    }
+    if (jsonNumber(root["dose_in_g"]) && root["dose_in_g"].as<float>() > 0.0f && jsonNumber(root["beverage_out_g"])) {
+        root["brew_ratio"] = root["beverage_out_g"].as<float>() / root["dose_in_g"].as<float>();
     }
     const AutoTuning::FollowThroughStatus followThrough = AutoTuning::deriveFollowThrough(storedGrind, storedDose, storedYield);
     if (followThrough == AutoTuning::FollowThroughStatus::Unknown) {

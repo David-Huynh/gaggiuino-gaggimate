@@ -11,8 +11,7 @@ void action_on_wakeup(lv_event_t *e) {
         return;
     }
     controller.getUI()->changeScreen(SCREEN_ID_BREW_SCREEN);
-    controller.deactivate();
-    controller.setMode(MODE_BREW);
+    controller.postCommand(CtrlCmd::CHANGE_MODE, MODE_BREW);
 };
 
 void action_on_load_started(lv_event_t *e) {
@@ -20,37 +19,33 @@ void action_on_load_started(lv_event_t *e) {
 };
 
 void action_on_menu_click(lv_event_t *e) {
-    controller.deactivate();
+    controller.postCommand(CtrlCmd::DEACTIVATE);
     controller.getUI()->changeScreen(SCREEN_ID_MENU_SCREEN_NEW);
 };
 
 void action_on_brew_screen(lv_event_t *e) {
     controller.getUI()->changeScreen(SCREEN_ID_BREW_SCREEN);
-    controller.deactivate();
-    controller.setMode(MODE_BREW);
+    controller.postCommand(CtrlCmd::CHANGE_MODE, MODE_BREW);
 };
 
 void action_on_steam_screen(lv_event_t *e) {
     controller.getUI()->changeScreen(SCREEN_ID_STEAM_SCREEN);
-    controller.setMode(MODE_STEAM);
-    controller.deactivate();
+    controller.postCommand(CtrlCmd::CHANGE_MODE, MODE_STEAM);
 };
 
 void action_on_water_screen(lv_event_t *e) {
     controller.getUI()->changeScreen(SCREEN_ID_WATER_SCREEN);
-    controller.setMode(MODE_WATER);
-    controller.deactivate();
+    controller.postCommand(CtrlCmd::CHANGE_MODE, MODE_WATER);
 };
 
 void action_on_grind_screen(lv_event_t *e) {
     controller.getUI()->changeScreen(SCREEN_ID_GRIND_SCREEN);
-    controller.setMode(MODE_GRIND);
-    controller.deactivate();
+    controller.postCommand(CtrlCmd::CHANGE_MODE, MODE_GRIND);
 };
 
-void action_on_brew_start(lv_event_t *e) { controller.activate(); };
+void action_on_brew_start(lv_event_t *e) { controller.postCommand(CtrlCmd::ACTIVATE); };
 
-void action_on_flush(lv_event_t *e) { controller.onFlush(); };
+void action_on_flush(lv_event_t *e) { controller.postCommand(CtrlCmd::START_FLUSH); };
 
 void action_on_volumetric_hold(lv_event_t *e) {
     controller.getClientController()->tare();
@@ -63,12 +58,12 @@ void action_on_profile_settings(lv_event_t *e) { controller.getUI()->changeBrewS
 
 void action_on_brew_temp_lower(lv_event_t *e) {
     controller.getUI()->markProfileDirty();
-    controller.lowerTemp();
+    controller.postCommand(CtrlCmd::LOWER_TEMP);
 };
 
 void action_on_brew_temp_raise(lv_event_t *e) {
     controller.getUI()->markProfileDirty();
-    controller.raiseTemp();
+    controller.postCommand(CtrlCmd::RAISE_TEMP);
 };
 
 void action_on_brew_time_raise(lv_event_t *e) {
@@ -185,13 +180,13 @@ void action_on_meter_draw(lv_event_t *e) {
     }
 };
 
-void action_on_steam_temp_lower(lv_event_t *e) { controller.lowerTemp(); };
+void action_on_steam_temp_lower(lv_event_t *e) { controller.postCommand(CtrlCmd::LOWER_TEMP); };
 
-void action_on_steam_temp_raise(lv_event_t *e) { controller.raiseTemp(); };
+void action_on_steam_temp_raise(lv_event_t *e) { controller.postCommand(CtrlCmd::RAISE_TEMP); };
 
-void action_on_grind_time_lower(lv_event_t *e) { controller.lowerGrindTarget(); };
+void action_on_grind_time_lower(lv_event_t *e) { controller.postCommand(CtrlCmd::LOWER_GRIND_TARGET); };
 
-void action_on_grind_time_raise(lv_event_t *e) { controller.raiseGrindTarget(); };
+void action_on_grind_time_raise(lv_event_t *e) { controller.postCommand(CtrlCmd::RAISE_GRIND_TARGET); };
 
 void action_on_timed_click(lv_event_t *e) {
 
@@ -203,12 +198,12 @@ void action_on_volumetric_click(lv_event_t *e) {
 };
 
 void action_on_grind_toggle(lv_event_t *e) {
-    controller.isGrindActive() ? controller.deactivateGrind() : controller.activateGrind();
+    controller.postCommand(controller.isGrindActive() ? CtrlCmd::DEACTIVATE_GRIND : CtrlCmd::ACTIVATE_GRIND);
 };
 
 void action_on_simple_process_toggle(lv_event_t *e) {
     if (controller.getMode() != MODE_STEAM) {
-        controller.isActive() ? controller.deactivate() : controller.activate();
+        controller.postCommand(controller.isActive() ? CtrlCmd::DEACTIVATE : CtrlCmd::ACTIVATE);
     }
 };
 
@@ -219,11 +214,10 @@ void action_on_previous_profile(lv_event_t *e) { controller.getUI()->onPreviousP
 void action_on_next_profile(lv_event_t *e) { controller.getUI()->onNextProfile(); };
 
 void action_on_brew_cancel(lv_event_t *e) {
-    controller.deactivate();
-    controller.clear();
+    controller.postCommand(CtrlCmd::DEACTIVATE_CLEAR);
 }
 
-void action_on_standby(lv_event_t *e) { controller.activateStandby(); }
+void action_on_standby(lv_event_t *e) { controller.postCommand(CtrlCmd::ACTIVATE_STANDBY); }
 
 void applyClickArea(lv_obj_t *obj, lv_coord_t size) {
     if (obj == nullptr) {

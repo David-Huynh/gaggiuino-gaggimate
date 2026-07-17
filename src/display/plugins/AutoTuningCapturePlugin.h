@@ -5,6 +5,10 @@
 #include <display/core/AutoTuningModels.h>
 #include <display/core/Event.h>
 #include <display/util/PsramStlAllocator.h>
+#include <atomic>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -16,11 +20,14 @@ class AutoTuningCapturePlugin : public Plugin {
   private:
     void resetShotCapture();
     void recordShotSample();
+    void publishLiveShotStarted();
+    void publishLiveShotEnded(const char *endState);
     bool latchShotStop(unsigned long finishedAtMs);
     void trimShotSamplesToElapsed(uint16_t elapsedMs);
     bool trimShotSamplesToInactiveControlTail();
     void appendShotStopSample(uint16_t elapsedMs, float weightG);
     void publishShotProfile();
+    void persistPendingShot();
     void captureCompletedGrindDose();
     void handleRecommendationReceived(Event const &event);
     void clearLatestRecommendation();
@@ -41,16 +48,26 @@ class AutoTuningCapturePlugin : public Plugin {
     Controller *controller = nullptr;
     PluginManager *pluginManager = nullptr;
 
+    using ShotSampleVector = std::vector<AutoTuning::ShotSample, PsramStlAllocator<AutoTuning::ShotSample>>;
+    struct PendingShot {
+        AutoTuning::ShotRecord shot;
+        AutoTuning::ShotCompletion completion;
+        AutoTuning::ShotCaptureDisposition disposition;
+        ShotSampleVector samples;
+    };
+
     bool isBrewing = false;
     unsigned long brewStartMs = 0;
     unsigned long lastSampleMs = 0;
+    AutoTuning::Timestamp liveShotStartedAtMs = 0;
+    bool liveShotActive = false;
     uint16_t shotStopElapsedMs = 0;
     float shotStopWeightG = 0.0f;
     String currentShotId;
     int shotSource = 0;
-    float currentBluetoothWeight = 0.0f;
-    float currentHardwareWeight = 0.0f;
-    float currentEstimatedWeight = 0.0f;
+    std::atomic<float> currentBluetoothWeight{0.0f};
+    std::atomic<float> currentHardwareWeight{0.0f};
+    std::atomic<float> currentEstimatedWeight{0.0f};
 
     bool pendingMeasuredDoseAvailable = false;
     float pendingMeasuredDoseG = 0.0f;
@@ -65,7 +82,11 @@ class AutoTuningCapturePlugin : public Plugin {
     bool shotHasRecommendation = false;
     AutoTuning::RecommendationReference shotRecommendation;
 
-    std::vector<AutoTuning::ShotSample, PsramStlAllocator<AutoTuning::ShotSample>> shotSamples;
+    mutable std::mutex captureMutex;
+    std::mutex pendingShotMutex;
+    std::deque<std::unique_ptr<PendingShot>> pendingShots;
+    unsigned long nextPersistAttemptMs = 0;
+    ShotSampleVector shotSamples;
 };
 
 extern AutoTuningCapturePlugin AutoTuningCapture;

@@ -47,7 +47,7 @@ void UartTransport::loop() {
     }
 
     const unsigned long now = millis();
-    if (_connected && now - _lastRxMs > LINK_TIMEOUT_MS)
+    if (_connected.load(std::memory_order_acquire) && now - _lastRxMs > LINK_TIMEOUT_MS)
         setConnected(false);
 
     // Not gated on _connected -- see the header for why.
@@ -141,9 +141,8 @@ void UartTransport::markAlive() {
 }
 
 void UartTransport::setConnected(bool connected) {
-    if (_connected == connected)
+    if (_connected.exchange(connected, std::memory_order_acq_rel) == connected)
         return;
-    _connected = connected;
     if (connected) {
         _diagnostics.displayLinkUpCount++;
     } else {

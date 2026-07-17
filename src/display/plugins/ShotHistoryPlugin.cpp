@@ -79,6 +79,26 @@ String padId(String id, int length = 6) {
     return id;
 }
 
+bool readOptionalCorrectionFloat(JsonObjectConst source, const char *key, std::optional<float> &out, String &reason) {
+    JsonVariantConst value = source[key];
+    if (value.isNull()) {
+        out.reset();
+        return true;
+    }
+    if (value.is<bool>() ||
+        !(value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>())) {
+        reason = String("Correction field '") + key + "' must be numeric";
+        return false;
+    }
+    const float parsed = value.as<float>();
+    if (!std::isfinite(parsed)) {
+        reason = String("Correction field '") + key + "' must be finite";
+        return false;
+    }
+    out = parsed;
+    return true;
+}
+
 } // namespace
 
 ShotHistoryPlugin ShotHistory;
@@ -114,6 +134,8 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     }
     xTaskCreatePinnedToCore(loopTask, "ShotHistoryPlugin::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle, 0);
 }
+
+void ShotHistoryPlugin::loop() {}
 
 float ShotHistoryPlugin::sourceWeight(VolumetricMeasurementSource source) const {
     switch (source) {
@@ -501,17 +523,38 @@ void ShotHistoryPlugin::rememberRLShotHistoryMapping(Event const &event) {
     const String shotId = event.getString("shot_id");
     if (shotId.isEmpty() || currentId.isEmpty())
         return;
-    const String historyId = String(currentId.toInt(), 10);
+
+    PendingRLShotHistoryMapping mapping;
+    mapping.historyId = String(currentId.toInt(), 10);
+    mapping.shotId = shotId;
+    mapping.recommendationId = event.getString("recommendation_id");
+    std::lock_guard<std::mutex> guard(pendingRLMappingMutex);
+    pendingRLMappings.push_back(std::move(mapping));
+}
+
+void ShotHistoryPlugin::persistNextRLShotHistoryMapping() {
+    // The recorder task owns the open .slog file. Wait until it has flushed and
+    // closed so notes never enter LittleFS concurrently with shot finalization.
+    if (isFileOpen)
+        return;
+
+    PendingRLShotHistoryMapping mapping;
+    {
+        std::lock_guard<std::mutex> guard(pendingRLMappingMutex);
+        if (pendingRLMappings.empty())
+            return;
+        mapping = std::move(pendingRLMappings.front());
+        pendingRLMappings.pop_front();
+    }
 
     JsonDocument notes(&psramAllocator);
-    loadNotes(historyId, notes);
-    notes["id"] = historyId;
-    notes["rlShotId"] = shotId;
-    const String recommendationId = event.getString("recommendation_id");
-    if (!recommendationId.isEmpty()) {
-        notes["rlRecommendationId"] = recommendationId;
+    loadNotes(mapping.historyId, notes);
+    notes["id"] = mapping.historyId;
+    notes["rlShotId"] = mapping.shotId;
+    if (!mapping.recommendationId.isEmpty()) {
+        notes["rlRecommendationId"] = mapping.recommendationId;
     }
-    saveNotes(historyId, notes);
+    saveNotes(mapping.historyId, notes);
 }
 
 void ShotHistoryPlugin::attachAutoTuningSummary(JsonDocument &response, JsonObjectConst notes) const {
@@ -691,8 +734,79 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         attachAutoTuningSummary(response, notes.as<JsonObjectConst>());
     } else if (type == "req:history:notes:save") {
         auto id = request["id"].as<String>();
-        JsonDocument notes; // explicit document: variant->const JsonDocument& is ambiguous on clang
+        if (!request["notes"].is<JsonObjectConst>()) {
+            response["error"] = "Shot notes must be an object";
+            return;
+        }
+        JsonDocument existingNotes(&psramAllocator);
+        loadNotes(id, existingNotes);
+        const String rlShotId = existingNotes["rlShotId"].as<String>();
+        const String rlRecommendationId = existingNotes["rlRecommendationId"].as<String>();
+
+        JsonDocument notes(&psramAllocator); // variant->const JsonDocument& is ambiguous on clang
         notes.set(request["notes"]);
+        notes.remove("rlShotId");
+        notes.remove("rlRecommendationId");
+        notes["id"] = id;
+        if (!rlShotId.isEmpty()) {
+            notes["rlShotId"] = rlShotId;
+        }
+        if (!rlRecommendationId.isEmpty()) {
+            notes["rlRecommendationId"] = rlRecommendationId;
+        }
+
+        JsonVariantConst correctionValue = request["shot_correction"];
+        if (!correctionValue.isNull()) {
+            if (!correctionValue.is<JsonObjectConst>()) {
+                response["error"] = "Shot correction must be an object";
+            } else if (rlShotId.isEmpty()) {
+                response["error"] = "This history entry is not linked to an auto-tuning shot";
+            } else {
+                AutoTuning::ShotCorrection correction;
+                correction.shotId = rlShotId.c_str();
+                correction.source = "gaggimate_shot_history";
+                JsonObjectConst correctionJson = correctionValue.as<JsonObjectConst>();
+                String correctionError;
+                const bool valid =
+                    readOptionalCorrectionFloat(correctionJson, "relative_grind_steps_from_reference",
+                                                correction.relativeGrindStepsFromReference, correctionError) &&
+                    readOptionalCorrectionFloat(correctionJson, "current_absolute_step", correction.currentAbsoluteStep,
+                                                correctionError) &&
+                    readOptionalCorrectionFloat(correctionJson, "dose_in_g", correction.doseInG, correctionError) &&
+                    readOptionalCorrectionFloat(correctionJson, "target_yield_g", correction.targetYieldG,
+                                                correctionError) &&
+                    readOptionalCorrectionFloat(correctionJson, "beverage_out_g", correction.beverageOutG,
+                                                correctionError);
+                if (!valid) {
+                    response["error"] = correctionError;
+                } else {
+                    AutoTuning::AutoTuningRecordStorePort *store = controller->getAutoTuningRecordStore();
+                    AutoTuning::CorrectedShotRecord corrected;
+                    std::string reason;
+                    if (!store || !store->correctShot(correction, corrected, reason)) {
+                        response["error"] = reason.empty() ? "Unable to correct the stored shot" : reason.c_str();
+                    } else {
+                        Event correctionEvent;
+                        correctionEvent.id = "rl:shot:correction";
+                        correctionEvent.setString("shot_id", rlShotId);
+                        correctionEvent.setPayload(correction);
+                        pluginManager->trigger(correctionEvent);
+                        response["optimizer_persisted"] = correctionEvent.getInt("optimizer_persisted") == 1;
+
+                        AutoTuning::CommunityUploadPort *community = controller->getCommunityUpload();
+                        const bool hasCorrectedReplay = !corrected.record.shotId.empty();
+                        response["community_replacement_queued"] =
+                            hasCorrectedReplay && community && community->enqueueShot(corrected.record);
+                    }
+                }
+            }
+        }
+
+        if (!response["error"].isNull()) {
+            attachAutoTuningSummary(response, existingNotes.as<JsonObjectConst>());
+            return;
+        }
+
         saveNotes(id, notes);
         // Update rating and volume in index
         uint8_t rating = notes["rating"].as<uint8_t>();
@@ -741,6 +855,7 @@ void ShotHistoryPlugin::loopTask(void *arg) {
     auto *plugin = static_cast<ShotHistoryPlugin *>(arg);
     while (true) {
         plugin->record();
+        plugin->persistNextRLShotHistoryMapping();
         // Use canonical interval from shot log format to avoid divergence.
         vTaskDelay(SHOT_LOG_SAMPLE_INTERVAL_MS / portTICK_PERIOD_MS);
     }

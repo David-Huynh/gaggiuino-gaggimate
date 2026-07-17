@@ -1,0 +1,14 @@
+#ifndef GAGGIMATE_FEATURE_FLAGS_H
+#define GAGGIMATE_FEATURE_FLAGS_H
+
+#ifndef GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT
+#define GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT 1
+#endif
+
+namespace FeatureFlags {
+
+inline constexpr bool legacyHomeAssistantMqtt = GAGGIMATE_ENABLE_LEGACY_HOME_ASSISTANT_MQTT != 0;
+
+} // namespace FeatureFlags
+
+#endif // GAGGIMATE_FEATURE_FLAGS_H

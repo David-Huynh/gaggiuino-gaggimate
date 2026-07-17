@@ -10,6 +10,7 @@ import { OptimizationStrip } from '../OptimizationStrip.jsx';
 export function ActionCard({
   mode,
   isActive,
+  isStarting,
   isFinished,
   isBrewing,
   isGrinding,
@@ -40,19 +41,20 @@ export function ActionCard({
   const showStandby = mode === 0;
   const showSteam = mode === 2;
 
-  const showFlush = isBrewing && !isActive && !isFinished;
+  const showFlush = isBrewing && !isActive && !isStarting && !isFinished;
   const grindValue =
     grindTarget === 1 && volumetricAvailable
       ? `${grindTargetVolume}g`
       : `${Math.round(grindTargetDuration / 1000)}s`;
 
   const handlePrimary = () => {
-    if (isActive) deactivate();
+    if (isActive || isStarting) deactivate();
     else if (isFinished) clear();
     else activate();
   };
 
-  const primaryLabel = getPrimaryLabel(isActive, isFinished);
+  const primaryActive = isActive || isStarting;
+  const primaryLabel = isStarting ? 'Cancel brew start' : getPrimaryLabel(isActive, isFinished);
 
   useEffect(() => {
     setPreheated(false);
@@ -97,7 +99,7 @@ export function ActionCard({
           aria-label={primaryLabel}
           title={primaryLabel}
         >
-          <FontAwesomeIcon icon={getPrimaryIcon(isActive, isFinished)} className='text-2xl' />
+          <FontAwesomeIcon icon={getPrimaryIcon(primaryActive, isFinished)} className='text-2xl' />
         </button>
       )}
       {showStandby && (
@@ -128,6 +130,7 @@ export function ActionCard({
 ActionCard.propTypes = {
   mode: PropTypes.number.isRequired,
   isActive: PropTypes.bool.isRequired,
+  isStarting: PropTypes.bool.isRequired,
   isFinished: PropTypes.bool.isRequired,
   isBrewing: PropTypes.bool.isRequired,
   isGrinding: PropTypes.bool.isRequired,
