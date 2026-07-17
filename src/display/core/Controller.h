@@ -21,15 +21,39 @@ const IPAddress WIFI_SUBNET_MASK(255, 255, 255, 0); // no need to change: https:
 
 enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH };
 
+// Commands posted from any task are drained on the controller logic task so
+// process-state mutation has one deterministic owner.
+enum class CtrlCmd : uint8_t {
+    ACTIVATE,
+    DEACTIVATE,
+    DEACTIVATE_CLEAR,
+    CLEAR,
+    ACTIVATE_GRIND,
+    DEACTIVATE_GRIND,
+    ACTIVATE_STANDBY,
+    DEACTIVATE_STANDBY,
+    SET_MODE,
+    CHANGE_MODE,
+    START_FLUSH,
+    BUTTON_STATE,
+    RAISE_TEMP,
+    LOWER_TEMP,
+    RAISE_GRIND_TARGET,
+    LOWER_GRIND_TARGET,
+};
+
 class Controller {
   public:
     Controller() = default;
+
+    // Thread-safe and non-blocking for WebUI, LVGL, plugin, and transport tasks.
+    void postCommand(CtrlCmd cmd, int32_t arg = 0);
 
     void setup();
     void connect();
     void loop();
     void loopLogic();
-    void loopControl();
+    void loopControl(bool urgent = false);
 
     void setMode(int newMode);
     void setTargetTemp(float temperature);
@@ -141,7 +165,7 @@ class Controller {
     void setupWifi();
 
     // Functional methods
-    void updateControl();
+    void updateControl(bool urgent = false);
     // Switch the BLE connection interval based on whether a process is running.
     // force re-applies even if the desired state is unchanged (use on connect).
     void applyConnectionPriority(bool force = false);
@@ -151,14 +175,16 @@ class Controller {
     // so plugin handlers never run under the lock (avoids lock-order inversions).
     bool isActiveLocked() const { return currentProcess != nullptr && currentProcess->isActive(); }
     void startProcessLocked(Process *process, std::vector<const char *> &events);
-    void deactivateLocked(std::vector<const char *> &events);
+    bool deactivateLocked(std::vector<const char *> &events);
     void clearLocked(std::vector<const char *> &events);
     void dispatchEvents(const std::vector<const char *> &events);
+    void drainCommandQueue();
 
     // Event handlers
     void onTempRead(float temperature);
 
     void handleBrewButton(int brewButtonStatus);
+    void handleControllerButton(uint8_t index, bool pressed);
     void handleSteamButton(int steamButtonStatus);
     void handleWaterButton(int buttonStatus);
     void handleProfileButton(int buttonStatus, String id);
@@ -212,6 +238,8 @@ class Controller {
     Process *currentProcess = nullptr;
     Process *lastProcess = nullptr;
 
+    QueueHandle_t cmdQueue = nullptr;
+
     unsigned long grindActiveUntil = 0;
     unsigned long lastPing = 0;
     unsigned long lastProgress = 0;
@@ -246,7 +274,7 @@ class Controller {
     static const unsigned long BLUETOOTH_GRACE_PERIOD_MS = 1500; // 1.5 second grace period
     static const unsigned long CONTROLLER_WAITING_TIMEOUT_MS = 10000;
 
-    xTaskHandle logicTaskHandle;
+    xTaskHandle logicTaskHandle = nullptr;
 
     static void loopLogicTask(void *arg);
 };

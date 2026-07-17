@@ -7,6 +7,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+namespace AutoTuning {
+struct ShotCorrection;
+}
+
 class CommunityUploadQueue {
   public:
     enum class Status : std::uint8_t {
@@ -51,8 +55,7 @@ class CommunityUploadQueue {
     void recover();
     bool enqueue(const String &uploadId, const String &recordType, const String &recordId, const String &payloadJson,
                  const String &endpoint, std::int64_t createdAt, std::int64_t nextRetryAt, bool replaceRecord);
-    bool patchShotCorrection(const String &shotId, bool hasGrindFollowed, bool grindFollowed, bool hasDoseFollowed,
-                             bool doseFollowed, bool hasYieldFollowed, bool yieldFollowed, std::int64_t updatedAt,
+    bool patchShotCorrection(const String &shotId, AutoTuning::ShotCorrection const &correction, std::int64_t updatedAt,
                              std::int64_t nextRetryAt);
     bool selectReady(const String &endpoint, std::int64_t now, Item &item, String &payloadJson) const;
     MutationResult replaceIfCurrent(Item const &expected, const String &expectedPayload, Item replacement,

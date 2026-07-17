@@ -234,9 +234,7 @@ bool CommunityUploadPlugin::applyCorrection(AutoTuning::ShotCorrection const &co
     }
     const EpochSeconds updatedAt = nowEpoch();
     const bool patched = uploadQueue.patchShotCorrection(
-        correction.shotId.c_str(), correction.grindFollowed.has_value(), correction.grindFollowed.value_or(false),
-        correction.doseFollowed.has_value(), correction.doseFollowed.value_or(false), correction.yieldFollowed.has_value(),
-        correction.yieldFollowed.value_or(false), updatedAt,
+        correction.shotId.c_str(), correction, updatedAt,
         updatedAt + static_cast<EpochSeconds>(RECOMMENDATION_UPLOAD_GRACE_SECONDS));
     if (patched) {
         publishStatus();

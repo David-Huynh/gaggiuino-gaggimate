@@ -52,8 +52,8 @@ class AutoTuningPreferencePlugin : public Plugin {
 
     String pendingRecommendationId;
     String pendingRecommendationStatus;
-    String pendingStepDirection = "higher_is_finer";
-    float pendingGrindDeltaStepsFromCurrent = 0.0f;
+    float pendingCurrentRelativeStepFromReference = 0.0f;
+    float pendingProjectedRelativeStepFromReference = 0.0f;
     bool pendingHasCurrentAbsoluteStep = false;
     float pendingCurrentAbsoluteStep = 0.0f;
     bool pendingHasProjectedAbsoluteStep = false;

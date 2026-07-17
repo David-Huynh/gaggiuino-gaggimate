@@ -6,6 +6,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <display/core/AutoTuning.h>
 #include <display/core/Controller.h>
@@ -185,14 +186,28 @@ void LocalAutoTuningStorePlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("rl:dose-confirmation", [this](Event const &event) { handleDoseConfirmation(event); });
     pm->on("rl:shot:reprocess", [this](Event const &event) { handleShotReprocess(event); });
     pm->on("rl:shot:delivery:ack", [this](Event const &event) { handleShotDeliveryAck(event); });
-    pm->on("rl:local:shot:delete", [this](Event const &event) { removeShotData(event.getString("shot_id"), true); });
+    pm->on("rl:local:shot:delete", [this](Event const &event) {
+        const String shotId = event.getString("shot_id");
+        if (!removeShotData(shotId, true)) {
+            return;
+        }
+        Event invalidated;
+        invalidated.id = "rl:prompts:invalidated";
+        invalidated.setString("shot_id", shotId);
+        pluginManager->trigger(invalidated);
+    });
     pm->on("rl:shot:correction", [this](Event const &event) { handleShotCorrection(event); });
     pm->on("rl:community-upload:ready", [this](Event const &) { dispatchPendingCommunityUploads(); });
     pm->on("rl:recommendation:apply", [this](Event const &event) { handleRecommendationApply(event); });
     pm->on("rl:recommendation:ignore", [this](Event const &event) { handleRecommendationIgnore(event); });
     pm->on("rl:local:reset", [this](Event const &) {
-        reset();
+        const bool resetComplete = reset();
         snapshotContexts();
+        if (resetComplete) {
+            Event invalidated;
+            invalidated.id = "rl:prompts:invalidated";
+            pluginManager->trigger(invalidated);
+        }
     });
 
     publishStatus();
@@ -227,6 +242,160 @@ bool LocalAutoTuningStorePlugin::storeShot(AutoTuning::ShotRecord const &shot, A
         nextDeliveryCheckAt = 0;
     }
     refreshDeliveryStatus();
+    publishStatus();
+    return true;
+}
+
+bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &correction,
+                                             AutoTuning::CorrectedShotRecord &corrected, std::string &reason) {
+    reason.clear();
+    if (!controller || correction.shotId.empty()) {
+        reason = "Shot correction is missing its shot ID";
+        return false;
+    }
+    if (!correction.relativeGrindStepsFromReference.has_value() && !correction.currentAbsoluteStep.has_value() &&
+        !correction.doseInG.has_value() && !correction.targetYieldG.has_value() && !correction.beverageOutG.has_value()) {
+        reason = "Shot correction contains no editable parameters";
+        return false;
+    }
+
+    auto finite = [](std::optional<float> const &value) { return !value.has_value() || std::isfinite(*value); };
+    if (!finite(correction.relativeGrindStepsFromReference) || !finite(correction.currentAbsoluteStep) ||
+        !finite(correction.doseInG) || !finite(correction.targetYieldG) || !finite(correction.beverageOutG)) {
+        reason = "Shot correction values must be finite";
+        return false;
+    }
+
+    if (correction.relativeGrindStepsFromReference.has_value() &&
+        std::fabs(*correction.relativeGrindStepsFromReference) > AutoTuning::RECIPE_DOMAIN_GRIND_RADIUS_MAX_STEPS) {
+        reason = "Corrected grind setting is outside the integrity envelope";
+        return false;
+    }
+    if (correction.doseInG.has_value() &&
+        (*correction.doseInG < AutoTuning::RECIPE_DOMAIN_DOSE_MIN_G ||
+         *correction.doseInG > AutoTuning::RECIPE_DOMAIN_DOSE_MAX_G)) {
+        reason = "Corrected dose is outside the integrity envelope";
+        return false;
+    }
+    if (correction.targetYieldG.has_value() &&
+        (*correction.targetYieldG < AutoTuning::RECIPE_DOMAIN_OUTPUT_MIN_G ||
+         *correction.targetYieldG > AutoTuning::RECIPE_DOMAIN_OUTPUT_MAX_G)) {
+        reason = "Corrected target yield is outside the integrity envelope";
+        return false;
+    }
+    if (correction.beverageOutG.has_value() &&
+        (*correction.beverageOutG < AutoTuning::RECIPE_DOMAIN_OUTPUT_MIN_G ||
+         *correction.beverageOutG > AutoTuning::RECIPE_DOMAIN_OUTPUT_MAX_G)) {
+        reason = "Corrected beverage output is outside the integrity envelope";
+        return false;
+    }
+
+    JsonDocument envelope(&psramAllocator);
+    if (!loadReplaySnapshot(correction.shotId.c_str(), envelope)) {
+        summaryStore.patchShotCorrection(correction.shotId.c_str(), correction);
+        publishStatus();
+        return true;
+    }
+    JsonVariantConst payload = envelope["payload"];
+    AutoTuningJsonCodec::DecodedShotRecord decoded;
+    String parseError;
+    if (!AutoTuningJsonCodec::parseShotRecord(payload, decoded, parseError)) {
+        reason = parseError.c_str();
+        return false;
+    }
+    if (decoded.record.shotId != correction.shotId) {
+        reason = "Shot correction does not match the stored replay";
+        return false;
+    }
+
+    AutoTuning::ShotRecord &record = decoded.record;
+    AutoTuning::GrinderSnapshot &grinder = record.recipe.grinder;
+    std::optional<float> relativeGrind = correction.relativeGrindStepsFromReference;
+    if (correction.currentAbsoluteStep.has_value()) {
+        if (!grinder.absoluteReferenceStep.has_value()) {
+            reason = "This shot has no absolute grinder reference";
+            return false;
+        }
+        const float derivedRelative = *correction.currentAbsoluteStep - *grinder.absoluteReferenceStep;
+        if (relativeGrind.has_value() && std::fabs(*relativeGrind - derivedRelative) > 0.01f) {
+            reason = "Absolute and relative grind corrections disagree";
+            return false;
+        }
+        relativeGrind = derivedRelative;
+    }
+
+    if (relativeGrind.has_value() &&
+        std::fabs(*relativeGrind) > AutoTuning::RECIPE_DOMAIN_GRIND_RADIUS_MAX_STEPS) {
+        reason = "Corrected grind setting is outside the integrity envelope";
+        return false;
+    }
+    if (relativeGrind.has_value()) {
+        grinder.relativeStepsFromReference = *relativeGrind;
+        grinder.observed = true;
+        if (grinder.absoluteReferenceStep.has_value()) {
+            grinder.currentAbsoluteStep = *grinder.absoluteReferenceStep + *relativeGrind;
+        }
+        if (grinder.micronsPerStep.has_value()) {
+            const float directionSign = grinder.stepDirection == "higher_is_finer" ? 1.0f : -1.0f;
+            grinder.relativeMicronsFromReference = *relativeGrind * *grinder.micronsPerStep * directionSign;
+        }
+    }
+    if (correction.doseInG.has_value()) {
+        record.measuredDoseG = *correction.doseInG;
+        record.doseObserved = true;
+        record.doseTargetConfirmed = false;
+        record.recipe.doseTargetG = *correction.doseInG;
+    }
+    if (correction.targetYieldG.has_value()) {
+        record.recipe.targetYieldG = *correction.targetYieldG;
+    }
+    if (correction.beverageOutG.has_value()) {
+        record.beverageOutG = *correction.beverageOutG;
+        record.beverageOutObservation = "user_corrected";
+    }
+    if (record.recipe.doseTargetG.has_value() && record.recipe.targetYieldG.has_value()) {
+        record.recipe.targetRatio = *record.recipe.targetYieldG / *record.recipe.doseTargetG;
+    }
+
+    if (!record.recipe.doseTargetG.has_value() || !record.recipe.targetYieldG.has_value() ||
+        !record.recipe.targetRatio.has_value()) {
+        reason = "Corrected shot is missing a complete optimizer recipe";
+        return false;
+    }
+    if (*record.recipe.doseTargetG < AutoTuning::RECIPE_DOMAIN_DOSE_MIN_G ||
+        *record.recipe.doseTargetG > AutoTuning::RECIPE_DOMAIN_DOSE_MAX_G ||
+        *record.recipe.targetYieldG < AutoTuning::RECIPE_DOMAIN_OUTPUT_MIN_G ||
+        *record.recipe.targetYieldG > AutoTuning::RECIPE_DOMAIN_OUTPUT_MAX_G ||
+        !std::isfinite(*record.recipe.targetRatio) || *record.recipe.targetRatio <= 0.0f) {
+        reason = "Corrected recipe is outside the integrity envelope";
+        return false;
+    }
+
+    corrected.record = record;
+    corrected.samples.assign(decoded.samples.begin(), decoded.samples.end());
+    corrected.bindSamples();
+
+    JsonDocument correctedPayload(&psramAllocator);
+    if (!AutoTuningJsonCodec::writeShotRecord(corrected.record, correctedPayload)) {
+        reason = "Unable to serialize the corrected shot";
+        return false;
+    }
+    JsonObject replay = envelope.as<JsonObject>();
+    replay["payload"].set(correctedPayload.as<JsonObjectConst>());
+    replay["payload_revision"] = (replay["payload_revision"] | 0) + 1;
+    replay["corrected_at"] = nowEpoch();
+    replay["updated_at"] = nowEpoch();
+    if (replay["community_required"] | false) {
+        replay["community_dispatched"] = false;
+    }
+    if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, correction.shotId.c_str()), envelope)) {
+        reason = "Unable to persist the corrected shot replay";
+        return false;
+    }
+    if (!summaryStore.upsertShot(correctedPayload.as<JsonObjectConst>())) {
+        reason = "Unable to persist the corrected shot summary";
+        return false;
+    }
     publishStatus();
     return true;
 }
@@ -347,6 +516,17 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
     }
     JsonDocument envelope(&psramAllocator);
     if (!loadReplaySnapshot(shotId, envelope)) {
+        if (hasShotReplay(shotId)) {
+            ESP_LOGE(LOG_TAG, "Failed to load dose confirmation replay for shot %s", shotId.c_str());
+            return;
+        }
+        ESP_LOGW(LOG_TAG, "Discarding stale dose confirmation for unavailable shot %s", shotId.c_str());
+        Event resolved;
+        resolved.id = "rl:dose-confirmation:resolved";
+        resolved.setString("shot_id", shotId);
+        resolved.setInt("followed", event.getInt("followed") == 1 ? 1 : 0);
+        resolved.setInt("persisted", 0);
+        pluginManager->trigger(resolved);
         return;
     }
     JsonObject root = envelope.as<JsonObject>();
@@ -367,6 +547,7 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
     root["local_next_retry_at"] = 0;
     root["updated_at"] = nowEpoch();
     if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
+        ESP_LOGE(LOG_TAG, "Failed to persist dose confirmation for shot %s", shotId.c_str());
         return;
     }
 
@@ -375,6 +556,7 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
     resolved.id = "rl:dose-confirmation:resolved";
     resolved.setString("shot_id", shotId);
     resolved.setInt("followed", followed ? 1 : 0);
+    resolved.setInt("persisted", 1);
     pluginManager->trigger(resolved);
     deliveryWorkPending = true;
     nextDeliveryCheckAt = 0;
@@ -757,10 +939,7 @@ void LocalAutoTuningStorePlugin::handleShotCorrection(Event const &event) {
     if (!correction || correction->shotId.empty()) {
         return;
     }
-    if (summaryStore.patchShotCorrection(correction->shotId.c_str(), correction->grindFollowed.has_value(),
-                                         correction->grindFollowed.value_or(false), correction->doseFollowed.has_value(),
-                                         correction->doseFollowed.value_or(false), correction->yieldFollowed.has_value(),
-                                         correction->yieldFollowed.value_or(false))) {
+    if (summaryStore.patchShotCorrection(correction->shotId.c_str(), *correction)) {
         publishStatus();
     }
 }

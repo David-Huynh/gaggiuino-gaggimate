@@ -51,8 +51,89 @@
 
 const String LOG_TAG = F("Controller");
 
+struct CtrlCmdMsg {
+    CtrlCmd type;
+    int32_t arg;
+};
+
+void Controller::postCommand(CtrlCmd cmd, int32_t arg) {
+    if (cmdQueue == nullptr)
+        return;
+
+    CtrlCmdMsg msg{cmd, arg};
+    if (xQueueSend(cmdQueue, &msg, 0) != pdTRUE) {
+        ESP_LOGW(LOG_TAG.c_str(), "Controller cmdQueue full, dropped cmd=%u", static_cast<unsigned>(cmd));
+        return;
+    }
+    if (logicTaskHandle != nullptr)
+        xTaskNotifyGive(logicTaskHandle);
+}
+
+void Controller::drainCommandQueue() {
+    if (cmdQueue == nullptr)
+        return;
+
+    CtrlCmdMsg msg;
+    while (xQueueReceive(cmdQueue, &msg, 0) == pdTRUE) {
+        switch (msg.type) {
+        case CtrlCmd::ACTIVATE:
+            activate();
+            break;
+        case CtrlCmd::DEACTIVATE:
+            deactivate();
+            break;
+        case CtrlCmd::DEACTIVATE_CLEAR:
+            deactivate();
+            clear();
+            break;
+        case CtrlCmd::CLEAR:
+            clear();
+            break;
+        case CtrlCmd::ACTIVATE_GRIND:
+            activateGrind();
+            break;
+        case CtrlCmd::DEACTIVATE_GRIND:
+            deactivateGrind();
+            break;
+        case CtrlCmd::ACTIVATE_STANDBY:
+            activateStandby();
+            break;
+        case CtrlCmd::DEACTIVATE_STANDBY:
+            deactivateStandby();
+            break;
+        case CtrlCmd::SET_MODE:
+            setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::CHANGE_MODE:
+            deactivate();
+            clear();
+            setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::START_FLUSH:
+            onFlush();
+            break;
+        case CtrlCmd::BUTTON_STATE:
+            handleControllerButton(static_cast<uint8_t>((msg.arg >> 1) & 0xFF), (msg.arg & 1) != 0);
+            break;
+        case CtrlCmd::RAISE_TEMP:
+            raiseTemp();
+            break;
+        case CtrlCmd::LOWER_TEMP:
+            lowerTemp();
+            break;
+        case CtrlCmd::RAISE_GRIND_TARGET:
+            raiseGrindTarget();
+            break;
+        case CtrlCmd::LOWER_GRIND_TARGET:
+            lowerGrindTarget();
+            break;
+        }
+    }
+}
+
 void Controller::setup() {
     mode = MODE_STANDBY;
+    cmdQueue = xQueueCreate(16, sizeof(CtrlCmdMsg));
 
     // Web assets are served from this partition. LittleFS (not SPIFFS): SPIFFS
     // has no directory tree, so stat()/exists() is O(whole filesystem) and a
@@ -96,9 +177,9 @@ void Controller::setup() {
         pluginManager->registerPlugin(new SmartGrindPlugin());
     }
 #ifndef GAGGIMATE_SIM // MQTT/HomeAssistant is device-only
-    if (settings.isHomeAssistant()) {
-        pluginManager->registerPlugin(new MQTTPlugin());
-    }
+    // The optimizer transport must exist even when legacy Home Assistant MQTT
+    // is disabled, including when off-board optimization is enabled at runtime.
+    pluginManager->registerPlugin(new MQTTPlugin());
 #ifndef GAGGIMATE_HEADLESS
     pluginManager->registerPlugin(new AutoTuningPreferencePlugin());
 #endif
@@ -289,50 +370,8 @@ void Controller::setupBluetooth() {
         pluginManager->trigger("pump:puck-resistance:change", "value", puckResistance);
     });
     comms.onButtonState([this](uint8_t index, bool pressed) {
-        const int status = pressed ? 1 : 0;
-        String behavior = settings.getButtonBehavior(index);
-        ESP_LOGV("Controller", "Button %d changed to %d, behavior: %s", index, status, behavior);
-        if (behavior == "" || behavior == "none") {
-            return;
-        }
-        if (behavior == "brew") {
-            handleBrewButton(status);
-            return;
-        }
-        if (behavior == "steam") {
-            handleSteamButton(status);
-            return;
-        }
-        if (behavior == "water") {
-            handleWaterButton(status);
-            return;
-        }
-        if (behavior == "flush") {
-            // Flush is a one-shot fixed-duration BrewProcess. Trigger on
-            // press only; release does nothing so the user can't
-            // accidentally cancel mid-flush by letting go (push button)
-            // or flipping the rocker back. onFlush() itself is a no-op
-            // if a process is already active, so rapid presses don't
-            // queue.
-            //
-            // Ensure we land in MODE_BREW so the flush UI renders, but
-            // only when no other process is currently running. Mutating
-            // mode mid-process would orphan the active mode's UI while
-            // onFlush() silently no-ops on the re-entrancy guard. The
-            // setMode guard mirrors the pattern other button handlers
-            // use when they need to switch modes safely.
-            if (status) {
-                if (getMode() == MODE_STANDBY) {
-                    deactivateStandby();
-                }
-                if (getMode() != MODE_BREW && !isActive()) {
-                    setMode(MODE_BREW);
-                }
-                onFlush();
-            }
-            return;
-        }
-        handleProfileButton(status, behavior);
+        const int32_t packed = (static_cast<int32_t>(index) << 1) | (pressed ? 1 : 0);
+        postCommand(CtrlCmd::BUTTON_STATE, packed);
     });
     comms.onError([this](int error) {
         // Autotune timeout = info-level, not runaway. Controller already
@@ -559,8 +598,6 @@ void Controller::loop() {
         pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
     }
 
-    pluginManager->loop();
-
     if (screenReady && !initialized) {
         connect();
     }
@@ -568,6 +605,8 @@ void Controller::loop() {
     if (initialized) {
         comms.loop(); // drive the comms send pump + retransmit
     }
+
+    pluginManager->loop();
 
     unsigned long now = millis();
 
@@ -607,6 +646,7 @@ void Controller::loopLogic() {
 
     // Process lifecycle under the lock (GM-147); events and NVS writes deferred past unlock.
     std::vector<const char *> events;
+    bool processEnded = false;
     double newBrewDelay = -1.0;
     double newGrindDelay = -1.0;
     {
@@ -622,7 +662,7 @@ void Controller::loopLogic() {
             }
             currentProcess->progress();
             if (!isActiveLocked()) {
-                deactivateLocked(events);
+                processEnded = deactivateLocked(events);
             }
         }
 
@@ -645,6 +685,10 @@ void Controller::loopLogic() {
             }
         }
     }
+    if (processEnded) {
+        loopControl(true);
+        applyConnectionPriority();
+    }
     dispatchEvents(events);
     if (newBrewDelay >= 0) {
         settings.setBrewDelay(newBrewDelay);
@@ -663,7 +707,7 @@ void Controller::loopLogic() {
     loopControl();
 }
 
-void Controller::loopControl() {
+void Controller::loopControl(bool urgent) {
     if (initialized) {
         unsigned long now = millis();
 
@@ -676,7 +720,7 @@ void Controller::loopControl() {
             lastPing = now;
         }
 
-        updateControl();
+        updateControl(urgent);
     }
 }
 
@@ -899,29 +943,58 @@ void Controller::lowerGrindTarget() {
     }
 }
 
-void Controller::updateControl() {
+void Controller::updateControl(bool urgent) {
     // Never drive a controller whose protocol version we don't match -- the
     // commands could be misinterpreted (OTA recovery still works; see onSystemInfo).
     if (systemInfo.protocolMismatch) {
         return;
     }
 
-    // Hold the process lock across the deref: deactivate()/clear() on other tasks
-    // can delete the process mid-computation (GM-147). comms sends are queued
-    // (pumped from comms.loop()), so no cross-task blocking happens under the lock.
-    std::lock_guard<std::recursive_mutex> guard(processMutex);
-    Process *proc = currentProcess;
-    bool active = isActiveLocked();
-
-    float targetTemp = getTargetTemp();
-    if (targetTemp > .0f) {
-        targetTemp = targetTemp + static_cast<float>(settings.getTemperatureOffset());
-    }
-
     bool altRelayActive = false;
-    if (active && proc->isAltRelayActive()) {
-        if (proc->getType() == MODE_GRIND && settings.getAltRelayFunction() == ALT_RELAY_GRIND) {
+    bool useAdvancedOutput = false;
+    bool outputValve = false;
+    bool pressureTarget = false;
+    float pumpSetpoint = 0.0f;
+    float advancedPressure = 0.0f;
+    float advancedFlow = 0.0f;
+    float targetTemp = 0.0f;
+
+    // Snapshot process output under the mutex, then release it before transport
+    // delivery so process start/stop is not delayed by a slow link.
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        Process *proc = currentProcess;
+        const bool active = (proc != nullptr) && proc->isActive();
+
+        targetTemp = getTargetTemp();
+        if (targetTemp > .0f)
+            targetTemp += static_cast<float>(settings.getTemperatureOffset());
+
+        if (active && proc->isAltRelayActive() && proc->getType() == MODE_GRIND &&
+            settings.getAltRelayFunction() == ALT_RELAY_GRIND) {
             altRelayActive = true;
+        }
+
+        if (active && systemInfo.capabilities.pressure) {
+            if (proc->getType() == MODE_STEAM) {
+                useAdvancedOutput = true;
+                advancedPressure = settings.getSteamPumpCutoff();
+                advancedFlow = proc->getPumpValue() * 0.1f;
+            } else if (proc->getType() == MODE_BREW) {
+                auto *brewProcess = static_cast<BrewProcess *>(proc);
+                if (brewProcess->isAdvancedPump()) {
+                    useAdvancedOutput = true;
+                    outputValve = brewProcess->isRelayActive();
+                    pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
+                    advancedPressure = brewProcess->getPumpPressure();
+                    advancedFlow = brewProcess->getPumpFlow();
+                }
+            }
+        }
+
+        if (!useAdvancedOutput) {
+            outputValve = active && proc->isRelayActive();
+            pumpSetpoint = active ? proc->getPumpValue() : 0.0f;
         }
     }
 
@@ -931,42 +1004,25 @@ void Controller::updateControl() {
     BoilerCommand boiler;
     boiler.index = 0;
     boiler.setpoint = targetTemp;
+
     PumpCommand pump;
     pump.index = 0;
-    RelayCommand relay; // index 0 = brew valve
+
+    RelayCommand relay;
     relay.index = 0;
+    relay.open = outputValve;
 
-    bool handled = false;
-    if (active && systemInfo.capabilities.pressure) {
-        if (proc->getType() == MODE_STEAM) {
-            targetPressure = settings.getSteamPumpCutoff();
-            targetFlow = proc->getPumpValue() * 0.1f;
-            relay.open = false;
-            pump.mode = PumpControlMode::Flow; // flow target, pressure as the limit
-            pump.flow = targetFlow;
-            pump.pressure = targetPressure;
-            handled = true;
-        } else if (proc->getType() == MODE_BREW) {
-            auto *brewProcess = static_cast<BrewProcess *>(proc);
-            if (brewProcess->isAdvancedPump()) {
-                const bool pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
-                relay.open = brewProcess->isRelayActive();
-                pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
-                pump.pressure = brewProcess->getPumpPressure();
-                pump.flow = brewProcess->getPumpFlow();
-                targetPressure = brewProcess->getPumpPressure();
-                targetFlow = brewProcess->getPumpFlow();
-                handled = true;
-            }
-        }
-    }
-
-    if (!handled) {
+    if (useAdvancedOutput) {
+        targetPressure = advancedPressure;
+        targetFlow = advancedFlow;
+        pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
+        pump.pressure = advancedPressure;
+        pump.flow = advancedFlow;
+    } else {
         targetPressure = 0.0f;
         targetFlow = 0.0f;
-        relay.open = active && proc->isRelayActive();
         pump.mode = PumpControlMode::Power;
-        pump.power = active ? proc->getPumpValue() : 0;
+        pump.power = pumpSetpoint;
     }
 
     // Only send components that changed since the last update. The controller is
@@ -976,17 +1032,21 @@ void Controller::updateControl() {
     // a full resend.
     gm::Payload batch[4];
     size_t count = 0;
-    if (!controlStateSent || boiler != lastBoiler)
+    if (urgent || !controlStateSent || boiler != lastBoiler)
         batch[count++] = comms.buildBoilerControl(boiler.index, boiler.mode, boiler.setpoint);
-    if (!controlStateSent || pump != lastPump)
+    if (urgent || !controlStateSent || pump != lastPump)
         batch[count++] = comms.buildPumpControl(pump.index, pump.mode, pump.power, pump.pressure, pump.flow);
-    if (!controlStateSent || relay != lastRelay)
+    if (urgent || !controlStateSent || relay != lastRelay)
         batch[count++] = comms.buildRelayControl(relay.index, relay.open); // index 0 = brew valve
-    if (!controlStateSent || altRelayActive != lastAlt)
+    if (urgent || !controlStateSent || altRelayActive != lastAlt)
         batch[count++] = comms.buildRelayControl(1, altRelayActive); // index 1 = alt relay
 
-    if (count > 0)
-        comms.sendBatch(batch, count);
+    if (count > 0) {
+        if (urgent)
+            comms.sendUrgentBatch(batch, count);
+        else
+            comms.sendBatch(batch, count);
+    }
 
     lastBoiler = boiler;
     lastPump = pump;
@@ -1040,21 +1100,28 @@ void Controller::activate() {
 
 void Controller::deactivate() {
     std::vector<const char *> events;
+    bool processEnded = false;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
-        deactivateLocked(events);
+        processEnded = deactivateLocked(events);
     }
+    if (!processEnded)
+        return;
+
+    // Deliver the stopped pump/valve state before shot observers serialize or
+    // publish the completed record.
+    loopControl(true);
+    applyConnectionPriority();
     dispatchEvents(events);
 }
 
-void Controller::deactivateLocked(std::vector<const char *> &events) {
+bool Controller::deactivateLocked(std::vector<const char *> &events) {
     if (currentProcess == nullptr) {
-        return;
+        return false;
     }
     delete lastProcess;
     lastProcess = currentProcess;
     currentProcess = nullptr;
-    applyConnectionPriority(); // shot ended -> relaxed BLE interval
     if (lastProcess->getType() == MODE_BREW) {
         events.push_back("controller:brew:end");
     } else if (lastProcess->getType() == MODE_GRIND) {
@@ -1062,6 +1129,7 @@ void Controller::deactivateLocked(std::vector<const char *> &events) {
     }
     events.push_back("controller:process:end");
     updateLastAction();
+    return true;
 }
 
 void Controller::clear() {
@@ -1252,6 +1320,37 @@ void Controller::handleBrewButton(int brewButtonStatus) {
     }
 }
 
+void Controller::handleControllerButton(uint8_t index, bool pressed) {
+    const int status = pressed ? 1 : 0;
+    String behavior = settings.getButtonBehavior(index);
+    ESP_LOGV("Controller", "Button %d changed to %d, behavior: %s", index, status, behavior.c_str());
+    if (behavior.isEmpty() || behavior == "none")
+        return;
+    if (behavior == "brew") {
+        handleBrewButton(status);
+        return;
+    }
+    if (behavior == "steam") {
+        handleSteamButton(status);
+        return;
+    }
+    if (behavior == "water") {
+        handleWaterButton(status);
+        return;
+    }
+    if (behavior == "flush") {
+        if (status) {
+            if (getMode() == MODE_STANDBY)
+                deactivateStandby();
+            if (getMode() != MODE_BREW && !isActive())
+                setMode(MODE_BREW);
+            onFlush();
+        }
+        return;
+    }
+    handleProfileButton(status, behavior);
+}
+
 void Controller::handleSteamButton(int steamButtonStatus) {
     if (steamButtonStatus) {
         if (getMode() != MODE_STEAM) {
@@ -1313,10 +1412,10 @@ void Controller::handleProfileUpdate() {
 }
 
 void Controller::loopLogicTask(void *arg) {
-    TickType_t lastWake = xTaskGetTickCount();
     auto *controller = static_cast<Controller *>(arg);
     while (true) {
+        controller->drainCommandQueue();
         controller->loopLogic();
-        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(controller->getMode() == MODE_STANDBY ? 1000 : PROGRESS_INTERVAL));
     }
 }

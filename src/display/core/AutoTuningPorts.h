@@ -3,6 +3,7 @@
 
 #include "AutoTuningModels.h"
 #include <cstddef>
+#include <string>
 
 namespace AutoTuning {
 
@@ -26,6 +27,9 @@ class OptimizerTransportPort {
     virtual bool configured() const = 0;
     virtual bool connected() const = 0;
     virtual bool publishShot(ShotRecord const &shot, bool reprocess) = 0;
+    virtual bool publishLiveShotStarted(LiveShotStarted const &event) = 0;
+    virtual bool publishLiveShotSample(LiveShotSample const &event) = 0;
+    virtual bool publishLiveShotEnded(LiveShotEnded const &event) = 0;
 };
 
 class AutoTuningRecordStorePort {
@@ -35,6 +39,7 @@ class AutoTuningRecordStorePort {
     virtual bool storeShot(ShotRecord const &shot, ShotCompletion const &completion,
                            ShotCaptureDisposition const &disposition) = 0;
     virtual bool storeRecommendation(Recommendation const &recommendation) = 0;
+    virtual bool correctShot(ShotCorrection const &correction, CorrectedShotRecord &corrected, std::string &reason) = 0;
 };
 
 class LocalOptimizationStorePort {

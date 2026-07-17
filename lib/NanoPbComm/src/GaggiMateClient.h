@@ -93,6 +93,7 @@ class GaggiMateClient {
     // from build*() helpers -- e.g. the display's delta-based control update.
     void send(const gm::Payload &payload) { _endpoint.send(payload); }
     void sendBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendBatch(payloads, count); }
+    void sendUrgentBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendUrgentBatch(payloads, count); }
 
     // Fired when the connected controller is missing the framed-comms
     // characteristics (old / incompatible firmware); link is kept for OTA.

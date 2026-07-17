@@ -30,6 +30,11 @@ function lastShotStatusText(formData) {
   return `${formatStatusTime(formData.rlLastShotAt)} - ${formData.rlLastShotId}`;
 }
 
+function mqttConfigured(formData) {
+  const port = Number(formData.haPort);
+  return Boolean(String(formData.haIP || '').trim()) && Number.isInteger(port) && port > 0 && port <= 65535;
+}
+
 function statusText(formData) {
   if (!formData.rlAutoTuningEnabled) {
     return 'Disabled';
@@ -37,7 +42,7 @@ function statusText(formData) {
   if (formData.rlProviderMode === 'on_board') {
     return 'Not implemented';
   }
-  if (formData.rlProviderMode === 'off_board' && !formData.homeAssistant) {
+  if (formData.rlProviderMode === 'off_board' && !mqttConfigured(formData)) {
     return 'Needs MQTT';
   }
   if (!formData.rlStatusSeen) {
@@ -460,9 +465,9 @@ export function PluginCard({
                 label='Details'
                 value={formData.rlProviderSummary || statusText(formData)}
               />
-              {formData.rlProviderMode === 'off_board' && !formData.homeAssistant && (
+              {formData.rlProviderMode === 'off_board' && !mqttConfigured(formData) && (
                 <div className='alert alert-warning py-2 text-sm'>
-                  Enable MQTT Broker below to use the off-board EspressoRL provider.
+                  Configure the MQTT broker below to use the off-board EspressoRL provider.
                 </div>
               )}
 
@@ -499,105 +504,102 @@ export function PluginCard({
               </a>
             </div>
           )}
+
+          <section className='border-base-300 space-y-4 border-t pt-4'>
+            <span className='block text-base font-semibold'>Off-board MQTT</span>
+            <div className='grid grid-cols-1 gap-4 sm:grid-cols-2'>
+              <div className='form-control'>
+                <label htmlFor='haIP' className='mb-2 block text-sm font-medium'>
+                  MQTT host
+                </label>
+                <input
+                  id='haIP'
+                  name='haIP'
+                  type='text'
+                  className='input input-bordered w-full'
+                  value={formData.haIP}
+                  onChange={onChange('haIP')}
+                />
+              </div>
+              <div className='form-control'>
+                <label htmlFor='haPort' className='mb-2 block text-sm font-medium'>
+                  MQTT port
+                </label>
+                <input
+                  id='haPort'
+                  name='haPort'
+                  type='number'
+                  min='1'
+                  max='65535'
+                  className='input input-bordered w-full'
+                  value={formData.haPort}
+                  onChange={onChange('haPort')}
+                />
+              </div>
+              <div className='form-control'>
+                <label htmlFor='haUser' className='mb-2 block text-sm font-medium'>
+                  MQTT user
+                </label>
+                <input
+                  id='haUser'
+                  name='haUser'
+                  type='text'
+                  className='input input-bordered w-full'
+                  value={formData.haUser}
+                  onChange={onChange('haUser')}
+                />
+              </div>
+              <div className='form-control'>
+                <label htmlFor='haPassword' className='mb-2 block text-sm font-medium'>
+                  MQTT password
+                </label>
+                <input
+                  id='haPassword'
+                  name='haPassword'
+                  type='password'
+                  className='input input-bordered w-full'
+                  value={formData.haPassword}
+                  onChange={onChange('haPassword')}
+                />
+              </div>
+            </div>
+            {formData.legacyHomeAssistantMqttAvailable !== false && (
+              <div className='border-base-300 flex items-center justify-between gap-4 border-t pt-4'>
+                <label htmlFor='homeAssistant' className='block text-sm font-medium'>
+                  Legacy Home Assistant MQTT
+                </label>
+                <input
+                  id='homeAssistant'
+                  name='homeAssistant'
+                  value='homeAssistant'
+                  type='checkbox'
+                  className='toggle toggle-primary shrink-0'
+                  checked={!!formData.homeAssistant}
+                  onChange={onChange('homeAssistant')}
+                  aria-label='Enable legacy Home Assistant MQTT'
+                />
+              </div>
+            )}
+            {formData.legacyHomeAssistantMqttAvailable !== false && formData.homeAssistant && (
+              <div className='form-control'>
+                <label htmlFor='haTopic' className='mb-2 block text-sm font-medium'>
+                  Discovery topic
+                </label>
+                <input
+                  id='haTopic'
+                  name='haTopic'
+                  type='text'
+                  className='input input-bordered w-full'
+                  value={formData.haTopic}
+                  onChange={onChange('haTopic')}
+                />
+              </div>
+            )}
+          </section>
         </div>
       </div>
 
       <CommunityUploadSettings formData={formData} onChange={onChange} />
-
-      <div className='bg-base-200 rounded-lg p-4'>
-        <div className='flex items-center justify-between'>
-          <span className='text-xl font-medium'>MQTT Broker</span>
-          <input
-            id='homeAssistant'
-            name='homeAssistant'
-            value='homeAssistant'
-            type='checkbox'
-            className='toggle toggle-primary'
-            checked={!!formData.homeAssistant}
-            onChange={onChange('homeAssistant')}
-            aria-label='Enable MQTT'
-          />
-        </div>
-        {formData.homeAssistant && (
-          <div className='border-base-300 mt-4 space-y-4 border-t pt-4'>
-            <p className='text-sm opacity-70'>
-              Connect GaggiMate to an MQTT broker for telemetry and off-board integrations.
-            </p>
-            <div className='form-control'>
-              <label htmlFor='haIP' className='mb-2 block text-sm font-medium'>
-                MQTT IP
-              </label>
-              <input
-                id='haIP'
-                name='haIP'
-                type='text'
-                className='input input-bordered w-full'
-                placeholder='0'
-                value={formData.haIP}
-                onChange={onChange('haIP')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='haPort' className='mb-2 block text-sm font-medium'>
-                MQTT Port
-              </label>
-              <input
-                id='haPort'
-                name='haPort'
-                type='number'
-                className='input input-bordered w-full'
-                placeholder='0'
-                value={formData.haPort}
-                onChange={onChange('haPort')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='haUser' className='mb-2 block text-sm font-medium'>
-                MQTT User
-              </label>
-              <input
-                id='haUser'
-                name='haUser'
-                type='text'
-                className='input input-bordered w-full'
-                placeholder='user'
-                value={formData.haUser}
-                onChange={onChange('haUser')}
-              />
-            </div>
-
-            <div className='form-control'>
-              <label htmlFor='haPassword' className='mb-2 block text-sm font-medium'>
-                MQTT Password
-              </label>
-              <input
-                id='haPassword'
-                name='haPassword'
-                type='password'
-                className='input input-bordered w-full'
-                placeholder='password'
-                value={formData.haPassword}
-                onChange={onChange('haPassword')}
-              />
-            </div>
-            <div className='form-control'>
-              <label htmlFor='haTopic' className='mb-2 block text-sm font-medium'>
-                Discovery Topic
-              </label>
-              <input
-                id='haTopic'
-                name='haTopic'
-                type='text'
-                className='input input-bordered w-full'
-                value={formData.haTopic}
-                onChange={onChange('haTopic')}
-              />
-            </div>
-          </div>
-        )}
-      </div>
 
       {gearpumpAddon.value && (
         <div className='bg-base-200 rounded-lg p-4'>

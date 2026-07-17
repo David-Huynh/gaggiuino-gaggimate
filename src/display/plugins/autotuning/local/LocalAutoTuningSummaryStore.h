@@ -5,6 +5,10 @@
 #include <ArduinoJson.h>
 #include <cstddef>
 
+namespace AutoTuning {
+struct ShotCorrection;
+}
+
 class LocalAutoTuningSummaryStore {
   public:
     struct Stats {
@@ -20,8 +24,7 @@ class LocalAutoTuningSummaryStore {
     bool removeShot(const String &shotId) const;
     bool upsertShot(JsonObjectConst shot);
     bool upsertRecommendation(JsonObjectConst recommendation);
-    bool patchShotCorrection(const String &shotId, bool hasGrindFollowed, bool grindFollowed, bool hasDoseFollowed,
-                             bool doseFollowed, bool hasYieldFollowed, bool yieldFollowed);
+    bool patchShotCorrection(const String &shotId, AutoTuning::ShotCorrection const &correction);
     bool patchRecommendationStatus(const String &recommendationId, const String &status, const char *timestampKey);
     void prune() const;
 };

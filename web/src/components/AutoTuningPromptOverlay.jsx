@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { ApiServiceContext } from '../services/ApiService.js';
-import { grindDirectionForStepDelta } from '../utils/grinderDirection.js';
+import { formatGrinderSettingTransition } from '../utils/grinderRecommendation.js';
 
 const PREFERENCE_DISMISS_MS = 45000;
 const RECOMMENDATION_STATUSES = new Set(['', 'pending', 'shown']);
@@ -17,25 +17,16 @@ function formatYield(value) {
 }
 
 function formatGrind(recommendation) {
-  const current = Number(recommendation?.current_absolute_step);
-  const projected = Number(recommendation?.projected_absolute_step);
-  if (
-    recommendation?.has_current_absolute_step &&
-    recommendation?.has_projected_absolute_step &&
-    Number.isFinite(current) &&
-    Number.isFinite(projected)
-  ) {
-    return `Set grinder ${current.toFixed(1)} -> ${projected.toFixed(1)}`;
-  }
-
-  const delta = Number(recommendation?.grind_delta_steps_from_current || 0);
-  if (!Number.isFinite(delta) || Math.abs(delta) < 0.001) {
-    return 'Keep grind';
-  }
-  const magnitude = Math.abs(delta);
-  const stepText = Number.isInteger(magnitude) ? magnitude.toFixed(0) : magnitude.toFixed(1);
-  const label = Math.abs(magnitude - 1) < 0.001 ? 'step' : 'steps';
-  return `${stepText} ${label} ${grindDirectionForStepDelta(delta, recommendation.step_direction)}`;
+  return formatGrinderSettingTransition({
+    currentAbsoluteStep: recommendation?.has_current_absolute_step
+      ? recommendation.current_absolute_step
+      : undefined,
+    projectedAbsoluteStep: recommendation?.has_projected_absolute_step
+      ? recommendation.projected_absolute_step
+      : undefined,
+    projectedRelativeStep: recommendation?.projected_relative_step_from_reference,
+    deltaSteps: recommendation?.grind_delta_steps_from_current,
+  });
 }
 
 function loadSeen() {
@@ -139,11 +130,17 @@ export function AutoTuningPromptOverlay() {
       }
     });
 
-    const clearListener = apiService.on('evt:rl:prompts-clear', () => {
-      setPendingDose(null);
-      setPendingPreference(null);
-      setPendingRecommendation(null);
-      setView(null);
+    const clearListener = apiService.on('evt:rl:prompts-clear', message => {
+      if (!message.shot_id) {
+        setPendingDose(null);
+        setPendingPreference(null);
+        setPendingRecommendation(null);
+        setView(null);
+        return;
+      }
+      setPendingDose(current => (current?.shot_id === message.shot_id ? null : current));
+      setPendingPreference(current => (current?.shot_id === message.shot_id ? null : current));
+      setView(current => (current === 'dose' || current === 'preference' ? null : current));
     });
 
     return () => {
@@ -195,6 +192,7 @@ export function AutoTuningPromptOverlay() {
         shot_id: pendingDose.shot_id,
         followed: Boolean(followed),
       });
+      setView(null);
     },
     [apiService, pendingDose],
   );
@@ -230,12 +228,20 @@ export function AutoTuningPromptOverlay() {
     return (
       <div className='fixed right-4 bottom-[calc(1rem_+_env(safe-area-inset-bottom))] left-4 z-50 flex flex-col items-stretch gap-2 sm:left-auto sm:items-end'>
         {pendingDose && (
-          <button type='button' className='btn btn-primary btn-sm shadow-lg' onClick={() => setView('dose')}>
+          <button
+            type='button'
+            className='btn btn-primary btn-sm shadow-lg'
+            onClick={() => setView('dose')}
+          >
             Confirm dose
           </button>
         )}
         {pendingPreference && (
-          <button type='button' className='btn btn-primary btn-sm shadow-lg' onClick={() => setView('preference')}>
+          <button
+            type='button'
+            className='btn btn-primary btn-sm shadow-lg'
+            onClick={() => setView('preference')}
+          >
             Compare last shot
           </button>
         )}
@@ -270,15 +276,29 @@ export function AutoTuningPromptOverlay() {
         {view === 'dose' && pendingDose && (
           <div className='space-y-4'>
             <div>
-              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>Shot dose</div>
-              <h2 className='text-xl font-bold'>Did you use {formatDose(pendingDose.dose_target_g)}?</h2>
-              <p className='text-base-content/60 text-sm'>The dose was not measured by grind by weight.</p>
+              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
+                Shot dose
+              </div>
+              <h2 className='text-xl font-bold'>
+                Did you use {formatDose(pendingDose.dose_target_g)}?
+              </h2>
+              <p className='text-base-content/60 text-sm'>
+                The dose was not measured by grind by weight.
+              </p>
             </div>
             <div className='grid grid-cols-2 gap-2'>
-              <button type='button' className='btn btn-primary min-h-12' onClick={() => submitDoseConfirmation(true)}>
+              <button
+                type='button'
+                className='btn btn-primary min-h-12'
+                onClick={() => submitDoseConfirmation(true)}
+              >
                 Yes
               </button>
-              <button type='button' className='btn btn-outline min-h-12' onClick={() => submitDoseConfirmation(false)}>
+              <button
+                type='button'
+                className='btn btn-outline min-h-12'
+                onClick={() => submitDoseConfirmation(false)}
+              >
                 No
               </button>
             </div>
@@ -288,21 +308,38 @@ export function AutoTuningPromptOverlay() {
         {view === 'preference' && pendingPreference && (
           <div className='space-y-4'>
             <div>
-              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>Shot comparison</div>
+              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
+                Shot comparison
+              </div>
               <h2 className='text-xl font-bold'>Which tasted better?</h2>
               <p className='text-base-content/60 text-sm'>
                 Compare this shot with the{' '}
-                {pendingPreference.comparison_mode === 'best_incumbent' ? 'current best' : 'previous'} shot.
+                {pendingPreference.comparison_mode === 'best_incumbent'
+                  ? 'current best'
+                  : 'previous'}{' '}
+                shot.
               </p>
             </div>
             <div className='grid grid-cols-1 gap-2'>
-              <button type='button' className='btn btn-primary min-h-12' onClick={() => submitPreference('new_better')}>
+              <button
+                type='button'
+                className='btn btn-primary min-h-12'
+                onClick={() => submitPreference('new_better')}
+              >
                 New shot is better
               </button>
-              <button type='button' className='btn btn-outline min-h-12' onClick={() => submitPreference('tie')}>
+              <button
+                type='button'
+                className='btn btn-outline min-h-12'
+                onClick={() => submitPreference('tie')}
+              >
                 No noticeable difference
               </button>
-              <button type='button' className='btn btn-outline min-h-12' onClick={() => submitPreference('anchor_better')}>
+              <button
+                type='button'
+                className='btn btn-outline min-h-12'
+                onClick={() => submitPreference('anchor_better')}
+              >
                 {pendingPreference.comparison_mode === 'best_incumbent'
                   ? 'Current best is better'
                   : 'Previous shot is better'}
@@ -314,7 +351,9 @@ export function AutoTuningPromptOverlay() {
         {view === 'recommendation' && pendingRecommendation && (
           <div className='space-y-4'>
             <div>
-              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>Next shot</div>
+              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
+                Next shot
+              </div>
               <h2 className='text-xl font-bold'>Next recipe</h2>
             </div>
             <div className='grid grid-cols-1 gap-2 sm:grid-cols-3'>
@@ -324,20 +363,34 @@ export function AutoTuningPromptOverlay() {
               </div>
               <div className='bg-base-200 rounded-md p-3'>
                 <div className='text-base-content/60 text-xs uppercase'>Dose</div>
-                <div className='text-base font-semibold'>{formatDose(pendingRecommendation.next_dose_g)}</div>
+                <div className='text-base font-semibold'>
+                  {formatDose(pendingRecommendation.next_dose_g)}
+                </div>
               </div>
               <div className='bg-base-200 rounded-md p-3'>
                 <div className='text-base-content/60 text-xs uppercase'>Yield</div>
-                <div className='text-base font-semibold'>{formatYield(pendingRecommendation.target_yield_g)}</div>
+                <div className='text-base font-semibold'>
+                  {formatYield(pendingRecommendation.target_yield_g)}
+                </div>
               </div>
             </div>
             <p className='text-base-content/70 text-sm'>
               Grind remains manual. Use applies machine-controllable targets.
             </p>
             <div className='grid grid-cols-3 gap-2'>
-              <button type='button' className='btn btn-primary' onClick={useRecommendation}>Use</button>
-              <button type='button' className='btn btn-outline' onClick={() => setView(null)}>Later</button>
-              <button type='button' className='btn btn-error btn-outline' onClick={ignoreRecommendation}>Ignore</button>
+              <button type='button' className='btn btn-primary' onClick={useRecommendation}>
+                Use
+              </button>
+              <button type='button' className='btn btn-outline' onClick={() => setView(null)}>
+                Later
+              </button>
+              <button
+                type='button'
+                className='btn btn-error btn-outline'
+                onClick={ignoreRecommendation}
+              >
+                Ignore
+              </button>
             </div>
           </div>
         )}

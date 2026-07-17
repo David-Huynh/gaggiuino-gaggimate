@@ -26,13 +26,13 @@
  *     non-idempotent ops) and ACKed; payloads are dispatched by oneof tag to
  *     typed handlers -- no run-time type erasure.
  *
- * Threading: decode + ACK/dedup + the send pump run on the transport's callback
- * thread, but registered handlers are invoked on a dedicated dispatch task (fed
- * by an inbound payload queue) so slow application callbacks never block the BLE
- * host task. If the inbound queue is full the frame is left un-ACKed, which
- * back-pressures the sender into retransmitting. Queue + in-flight state are
- * guarded by a mutex; handlers run with the mutex released, so a handler may
- * call send() re-entrantly.
+ * Threading: decode + ACK/dedup run on the transport's callback/pump thread, and
+ * the send pump may also be driven by a dedicated transport task. Registered
+ * handlers run on a separate dispatch task (fed by an inbound payload queue), so
+ * slow application callbacks never block transport receive. If the inbound
+ * queue is full the frame is left un-ACKed, which back-pressures the sender into
+ * retransmitting. Queue + in-flight state are guarded by a mutex; handlers run
+ * with the mutex released, so a handler may call send() re-entrantly.
  */
 class Endpoint {
   public:
@@ -58,6 +58,13 @@ class Endpoint {
     // (atomic multi-component update). They are drained into one frame on the
     // next pump as long as nothing else preempts them.
     void sendBatch(const gm::Payload *payloads, size_t count);
+
+    // Immediately supersede the current reliable frame with this batch. This is
+    // reserved for state transitions such as pump/valve shutdown where an older
+    // in-flight control frame must never be retransmitted after the new state.
+    // In-flight values not replaced by the urgent batch are returned to the
+    // coalescing queue.
+    void sendUrgentBatch(const gm::Payload *payloads, size_t count);
 
     // Fire-and-forget: send immediately as an unacknowledged frame (id == 0).
     // Not queued, not coalesced, never retransmitted -- dropped if the link is
@@ -108,6 +115,8 @@ class Endpoint {
     unsigned long _sentAt = 0;
     uint8_t _retries = 0;
     bool _inFlight = false;
+    std::array<gm::Payload, MAX_PAYLOADS_PER_FRAME> _inFlightPayloads{};
+    pb_size_t _inFlightPayloadCount = 0;
 
     // Round-trip latency from the reliability layer. Sampled only on frames
     // ACKed without a retransmit (Karn's algorithm) so an ambiguous retransmit
