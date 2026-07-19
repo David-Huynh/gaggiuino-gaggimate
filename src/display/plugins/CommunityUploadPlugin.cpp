@@ -167,11 +167,12 @@ void CommunityUploadPlugin::setup(Controller *ctrl, PluginManager *pm) {
     uploadQueue.begin();
     uploadQueue.recover();
     discardMismatchedQueueItems();
+    refreshQueueStatus();
     xTaskCreatePinnedToCore(workerTask, "CommunityUpload", 12288, this, 1, &workerTaskHandle, 0);
 
     pm->on("settings:changed", [this](Event const &) {
         refreshConfiguration();
-        discardMismatchedQueueItems();
+        requestQueueMaintenance();
         {
             StateLock lock(stateMutex);
             registrationReadyPending = uploadConfiguration.requested && uploadConfiguration.configured();
@@ -180,7 +181,7 @@ void CommunityUploadPlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
     pm->on("rl:settings:changed", [this](Event const &) {
         refreshConfiguration();
-        discardMismatchedQueueItems();
+        requestQueueMaintenance();
         {
             StateLock lock(stateMutex);
             registrationReadyPending = uploadConfiguration.requested && uploadConfiguration.configured();
@@ -237,7 +238,7 @@ bool CommunityUploadPlugin::applyCorrection(AutoTuning::ShotCorrection const &co
         correction.shotId.c_str(), correction, updatedAt,
         updatedAt + static_cast<EpochSeconds>(RECOMMENDATION_UPLOAD_GRACE_SECONDS));
     if (patched) {
-        publishStatus();
+        requestStatusPublish();
     }
     return patched;
 }
@@ -271,12 +272,12 @@ void CommunityUploadPlugin::loop() {
     if (controller && clearCredentials) {
         controller->getSettings().clearRLUploadCredentials();
         refreshConfiguration();
-        discardMismatchedQueueItems();
+        requestQueueMaintenance();
         resetWorkerAttempts();
     } else if (controller && applyCredentials) {
         controller->getSettings().setRLUploadCredentials(installId, tokenId, secret);
         refreshConfiguration();
-        discardMismatchedQueueItems();
+        requestQueueMaintenance();
         registrationReady = true;
     }
 
@@ -292,6 +293,22 @@ void CommunityUploadPlugin::loop() {
 
 void CommunityUploadPlugin::requestStatusPublish() {
     StateLock lock(stateMutex);
+    queueStatusRefreshRequested = true;
+}
+
+void CommunityUploadPlugin::requestQueueMaintenance() {
+    StateLock lock(stateMutex);
+    queueMaintenanceRequested = true;
+    queueStatusRefreshRequested = true;
+}
+
+void CommunityUploadPlugin::refreshQueueStatus() {
+    const bool storageAvailable = uploadQueue.storageAvailable();
+    const CommunityUploadQueue::Stats stats = uploadQueue.stats();
+    StateLock lock(stateMutex);
+    cachedQueueStorageAvailable = storageAvailable;
+    cachedQueueStats = stats;
+    lastQueueStatusRefreshMs = millis();
     statusPublishRequested = true;
 }
 
@@ -878,7 +895,7 @@ bool CommunityUploadPlugin::enqueueValidatedPayload(const String &recordType, co
         setLastError("queue write failed");
         return false;
     }
-    publishStatus();
+    requestStatusPublish();
     return true;
 }
 
@@ -893,9 +910,25 @@ void CommunityUploadPlugin::discardMismatchedQueueItems() {
     auto *plugin = static_cast<CommunityUploadPlugin *>(arg);
     vTaskDelay(pdMS_TO_TICKS(15000));
     while (true) {
+        bool maintainQueue = false;
+        bool refreshStatus = false;
+        {
+            StateLock lock(plugin->stateMutex);
+            maintainQueue = plugin->queueMaintenanceRequested;
+            refreshStatus = plugin->queueStatusRefreshRequested;
+            plugin->queueMaintenanceRequested = false;
+            plugin->queueStatusRefreshRequested = false;
+        }
+        if (maintainQueue) {
+            plugin->discardMismatchedQueueItems();
+        }
         plugin->uploadQueue.removeOneLegacyItem();
         plugin->maybeRegister();
         plugin->maybeUpload();
+        if (maintainQueue || refreshStatus ||
+            millis() - plugin->lastQueueStatusRefreshMs >= STATUS_INTERVAL_MS) {
+            plugin->refreshQueueStatus();
+        }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
@@ -907,12 +940,17 @@ void CommunityUploadPlugin::publishStatus() {
 
     const UploadConfiguration configuration = configurationSnapshot();
     const bool requested = configuration.requested;
-    const bool storageAvailable = uploadQueue.storageAvailable();
     const bool hasBase = !configuration.baseUrl.isEmpty();
     const bool configured = configuration.configured();
     const bool effective = requested && configured;
-    CommunityUploadQueue::Stats stats = uploadQueue.stats();
-    stats.rejected += rejectedCount();
+    bool storageAvailable = false;
+    CommunityUploadQueue::Stats stats;
+    {
+        StateLock lock(stateMutex);
+        storageAvailable = cachedQueueStorageAvailable;
+        stats = cachedQueueStats;
+        stats.rejected += rejectedSinceBoot;
+    }
 
     String status = "off";
     String summary = "Community upload disabled";

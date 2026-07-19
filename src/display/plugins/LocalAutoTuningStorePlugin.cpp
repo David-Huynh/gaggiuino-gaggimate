@@ -13,6 +13,7 @@
 #include <display/core/EpochTime.h>
 #include <display/core/PluginManager.h>
 #include <display/core/Settings.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 #include <esp_log.h>
@@ -30,6 +31,8 @@ constexpr size_t MAX_REPLAY_SNAPSHOTS = 4;
 constexpr size_t MAX_REPLAY_BYTES = 256 * 1024;
 
 using EpochSeconds = EpochTime::Seconds;
+
+using LocalStoreLock = std::lock_guard<std::recursive_mutex>;
 
 static EpochSeconds nowEpoch() { return EpochTime::now(); }
 
@@ -140,13 +143,12 @@ static DeliveryStats localDeliveryStats() {
     return stats;
 }
 
-static bool removeOldestTerminalReplay() {
+static bool findOldestTerminalReplay(String &oldestPath, String &oldestShotId) {
     std::vector<String> paths;
     if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return false;
     }
     bool found = false;
-    String oldestPath;
     EpochSeconds oldestTimestamp = std::numeric_limits<EpochSeconds>::max();
     for (const String &path : paths) {
         JsonDocument doc(&psramAllocator);
@@ -160,11 +162,24 @@ static bool removeOldestTerminalReplay() {
             if (!found || timestamp < oldestTimestamp) {
                 found = true;
                 oldestPath = path;
+                oldestShotId = replay["shot_id"].as<String>();
                 oldestTimestamp = timestamp;
             }
         }
     }
-    return found && LittleFS.remove(oldestPath);
+    return found && !oldestPath.isEmpty() && !oldestShotId.isEmpty();
+}
+
+static AutoTuning::PromptState promptState(JsonObjectConst replay) {
+    AutoTuning::PromptState prompt;
+    const String state = jsonStringOrEmpty(replay["prompt_state"]);
+    if (!state.isEmpty()) {
+        prompt.status = AutoTuning::promptStatusFromKey(state.c_str())
+                            .value_or(AutoTuning::PromptStatus::Processing);
+    }
+    prompt.revision = std::max(1, replay["prompt_revision"] | 1);
+    prompt.updatedAt = jsonEpochOrZero(replay["prompt_updated_at"]);
+    return prompt;
 }
 
 } // namespace
@@ -175,16 +190,29 @@ void LocalAutoTuningStorePlugin::setup(Controller *ctrl, PluginManager *pm) {
     controller = ctrl;
     pluginManager = pm;
     ctrl->setAutoTuningRecordStore(this);
-    ensureDirectories();
-    refreshDeliveryStatus();
+    {
+        LocalStoreLock lock(storeMutex);
+        ensureDirectories();
+    }
+    recoverCommittedArtifacts();
+    refreshCachedStatus();
     snapshotContexts();
+#if !defined(GAGGIMATE_SIM)
+    if (xTaskCreatePinnedToCore(workerTask, "AutoTune replay", 8192, this, 1, &workerTaskHandle, 0) != pdPASS) {
+        workerTaskHandle = nullptr;
+        ESP_LOGE(LOG_TAG, "Unable to start replay worker; background persistence is disabled");
+    } else {
+        xTaskNotifyGive(workerTaskHandle);
+    }
+    workerStartAttempted.store(true, std::memory_order_release);
+#endif
 
     pm->on("settings:changed", [this](Event const &) { snapshotContexts(); });
     pm->on("rl:settings:changed", [this](Event const &) { snapshotContexts(); });
-    pm->on("rl:status:refresh", [this](Event const &) { publishStatus(); });
+    pm->on("rl:status:refresh", [this](Event const &) { requestStatusRefresh(); });
     pm->on("rl:shot:dispatch", [this](Event const &event) { handleShotDispatch(event); });
     pm->on("rl:dose-confirmation", [this](Event const &event) { handleDoseConfirmation(event); });
-    pm->on("rl:shot:reprocess", [this](Event const &event) { handleShotReprocess(event); });
+    pm->on("rl:shot:reprocess", [this](Event &event) { handleShotReprocess(event); });
     pm->on("rl:shot:delivery:ack", [this](Event const &event) { handleShotDeliveryAck(event); });
     pm->on("rl:local:shot:delete", [this](Event const &event) {
         const String shotId = event.getString("shot_id");
@@ -197,9 +225,19 @@ void LocalAutoTuningStorePlugin::setup(Controller *ctrl, PluginManager *pm) {
         pluginManager->trigger(invalidated);
     });
     pm->on("rl:shot:correction", [this](Event const &event) { handleShotCorrection(event); });
-    pm->on("rl:community-upload:ready", [this](Event const &) { dispatchPendingCommunityUploads(); });
+    pm->on("rl:community-upload:ready", [this](Event const &) {
+        WorkItem work;
+        work.kind = WorkKind::CommunitySweep;
+        enqueueWork(std::move(work));
+    });
     pm->on("rl:recommendation:apply", [this](Event const &event) { handleRecommendationApply(event); });
     pm->on("rl:recommendation:ignore", [this](Event const &event) { handleRecommendationIgnore(event); });
+    pm->on("rl:prompt:claim", [this](Event &event) { handlePromptClaim(event); });
+    pm->on("rl:prompt:release", [this](Event &event) {
+        event.setInt("release", 1);
+        handlePromptClaim(event);
+    });
+    pm->on("rl:preference", [this](Event const &event) { handlePreferencePersisted(event); });
     pm->on("rl:local:reset", [this](Event const &) {
         const bool resetComplete = reset();
         snapshotContexts();
@@ -210,44 +248,106 @@ void LocalAutoTuningStorePlugin::setup(Controller *ctrl, PluginManager *pm) {
         }
     });
 
-    publishStatus();
+    requestStatusRefresh();
 }
 
-bool LocalAutoTuningStorePlugin::storeShot(AutoTuning::ShotRecord const &shot, AutoTuning::ShotCompletion const &completion,
-                                           AutoTuning::ShotCaptureDisposition const &disposition) {
-    JsonDocument payload(&psramAllocator);
-    JsonDocument completionPayload(&psramAllocator);
-    if (!AutoTuningJsonCodec::writeShotRecord(shot, payload) ||
-        !AutoTuningJsonCodec::writeShotCompletion(completion, completionPayload)) {
+static String deliveryAttemptId(const String &payloadHash, const std::uint32_t revision,
+                                const int attemptCount, const EpochSeconds timestamp) {
+    char value[88];
+    snprintf(value, sizeof(value), "a-%08x-%08x-%016llx-%.16s", revision,
+             static_cast<unsigned int>(std::max(attemptCount, 0)),
+             static_cast<unsigned long long>(std::max<EpochSeconds>(timestamp, 0)),
+             payloadHash.c_str());
+    return value;
+}
+
+static String legacyPayloadIdentity(const String &shotId, const std::uint32_t revision) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (size_t index = 0; index < shotId.length(); ++index) {
+        hash ^= static_cast<std::uint8_t>(shotId.charAt(index));
+        hash *= 1099511628211ULL;
+    }
+    hash ^= revision;
+    hash *= 1099511628211ULL;
+    char chunk[17];
+    snprintf(chunk, sizeof(chunk), "%016llx", static_cast<unsigned long long>(hash));
+    String result;
+    result.reserve(64);
+    for (int index = 0; index < 4; ++index) {
+        result += chunk;
+    }
+    return result;
+}
+
+bool LocalAutoTuningStorePlugin::enqueueShot(AutoTuning::ShotRecord const &shot,
+                                             AutoTuning::ShotCompletion const &completion,
+                                             AutoTuning::ShotCaptureDisposition const &disposition) {
+    if (shot.shotId.empty() || shot.samples.empty()) {
         return false;
     }
+    auto queued = std::make_unique<QueuedShot>();
+    queued->samples.assign(shot.samples.begin(), shot.samples.end());
+    queued->shot = shot;
+    queued->shot.samples =
+        AutoTuning::ArrayView<const AutoTuning::ShotSample>(queued->samples.data(), queued->samples.size());
+    queued->completion = completion;
+    queued->disposition = disposition;
+    queued->committedAt = nowEpoch();
+
+    WorkItem work;
+    work.kind = WorkKind::StoreShot;
+    work.shotId = shot.shotId.c_str();
+    work.queuedShot = std::move(queued);
+    pendingDoseRecoveryChecked.store(true, std::memory_order_release);
+    return enqueueWork(std::move(work));
+}
+
+bool LocalAutoTuningStorePlugin::persistShot(AutoTuning::ShotRecord const &shot,
+                                             AutoTuning::ShotCompletion const &completion,
+                                             AutoTuning::ShotCaptureDisposition const &disposition,
+                                             const AutoTuning::Timestamp committedAt) {
+    LocalStoreLock lock(storeMutex);
+    if (!ensureDirectories()) {
+        return false;
+    }
+
+    AutoTuning::CompletedShotArtifact artifact;
+    artifact.record = shot;
+    artifact.completion = completion;
+    artifact.disposition = disposition;
+    artifact.samples.assign(shot.samples.begin(), shot.samples.end());
+    artifact.revision = 1;
+    artifact.committedAt = committedAt;
+    artifact.bindSamples();
+    if (!artifactStore.write(artifact)) {
+        ESP_LOGW(LOG_TAG, "Failed to commit canonical shot artifact for %s", shot.shotId.c_str());
+        requestStatusRefresh();
+        return false;
+    }
+
     const String shotId(shot.shotId.c_str());
-    pendingDoseRecoveryChecked = true;
-    const bool replaySaved = saveReplaySnapshot(shotId, payload.as<JsonVariantConst>(), completionPayload.as<JsonVariantConst>(),
-                                                disposition.doseConfirmationRequired, disposition.optimizerDeliveryRequired,
-                                                disposition.communityUploadRequired);
+    const bool replaySaved = saveReplaySnapshot(artifact);
     if (!replaySaved) {
-        ESP_LOGW(LOG_TAG, "Failed to persist replay snapshot for %s", shotId.c_str());
-        refreshDeliveryStatus();
-        publishStatus();
+        ESP_LOGW(LOG_TAG, "Canonical shot %s committed; replay projection will recover on boot", shotId.c_str());
+        requestStatusRefresh();
         return false;
     }
-    const bool summarySaved = summaryStore.upsertShot(payload.as<JsonObjectConst>());
+    const bool summarySaved = upsertArtifactSummary(artifact);
     if (!summarySaved) {
-        ESP_LOGW(LOG_TAG, "Replay saved without compact summary for %s", shotId.c_str());
+        ESP_LOGW(LOG_TAG, "Canonical shot %s committed without compact summary", shotId.c_str());
     }
     prune();
     if (!disposition.doseConfirmationRequired) {
         deliveryWorkPending = true;
         nextDeliveryCheckAt = 0;
     }
-    refreshDeliveryStatus();
-    publishStatus();
+    requestStatusRefresh();
     return true;
 }
 
 bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &correction,
                                              AutoTuning::CorrectedShotRecord &corrected, std::string &reason) {
+    LocalStoreLock lock(storeMutex);
     reason.clear();
     if (!controller || correction.shotId.empty()) {
         reason = "Shot correction is missing its shot ID";
@@ -290,25 +390,38 @@ bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &c
         return false;
     }
 
+    const String shotId(correction.shotId.c_str());
     JsonDocument envelope(&psramAllocator);
-    if (!loadReplaySnapshot(correction.shotId.c_str(), envelope)) {
+    if (!loadReplaySnapshot(shotId, envelope)) {
         summaryStore.patchShotCorrection(correction.shotId.c_str(), correction);
-        publishStatus();
+        requestStatusRefresh();
         return true;
     }
-    JsonVariantConst payload = envelope["payload"];
-    AutoTuningJsonCodec::DecodedShotRecord decoded;
-    String parseError;
-    if (!AutoTuningJsonCodec::parseShotRecord(payload, decoded, parseError)) {
-        reason = parseError.c_str();
+
+    AutoTuning::CompletedShotArtifact artifact;
+    if (!loadCommittedShot(shotId, artifact)) {
+        reason = "Stored shot artifact is unavailable";
         return false;
     }
-    if (decoded.record.shotId != correction.shotId) {
+    const bool canonicalArtifact = artifactStore.exists(shotId);
+    if (artifact.record.shotId != correction.shotId) {
         reason = "Shot correction does not match the stored replay";
         return false;
     }
 
-    AutoTuning::ShotRecord &record = decoded.record;
+    AutoTuning::ShotRecord &record = artifact.record;
+    if (correction.excludeFromLocalOptimization.has_value()) {
+        record.excludeFromLocalOptimization = *correction.excludeFromLocalOptimization;
+    }
+    if (correction.grindFollowed.has_value()) {
+        record.grindFollowed = correction.grindFollowed;
+    }
+    if (correction.doseFollowed.has_value()) {
+        record.doseFollowed = correction.doseFollowed;
+    }
+    if (correction.yieldFollowed.has_value()) {
+        record.yieldFollowed = correction.yieldFollowed;
+    }
     AutoTuning::GrinderSnapshot &grinder = record.recipe.grinder;
     std::optional<float> relativeGrind = correction.relativeGrindStepsFromReference;
     if (correction.currentAbsoluteStep.has_value()) {
@@ -345,6 +458,10 @@ bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &c
         record.doseObserved = true;
         record.doseTargetConfirmed = false;
         record.recipe.doseTargetG = *correction.doseInG;
+        if (record.recommendation.present()) {
+            const float doseErrorG = std::fabs(*correction.doseInG - record.recommendation.nextDoseG);
+            record.doseFollowed = doseErrorG <= AutoTuning::DOSE_FOLLOW_THROUGH_TOLERANCE_G;
+        }
     }
     if (correction.targetYieldG.has_value()) {
         record.recipe.targetYieldG = *correction.targetYieldG;
@@ -372,7 +489,7 @@ bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &c
     }
 
     corrected.record = record;
-    corrected.samples.assign(decoded.samples.begin(), decoded.samples.end());
+    corrected.samples.assign(artifact.samples.begin(), artifact.samples.end());
     corrected.bindSamples();
 
     JsonDocument correctedPayload(&psramAllocator);
@@ -381,14 +498,42 @@ bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &c
         return false;
     }
     JsonObject replay = envelope.as<JsonObject>();
-    replay["payload"].set(correctedPayload.as<JsonObjectConst>());
-    replay["payload_revision"] = (replay["payload_revision"] | 0) + 1;
-    replay["corrected_at"] = nowEpoch();
-    replay["updated_at"] = nowEpoch();
+    const EpochSeconds now = nowEpoch();
+    if (canonicalArtifact) {
+        artifact.record = corrected.record;
+        artifact.samples.assign(corrected.samples.begin(), corrected.samples.end());
+        artifact.revision += 1;
+        artifact.bindSamples();
+        if (!artifactStore.write(artifact)) {
+            reason = "Unable to commit the corrected shot artifact";
+            return false;
+        }
+        replay.remove("payload");
+        replay.remove("completion");
+        replay["schema_version"] = 3;
+        updateReplayArtifactIdentity(replay, artifact);
+    } else {
+        replay["payload"].set(correctedPayload.as<JsonObjectConst>());
+        replay["payload_revision"] = (replay["payload_revision"] | 0) + 1;
+    }
+    const AutoTuning::DeliveryStatus currentDelivery = deliveryState(replay).status;
+    if (currentDelivery == AutoTuning::DeliveryStatus::Pending ||
+        currentDelivery == AutoTuning::DeliveryStatus::RetryWait ||
+        currentDelivery == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
+        replay["local_delivery_state"] = "pending";
+        replay["local_next_retry_at"] = 0;
+        replay["local_last_error"] = nullptr;
+        replay.remove("active_attempt_id");
+        transitionPrompt(replay, AutoTuning::PromptStatus::Processing, now);
+        deliveryWorkPending = true;
+        nextDeliveryCheckAt = 0;
+    }
+    replay["corrected_at"] = now;
+    replay["updated_at"] = now;
     if (replay["community_required"] | false) {
         replay["community_dispatched"] = false;
     }
-    if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, correction.shotId.c_str()), envelope)) {
+    if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
         reason = "Unable to persist the corrected shot replay";
         return false;
     }
@@ -396,79 +541,131 @@ bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &c
         reason = "Unable to persist the corrected shot summary";
         return false;
     }
-    publishStatus();
+    requestStatusRefresh();
     return true;
 }
 
 bool LocalAutoTuningStorePlugin::storeRecommendation(AutoTuning::Recommendation const &recommendation) {
+    WorkItem work;
+    work.kind = WorkKind::StoreRecommendation;
+    work.recommendation =
+        std::make_unique<AutoTuning::Recommendation>(recommendation);
+    return enqueueWork(std::move(work));
+}
+
+bool LocalAutoTuningStorePlugin::persistRecommendation(
+    AutoTuning::Recommendation const &recommendation) {
+    LocalStoreLock lock(storeMutex);
     JsonDocument payload(&psramAllocator);
     if (!AutoTuningJsonCodec::writeRecommendation(recommendation, payload) ||
         !summaryStore.upsertRecommendation(payload.as<JsonObjectConst>())) {
         return false;
     }
     prune();
-    publishStatus();
+    requestStatusRefresh();
     return true;
 }
 
 void LocalAutoTuningStorePlugin::loop() {
-    if (!pendingDoseRecoveryChecked && millis() >= 1000) {
-        pendingDoseRecoveryChecked = true;
-        recoverPendingDoseConfirmation();
+    drainStoredShots();
+    drainShotCompletions();
+    if (!pendingDoseRecoveryChecked.load(std::memory_order_acquire) && millis() >= 1000) {
+        pendingDoseRecoveryChecked.store(true, std::memory_order_release);
+        WorkItem recovery;
+        recovery.kind = WorkKind::DoseConfirmationRecovery;
+        enqueueWork(std::move(recovery));
     }
     if (millis() - lastDeliverySweepMs >= DELIVERY_SWEEP_INTERVAL_MS) {
         lastDeliverySweepMs = millis();
-        processDueDelivery();
+        WorkItem delivery;
+        delivery.kind = WorkKind::DeliverySweep;
+        enqueueWork(std::move(delivery));
         if (controller && controller->getSettings().isRLCommunityUploadEnabled() && nowEpoch() >= EpochTime::MIN_VALID) {
-            dispatchPendingCommunityUploads();
+            WorkItem community;
+            community.kind = WorkKind::CommunitySweep;
+            enqueueWork(std::move(community));
         }
     }
     if (millis() - lastStatusMs >= STATUS_INTERVAL_MS) {
+        requestStatusRefresh();
+    }
+#if defined(GAGGIMATE_SIM)
+    if (workerTaskHandle == nullptr) {
+        processOneWorkItem();
+    }
+#endif
+    if (statusPublishRequested.exchange(false, std::memory_order_acq_rel)) {
         publishStatus();
     }
 }
 
-bool LocalAutoTuningStorePlugin::ensureDirectories() const {
-    const bool available = LocalAutoTuningFiles::ensureDirectory(STORE_DIR) && summaryStore.begin() && contextStore.begin() &&
-                           LocalAutoTuningFiles::ensureDirectory(REPLAY_DIR);
+bool LocalAutoTuningStorePlugin::ensureDirectories() {
+    const bool available =
+        LocalAutoTuningFiles::ensureDirectory(STORE_DIR) && summaryStore.begin() &&
+        contextStore.begin() && LocalAutoTuningFiles::ensureDirectory(REPLAY_DIR);
     if (available) {
         LocalAutoTuningFiles::recoverDirectory(REPLAY_DIR);
     }
-    return available;
+    if (!available) {
+        return false;
+    }
+    if (!artifactStoreReady) {
+        artifactStoreReady = artifactStore.begin();
+    }
+    return artifactStoreReady;
 }
 
 bool LocalAutoTuningStorePlugin::reset() {
+    LocalStoreLock lock(storeMutex);
     if (!ensureDirectories()) {
         return false;
     }
-    const bool ok = summaryStore.reset() && LocalAutoTuningFiles::clearDirectory(REPLAY_DIR) && contextStore.clear();
+    // The artifact is the canonical record. Clear derived state first so an
+    // interrupted reset can be reconstructed from any artifact that remains.
+    const bool projectionsCleared =
+        summaryStore.reset() && LocalAutoTuningFiles::clearDirectory(REPLAY_DIR) &&
+        contextStore.clear();
+    if (!projectionsCleared) {
+        requestStatusRefresh();
+        return false;
+    }
+    std::vector<String> artifactShotIds;
+    const bool listed = artifactStore.listShotIds(artifactShotIds);
+    bool artifactsCleared = listed;
+    for (const String &shotId : artifactShotIds) {
+        artifactsCleared = artifactStore.remove(shotId) && artifactsCleared;
+    }
+    const bool ok = projectionsCleared && artifactsCleared;
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        storedShotNotices.clear();
+        completionNotices.clear();
+        queuedCompletionShotIds.clear();
+        claimablePrompts.clear();
+    }
     deliveryWorkPending = false;
     nextDeliveryCheckAt = 0;
-    refreshDeliveryStatus();
-    publishStatus();
+    requestStatusRefresh();
     return ok;
 }
 
 AutoTuning::LocalStoreStats LocalAutoTuningStorePlugin::stats() const {
-    AutoTuning::LocalStoreStats out;
-    out.available = LittleFSUtil::existsQuietly(STORE_DIR);
-    const LocalAutoTuningSummaryStore::Stats summaries = summaryStore.stats();
-    const LocalAutoTuningFiles::DirectoryStats replays = LocalAutoTuningFiles::directoryStats(REPLAY_DIR);
-    out.shotCount = summaries.shotCount;
-    out.recommendationCount = summaries.recommendationCount;
-    out.bytes = summaries.bytes + replays.bytes + contextStore.bytes();
-    return out;
+    std::lock_guard<std::mutex> guard(statusMutex);
+    return cachedStats;
 }
 
 bool LocalAutoTuningStorePlugin::loadShotSummary(const String &shotId, JsonDocument &out) const {
+    LocalStoreLock lock(storeMutex);
     return summaryStore.loadShot(shotId, out);
 }
 
 bool LocalAutoTuningStorePlugin::hasShotReplay(const String &shotId) const {
+    LocalStoreLock lock(storeMutex);
     return !shotId.isEmpty() && LittleFSUtil::existsQuietly(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId));
 }
 
 bool LocalAutoTuningStorePlugin::canRemoveShotData(const String &shotId) const {
+    LocalStoreLock lock(storeMutex);
     if (shotId.isEmpty()) {
         return false;
     }
@@ -486,6 +683,7 @@ bool LocalAutoTuningStorePlugin::canRemoveShotData(const String &shotId) const {
 }
 
 bool LocalAutoTuningStorePlugin::removeShotData(const String &shotId, const bool force) {
+    LocalStoreLock lock(storeMutex);
     if (shotId.isEmpty()) {
         return false;
     }
@@ -496,26 +694,71 @@ bool LocalAutoTuningStorePlugin::removeShotData(const String &shotId, const bool
     const String replayPath = LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId);
     removed = summaryStore.removeShot(shotId) || removed;
     if (LittleFSUtil::existsQuietly(replayPath)) {
+        auto lease = StorageCoordinator::instance().acquireFlash();
         removed = LittleFS.remove(replayPath) || removed;
     }
+    removed = artifactStore.remove(shotId) || removed;
     if (removed) {
+        {
+            std::lock_guard<std::mutex> guard(workMutex);
+            storedShotNotices.erase(
+                std::remove_if(storedShotNotices.begin(), storedShotNotices.end(),
+                               [&shotId](StoredShotNotice const &notice) {
+                                   return notice.shotId == shotId;
+                               }),
+                storedShotNotices.end());
+            completionNotices.erase(
+                std::remove_if(completionNotices.begin(), completionNotices.end(),
+                               [&shotId](CompletionNotice const &notice) {
+                                   return notice.shotId == shotId;
+                               }),
+                completionNotices.end());
+            queuedCompletionShotIds.erase(
+                std::remove(queuedCompletionShotIds.begin(),
+                            queuedCompletionShotIds.end(), shotId),
+                queuedCompletionShotIds.end());
+            claimablePrompts.erase(
+                std::remove_if(claimablePrompts.begin(), claimablePrompts.end(),
+                               [&shotId](ClaimablePrompt const &prompt) {
+                                   return prompt.shotId == shotId;
+                               }),
+                claimablePrompts.end());
+        }
         deliveryWorkPending = true;
         nextDeliveryCheckAt = 0;
-        refreshDeliveryStatus();
-        publishStatus();
+        requestStatusRefresh();
     }
     return removed;
 }
 
-void LocalAutoTuningStorePlugin::handleShotDispatch(Event const &event) { dispatchStoredShot(event.getString("shot_id"), false); }
+void LocalAutoTuningStorePlugin::handleShotDispatch(Event const &event) {
+    WorkItem work;
+    work.kind = WorkKind::Dispatch;
+    work.shotId = event.getString("shot_id");
+    enqueueWork(std::move(work));
+}
 
 void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
+    LocalStoreLock lock(storeMutex);
     const String shotId = event.getString("shot_id");
-    if (shotId.isEmpty() || event.getInt("has_followed") != 1) {
+    const std::uint32_t promptRevision =
+        static_cast<std::uint32_t>(std::max<std::int64_t>(
+            event.getInt64("prompt_revision"), 0));
+    if (shotId.isEmpty() || promptRevision == 0 ||
+        event.getInt("prompt_claimed") != 1 ||
+        event.getInt("has_followed") != 1) {
         return;
     }
+    const auto releaseClaim = [this, &shotId, promptRevision]() {
+        Event release;
+        release.id = "rl:prompt:release";
+        release.setString("shot_id", shotId);
+        release.setInt64("prompt_revision", promptRevision);
+        pluginManager->trigger(release);
+    };
     JsonDocument envelope(&psramAllocator);
     if (!loadReplaySnapshot(shotId, envelope)) {
+        releaseClaim();
         if (hasShotReplay(shotId)) {
             ESP_LOGE(LOG_TAG, "Failed to load dose confirmation replay for shot %s", shotId.c_str());
             return;
@@ -524,79 +767,161 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
         Event resolved;
         resolved.id = "rl:dose-confirmation:resolved";
         resolved.setString("shot_id", shotId);
+        resolved.setInt64("prompt_revision", promptRevision);
         resolved.setInt("followed", event.getInt("followed") == 1 ? 1 : 0);
         resolved.setInt("persisted", 0);
         pluginManager->trigger(resolved);
         return;
     }
     JsonObject root = envelope.as<JsonObject>();
-    JsonObject payload = root["payload"].as<JsonObject>();
-    if (payload.isNull()) {
+    const AutoTuning::PromptState currentPrompt = promptState(root);
+    if (currentPrompt.revision != promptRevision ||
+        deliveryState(root).status !=
+            AutoTuning::DeliveryStatus::AwaitingDoseConfirmation) {
+        releaseClaim();
+        return;
+    }
+    AutoTuning::CompletedShotArtifact artifact;
+    if (!loadCommittedShot(shotId, artifact)) {
+        releaseClaim();
         return;
     }
     const bool followed = event.getInt("followed") == 1;
-    payload["dose_target_confirmed"] = followed;
-    payload["dose_followed"] = followed;
-    payload["dose_observed"] = payload["dose_observed"] | false;
-    if (followed && payload["dose_in_g"].isNull() && jsonNumber(payload["dose_target_g"])) {
-        payload["dose_in_g"] = payload["dose_target_g"];
+    artifact.record.doseTargetConfirmed = followed;
+    artifact.record.doseFollowed = followed;
+    if (followed && !artifact.record.measuredDoseG.has_value() &&
+        artifact.record.recipe.doseTargetG.has_value()) {
+        artifact.record.measuredDoseG = artifact.record.recipe.doseTargetG;
     }
+    const bool canonicalArtifact = artifactStore.exists(shotId);
+    JsonDocument payload(&psramAllocator);
+    if (canonicalArtifact) {
+        artifact.revision += 1;
+        artifact.bindSamples();
+        if (!artifactStore.write(artifact)) {
+            ESP_LOGE(LOG_TAG, "Failed to commit dose confirmation for shot %s", shotId.c_str());
+            releaseClaim();
+            return;
+        }
+        root.remove("payload");
+        root.remove("completion");
+        root["schema_version"] = 3;
+        updateReplayArtifactIdentity(root, artifact);
+    } else if (!AutoTuningJsonCodec::writeShotRecord(artifact.record, payload)) {
+        releaseClaim();
+        return;
+    } else {
+        root["payload"].set(payload.as<JsonObjectConst>());
+    }
+    const EpochSeconds now = nowEpoch();
     root["dose_confirmation_status"] = followed ? "confirmed" : "not_followed";
     root["dispatch_state"] = "ready";
     root["local_delivery_state"] = "pending";
     root["local_next_retry_at"] = 0;
-    root["updated_at"] = nowEpoch();
+    root["updated_at"] = now;
+    transitionPrompt(root, AutoTuning::PromptStatus::Processing, now);
     if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
         ESP_LOGE(LOG_TAG, "Failed to persist dose confirmation for shot %s", shotId.c_str());
+        releaseClaim();
         return;
     }
 
-    summaryStore.upsertShot(payload);
+    if (canonicalArtifact) {
+        upsertArtifactSummary(artifact);
+    } else {
+        summaryStore.upsertShot(payload.as<JsonObjectConst>());
+    }
     Event resolved;
     resolved.id = "rl:dose-confirmation:resolved";
     resolved.setString("shot_id", shotId);
+    resolved.setInt64("prompt_revision", promptRevision);
     resolved.setInt("followed", followed ? 1 : 0);
     resolved.setInt("persisted", 1);
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        claimablePrompts.erase(
+            std::remove_if(
+                claimablePrompts.begin(), claimablePrompts.end(),
+                [&shotId, promptRevision](ClaimablePrompt const &prompt) {
+                    return prompt.shotId == shotId &&
+                           prompt.revision == promptRevision;
+                }),
+            claimablePrompts.end());
+    }
     pluginManager->trigger(resolved);
     deliveryWorkPending = true;
     nextDeliveryCheckAt = 0;
-    dispatchStoredShot(shotId, false);
-    recoverPendingDoseConfirmation();
+    WorkItem work;
+    work.kind = WorkKind::Dispatch;
+    work.shotId = shotId;
+    enqueueWork(std::move(work));
+    WorkItem recovery;
+    recovery.kind = WorkKind::DoseConfirmationRecovery;
+    enqueueWork(std::move(recovery));
 }
 
-void LocalAutoTuningStorePlugin::handleShotReprocess(Event const &event) {
-    const String shotId = event.getString("shot_id");
+void LocalAutoTuningStorePlugin::handleShotReprocess(Event &event) {
+    WorkItem work;
+    work.kind = WorkKind::Reprocess;
+    work.shotId = event.getString("shot_id");
+    event.setInt("queued", enqueueWork(std::move(work)) ? 1 : 0);
+}
+
+bool LocalAutoTuningStorePlugin::prepareShotReprocess(const String &shotId) {
+    LocalStoreLock lock(storeMutex);
     JsonDocument envelope(&psramAllocator);
     if (!controller || !loadReplaySnapshot(shotId, envelope)) {
-        return;
+        return false;
     }
     JsonObject root = envelope.as<JsonObject>();
     if (deliveryState(root).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation) {
-        Event confirmation;
-        confirmation.id = "rl:dose-confirmation:required";
-        confirmation.setString("shot_id", shotId);
-        JsonObjectConst payload = root["payload"].as<JsonObjectConst>();
-        confirmation.setFloat("dose_target_g", payload["dose_target_g"] | 0.0f);
-        pluginManager->trigger(confirmation);
-        return;
+        StoredShotNotice notice;
+        notice.shotId = shotId;
+        notice.doseConfirmationRequired = true;
+        notice.doseTargetG = root["dose_target_g"] | 0.0f;
+        notice.promptRevision = promptState(root).revision;
+        if (notice.doseTargetG <= 0.0f) {
+            AutoTuning::CompletedShotArtifact artifact;
+            if (loadCommittedShot(shotId, artifact)) {
+                notice.doseTargetG = artifact.completion.doseTargetG;
+            }
+        }
+        std::lock_guard<std::mutex> guard(workMutex);
+        storedShotNotices.push_back(std::move(notice));
+        return true;
     }
-    JsonObject payload = root["payload"].as<JsonObject>();
-    if (payload.isNull()) {
-        return;
+    AutoTuning::CompletedShotArtifact artifact;
+    if (!loadCommittedShot(shotId, artifact)) {
+        return false;
     }
-    if (payload["taste_goal"].isNull()) {
+    if (!artifact.record.recipe.tasteGoal.valid()) {
         Settings const &settings = controller->getSettings();
         const bool activeContextMatches =
-            jsonStringOrEmpty(payload["bean_context_id"]) == settings.getRLBeanContextId() &&
-            jsonStringOrEmpty(payload["grinder_context_id"]) == settings.getRLGrinderContextId();
+            artifact.record.recipe.beanContextId == settings.getRLBeanContextId().c_str() &&
+            artifact.record.recipe.grinder.contextId == settings.getRLGrinderContextId().c_str();
         AutoTuning::TasteGoal activeGoal;
         String goalError;
         if (!activeContextMatches || !AutoTuning::activeTasteGoal(settings, activeGoal, &goalError)) {
             ESP_LOGW(LOG_TAG, "Cannot restore the missing taste goal for shot %s", shotId.c_str());
-            return;
+            return false;
         }
-        AutoTuning::writeTasteGoal(activeGoal, payload["taste_goal"].to<JsonObject>());
-        summaryStore.upsertShot(payload);
+        artifact.record.recipe.tasteGoal = activeGoal;
+        if (artifactStore.exists(shotId)) {
+            artifact.revision += 1;
+            artifact.bindSamples();
+            if (!artifactStore.write(artifact)) {
+                return false;
+            }
+            updateReplayArtifactIdentity(root, artifact);
+            upsertArtifactSummary(artifact);
+        } else {
+            JsonDocument payload(&psramAllocator);
+            if (!AutoTuningJsonCodec::writeShotRecord(artifact.record, payload)) {
+                return false;
+            }
+            root["payload"].set(payload.as<JsonObjectConst>());
+            summaryStore.upsertShot(payload.as<JsonObjectConst>());
+        }
         ESP_LOGI(LOG_TAG, "Restored the active taste goal while reprocessing shot %s", shotId.c_str());
     }
     const bool localDeliveryRequired = controller && AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
@@ -609,28 +934,73 @@ void LocalAutoTuningStorePlugin::handleShotReprocess(Event const &event) {
     root["community_dispatched"] = false;
     root["community_required"] = controller && controller->getSettings().isRLCommunityUploadEnabled();
     root["completion_emitted"] = !localDeliveryRequired;
-    root["updated_at"] = nowEpoch();
+    const EpochSeconds now = nowEpoch();
+    root["updated_at"] = now;
+    transitionPrompt(root, AutoTuning::PromptStatus::Processing, now);
     if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
-        return;
+        return false;
     }
     deliveryWorkPending = true;
     nextDeliveryCheckAt = 0;
-    dispatchStoredShot(shotId, true);
+    WorkItem work;
+    work.kind = WorkKind::Dispatch;
+    work.shotId = shotId;
+    work.reprocess = true;
+    return enqueueWork(std::move(work));
 }
 
-bool LocalAutoTuningStorePlugin::saveReplaySnapshot(const String &shotId, JsonVariantConst payload, JsonVariantConst completion,
-                                                    bool doseConfirmationRequired, bool localDeliveryRequired,
-                                                    bool communityUploadRequired) {
-    if (!ensureDirectories() || shotId.isEmpty() || !payload.is<JsonObjectConst>()) {
+bool LocalAutoTuningStorePlugin::transitionPrompt(JsonObject root, const AutoTuning::PromptStatus status,
+                                                  const std::int64_t timestamp) const {
+    if (root.isNull()) {
         return false;
     }
+    const String current = jsonStringOrEmpty(root["prompt_state"]);
+    const char *next = AutoTuning::promptStatusKey(status);
+    if (current == next) {
+        return false;
+    }
+    root["prompt_state"] = next;
+    root["prompt_revision"] = std::max(0, root["prompt_revision"] | 0) + 1;
+    root["prompt_updated_at"] = timestamp;
+    return true;
+}
+
+bool LocalAutoTuningStorePlugin::updateReplayArtifactIdentity(
+    JsonObject root, AutoTuning::CompletedShotArtifact const &artifact) const {
+    if (root.isNull() || artifact.record.shotId.empty() || artifact.revision == 0 ||
+        artifact.payloadHash.size() != 64) {
+        return false;
+    }
+    root["artifact_revision"] = artifact.revision;
+    root["artifact_payload_hash"] = artifact.payloadHash.c_str();
+    root["artifact_encoding_version"] = 1;
+    return true;
+}
+
+bool LocalAutoTuningStorePlugin::upsertArtifactSummary(
+    AutoTuning::CompletedShotArtifact const &artifact) {
+    JsonDocument payload(&psramAllocator);
+    return AutoTuningJsonCodec::writeShotRecord(artifact.record, payload) &&
+           summaryStore.upsertShot(payload.as<JsonObjectConst>());
+}
+
+bool LocalAutoTuningStorePlugin::saveReplaySnapshot(
+    AutoTuning::CompletedShotArtifact const &artifact) {
+    const String shotId(artifact.record.shotId.c_str());
+    if (!ensureDirectories() || shotId.isEmpty() || artifact.payloadHash.size() != 64) {
+        return false;
+    }
+    const bool doseConfirmationRequired = artifact.disposition.doseConfirmationRequired;
+    const bool localDeliveryRequired = artifact.disposition.optimizerDeliveryRequired;
+    const bool communityUploadRequired = artifact.disposition.communityUploadRequired;
+    const EpochSeconds now = nowEpoch();
     JsonDocument envelope(&psramAllocator);
     JsonObject root = envelope.to<JsonObject>();
     root["event_type"] = "local_shot_replay";
-    root["schema_version"] = 2;
+    root["schema_version"] = 3;
     root["shot_id"] = shotId;
-    root["captured_at"] = nowEpoch();
-    root["updated_at"] = nowEpoch();
+    root["captured_at"] = artifact.committedAt;
+    root["updated_at"] = now;
     root["dispatch_state"] = doseConfirmationRequired ? "awaiting_dose_confirmation" : "ready";
     root["local_delivery_state"] =
         doseConfirmationRequired ? "awaiting_dose_confirmation" : (localDeliveryRequired ? "pending" : "not_required");
@@ -643,10 +1013,11 @@ bool LocalAutoTuningStorePlugin::saveReplaySnapshot(const String &shotId, JsonVa
     root["community_dispatched"] = false;
     root["community_required"] = communityUploadRequired;
     root["completion_emitted"] = !localDeliveryRequired;
-    root["payload"].set(payload);
-    if (completion.is<JsonObjectConst>()) {
-        root["completion"].set(completion);
-    }
+    root["dose_target_g"] = artifact.completion.doseTargetG;
+    root["prompt_state"] = AutoTuning::promptStatusKey(AutoTuning::PromptStatus::Processing);
+    root["prompt_revision"] = 1;
+    root["prompt_updated_at"] = now;
+    updateReplayArtifactIdentity(root, artifact);
     return LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
 }
 
@@ -664,81 +1035,251 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
         nextDeliveryCheckAt = 0;
         return false;
     }
+
+    AutoTuning::CompletedShotArtifact artifact;
+    AutoTuning::ShotDeliveryAttempt attempt;
+    bool localDeliveryRequired = false;
+    bool communityRequired = false;
+    bool communityDispatched = false;
     JsonDocument envelope(&psramAllocator);
-    if (!loadReplaySnapshot(shotId, envelope)) {
-        return false;
-    }
-    JsonObject root = envelope.as<JsonObject>();
-    if (deliveryState(root).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation) {
-        return false;
-    }
-    const bool localDeliveryRequired =
-        root["local_delivery_required"].isNull() ? true : root["local_delivery_required"].as<bool>();
-    const int replaySchemaVersion = root["schema_version"] | 1;
-    if (replaySchemaVersion < 2 && root["completion_emitted"].isNull()) {
-        // Version 1 emitted completion immediately after dispatch. Preserve
-        // that fact when recovering an old sent snapshot so its acknowledgement
-        // cannot reopen a stale preference prompt.
-        root["completion_emitted"] = root["dispatch_state"].as<String>() == "dispatched";
-    }
-    root["schema_version"] = 2;
-    JsonObject payload = root["payload"].as<JsonObject>();
-    if (payload.isNull() || payload["shot_id"].as<String>() != shotId) {
-        return false;
-    }
-    EpochSeconds payloadTimestamp = 0;
-    if (!jsonEpoch(payload["timestamp"], payloadTimestamp) || payloadTimestamp < EpochTime::MIN_VALID) {
-        payload["timestamp"] = now;
-        root["updated_at"] = now;
-        if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
+    {
+        LocalStoreLock lock(storeMutex);
+        if (!loadReplaySnapshot(shotId, envelope) || !loadCommittedShot(shotId, artifact)) {
             return false;
         }
-    }
-    AutoTuningJsonCodec::DecodedShotRecord decoded;
-    String decodeError;
-    if (!AutoTuningJsonCodec::parseShotRecord(payload, decoded, decodeError)) {
-        ESP_LOGW(LOG_TAG, "Stored shot %s is invalid: %s", shotId.c_str(), decodeError.c_str());
-        return false;
-    }
+        JsonObject root = envelope.as<JsonObject>();
+        if (deliveryState(root).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation) {
+            return false;
+        }
+        localDeliveryRequired =
+            root["local_delivery_required"].isNull() ? true
+                                                     : root["local_delivery_required"].as<bool>();
+        communityRequired = root["community_required"] | false;
+        communityDispatched = root["community_dispatched"] | false;
 
-    root["dispatch_state"] = "dispatched";
-    root["updated_at"] = now;
-    if (localDeliveryRequired) {
+        if (artifact.record.timestamp < EpochTime::MIN_VALID) {
+            artifact.record.timestamp = now;
+            if (artifactStore.exists(shotId)) {
+                artifact.revision += 1;
+                artifact.bindSamples();
+                if (!artifactStore.write(artifact)) {
+                    return false;
+                }
+                updateReplayArtifactIdentity(root, artifact);
+                upsertArtifactSummary(artifact);
+            } else {
+                JsonDocument legacyPayload(&psramAllocator);
+                if (!AutoTuningJsonCodec::writeShotRecord(artifact.record, legacyPayload)) {
+                    return false;
+                }
+                root["payload"].set(legacyPayload.as<JsonObjectConst>());
+            }
+        }
+
         const int previousAttempts =
-            jsonNumber(root["local_attempt_count"]) ? root["local_attempt_count"].as<int>() : (root["dispatch_count"] | 0);
+            jsonNumber(root["local_attempt_count"])
+                ? root["local_attempt_count"].as<int>()
+                : (root["dispatch_count"] | 0);
         const int attemptCount = previousAttempts + 1;
-        root["local_delivery_state"] = "awaiting_ack";
+        const String payloadHash =
+            artifact.payloadHash.empty()
+                ? legacyPayloadIdentity(shotId, artifact.revision)
+                : String(artifact.payloadHash.c_str());
+        attempt.shotId = artifact.record.shotId;
+        attempt.payloadHash = payloadHash.c_str();
+        attempt.artifactRevision = artifact.revision;
+        attempt.encodingVersion = 1;
+        attempt.reprocess = reprocess;
+        attempt.attemptId =
+            deliveryAttemptId(payloadHash, artifact.revision, attemptCount, now).c_str();
+        if (!attempt.valid()) {
+            return false;
+        }
+
+        root["schema_version"] = artifact.payloadHash.empty() ? (root["schema_version"] | 2) : 3;
+        root["dispatch_state"] = "dispatching";
+        root["updated_at"] = now;
         root["local_attempt_count"] = attemptCount;
         root["local_last_attempt_at"] = now;
-        root["local_next_retry_at"] = now + deliveryRetryDelaySeconds(attemptCount);
+        root["local_next_retry_at"] = 0;
         root["local_last_error"] = nullptr;
+        root["active_attempt_id"] = attempt.attemptId.c_str();
+        root["active_payload_hash"] = attempt.payloadHash.c_str();
+        root["active_artifact_revision"] = attempt.artifactRevision;
+        root["active_encoding_version"] = attempt.encodingVersion;
+        root["local_delivery_state"] =
+            localDeliveryRequired ? "pending" : "not_required";
         if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
             return false;
         }
-        deliveryWorkPending = true;
-        nextDeliveryCheckAt = jsonEpochOrZero(root["local_next_retry_at"]);
-
-        AutoTuning::OptimizerTransportPort *transport = controller ? controller->getOptimizerTransport() : nullptr;
-        if (transport) {
-            transport->publishShot(decoded.record, reprocess);
-        }
-    } else {
-        root["local_delivery_state"] = "not_required";
-        root["local_next_retry_at"] = 0;
-        root["local_last_error"] = nullptr;
     }
 
-    const bool communityDispatched = root["community_dispatched"] | false;
-    const bool communityRequired = root["community_required"] | false;
+    AutoTuning::ShotSubmissionResult submission{
+        AutoTuning::ShotSubmissionOutcome::Submitted, "not_required"};
+    if (localDeliveryRequired) {
+        AutoTuning::OptimizerTransportPort *transport =
+            controller ? controller->getOptimizerTransport() : nullptr;
+        submission =
+            transport
+                ? transport->publishShot(artifact.record, attempt)
+                : AutoTuning::ShotSubmissionResult{
+                      AutoTuning::ShotSubmissionOutcome::NotConnected,
+                      "optimizer_transport_unavailable"};
+    }
+
+    bool communityQueued = false;
     if (!automaticRetry && communityRequired && !communityDispatched) {
         AutoTuning::CommunityUploadPort *upload = controller ? controller->getCommunityUpload() : nullptr;
-        root["community_dispatched"] = upload && upload->enqueueShot(decoded.record);
+        communityQueued = upload && upload->enqueueShot(artifact.record);
     }
-    root["dispatch_count"] = (root["dispatch_count"] | 0) + 1;
-    LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
-    refreshDeliveryStatus();
-    publishStatus();
+
+    {
+        LocalStoreLock lock(storeMutex);
+        JsonDocument latest(&psramAllocator);
+        if (!loadReplaySnapshot(shotId, latest)) {
+            return false;
+        }
+        JsonObject root = latest.as<JsonObject>();
+        if (jsonStringOrEmpty(root["active_attempt_id"]) != attempt.attemptId.c_str() ||
+            jsonStringOrEmpty(root["active_payload_hash"]) != attempt.payloadHash.c_str() ||
+            (root["active_artifact_revision"] | 0U) != attempt.artifactRevision) {
+            return false;
+        }
+        const int attemptCount = root["local_attempt_count"] | 1;
+        root["dispatch_count"] = (root["dispatch_count"] | 0) + 1;
+        root["updated_at"] = nowEpoch();
+        if (communityQueued) {
+            root["community_dispatched"] = true;
+        }
+        if (!localDeliveryRequired) {
+            root["dispatch_state"] = "not_required";
+            root["local_delivery_state"] = "not_required";
+            root["local_next_retry_at"] = 0;
+            transitionPrompt(root, AutoTuning::PromptStatus::Resolved, nowEpoch());
+        } else if (submission.submitted()) {
+            root["dispatch_state"] = "dispatched";
+            root["local_delivery_state"] = "awaiting_ack";
+            root["local_next_retry_at"] =
+                nowEpoch() + deliveryRetryDelaySeconds(attemptCount);
+            transitionPrompt(root, AutoTuning::PromptStatus::AwaitingAcknowledgement,
+                             nowEpoch());
+        } else if (submission.retryable()) {
+            root["dispatch_state"] = "retry_wait";
+            root["local_delivery_state"] = "retry_wait";
+            root["local_next_retry_at"] =
+                nowEpoch() + deliveryRetryDelaySeconds(attemptCount);
+            root["local_last_error"] = submission.reason.c_str();
+            transitionPrompt(root, AutoTuning::PromptStatus::DeliveryRetrying, nowEpoch());
+        } else {
+            root["dispatch_state"] = "delivery_error";
+            root["local_delivery_state"] = "permanent_rejection";
+            root["local_next_retry_at"] = 0;
+            root["local_last_error"] = submission.reason.c_str();
+            transitionPrompt(root, AutoTuning::PromptStatus::DeliveryError, nowEpoch());
+        }
+        if (!LocalAutoTuningFiles::writeJson(
+                LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), latest)) {
+            return false;
+        }
+        deliveryWorkPending = localDeliveryRequired && !deliveryState(root).terminal();
+        nextDeliveryCheckAt = jsonEpochOrZero(root["local_next_retry_at"]);
+    }
+    refreshCachedStatus();
+    return !localDeliveryRequired || submission.submitted();
+}
+
+bool LocalAutoTuningStorePlugin::loadCommittedShot(
+    const String &shotId, AutoTuning::CompletedShotArtifact &artifact) const {
+    if (shotId.isEmpty()) {
+        return false;
+    }
+    if (artifactStore.load(shotId, artifact)) {
+        return true;
+    }
+
+    // Read-only migration fallback for snapshots created before the canonical
+    // artifact format. New writes never duplicate the payload in replay JSON.
+    JsonDocument replay(&psramAllocator);
+    if (!loadReplaySnapshot(shotId, replay)) {
+        return false;
+    }
+    JsonObjectConst root = replay.as<JsonObjectConst>();
+    AutoTuningJsonCodec::DecodedShotRecord decoded;
+    AutoTuning::ShotCompletion completion;
+    String error;
+    if (!AutoTuningJsonCodec::parseShotRecord(root["payload"], decoded, error) ||
+        !AutoTuningJsonCodec::parseShotCompletion(root["completion"], completion, error)) {
+        return false;
+    }
+    artifact = AutoTuning::CompletedShotArtifact{};
+    artifact.record = std::move(decoded.record);
+    artifact.completion = std::move(completion);
+    artifact.disposition.doseConfirmationRequired =
+        deliveryState(root).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation;
+    artifact.disposition.optimizerDeliveryRequired =
+        root["local_delivery_required"].isNull() || root["local_delivery_required"].as<bool>();
+    artifact.disposition.communityUploadRequired = root["community_required"] | false;
+    artifact.samples.assign(decoded.samples.begin(), decoded.samples.end());
+    artifact.revision = std::max(1, root["payload_revision"] | 1);
+    artifact.committedAt = jsonEpochOrZero(root["captured_at"]);
+    artifact.bindSamples();
     return true;
+}
+
+bool LocalAutoTuningStorePlugin::recoverCommittedArtifacts() {
+    LocalStoreLock lock(storeMutex);
+    if (!ensureDirectories()) {
+        return false;
+    }
+    std::vector<String> shotIds;
+    if (!artifactStore.listShotIds(shotIds)) {
+        return false;
+    }
+    bool recovered = true;
+    for (const String &shotId : shotIds) {
+        AutoTuning::CompletedShotArtifact artifact;
+        if (!artifactStore.load(shotId, artifact)) {
+            recovered = false;
+            continue;
+        }
+        JsonDocument replay(&psramAllocator);
+        if (!loadReplaySnapshot(shotId, replay)) {
+            recovered = saveReplaySnapshot(artifact) && recovered;
+        } else {
+            JsonObject root = replay.as<JsonObject>();
+            const bool identityChanged =
+                jsonStringOrEmpty(root["artifact_payload_hash"]) != artifact.payloadHash.c_str() ||
+                (root["artifact_revision"] | 0U) != artifact.revision;
+            root["schema_version"] = 3;
+            root.remove("payload");
+            root.remove("completion");
+            updateReplayArtifactIdentity(root, artifact);
+            if (root["dose_target_g"].isNull()) {
+                root["dose_target_g"] = artifact.completion.doseTargetG;
+            }
+            if (root["prompt_state"].isNull()) {
+                root["prompt_state"] =
+                    AutoTuning::promptStatusKey(AutoTuning::PromptStatus::Processing);
+                root["prompt_revision"] = 1;
+                root["prompt_updated_at"] = nowEpoch();
+            }
+            if (identityChanged) {
+                root["updated_at"] = nowEpoch();
+            }
+            recovered =
+                LocalAutoTuningFiles::writeJson(
+                    LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), replay) &&
+                recovered;
+        }
+        recovered = upsertArtifactSummary(artifact) && recovered;
+        AutoTuning::CompletedShotProjectionPort *projection =
+            controller ? controller->getCompletedShotProjection() : nullptr;
+        if (projection) {
+            recovered = projection->ensureProjection(artifact) && recovered;
+        }
+    }
+    requestStatusRefresh();
+    return recovered;
 }
 
 void LocalAutoTuningStorePlugin::dispatchPendingCommunityUploads() {
@@ -750,20 +1291,35 @@ void LocalAutoTuningStorePlugin::dispatchPendingCommunityUploads() {
         return;
     }
     for (const String &path : paths) {
+        String shotId;
+        AutoTuning::CompletedShotArtifact artifact;
+        bool due = false;
         JsonDocument envelope(&psramAllocator);
-        if (LocalAutoTuningFiles::readJson(path, envelope)) {
-            JsonObject root = envelope.as<JsonObject>();
-            JsonObjectConst payload = root["payload"].as<JsonObjectConst>();
-            if ((root["community_required"] | false) && !(root["community_dispatched"] | false) &&
-                deliveryState(root).status != AutoTuning::DeliveryStatus::AwaitingDoseConfirmation && !payload.isNull()) {
-                AutoTuningJsonCodec::DecodedShotRecord decoded;
-                String decodeError;
-                AutoTuning::CommunityUploadPort *upload = controller ? controller->getCommunityUpload() : nullptr;
-                if (upload && AutoTuningJsonCodec::parseShotRecord(payload, decoded, decodeError) &&
-                    upload->enqueueShot(decoded.record)) {
+        {
+            LocalStoreLock lock(storeMutex);
+            if (LocalAutoTuningFiles::readJson(path, envelope)) {
+                JsonObjectConst root = envelope.as<JsonObjectConst>();
+                shotId = root["shot_id"].as<String>();
+                due = (root["community_required"] | false) &&
+                      !(root["community_dispatched"] | false) &&
+                      deliveryState(root).status !=
+                          AutoTuning::DeliveryStatus::AwaitingDoseConfirmation &&
+                      loadCommittedShot(shotId, artifact);
+            }
+        }
+        AutoTuning::CommunityUploadPort *upload =
+            controller ? controller->getCommunityUpload() : nullptr;
+        if (due && upload && upload->enqueueShot(artifact.record)) {
+            LocalStoreLock lock(storeMutex);
+            JsonDocument latest(&psramAllocator);
+            if (loadReplaySnapshot(shotId, latest)) {
+                JsonObject root = latest.as<JsonObject>();
+                if ((root["community_required"] | false) &&
+                    !(root["community_dispatched"] | false)) {
                     root["community_dispatched"] = true;
                     root["updated_at"] = nowEpoch();
-                    LocalAutoTuningFiles::writeJson(path, envelope);
+                    LocalAutoTuningFiles::writeJson(
+                        LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), latest);
                 }
             }
         }
@@ -771,18 +1327,45 @@ void LocalAutoTuningStorePlugin::dispatchPendingCommunityUploads() {
 }
 
 void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
-    const String shotId = event.getString("shot_id");
-    const String outcome = event.getString("outcome");
-    const String reason = event.getString("reason");
+    AutoTuning::ShotDeliveryAcknowledgement const *acknowledgement =
+        event.getPayload<AutoTuning::ShotDeliveryAcknowledgement>();
+    if (!acknowledgement) {
+        return;
+    }
+    WorkItem work;
+    work.kind = WorkKind::DeliveryAcknowledgement;
+    work.shotId = acknowledgement->shotId.c_str();
+    work.outcome = acknowledgement->outcome.c_str();
+    work.reason = acknowledgement->reason.c_str();
+    work.timestamp = acknowledgement->timestamp;
+    work.attemptId = acknowledgement->attemptId.c_str();
+    work.payloadHash = acknowledgement->payloadHash.c_str();
+    work.artifactRevision = acknowledgement->artifactRevision;
+    work.encodingVersion = acknowledgement->encodingVersion;
+    work.preferenceRequest = acknowledgement->preferenceRequest;
+    enqueueWork(std::move(work));
+}
+
+void LocalAutoTuningStorePlugin::processShotDeliveryAck(const String &shotId, const String &outcome, const String &reason,
+                                                        const std::int64_t acknowledgementTimestamp,
+                                                        const String &attemptId, const String &payloadHash,
+                                                        const std::uint32_t artifactRevision,
+                                                        const std::uint16_t encodingVersion,
+                                                         std::optional<AutoTuning::PreferenceRequest> const &preferenceRequest) {
+    LocalStoreLock lock(storeMutex);
     JsonDocument envelope(&psramAllocator);
     if (shotId.isEmpty() || !loadReplaySnapshot(shotId, envelope)) {
         return;
     }
     JsonObject root = envelope.as<JsonObject>();
     const AutoTuning::DeliveryState currentDelivery = deliveryState(root);
-    const EpochSeconds acknowledgementTimestamp = event.getInt64("timestamp");
+    const String expectedHash = jsonStringOrEmpty(root["active_payload_hash"]);
+    const std::uint32_t expectedRevision = root["active_artifact_revision"] | 0U;
+    const std::uint16_t expectedEncoding =
+        static_cast<std::uint16_t>(root["active_encoding_version"] | 0U);
     if (currentDelivery.terminal() || acknowledgementTimestamp < EpochTime::MIN_VALID ||
-        (currentDelivery.lastAttemptAt.has_value() && acknowledgementTimestamp < *currentDelivery.lastAttemptAt)) {
+        attemptId.isEmpty() || payloadHash != expectedHash ||
+        artifactRevision != expectedRevision || encodingVersion != expectedEncoding) {
         return;
     }
     const EpochSeconds now = nowEpoch();
@@ -790,14 +1373,46 @@ void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
         if (!currentDelivery.canTransitionTo(AutoTuning::DeliveryStatus::Accepted)) {
             return;
         }
+        if (preferenceRequest.has_value()) {
+            AutoTuning::CompletedShotArtifact artifact;
+            if (!loadCommittedShot(shotId, artifact)) {
+                ESP_LOGW(LOG_TAG, "Cannot attach comparison request to unavailable shot %s",
+                         shotId.c_str());
+                return;
+            }
+            artifact.completion.preferenceRequest = preferenceRequest;
+            if (artifactStore.exists(shotId)) {
+                artifact.revision += 1;
+                artifact.bindSamples();
+                if (!artifactStore.write(artifact)) {
+                    ESP_LOGW(LOG_TAG, "Cannot commit comparison request for shot %s",
+                             shotId.c_str());
+                    return;
+                }
+                updateReplayArtifactIdentity(root, artifact);
+            } else {
+                JsonDocument updatedCompletion(&psramAllocator);
+                if (!AutoTuningJsonCodec::writeShotCompletion(artifact.completion,
+                                                               updatedCompletion)) {
+                    return;
+                }
+                root["completion"].set(updatedCompletion.as<JsonObjectConst>());
+            }
+        }
         root["local_delivery_state"] = "accepted";
         root["local_delivery_outcome"] = outcome;
         root["local_acknowledged_at"] = now;
         root["local_next_retry_at"] = 0;
         root["local_last_error"] = nullptr;
         root["updated_at"] = now;
+        transitionPrompt(
+            root,
+            preferenceRequest.has_value()
+                ? AutoTuning::PromptStatus::ComparisonAvailable
+                : AutoTuning::PromptStatus::Resolved,
+            now);
         if (LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
-            emitShotComplete(shotId, envelope);
+            prepareShotComplete(shotId, envelope);
         }
         deliveryWorkPending = true;
         nextDeliveryCheckAt = 0;
@@ -811,6 +1426,7 @@ void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
         root["local_next_retry_at"] = now + deliveryRetryDelaySeconds(attempts);
         root["local_last_error"] = reason.isEmpty() ? String("ingest_unavailable") : reason;
         root["updated_at"] = now;
+        transitionPrompt(root, AutoTuning::PromptStatus::DeliveryRetrying, now);
         LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
         deliveryWorkPending = true;
         nextDeliveryCheckAt = jsonEpochOrZero(root["local_next_retry_at"]);
@@ -822,6 +1438,7 @@ void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
         root["local_next_retry_at"] = 0;
         root["local_last_error"] = reason.isEmpty() ? String("permanent_rejection") : reason;
         root["updated_at"] = now;
+        transitionPrompt(root, AutoTuning::PromptStatus::DeliveryError, now);
         LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
         ESP_LOGW(LOG_TAG, "Shot %s was permanently rejected: %s", shotId.c_str(),
                  (reason.isEmpty() ? String("permanent_rejection") : reason).c_str());
@@ -830,105 +1447,446 @@ void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
     } else {
         return;
     }
-    refreshDeliveryStatus();
-    publishStatus();
+    refreshCachedStatus();
 }
 
-bool LocalAutoTuningStorePlugin::emitShotComplete(const String &shotId, JsonDocument &envelope) {
+bool LocalAutoTuningStorePlugin::prepareShotComplete(const String &shotId, JsonDocument &envelope) {
     JsonObject root = envelope.as<JsonObject>();
-    if ((root["completion_emitted"] | false) || deliveryState(root).status != AutoTuning::DeliveryStatus::Accepted) {
+    const int replaySchemaVersion = root["schema_version"] | 1;
+    const AutoTuning::PromptState prompt = promptState(root);
+    const bool durablePromptAvailable =
+        replaySchemaVersion >= 3 &&
+        prompt.status == AutoTuning::PromptStatus::ComparisonAvailable;
+    if (deliveryState(root).status != AutoTuning::DeliveryStatus::Accepted ||
+        (!durablePromptAvailable && (root["completion_emitted"] | false))) {
         return false;
     }
-    JsonObjectConst completion = root["completion"].as<JsonObjectConst>();
-    JsonObjectConst payload = root["payload"].as<JsonObjectConst>();
-    if (completion.isNull() || payload.isNull()) {
-        // Legacy or damaged snapshots may not contain prompt metadata. Their
-        // accepted delivery is still terminal and must not cause a hot retry
-        // scan forever.
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        if (std::find(queuedCompletionShotIds.begin(), queuedCompletionShotIds.end(), shotId) !=
+                queuedCompletionShotIds.end() ||
+            std::any_of(
+                claimablePrompts.begin(), claimablePrompts.end(),
+                [&shotId, &prompt](ClaimablePrompt const &candidate) {
+                    return candidate.shotId == shotId &&
+                           candidate.revision == prompt.revision;
+                })) {
+            return false;
+        }
+    }
+    AutoTuning::CompletedShotArtifact artifact;
+    if (!loadCommittedShot(shotId, artifact)) {
         root["completion_emitted"] = true;
         root["updated_at"] = nowEpoch();
         LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
         return false;
     }
-    AutoTuning::ShotCompletion completionRecord;
-    String completionError;
-    if (!AutoTuningJsonCodec::parseShotCompletion(completion, completionRecord, completionError)) {
-        ESP_LOGW(LOG_TAG, "Stored completion for %s is invalid: %s", shotId.c_str(), completionError.c_str());
-        root["completion_emitted"] = true;
-        root["updated_at"] = nowEpoch();
-        LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
+    AutoTuning::ShotCompletion completionRecord = artifact.completion;
+    const bool doseUsable = artifact.record.hasUsableDose();
+    if (!doseUsable) {
+        completionRecord.preferenceRequest.reset();
+    }
+    if (durablePromptAvailable && !completionRecord.preferenceRequest.has_value()) {
+        const EpochSeconds now = nowEpoch();
+        transitionPrompt(root, AutoTuning::PromptStatus::Resolved, now);
+        root["updated_at"] = now;
+        LocalAutoTuningFiles::writeJson(
+            LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
         return false;
     }
-    const bool doseUsable = payload["dose_observed"].as<bool>() || payload["dose_target_confirmed"].as<bool>();
-    completionRecord.recommendation.preferenceFeedbackRequired =
-        completionRecord.recommendation.preferenceFeedbackRequired && doseUsable;
-    Event completeEvent;
-    completeEvent.id = "rl:shot:complete";
-    completeEvent.setString("shot_id", shotId);
-    completeEvent.setInt("preference_feedback_required", completionRecord.recommendation.preferenceFeedbackRequired ? 1 : 0);
-    completeEvent.setPayload(completionRecord);
-    pluginManager->trigger(completeEvent);
-    root["completion_emitted"] = true;
-    root["updated_at"] = nowEpoch();
-    return LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        queuedCompletionShotIds.push_back(shotId);
+        completionNotices.push_back(
+            CompletionNotice{shotId, std::move(completionRecord),
+                             durablePromptAvailable ? prompt.revision : 0});
+    }
+    return true;
+}
+
+void LocalAutoTuningStorePlugin::drainStoredShots() {
+    for (;;) {
+        StoredShotNotice notice;
+        {
+            std::lock_guard<std::mutex> guard(workMutex);
+            if (storedShotNotices.empty()) {
+                return;
+            }
+            notice = std::move(storedShotNotices.front());
+            storedShotNotices.pop_front();
+        }
+
+        if (notice.doseConfirmationRequired) {
+            if (notice.promptRevision > 0) {
+                std::lock_guard<std::mutex> guard(workMutex);
+                const bool alreadyClaimable = std::any_of(
+                    claimablePrompts.begin(), claimablePrompts.end(),
+                    [&notice](ClaimablePrompt const &prompt) {
+                        return prompt.shotId == notice.shotId &&
+                               prompt.revision == notice.promptRevision;
+                    });
+                if (!alreadyClaimable) {
+                    claimablePrompts.push_back(
+                        ClaimablePrompt{notice.shotId, notice.promptRevision, false});
+                }
+            }
+            Event confirmationEvent;
+            confirmationEvent.id = "rl:dose-confirmation:required";
+            confirmationEvent.setString("shot_id", notice.shotId);
+            confirmationEvent.setFloat("dose_target_g", notice.doseTargetG);
+            confirmationEvent.setInt64("prompt_revision", notice.promptRevision);
+            pluginManager->trigger(confirmationEvent);
+        } else {
+            Event dispatchEvent;
+            dispatchEvent.id = "rl:shot:dispatch";
+            dispatchEvent.setString("shot_id", notice.shotId);
+            pluginManager->trigger(dispatchEvent);
+        }
+    }
+}
+
+void LocalAutoTuningStorePlugin::drainShotCompletions() {
+    for (;;) {
+        CompletionNotice notice;
+        {
+            std::lock_guard<std::mutex> guard(workMutex);
+            if (completionNotices.empty()) {
+                return;
+            }
+            notice = std::move(completionNotices.front());
+            completionNotices.pop_front();
+            queuedCompletionShotIds.erase(
+                std::remove(queuedCompletionShotIds.begin(),
+                            queuedCompletionShotIds.end(), notice.shotId),
+                queuedCompletionShotIds.end());
+            if (notice.promptRevision > 0) {
+                claimablePrompts.push_back(
+                    ClaimablePrompt{notice.shotId, notice.promptRevision, false});
+            }
+        }
+
+        Event completeEvent;
+        completeEvent.id = "rl:shot:complete";
+        completeEvent.setString("shot_id", notice.shotId);
+        completeEvent.setInt("preference_feedback_required",
+                             notice.completion.preferenceRequest.has_value() ? 1 : 0);
+        completeEvent.setInt64("prompt_revision", notice.promptRevision);
+        completeEvent.setPayload(std::move(notice.completion));
+        pluginManager->trigger(completeEvent);
+
+        if (notice.promptRevision == 0) {
+            WorkItem work;
+            work.kind = WorkKind::MarkCompletionEmitted;
+            work.shotId = notice.shotId;
+            enqueueWork(std::move(work));
+        }
+    }
+}
+
+bool LocalAutoTuningStorePlugin::markShotCompletionEmitted(const String &shotId) {
+    LocalStoreLock lock(storeMutex);
+    bool persisted = false;
+    JsonDocument envelope(&psramAllocator);
+    if (loadReplaySnapshot(shotId, envelope)) {
+        JsonObject root = envelope.as<JsonObject>();
+        if ((root["completion_emitted"] | false) ||
+            deliveryState(root).status != AutoTuning::DeliveryStatus::Accepted) {
+            persisted = true;
+        } else {
+            root["completion_emitted"] = true;
+            root["updated_at"] = nowEpoch();
+            persisted = LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        queuedCompletionShotIds.erase(
+            std::remove(queuedCompletionShotIds.begin(), queuedCompletionShotIds.end(), shotId),
+            queuedCompletionShotIds.end());
+    }
+    if (!persisted) {
+        deliveryWorkPending.store(true, std::memory_order_release);
+        nextDeliveryCheckAt.store(0, std::memory_order_release);
+    }
+    refreshCachedStatus();
+    return persisted;
+}
+
+bool LocalAutoTuningStorePlugin::enqueueWork(WorkItem work) {
+#if !defined(GAGGIMATE_SIM)
+    if (workerStartAttempted.load(std::memory_order_acquire) && workerTaskHandle == nullptr) {
+        return false;
+    }
+#endif
+    if (work.kind == WorkKind::StoreShot && (!work.queuedShot || work.shotId.isEmpty())) {
+        return false;
+    }
+    if (work.kind == WorkKind::StoreRecommendation && !work.recommendation) {
+        return false;
+    }
+    if (work.kind == WorkKind::PatchShotCorrection &&
+        (!work.correction || work.correction->shotId.empty())) {
+        return false;
+    }
+    if (work.kind == WorkKind::PatchRecommendationStatus &&
+        (work.recommendationId.isEmpty() || work.recommendationStatus.isEmpty() ||
+         work.recommendationTimestampField.isEmpty())) {
+        return false;
+    }
+    if ((work.kind == WorkKind::Reprocess || work.kind == WorkKind::Dispatch ||
+         work.kind == WorkKind::DeliveryAcknowledgement ||
+         work.kind == WorkKind::MarkCompletionEmitted) &&
+        work.shotId.isEmpty()) {
+        return false;
+    }
+    if (work.kind == WorkKind::ResolvePrompt &&
+        (work.shotId.isEmpty() || work.promptRevision == 0)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        if (work.kind == WorkKind::StoreShot) {
+            const std::size_t queuedShots =
+                std::count_if(workItems.begin(), workItems.end(),
+                              [](WorkItem const &queued) { return queued.kind == WorkKind::StoreShot; });
+            if (queuedShots >= MAX_PENDING_SHOT_WRITES) {
+                return false;
+            }
+        }
+        const bool coalescible =
+            work.kind == WorkKind::DeliverySweep || work.kind == WorkKind::CommunitySweep ||
+            work.kind == WorkKind::DoseConfirmationRecovery ||
+            work.kind == WorkKind::StatusRefresh ||
+            work.kind == WorkKind::SnapshotContexts ||
+            work.kind == WorkKind::RecoverCommittedArtifacts;
+        if (coalescible &&
+            std::any_of(workItems.begin(), workItems.end(),
+                        [&work](WorkItem const &queued) { return queued.kind == work.kind; })) {
+            return true;
+        }
+        workItems.push_back(std::move(work));
+    }
+    if (workerTaskHandle) {
+#if !defined(GAGGIMATE_SIM)
+        xTaskNotifyGive(workerTaskHandle);
+#endif
+    }
+    return true;
+}
+
+bool LocalAutoTuningStorePlugin::processOneWorkItem() {
+    WorkItem work;
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        if (workItems.empty()) {
+            return false;
+        }
+        work = std::move(workItems.front());
+        workItems.pop_front();
+    }
+    switch (work.kind) {
+    case WorkKind::StoreShot:
+        if (!work.queuedShot) {
+            break;
+        }
+        if (!persistShot(work.queuedShot->shot, work.queuedShot->completion,
+                         work.queuedShot->disposition,
+                         work.queuedShot->committedAt)) {
+            ESP_LOGE(LOG_TAG, "Failed to persist shot %s; retrying", work.shotId.c_str());
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            std::lock_guard<std::mutex> guard(workMutex);
+            workItems.push_back(std::move(work));
+            break;
+        }
+        {
+            StoredShotNotice notice;
+            notice.shotId = work.shotId;
+            notice.doseConfirmationRequired = work.queuedShot->disposition.doseConfirmationRequired;
+            notice.doseTargetG = work.queuedShot->completion.doseTargetG;
+            notice.promptRevision = notice.doseConfirmationRequired ? 1 : 0;
+            std::lock_guard<std::mutex> guard(workMutex);
+            storedShotNotices.push_back(std::move(notice));
+        }
+        break;
+    case WorkKind::Reprocess:
+        if (!prepareShotReprocess(work.shotId)) {
+            ESP_LOGW(LOG_TAG, "Unable to prepare shot %s for reprocessing", work.shotId.c_str());
+        }
+        break;
+    case WorkKind::Dispatch:
+        dispatchStoredShot(work.shotId, work.reprocess, work.automaticRetry);
+        break;
+    case WorkKind::DeliveryAcknowledgement:
+        processShotDeliveryAck(work.shotId, work.outcome, work.reason, work.timestamp,
+                               work.attemptId, work.payloadHash, work.artifactRevision,
+                               work.encodingVersion, work.preferenceRequest);
+        break;
+    case WorkKind::DeliverySweep:
+        processDueDelivery();
+        break;
+    case WorkKind::CommunitySweep:
+        dispatchPendingCommunityUploads();
+        break;
+    case WorkKind::DoseConfirmationRecovery:
+        recoverPendingDoseConfirmation();
+        break;
+    case WorkKind::StatusRefresh:
+        refreshCachedStatus();
+        break;
+    case WorkKind::MarkCompletionEmitted:
+        markShotCompletionEmitted(work.shotId);
+        break;
+    case WorkKind::RecoverCommittedArtifacts:
+        recoverCommittedArtifacts();
+        break;
+    case WorkKind::StoreRecommendation:
+        if (work.recommendation) {
+            persistRecommendation(*work.recommendation);
+        }
+        break;
+    case WorkKind::SnapshotContexts:
+        persistContexts();
+        break;
+    case WorkKind::PatchShotCorrection:
+        if (work.correction) {
+            LocalStoreLock lock(storeMutex);
+            if (summaryStore.patchShotCorrection(work.correction->shotId.c_str(),
+                                                 *work.correction)) {
+                requestStatusRefresh();
+            }
+        }
+        break;
+    case WorkKind::PatchRecommendationStatus: {
+        LocalStoreLock lock(storeMutex);
+        if (summaryStore.patchRecommendationStatus(
+                work.recommendationId, work.recommendationStatus.c_str(),
+                work.recommendationTimestampField.c_str())) {
+            requestStatusRefresh();
+        }
+        break;
+    }
+    case WorkKind::ResolvePrompt:
+        if (!resolvePrompt(work.shotId, work.promptRevision)) {
+            Event release;
+            release.id = "rl:prompt:release";
+            release.setString("shot_id", work.shotId);
+            release.setInt64("prompt_revision", work.promptRevision);
+            pluginManager->trigger(release);
+        }
+        break;
+    }
+    return true;
+}
+
+void LocalAutoTuningStorePlugin::workerTask(void *arg) {
+#if defined(GAGGIMATE_SIM)
+    (void)arg;
+#else
+    auto *plugin = static_cast<LocalAutoTuningStorePlugin *>(arg);
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        while (plugin->processOneWorkItem()) {
+        }
+    }
+#endif
 }
 
 void LocalAutoTuningStorePlugin::processDueDelivery() {
     const EpochSeconds now = nowEpoch();
-    if (now < EpochTime::MIN_VALID || !deliveryWorkPending || (nextDeliveryCheckAt > 0 && now < nextDeliveryCheckAt) ||
-        !controller || !pluginManager ||
-        !AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), controller->getOptimizerTransport())
-             .routeOffBoardTransport()) {
-        return;
-    }
-    std::vector<String> paths;
-    if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
+    const EpochSeconds scheduledRetry = nextDeliveryCheckAt.load(std::memory_order_acquire);
+    if (now < EpochTime::MIN_VALID || !deliveryWorkPending.load(std::memory_order_acquire) ||
+        (scheduledRetry > 0 && now < scheduledRetry) || !controller || !pluginManager) {
         return;
     }
     String dueShotId;
     bool completionDue = false;
-    EpochSeconds oldest = std::numeric_limits<EpochSeconds>::max();
-    EpochSeconds earliestFutureRetry = std::numeric_limits<EpochSeconds>::max();
-    bool activeDeliveryFound = false;
-    for (const String &path : paths) {
-        JsonDocument envelope(&psramAllocator);
-        if (LocalAutoTuningFiles::readJson(path, envelope)) {
-            JsonObjectConst replay = envelope.as<JsonObjectConst>();
-            const AutoTuning::DeliveryStatus state = deliveryState(replay).status;
-            const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
-            if (state == AutoTuning::DeliveryStatus::Accepted && !(replay["completion_emitted"] | false)) {
-                dueShotId = replay["shot_id"].as<String>();
-                completionDue = true;
-                break;
-            }
-            const EpochSeconds nextRetryAt = jsonEpochOrZero(replay["local_next_retry_at"]);
-            if (state == AutoTuning::DeliveryStatus::Pending || state == AutoTuning::DeliveryStatus::RetryWait ||
-                state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
-                activeDeliveryFound = true;
-                if (nextRetryAt > now) {
-                    earliestFutureRetry = std::min(earliestFutureRetry, nextRetryAt);
+    {
+        LocalStoreLock lock(storeMutex);
+        std::vector<String> paths;
+        if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
+            return;
+        }
+        EpochSeconds oldest = std::numeric_limits<EpochSeconds>::max();
+        EpochSeconds earliestFutureRetry = std::numeric_limits<EpochSeconds>::max();
+        bool activeDeliveryFound = false;
+        for (const String &path : paths) {
+            JsonDocument envelope(&psramAllocator);
+            if (LocalAutoTuningFiles::readJson(path, envelope)) {
+                JsonObjectConst replay = envelope.as<JsonObjectConst>();
+                const AutoTuning::DeliveryStatus state = deliveryState(replay).status;
+                const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
+                const bool durablePromptAvailable =
+                    (replay["schema_version"] | 1) >= 3 &&
+                    promptState(replay).status ==
+                        AutoTuning::PromptStatus::ComparisonAvailable;
+                bool promptAlreadyAnnounced = false;
+                if (durablePromptAvailable) {
+                    const String promptShotId = replay["shot_id"].as<String>();
+                    const std::uint32_t revision = promptState(replay).revision;
+                    std::lock_guard<std::mutex> guard(workMutex);
+                    promptAlreadyAnnounced =
+                        std::find(queuedCompletionShotIds.begin(),
+                                  queuedCompletionShotIds.end(),
+                                  promptShotId) != queuedCompletionShotIds.end() ||
+                        std::any_of(
+                            claimablePrompts.begin(), claimablePrompts.end(),
+                            [&promptShotId, revision](
+                                ClaimablePrompt const &candidate) {
+                                return candidate.shotId == promptShotId &&
+                                       candidate.revision == revision;
+                            });
+                }
+                const bool legacyCompletionAvailable =
+                    (replay["schema_version"] | 1) < 3 &&
+                    !(replay["completion_emitted"] | false);
+                if (state == AutoTuning::DeliveryStatus::Accepted &&
+                    ((durablePromptAvailable && !promptAlreadyAnnounced) ||
+                     legacyCompletionAvailable)) {
+                    dueShotId = replay["shot_id"].as<String>();
+                    completionDue = true;
+                    break;
+                }
+                const EpochSeconds nextRetryAt =
+                    jsonEpochOrZero(replay["local_next_retry_at"]);
+                if (state == AutoTuning::DeliveryStatus::Pending ||
+                    state == AutoTuning::DeliveryStatus::RetryWait ||
+                    state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) {
+                    activeDeliveryFound = true;
+                    if (nextRetryAt > now) {
+                        earliestFutureRetry =
+                            std::min(earliestFutureRetry, nextRetryAt);
+                    }
+                }
+                const bool due =
+                    (state == AutoTuning::DeliveryStatus::Pending ||
+                     state == AutoTuning::DeliveryStatus::RetryWait ||
+                     state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) &&
+                    (nextRetryAt <= 0 || now >= nextRetryAt);
+                if (due && updatedAt <= oldest) {
+                    dueShotId = replay["shot_id"].as<String>();
+                    oldest = updatedAt;
                 }
             }
-            const bool due =
-                (state == AutoTuning::DeliveryStatus::Pending || state == AutoTuning::DeliveryStatus::RetryWait ||
-                 state == AutoTuning::DeliveryStatus::AwaitingAcknowledgement) &&
-                (nextRetryAt <= 0 || now >= nextRetryAt);
-            if (due && updatedAt <= oldest) {
-                dueShotId = replay["shot_id"].as<String>();
-                oldest = updatedAt;
-            }
         }
+        deliveryWorkPending = activeDeliveryFound || completionDue;
+        nextDeliveryCheckAt =
+            earliestFutureRetry == std::numeric_limits<EpochSeconds>::max()
+                ? 0
+                : earliestFutureRetry;
     }
-    deliveryWorkPending = activeDeliveryFound || completionDue;
-    nextDeliveryCheckAt = earliestFutureRetry == std::numeric_limits<EpochSeconds>::max() ? 0 : earliestFutureRetry;
     if (dueShotId.isEmpty()) {
         return;
     }
     if (completionDue) {
         JsonDocument envelope(&psramAllocator);
         if (loadReplaySnapshot(dueShotId, envelope)) {
-            emitShotComplete(dueShotId, envelope);
+            prepareShotComplete(dueShotId, envelope);
         }
+        return;
+    }
+    if (!AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
+                            controller->getOptimizerTransport())
+             .routeOffBoardTransport()) {
         return;
     }
     dispatchStoredShot(dueShotId, true, true);
@@ -939,9 +1897,10 @@ void LocalAutoTuningStorePlugin::handleShotCorrection(Event const &event) {
     if (!correction || correction->shotId.empty()) {
         return;
     }
-    if (summaryStore.patchShotCorrection(correction->shotId.c_str(), *correction)) {
-        publishStatus();
-    }
+    WorkItem work;
+    work.kind = WorkKind::PatchShotCorrection;
+    work.correction = std::make_unique<AutoTuning::ShotCorrection>(*correction);
+    enqueueWork(std::move(work));
 }
 
 void LocalAutoTuningStorePlugin::handleRecommendationApply(Event const &event) {
@@ -949,8 +1908,13 @@ void LocalAutoTuningStorePlugin::handleRecommendationApply(Event const &event) {
         return;
     }
     const String recommendationId = event.getString("recommendation_id");
-    if (!recommendationId.isEmpty() && summaryStore.patchRecommendationStatus(recommendationId, "accepted", "accepted_at")) {
-        publishStatus();
+    if (!recommendationId.isEmpty()) {
+        WorkItem work;
+        work.kind = WorkKind::PatchRecommendationStatus;
+        work.recommendationId = recommendationId;
+        work.recommendationStatus = "accepted";
+        work.recommendationTimestampField = "accepted_at";
+        enqueueWork(std::move(work));
     }
 }
 
@@ -959,17 +1923,103 @@ void LocalAutoTuningStorePlugin::handleRecommendationIgnore(Event const &event) 
         return;
     }
     const String recommendationId = event.getString("recommendation_id");
-    if (!recommendationId.isEmpty() && summaryStore.patchRecommendationStatus(recommendationId, "ignored", "ignored_at")) {
-        publishStatus();
+    if (!recommendationId.isEmpty()) {
+        WorkItem work;
+        work.kind = WorkKind::PatchRecommendationStatus;
+        work.recommendationId = recommendationId;
+        work.recommendationStatus = "ignored";
+        work.recommendationTimestampField = "ignored_at";
+        enqueueWork(std::move(work));
     }
 }
 
+void LocalAutoTuningStorePlugin::handlePromptClaim(Event &event) {
+    const String shotId = event.getString("shot_id");
+    const std::uint32_t revision =
+        static_cast<std::uint32_t>(std::max<std::int64_t>(
+            event.getInt64("prompt_revision"), 0));
+    if (shotId.isEmpty() || revision == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(workMutex);
+    auto prompt = std::find_if(
+        claimablePrompts.begin(), claimablePrompts.end(),
+        [&shotId, revision](ClaimablePrompt const &candidate) {
+            return candidate.shotId == shotId && candidate.revision == revision;
+        });
+    if (prompt == claimablePrompts.end()) {
+        return;
+    }
+    if (event.getInt("release") == 1) {
+        prompt->claimed = false;
+        event.setInt("released", 1);
+    } else if (!prompt->claimed) {
+        prompt->claimed = true;
+        event.setInt("claimed", 1);
+    }
+}
+
+void LocalAutoTuningStorePlugin::handlePreferencePersisted(Event const &event) {
+    if (event.getInt("decision_persisted") != 1 ||
+        event.getInt("prompt_claimed") != 1) {
+        return;
+    }
+    WorkItem work;
+    work.kind = WorkKind::ResolvePrompt;
+    work.shotId = event.getString("new_shot_id");
+    work.promptRevision = static_cast<std::uint32_t>(
+        std::max<std::int64_t>(event.getInt64("prompt_revision"), 0));
+    enqueueWork(std::move(work));
+}
+
+bool LocalAutoTuningStorePlugin::resolvePrompt(const String &shotId,
+                                               const std::uint32_t revision) {
+    LocalStoreLock lock(storeMutex);
+    JsonDocument replay(&psramAllocator);
+    if (shotId.isEmpty() || revision == 0 || !loadReplaySnapshot(shotId, replay)) {
+        return false;
+    }
+    JsonObject root = replay.as<JsonObject>();
+    const AutoTuning::PromptState prompt = promptState(root);
+    if (prompt.revision != revision ||
+        (prompt.status != AutoTuning::PromptStatus::ComparisonAvailable &&
+         prompt.status != AutoTuning::PromptStatus::AwaitingComparison)) {
+        return false;
+    }
+    const EpochSeconds now = nowEpoch();
+    transitionPrompt(root, AutoTuning::PromptStatus::Resolved, now);
+    root["updated_at"] = now;
+    if (!LocalAutoTuningFiles::writeJson(
+            LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), replay)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(workMutex);
+        claimablePrompts.erase(
+            std::remove_if(
+                claimablePrompts.begin(), claimablePrompts.end(),
+                [&shotId](ClaimablePrompt const &prompt) {
+                    return prompt.shotId == shotId;
+                }),
+            claimablePrompts.end());
+    }
+    requestStatusRefresh();
+    return true;
+}
+
 void LocalAutoTuningStorePlugin::snapshotContexts() {
+    WorkItem work;
+    work.kind = WorkKind::SnapshotContexts;
+    enqueueWork(std::move(work));
+}
+
+void LocalAutoTuningStorePlugin::persistContexts() {
+    LocalStoreLock lock(storeMutex);
     if (!controller || !ensureDirectories()) {
         return;
     }
     contextStore.save(controller->getSettings());
-    publishStatus();
+    requestStatusRefresh();
 }
 
 void LocalAutoTuningStorePlugin::prune() {
@@ -988,9 +2038,17 @@ void LocalAutoTuningStorePlugin::pruneReplaySnapshots() {
         }
         // Active deliveries are durable. Retention removes only terminal
         // snapshots; an outage is surfaced instead of silently losing a shot.
-        if (!removeOldestTerminalReplay()) {
+        String replayPath;
+        String shotId;
+        if (!findOldestTerminalReplay(replayPath, shotId)) {
             break;
         }
+        auto lease = StorageCoordinator::instance().acquireFlash();
+        if (!LittleFS.remove(replayPath)) {
+            break;
+        }
+        lease.reset();
+        artifactStore.remove(shotId);
     }
 }
 
@@ -999,39 +2057,73 @@ void LocalAutoTuningStorePlugin::publishStatus() {
         return;
     }
     lastStatusMs = millis();
-    const AutoTuning::LocalStoreStats current = stats();
+    AutoTuning::LocalStoreStats current;
+    int pending = 0;
+    int retrying = 0;
+    int rejected = 0;
+    String lastError;
+    {
+        std::lock_guard<std::mutex> guard(statusMutex);
+        current = cachedStats;
+        pending = deliveryPendingCount;
+        retrying = deliveryRetryCount;
+        rejected = deliveryRejectedCount;
+        lastError = deliveryLastError;
+    }
     Event event;
     event.id = "rl:local_store:status";
     event.setInt("available", current.available ? 1 : 0);
     event.setInt("shot_count", static_cast<int>(current.shotCount));
     event.setInt("recommendation_count", static_cast<int>(current.recommendationCount));
     event.setInt("bytes", static_cast<int>(current.bytes));
-    event.setInt("delivery_pending_count", deliveryPendingCount);
-    event.setInt("delivery_retry_count", deliveryRetryCount);
-    event.setInt("delivery_rejected_count", deliveryRejectedCount);
-    event.setString("delivery_last_error", deliveryLastError);
+    event.setInt("delivery_pending_count", pending);
+    event.setInt("delivery_retry_count", retrying);
+    event.setInt("delivery_rejected_count", rejected);
+    event.setString("delivery_last_error", lastError);
     event.setString("summary", current.available ? "Local Auto-Tuning store ready" : "Local Auto-Tuning store unavailable");
     pluginManager->trigger(event);
 }
 
-void LocalAutoTuningStorePlugin::refreshDeliveryStatus() {
+void LocalAutoTuningStorePlugin::requestStatusRefresh() {
+    WorkItem work;
+    work.kind = WorkKind::StatusRefresh;
+    enqueueWork(std::move(work));
+}
+
+void LocalAutoTuningStorePlugin::refreshCachedStatus() {
+    LocalStoreLock lock(storeMutex);
+    AutoTuning::LocalStoreStats current;
+    current.available = LittleFSUtil::existsQuietly(STORE_DIR);
+    const LocalAutoTuningSummaryStore::Stats summaries = summaryStore.stats();
+    const LocalAutoTuningFiles::DirectoryStats replays = LocalAutoTuningFiles::directoryStats(REPLAY_DIR);
+    current.shotCount = summaries.shotCount;
+    current.recommendationCount = summaries.recommendationCount;
+    current.bytes = summaries.bytes + replays.bytes + contextStore.bytes() + artifactStore.bytes();
     const DeliveryStats delivery = localDeliveryStats();
-    deliveryPendingCount = delivery.pending;
-    deliveryRetryCount = delivery.retrying;
-    deliveryRejectedCount = delivery.rejected;
-    deliveryLastError = delivery.lastError;
+    {
+        std::lock_guard<std::mutex> guard(statusMutex);
+        cachedStats = current;
+        deliveryPendingCount = delivery.pending;
+        deliveryRetryCount = delivery.retrying;
+        deliveryRejectedCount = delivery.rejected;
+        deliveryLastError = delivery.lastError;
+    }
+    statusPublishRequested.store(true, std::memory_order_release);
+}
+
+void LocalAutoTuningStorePlugin::refreshDeliveryStatus() {
+    refreshCachedStatus();
 }
 
 void LocalAutoTuningStorePlugin::recoverPendingDoseConfirmation() {
-    if (!pluginManager) {
-        return;
-    }
+    LocalStoreLock lock(storeMutex);
     std::vector<String> paths;
     if (!LocalAutoTuningFiles::listRecordPaths(REPLAY_DIR, paths)) {
         return;
     }
     String newestShotId;
     float newestDoseTargetG = 0.0f;
+    std::uint32_t newestPromptRevision = 0;
     EpochSeconds newestTimestamp = std::numeric_limits<EpochSeconds>::min();
     for (const String &path : paths) {
         JsonDocument envelope(&psramAllocator);
@@ -1040,9 +2132,15 @@ void LocalAutoTuningStorePlugin::recoverPendingDoseConfirmation() {
             const EpochSeconds updatedAt = jsonEpochOrZero(replay["updated_at"]);
             if (deliveryState(replay).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation &&
                 updatedAt >= newestTimestamp) {
-                JsonObjectConst payload = replay["payload"].as<JsonObjectConst>();
                 newestShotId = replay["shot_id"].as<String>();
-                newestDoseTargetG = payload["dose_target_g"] | 0.0f;
+                newestDoseTargetG = replay["dose_target_g"] | 0.0f;
+                newestPromptRevision = promptState(replay).revision;
+                if (newestDoseTargetG <= 0.0f) {
+                    AutoTuning::CompletedShotArtifact artifact;
+                    if (loadCommittedShot(newestShotId, artifact)) {
+                        newestDoseTargetG = artifact.completion.doseTargetG;
+                    }
+                }
                 newestTimestamp = updatedAt;
             }
         }
@@ -1050,9 +2148,11 @@ void LocalAutoTuningStorePlugin::recoverPendingDoseConfirmation() {
     if (newestShotId.isEmpty() || newestDoseTargetG <= 0.0f) {
         return;
     }
-    Event confirmation;
-    confirmation.id = "rl:dose-confirmation:required";
-    confirmation.setString("shot_id", newestShotId);
-    confirmation.setFloat("dose_target_g", newestDoseTargetG);
-    pluginManager->trigger(confirmation);
+    StoredShotNotice notice;
+    notice.shotId = newestShotId;
+    notice.doseConfirmationRequired = true;
+    notice.doseTargetG = newestDoseTargetG;
+    notice.promptRevision = newestPromptRevision;
+    std::lock_guard<std::mutex> guard(workMutex);
+    storedShotNotices.push_back(std::move(notice));
 }

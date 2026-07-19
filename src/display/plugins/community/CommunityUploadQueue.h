@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <cstddef>
 #include <cstdint>
+#include <display/core/StorageCoordinator.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -67,11 +68,16 @@ class CommunityUploadQueue {
     void removeOneLegacyItem();
 
   private:
-    bool ensureDirectoryUnlocked() const;
-    bool readItemUnlocked(const String &path, Item &item, String *payloadJson = nullptr) const;
-    bool writeItemUnlocked(const Item &item, const String &payloadJson) const;
-    bool removeRecordUnlocked(const String &recordType, const String &recordId, const String &exceptPath = "");
-    bool pruneUnlocked();
+    bool ensureDirectoryUnlocked(StorageCoordinator::FlashLease &flashLease) const;
+    bool readItemUnlocked(const String &path, Item &item,
+                          StorageCoordinator::FlashLease &flashLease,
+                          String *payloadJson = nullptr) const;
+    bool writeItemUnlocked(const Item &item, const String &payloadJson,
+                           StorageCoordinator::FlashLease &flashLease) const;
+    bool removeRecordUnlocked(const String &recordType, const String &recordId,
+                              StorageCoordinator::FlashLease &flashLease,
+                              const String &exceptPath = "");
+    bool pruneUnlocked(StorageCoordinator::FlashLease &flashLease);
 
     mutable SemaphoreHandle_t mutex = nullptr;
 };

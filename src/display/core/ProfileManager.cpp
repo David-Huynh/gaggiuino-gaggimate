@@ -1,5 +1,6 @@
 #include "ProfileManager.h"
 #include <ArduinoJson.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/util/PsramAllocator.h>
 
 #include <utility>
@@ -40,6 +41,7 @@ void ProfileManager::setup() {
 }
 
 bool ProfileManager::ensureDirectory() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!_fs->exists(_dir)) {
         return _fs->mkdir(_dir);
     }
@@ -113,6 +115,7 @@ void ProfileManager::migrate(const std::vector<String> &existingProfiles) {
 }
 
 std::vector<String> ProfileManager::listProfiles() {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     std::vector<String> uuids;
     File root = _fs->open(_dir);
     if (!root || !root.isDirectory()) {
@@ -155,6 +158,7 @@ std::vector<String> ProfileManager::listProfiles() {
 }
 
 bool ProfileManager::loadProfile(const String &uuid, Profile &outProfile) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File file = _fs->open(profilePath(uuid), "r");
     if (!file)
         return false;
@@ -175,6 +179,7 @@ bool ProfileManager::loadProfile(const String &uuid, Profile &outProfile) {
 }
 
 bool ProfileManager::saveProfile(Profile &profile) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!ensureDirectory())
         return false;
     bool isNew = false;
@@ -209,6 +214,7 @@ bool ProfileManager::saveProfile(Profile &profile) {
 }
 
 bool ProfileManager::deleteProfile(const String &uuid) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     removeFavoritedProfile(uuid);
     if (_settings.getStartupProfile() == uuid) {
         _settings.setStartupProfile("");
@@ -216,7 +222,10 @@ bool ProfileManager::deleteProfile(const String &uuid) {
     return _fs->remove(profilePath(uuid));
 }
 
-bool ProfileManager::profileExists(const String &uuid) { return _fs->exists(profilePath(uuid)); }
+bool ProfileManager::profileExists(const String &uuid) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    return _fs->exists(profilePath(uuid));
+}
 
 void ProfileManager::selectProfile(const String &uuid) {
     ESP_LOGI("ProfileManager", "Selecting profile %s", uuid.c_str());

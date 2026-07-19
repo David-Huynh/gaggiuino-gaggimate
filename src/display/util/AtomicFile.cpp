@@ -2,6 +2,7 @@
 #include "LittleFSUtil.h"
 
 #include <LittleFS.h>
+#include <display/core/StorageCoordinator.h>
 
 namespace AtomicFile {
 
@@ -10,6 +11,7 @@ String temporaryPath(const String &path) { return path + ".tmp"; }
 String backupPath(const String &path) { return path + ".bak"; }
 
 bool restoreBackup(const String &path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const String backup = backupPath(path);
     if (!LittleFSUtil::existsQuietly(backup)) {
         return false;
@@ -20,9 +22,13 @@ bool restoreBackup(const String &path) {
     return LittleFS.rename(backup, path);
 }
 
-void discardBackup(const String &path) { LittleFSUtil::removeIfExists(backupPath(path)); }
+void discardBackup(const String &path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    LittleFSUtil::removeIfExists(backupPath(path));
+}
 
 bool commit(const String &path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const String temporary = temporaryPath(path);
     const String backup = backupPath(path);
     if (!LittleFSUtil::existsQuietly(temporary)) {
@@ -48,6 +54,7 @@ bool commit(const String &path) {
 }
 
 bool recoverPending(const String &path, bool temporaryFileValid) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const String temporary = temporaryPath(path);
     if (LittleFSUtil::existsQuietly(temporary)) {
         if (temporaryFileValid) {

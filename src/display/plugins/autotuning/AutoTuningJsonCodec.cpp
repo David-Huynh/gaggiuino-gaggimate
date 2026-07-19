@@ -185,6 +185,67 @@ void DecodedShotRecord::bindSamples() {
     record.samples = AutoTuning::ArrayView<const AutoTuning::ShotSample>(samples.data(), samples.size());
 }
 
+bool writePreferenceRequest(AutoTuning::PreferenceRequest const &request, JsonObject output) {
+    if (!request.valid()) {
+        return false;
+    }
+    if (request.recommendationId.empty()) {
+        output["recommendation_id"] = nullptr;
+    } else {
+        output["recommendation_id"] = request.recommendationId.c_str();
+    }
+    output["install_id"] = request.installId.c_str();
+    output["optimization_run_id"] = request.optimizationRunId.c_str();
+    output["new_shot_id"] = request.newShotId.c_str();
+    output["anchor_shot_id"] = request.anchorShotId.c_str();
+    output["comparison_mode"] = AutoTuning::comparisonModeKey(request.comparisonMode);
+    AutoTuning::writeTasteGoal(request.tasteGoal, output["taste_goal"].to<JsonObject>());
+    return true;
+}
+
+bool parsePreferenceRequest(JsonVariantConst source, AutoTuning::PreferenceRequest &request, String &error) {
+    if (!source.is<JsonObjectConst>()) {
+        error = "Preference request must be an object";
+        return false;
+    }
+    JsonObjectConst input = source.as<JsonObjectConst>();
+    if (input.size() != 7 || (!input["recommendation_id"].isNull() && !input["recommendation_id"].is<const char *>()) ||
+        !input["install_id"].is<const char *>() || !input["optimization_run_id"].is<const char *>() ||
+        !input["new_shot_id"].is<const char *>() || !input["anchor_shot_id"].is<const char *>() ||
+        !input["comparison_mode"].is<const char *>() || !input["taste_goal"].is<JsonObjectConst>()) {
+        error = "Preference request fields are invalid";
+        return false;
+    }
+    AutoTuning::PreferenceRequest parsed;
+    parsed.recommendationId = text(input["recommendation_id"]);
+    parsed.installId = text(input["install_id"]);
+    parsed.optimizationRunId = text(input["optimization_run_id"]);
+    parsed.newShotId = text(input["new_shot_id"]);
+    parsed.anchorShotId = text(input["anchor_shot_id"]);
+    if (parsed.recommendationId.size() > MAX_ID_LENGTH || parsed.installId.empty() ||
+        parsed.installId.size() > MAX_CONTEXT_ID_LENGTH || parsed.optimizationRunId.size() > MAX_ID_LENGTH ||
+        parsed.newShotId.size() > MAX_ID_LENGTH || parsed.anchorShotId.size() > MAX_ID_LENGTH) {
+        error = "Preference request identifiers are invalid";
+        return false;
+    }
+    const std::string mode = text(input["comparison_mode"]);
+    const auto comparisonMode = AutoTuning::comparisonModeFromKey(mode);
+    if (!comparisonMode) {
+        error = "Preference request comparison mode is invalid";
+        return false;
+    }
+    parsed.comparisonMode = *comparisonMode;
+    if (!AutoTuning::parseTasteGoal(input["taste_goal"], parsed.tasteGoal, error)) {
+        return false;
+    }
+    if (!parsed.valid()) {
+        error = "Preference request context is incomplete";
+        return false;
+    }
+    request = std::move(parsed);
+    return true;
+}
+
 bool writeShotRecord(AutoTuning::ShotRecord const &record, JsonDocument &document) {
     if (record.shotId.empty() || record.machineId.empty() || record.samples.empty()) {
         return false;
@@ -544,6 +605,14 @@ bool writeShotCompletion(AutoTuning::ShotCompletion const &completion, JsonDocum
     output["next_dose_g"] = recommendation.nextDoseG;
     output["target_yield_g"] = recommendation.targetYieldG;
     output["dose_target_g"] = completion.doseTargetG;
+    const std::optional<AutoTuning::PreferenceRequest> preferenceRequest =
+        completion.preferenceRequest.has_value()
+            ? completion.preferenceRequest
+            : AutoTuning::preferenceRequestFromRecommendation(recommendation, completion.shotId);
+    if (preferenceRequest.has_value() &&
+        !writePreferenceRequest(*preferenceRequest, output["preference_request"].to<JsonObject>())) {
+        return false;
+    }
     return true;
 }
 
@@ -615,6 +684,19 @@ bool parseShotCompletion(JsonVariantConst source, AutoTuning::ShotCompletion &co
          recommendation.anchorShotId == parsed.shotId || recommendation.comparisonMode == AutoTuning::ComparisonMode::None)) {
         error = "Shot completion preference context is incomplete";
         return false;
+    }
+    if (!input["preference_request"].isNull()) {
+        AutoTuning::PreferenceRequest preferenceRequest;
+        if (!parsePreferenceRequest(input["preference_request"], preferenceRequest, error) ||
+            preferenceRequest.newShotId != parsed.shotId) {
+            if (error.isEmpty()) {
+                error = "Shot completion preference request does not match the shot";
+            }
+            return false;
+        }
+        parsed.preferenceRequest = std::move(preferenceRequest);
+    } else {
+        parsed.preferenceRequest = AutoTuning::preferenceRequestFromRecommendation(recommendation, parsed.shotId);
     }
     completion = std::move(parsed);
     return true;

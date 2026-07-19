@@ -25,6 +25,11 @@ constexpr std::array<const char *, 10> RECOMMENDATION_STATUS_KEYS = {
     "", "pending", "shown", "accepted", "edited", "ignored", "used", "superseded", "expired", "failed"};
 constexpr std::array<const char *, 7> DELIVERY_STATUS_KEYS = {
     "not_required", "awaiting_dose_confirmation", "pending", "awaiting_ack", "retry_wait", "accepted", "permanent_rejection"};
+constexpr std::array<const char *, 9> PROMPT_STATUS_KEYS = {
+    "processing",          "delivery_retrying",      "awaiting_ack",
+    "awaiting_comparison", "comparison_available",   "recommendation_available",
+    "delivery_error",      "resolved",               "dismissed",
+};
 constexpr std::array<const char *, 3> PREFERENCE_LABEL_KEYS = {"new_better", "anchor_better", "tie"};
 constexpr std::array<const char *, 4> FOLLOW_THROUGH_STATUS_KEYS = {"", "followed", "not_followed", "partially_followed"};
 
@@ -48,6 +53,43 @@ bool TasteGoal::valid() const {
 }
 
 bool TasteGoal::operator==(TasteGoal const &other) const { return mode == other.mode && targets == other.targets; }
+
+bool PreferenceRequest::valid() const {
+    return !installId.empty() && !optimizationRunId.empty() && !newShotId.empty() && !anchorShotId.empty() &&
+           newShotId != anchorShotId && comparisonMode != ComparisonMode::None && tasteGoal.valid();
+}
+
+std::optional<PreferenceRequest> preferenceRequestFromRecommendation(RecommendationReference const &recommendation,
+                                                                     std::string const &newShotId) {
+    if (!recommendation.preferenceFeedbackRequired) {
+        return std::nullopt;
+    }
+    PreferenceRequest request;
+    request.recommendationId = recommendation.recommendationId;
+    request.installId = recommendation.installId;
+    request.optimizationRunId = recommendation.optimizationRunId;
+    request.newShotId = newShotId;
+    request.anchorShotId = recommendation.anchorShotId;
+    request.comparisonMode = recommendation.comparisonMode;
+    request.tasteGoal = recommendation.tasteGoal;
+    return request.valid() ? std::optional<PreferenceRequest>(std::move(request)) : std::nullopt;
+}
+
+bool ShotDeliveryAttempt::valid() const {
+    if (shotId.empty() || shotId.size() > 256 || attemptId.empty() || attemptId.size() > 96 ||
+        payloadHash.size() != 64 || artifactRevision == 0 || encodingVersion == 0) {
+        return false;
+    }
+    for (char character : payloadHash) {
+        const bool hex = (character >= '0' && character <= '9') ||
+                         (character >= 'a' && character <= 'f') ||
+                         (character >= 'A' && character <= 'F');
+        if (!hex) {
+            return false;
+        }
+    }
+    return true;
+}
 
 const char *tasteAttributeKey(TasteAttribute attribute) {
     const auto index = static_cast<std::size_t>(attribute);
@@ -139,6 +181,15 @@ const char *deliveryStatusKey(DeliveryStatus status) {
 
 std::optional<DeliveryStatus> deliveryStatusFromKey(std::string_view key) {
     return enumFromKey<DeliveryStatus>(key, DELIVERY_STATUS_KEYS);
+}
+
+const char *promptStatusKey(PromptStatus status) {
+    const auto index = static_cast<std::size_t>(status);
+    return index < PROMPT_STATUS_KEYS.size() ? PROMPT_STATUS_KEYS[index] : "";
+}
+
+std::optional<PromptStatus> promptStatusFromKey(std::string_view key) {
+    return enumFromKey<PromptStatus>(key, PROMPT_STATUS_KEYS);
 }
 
 const char *preferenceLabelKey(PreferenceLabel label) {

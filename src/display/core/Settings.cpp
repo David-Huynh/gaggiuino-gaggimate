@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <display/core/AutoTuning.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/util/ColorConversion.h>
 #include <utility>
 
@@ -80,6 +81,7 @@ bool PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
 }
 
 Settings::Settings() {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     preferences.begin(PREFERENCES_KEY, true);
     for (auto *property : registry) {
         property->load(preferences);
@@ -472,6 +474,10 @@ void Settings::doSave() {
         }
     }
     if (!dirty) {
+        return;
+    }
+    auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+    if (!flashLease) {
         return;
     }
     ESP_LOGI("Settings", "Saving changed settings");

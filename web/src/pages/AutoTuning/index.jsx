@@ -854,8 +854,24 @@ export function AutoTuning() {
           <h1 className='text-2xl font-bold sm:text-3xl'>Auto Tuning</h1>
           <div className='mt-2 flex flex-wrap gap-2'>
             <StatusPill tone='primary'>{providerLabel(settings.rlProviderMode)}</StatusPill>
-            <StatusPill tone={paused ? 'warning' : localOn ? 'success' : 'neutral'}>
-              {paused ? 'Paused' : localOn ? 'Optimizing' : 'Observation only'}
+            <StatusPill
+              tone={
+                settings.rlCPBOLocallyConverged
+                  ? 'primary'
+                  : paused
+                    ? 'warning'
+                    : localOn
+                      ? 'success'
+                      : 'neutral'
+              }
+            >
+              {settings.rlCPBOLocallyConverged
+                ? 'Local optimum found'
+                : paused
+                  ? 'Paused'
+                  : localOn
+                    ? 'Optimizing'
+                    : 'Observation only'}
             </StatusPill>
           </div>
         </div>
@@ -869,15 +885,29 @@ export function AutoTuning() {
             <FontAwesomeIcon icon={faGear} />
             Advanced
           </button>
-          <button
-            type='button'
-            className={paused ? 'btn btn-primary btn-sm' : 'btn btn-outline btn-sm'}
-            disabled={busy}
-            onClick={() => run(paused ? 'req:rl:optimization:resume' : 'req:rl:optimization:pause')}
-          >
-            <FontAwesomeIcon icon={paused ? faPlay : faPause} />
-            {paused ? 'Resume' : 'Pause'}
-          </button>
+          {settings.rlCPBOLocallyConverged ? (
+            <button
+              type='button'
+              className='btn btn-primary btn-sm'
+              disabled={busy || !settings.rlCPBOOptimizationRunId}
+              onClick={() => run('req:rl:optimization:resume-exploration')}
+            >
+              <FontAwesomeIcon icon={faPlay} />
+              Resume exploration
+            </button>
+          ) : (
+            <button
+              type='button'
+              className={paused ? 'btn btn-primary btn-sm' : 'btn btn-outline btn-sm'}
+              disabled={busy}
+              onClick={() =>
+                run(paused ? 'req:rl:optimization:resume' : 'req:rl:optimization:pause')
+              }
+            >
+              <FontAwesomeIcon icon={paused ? faPlay : faPause} />
+              {paused ? 'Resume' : 'Pause'}
+            </button>
+          )}
           <button
             type='button'
             className='btn btn-error btn-outline btn-sm'

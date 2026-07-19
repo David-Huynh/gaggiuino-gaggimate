@@ -5,6 +5,7 @@
 
 #include "../core/Event.h"
 #include "../core/Plugin.h"
+#include <cstdint>
 #include <deque>
 #include <display/core/AutoTuningModels.h>
 #include <lvgl.h>
@@ -40,7 +41,9 @@ class AutoTuningPreferencePlugin : public Plugin {
     AutoTuningOverlayMode overlayMode = AutoTuningOverlayMode::NONE;
 
     String pendingShotId;
+    std::uint32_t pendingPreferencePromptRevision = 0;
     String pendingDoseShotId;
+    std::uint32_t pendingDosePromptRevision = 0;
     float pendingDoseTargetG = 0.0f;
     String pendingShotRecommendationId;
     String pendingPreferenceInstallId;

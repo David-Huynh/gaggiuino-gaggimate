@@ -10,6 +10,7 @@
 #include <display/core/PluginManager.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
+#include <display/models/shot_log_format.h>
 #include <esp_system.h>
 #include <mutex>
 
@@ -67,6 +68,7 @@ struct BrewProcessSnapshot {
     bool valveOpen = false;
     float temperature = 0.0f;
     bool finished = false;
+    std::uint8_t finalExitReason = 0;
 };
 
 } // namespace
@@ -122,8 +124,10 @@ void AutoTuningCapturePlugin::setup(Controller *ctrl, PluginManager *pm) {
             pendingMeasuredDoseG = 0.0f;
             isBrewing = true;
             brewStartMs = millis();
+            shotStartedAt = EpochTime::now();
             currentShotId = makeShotId();
             shotSource = static_cast<int>(controller->getCurrentVolumetricSource());
+            captureHistoryStartMetadata(static_cast<std::uint32_t>(std::max(0, event.getInt("history_id"))));
             currentBluetoothWeight.store(0.0f, std::memory_order_relaxed);
             currentHardwareWeight.store(0.0f, std::memory_order_relaxed);
             currentEstimatedWeight.store(0.0f, std::memory_order_relaxed);
@@ -167,10 +171,8 @@ void AutoTuningCapturePlugin::setup(Controller *ctrl, PluginManager *pm) {
 }
 
 void AutoTuningCapturePlugin::loop() {
-    bool brewing = false;
     {
         std::lock_guard<std::mutex> guard(captureMutex);
-        brewing = isBrewing;
         if (isBrewing) {
             unsigned long finishedAtMs = 0;
             if (controller) {
@@ -189,18 +191,18 @@ void AutoTuningCapturePlugin::loop() {
             }
         }
     }
-    if (!brewing)
-        persistPendingShot();
 }
 
 void AutoTuningCapturePlugin::resetShotCapture() {
     isBrewing = false;
     brewStartMs = 0;
     lastSampleMs = 0;
+    shotStartedAt = 0;
     liveShotStartedAtMs = 0;
     liveShotActive = false;
     shotStopElapsedMs = 0;
     shotStopWeightG = 0.0f;
+    measuredFlowGPerS = 0.0f;
     currentShotId = "";
     shotMeasuredDoseAvailable = false;
     shotMeasuredDoseG = 0.0f;
@@ -208,6 +210,8 @@ void AutoTuningCapturePlugin::resetShotCapture() {
     shotCommunityUploadRequired = false;
     shotHasRecommendation = false;
     shotRecommendation = AutoTuning::RecommendationReference{};
+    shotHistory = AutoTuning::ShotHistoryMetadata{};
+    lastHistoryPhase = 0xFF;
     shotSamples.clear();
 }
 
@@ -228,9 +232,16 @@ void AutoTuningCapturePlugin::recordShotSample() {
     sample.temperature = controller->getCurrentTemp();
     sample.targetTemperature = controller->getTargetTemp();
     sample.weight = shotWeightG;
+    sample.measuredWeight = currentMeasuredWeightG();
+    sample.estimatedWeight = currentEstimatedWeight.load(std::memory_order_relaxed);
+    sample.measuredFlow = updateMeasuredFlowGPerS(sample.measuredWeight, elapsedMs);
+    sample.puckFlow = controller->getCurrentPuckFlow();
+    sample.puckResistance = controller->getCurrentPuckResistance();
     sample.pumpTargetMode = pumpTargetMode;
     sample.valveOpen = valveOpen;
+    sample.systemInfo = captureHistorySystemInfo();
     sample.elapsedMs = elapsedMs;
+    captureHistoryPhaseTransition();
     shotSamples.push_back(sample);
 
     if (liveShotActive && controller) {
@@ -248,7 +259,7 @@ void AutoTuningCapturePlugin::recordShotSample() {
 }
 
 void AutoTuningCapturePlugin::publishLiveShotStarted() {
-    liveShotStartedAtMs = EpochTime::now() * 1000;
+    liveShotStartedAtMs = shotStartedAt * 1000;
     liveShotActive = shotOptimizerDeliveryRequired && liveShotStartedAtMs >= EpochTime::MIN_VALID * 1000;
     if (!liveShotActive || !controller)
         return;
@@ -426,6 +437,8 @@ void AutoTuningCapturePlugin::publishShotProfile() {
             brew.valveOpen = phase.valve > 0;
             brew.temperature = process->getTemperature();
             brew.finished = process->processPhase == ProcessPhase::FINISHED;
+            brew.finalExitReason =
+                static_cast<std::uint8_t>(brew.finished ? process->lastExitReason : PhaseExitReason::ABORTED);
 
             if (std::isfinite(brew.stopMeasuredVolume) && brew.stopMeasuredVolume > 0.0) {
                 beverageOutG = static_cast<float>(brew.stopMeasuredVolume);
@@ -437,7 +450,7 @@ void AutoTuningCapturePlugin::publishShotProfile() {
     const String shotId = currentShotId.isEmpty() ? makeShotId() : currentShotId;
     shot.shotId = shotId.c_str();
     shot.machineId = machineId().c_str();
-    shot.timestamp = EpochTime::now();
+    shot.timestamp = shotStartedAt;
     shot.localOptimizationEnabled = shotOptimizerDeliveryRequired;
     // Enabling mid-shot cannot opt an earlier sample stream in, while disabling
     // remains an immediate consent veto before anything is queued.
@@ -485,7 +498,14 @@ void AutoTuningCapturePlugin::publishShotProfile() {
         shot.finalPhase.valveOpen = brew.valveOpen;
         shot.finalPhase.temperatureC = brew.temperature;
         shot.finalPhase.shotEndState = shotEndStateName(brew.finished);
+        shotHistory.brewDelayMs =
+            static_cast<std::uint16_t>(std::clamp(brew.brewDelay, 0.0, static_cast<double>(UINT16_MAX)));
+        shotHistory.finalExitReason = brew.finalExitReason;
     }
+    if (!shotSamples.empty()) {
+        shotHistory.finalMeasuredWeightG = shotSamples.back().measuredWeight;
+    }
+    shot.history = shotHistory;
     if (shotHasRecommendation) {
         shot.recommendation = shotRecommendation;
     }
@@ -495,6 +515,8 @@ void AutoTuningCapturePlugin::publishShotProfile() {
     AutoTuning::ShotCompletion completion;
     completion.shotId = shot.shotId;
     completion.recommendation = shotRecommendation;
+    completion.preferenceRequest =
+        AutoTuning::preferenceRequestFromRecommendation(shotRecommendation, completion.shotId);
     completion.doseTargetG = configuredDoseG;
     AutoTuning::ShotCaptureDisposition disposition;
     disposition.doseConfirmationRequired = doseConfirmationRequired;
@@ -505,68 +527,22 @@ void AutoTuningCapturePlugin::publishShotProfile() {
         return;
     }
 
-    auto pending = std::make_unique<PendingShot>();
-    pending->samples.assign(shotSamples.begin(), shotSamples.end());
-    pending->shot = std::move(shot);
-    pending->completion = std::move(completion);
-    pending->disposition = disposition;
-    pending->shot.samples =
-        AutoTuning::ArrayView<const AutoTuning::ShotSample>(pending->samples.data(), pending->samples.size());
-    {
-        std::lock_guard<std::mutex> guard(pendingShotMutex);
-        pendingShots.push_back(std::move(pending));
+    shot.samples = AutoTuning::ArrayView<const AutoTuning::ShotSample>(shotSamples.data(), shotSamples.size());
+    AutoTuning::AutoTuningRecordStorePort *store = controller ? controller->getAutoTuningRecordStore() : nullptr;
+    if (!store || !store->enqueueShot(shot, completion, disposition)) {
+        ESP_LOGE("AutoTuningCapture", "Unable to queue shot %s for durable storage", shotId.c_str());
+        return;
     }
 
     // ShotHistory snapshots its current history id from this event. The durable
-    // replay is written from loop() below so filesystem work cannot delay pump
-    // shutdown or the next controller command.
+    // replay is written by the record-store worker so filesystem work cannot
+    // delay pump shutdown or the next controller command.
     Event capturedEvent;
     capturedEvent.id = "rl:shot:captured";
     capturedEvent.setString("shot_id", shotId);
     capturedEvent.setString("recommendation_id", shotRecommendation.recommendationId.c_str());
+    capturedEvent.setInt("history_id", static_cast<int>(shotHistory.id));
     pluginManager->trigger(capturedEvent);
-}
-
-void AutoTuningCapturePlugin::persistPendingShot() {
-    const unsigned long now = millis();
-    if (nextPersistAttemptMs != 0 && static_cast<long>(now - nextPersistAttemptMs) < 0)
-        return;
-
-    std::unique_ptr<PendingShot> pending;
-    {
-        std::lock_guard<std::mutex> guard(pendingShotMutex);
-        if (pendingShots.empty())
-            return;
-        pending = std::move(pendingShots.front());
-        pendingShots.pop_front();
-    }
-
-    AutoTuning::AutoTuningRecordStorePort *store = controller ? controller->getAutoTuningRecordStore() : nullptr;
-    if (!store || !store->storeShot(pending->shot, pending->completion, pending->disposition)) {
-        ESP_LOGE("AutoTuningCapture", "Failed to persist shot %s; retrying",
-                 pending->shot.shotId.c_str());
-        {
-            std::lock_guard<std::mutex> guard(pendingShotMutex);
-            pendingShots.push_front(std::move(pending));
-        }
-        nextPersistAttemptMs = now + 1000;
-        return;
-    }
-    nextPersistAttemptMs = 0;
-
-    const String shotId(pending->shot.shotId.c_str());
-    if (pending->disposition.doseConfirmationRequired) {
-        Event confirmationEvent;
-        confirmationEvent.id = "rl:dose-confirmation:required";
-        confirmationEvent.setString("shot_id", shotId);
-        confirmationEvent.setFloat("dose_target_g", pending->completion.doseTargetG);
-        pluginManager->trigger(confirmationEvent);
-    } else {
-        Event dispatchEvent;
-        dispatchEvent.id = "rl:shot:dispatch";
-        dispatchEvent.setString("shot_id", shotId);
-        pluginManager->trigger(dispatchEvent);
-    }
 }
 
 void AutoTuningCapturePlugin::captureCompletedGrindDose() {
@@ -623,7 +599,7 @@ void AutoTuningCapturePlugin::clearLatestRecommendation() {
 }
 
 bool AutoTuningCapturePlugin::shouldCaptureShot() const {
-    return controller && (optimizerDeliveryRequired() || controller->getSettings().isRLCommunityUploadEnabled());
+    return controller != nullptr;
 }
 
 bool AutoTuningCapturePlugin::optimizerDeliveryRequired() const {
@@ -673,6 +649,19 @@ float AutoTuningCapturePlugin::currentShotWeightG() const {
     }
 }
 
+float AutoTuningCapturePlugin::currentMeasuredWeightG() const {
+    switch (static_cast<VolumetricMeasurementSource>(shotSource)) {
+    case VolumetricMeasurementSource::HARDWARE_SCALE:
+        return currentHardwareWeight.load(std::memory_order_relaxed);
+    case VolumetricMeasurementSource::BLUETOOTH:
+        return currentBluetoothWeight.load(std::memory_order_relaxed);
+    case VolumetricMeasurementSource::FLOW_ESTIMATION:
+    case VolumetricMeasurementSource::INACTIVE:
+    default:
+        return 0.0f;
+    }
+}
+
 float AutoTuningCapturePlugin::shotWeightAtElapsed(uint16_t elapsedMs) const {
     const size_t sampleCount = shotSamples.size();
     if (sampleCount == 0) {
@@ -717,6 +706,21 @@ float AutoTuningCapturePlugin::currentShotFlowGPerS(float currentWeightG, uint16
         return 0.0f;
     }
     return std::min(flow, MAX_CANONICAL_FLOW_G_PER_S);
+}
+
+float AutoTuningCapturePlugin::updateMeasuredFlowGPerS(float measuredWeightG, uint16_t elapsedMs) {
+    if (shotSamples.empty() || elapsedMs <= shotSamples.back().elapsedMs || !std::isfinite(measuredWeightG)) {
+        return measuredFlowGPerS;
+    }
+    const float previousWeightG = shotSamples.back().measuredWeight;
+    const float elapsedS = static_cast<float>(elapsedMs - shotSamples.back().elapsedMs) / 1000.0f;
+    const float delta = measuredWeightG - previousWeightG;
+    if (elapsedS <= 0.0f || !std::isfinite(previousWeightG) || std::fabs(delta) > MAX_CANONICAL_FLOW_G_PER_S * elapsedS) {
+        return measuredFlowGPerS;
+    }
+    const float instantaneous = delta / elapsedS;
+    measuredFlowGPerS = measuredFlowGPerS * 0.75f + instantaneous * 0.25f;
+    return measuredFlowGPerS;
 }
 
 const char *AutoTuningCapturePlugin::weightSourceName() const {
@@ -775,4 +779,70 @@ void AutoTuningCapturePlugin::captureCurrentBrewControl(AutoTuning::PumpTargetMo
         }
     }
     valveOpen = brew->isActive() && brew->currentPhase.valve > 0;
+}
+
+void AutoTuningCapturePlugin::captureHistoryStartMetadata(std::uint32_t historyId) {
+    shotHistory = AutoTuning::ShotHistoryMetadata{};
+    shotHistory.id = historyId;
+    shotHistory.reserved = true;
+    if (!controller) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
+    Process *process = controller->getProcess();
+    if (!process || process->getType() != MODE_BREW) {
+        return;
+    }
+    auto *brew = static_cast<BrewProcess *>(process);
+    shotHistory.startedVolumetric = brew->target == ProcessTarget::VOLUMETRIC;
+    shotHistory.brewDelayMs =
+        static_cast<std::uint16_t>(std::clamp(brew->brewDelay, 0.0, static_cast<double>(UINT16_MAX)));
+}
+
+void AutoTuningCapturePlugin::captureHistoryPhaseTransition() {
+    if (!controller || shotHistory.phaseTransitionCount >= shotHistory.phaseTransitions.size()) {
+        return;
+    }
+    std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
+    Process *process = controller->getProcess();
+    if (!process || process->getType() != MODE_BREW) {
+        return;
+    }
+    auto *brew = static_cast<BrewProcess *>(process);
+    const std::uint8_t phase = static_cast<std::uint8_t>(brew->phaseIndex);
+    if (phase == lastHistoryPhase) {
+        return;
+    }
+    AutoTuning::ShotPhaseTransition &transition =
+        shotHistory.phaseTransitions[shotHistory.phaseTransitionCount++];
+    transition.sampleIndex = static_cast<std::uint16_t>(shotSamples.size());
+    transition.phaseNumber = phase;
+    transition.exitReason = static_cast<std::uint8_t>(brew->lastExitReason);
+    transition.phaseName = brew->currentPhase.name.c_str();
+    lastHistoryPhase = phase;
+}
+
+std::uint16_t AutoTuningCapturePlugin::captureHistorySystemInfo() const {
+    std::uint16_t value = 0;
+    if (shotHistory.startedVolumetric) {
+        value |= SYSTEM_INFO_SHOT_STARTED_VOLUMETRIC;
+    }
+    if (controller) {
+        std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
+        Process *process = controller->getProcess();
+        if (process && process->getType() == MODE_BREW) {
+            auto *brew = static_cast<BrewProcess *>(process);
+            if (brew->target == ProcessTarget::VOLUMETRIC && brew->currentPhase.hasVolumetricTarget() &&
+                controller->isVolumetricAvailable()) {
+                value |= SYSTEM_INFO_CURRENTLY_VOLUMETRIC;
+            }
+        }
+        if (controller->isBluetoothScaleHealthy()) {
+            value |= SYSTEM_INFO_BLUETOOTH_SCALE_CONNECTED;
+        }
+        if (controller->isVolumetricAvailable()) {
+            value |= SYSTEM_INFO_VOLUMETRIC_AVAILABLE;
+        }
+    }
+    return value;
 }

@@ -15,7 +15,9 @@
 #include <mutex>
 #include <string>
 
-constexpr int MQTT_READ_BUFFER_SIZE = 8192;
+// Producers are capped below 8 KiB; this headroom also lets a device recover
+// from one oversized retained status published by an older container.
+constexpr int MQTT_READ_BUFFER_SIZE = 12288;
 constexpr int MQTT_WRITE_BUFFER_SIZE = 24576;
 
 class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
@@ -25,7 +27,8 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     void loop() override;
     bool configured() const override;
     bool connected() const override;
-    bool publishShot(AutoTuning::ShotRecord const &shot, bool reprocess) override;
+    AutoTuning::ShotSubmissionResult publishShot(AutoTuning::ShotRecord const &shot,
+                                                  AutoTuning::ShotDeliveryAttempt const &attempt) override;
     bool publishLiveShotStarted(AutoTuning::LiveShotStarted const &event) override;
     bool publishLiveShotSample(AutoTuning::LiveShotSample const &event) override;
     bool publishLiveShotEnded(AutoTuning::LiveShotEnded const &event) override;
@@ -89,6 +92,7 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
 #endif
     void publishMachineState(const char *state, bool force = false);
     void publishOptimizerSettings();
+    bool publishOptimizerControl(Event const &event);
     void handleRecommendation(const String &payload);
     void handleStatus(const String &payload);
     void handleShotDeliveryAck(const String &payload);
@@ -96,7 +100,7 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     bool applyLatestRecommendation();
     bool ignoreLatestRecommendation();
     void clearLatestRecommendation();
-    bool validateLatestRecommendation(String &reason) const;
+    bool validateLatestRecommendation(String &reason);
     void clearLatestRecommendationAndNotify();
     bool publishRecommendationDecision(const char *decision, bool includeEditedFields);
     void publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed);
@@ -179,6 +183,12 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     String latestStatusOptimizerFallbackReason;
     String latestStatusCPBOProfileName;
     String latestStatusCPBOComparisonMode;
+    String latestStatusCPBOOptimizationRunId;
+    bool latestStatusCPBOLocallyConverged = false;
+    float latestStatusCPBOTrustRegionLength = 0.0f;
+    int latestStatusCPBOTrustRegionSuccessCount = 0;
+    int latestStatusCPBOTrustRegionFailureCount = 0;
+    String latestStatusCPBOLastTransitionAction;
     int latestStatusLocalShotCount = 0;
     int latestStatusUploadQueueCount = 0;
     int latestStatusUploadQueueRejectedCount = 0;

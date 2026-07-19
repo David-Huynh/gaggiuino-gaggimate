@@ -45,6 +45,8 @@ class CommunityUploadPlugin : public Plugin, public AutoTuning::CommunityUploadP
     String machineTopicId() const;
     String machineId() const;
     void requestStatusPublish();
+    void requestQueueMaintenance();
+    void refreshQueueStatus();
     void setLastError(const String &error);
     String getLastError() const;
     void incrementRejected();
@@ -73,6 +75,11 @@ class CommunityUploadPlugin : public Plugin, public AutoTuning::CommunityUploadP
     unsigned long lastRegisterAttemptMs = 0;
     unsigned long lastUploadAttemptMs = 0;
     bool statusPublishRequested = false;
+    bool queueStatusRefreshRequested = false;
+    bool queueMaintenanceRequested = false;
+    bool cachedQueueStorageAvailable = false;
+    CommunityUploadQueue::Stats cachedQueueStats;
+    unsigned long lastQueueStatusRefreshMs = 0;
     bool registrationReadyPending = false;
     bool credentialUpdatePending = false;
     bool credentialClearPending = false;

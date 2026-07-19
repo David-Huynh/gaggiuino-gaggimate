@@ -2,6 +2,7 @@
 
 #include <display/util/AtomicFile.h>
 #include <display/util/LittleFSUtil.h>
+#include <display/core/StorageCoordinator.h>
 
 #include <LittleFS.h>
 #include <algorithm>
@@ -26,7 +27,9 @@ static String safeIdentifier(String value, size_t maxLength = 120) {
     return output.isEmpty() ? "record" : output;
 }
 
-static bool listRegularPaths(const char *directory, std::vector<String> &paths) {
+static bool listRegularPaths(const char *directory, std::vector<String> &paths,
+                             StorageCoordinator::FlashLease &flashLease) {
+    StorageCoordinator::instance().assertFlashLease();
     if (!LittleFSUtil::existsQuietly(directory)) {
         return false;
     }
@@ -35,6 +38,7 @@ static bool listRegularPaths(const char *directory, std::vector<String> &paths) 
         return false;
     }
     File file = root.openNextFile();
+    size_t scanned = 0;
     while (file) {
         const String path = LittleFSUtil::pathFromEntry(directory, file.name());
         const bool regularFile = !file.isDirectory();
@@ -42,13 +46,19 @@ static bool listRegularPaths(const char *directory, std::vector<String> &paths) 
         if (regularFile) {
             paths.push_back(path);
         }
+        if (++scanned % 8 == 0) {
+            flashLease.checkpoint();
+        }
         file = root.openNextFile();
     }
     root.close();
     return true;
 }
 
-static bool readJsonPath(const String &path, JsonDocument &document) {
+static bool readJsonPath(const String &path, JsonDocument &document,
+                         StorageCoordinator::FlashLease &flashLease) {
+    (void)flashLease;
+    StorageCoordinator::instance().assertFlashLease();
     File file = LittleFS.open(path, FILE_READ);
     if (!file) {
         return false;
@@ -56,6 +66,42 @@ static bool readJsonPath(const String &path, JsonDocument &document) {
     const DeserializationError error = deserializeJson(document, file);
     file.close();
     return !error && document.is<JsonObject>();
+}
+
+static bool listRecordPathsUnlocked(const char *directory,
+                                    std::vector<String> &paths,
+                                    StorageCoordinator::FlashLease &flashLease) {
+    std::vector<String> allPaths;
+    if (!listRegularPaths(directory, allPaths, flashLease)) {
+        return false;
+    }
+    for (const String &path : allPaths) {
+        if (path.endsWith(".json")) {
+            paths.push_back(path);
+        }
+    }
+    return true;
+}
+
+static bool readJsonUnlocked(const String &path, JsonDocument &document,
+                             StorageCoordinator::FlashLease &flashLease) {
+    const String temporaryPath = AtomicFile::temporaryPath(path);
+    if (LittleFSUtil::existsQuietly(temporaryPath)) {
+        JsonDocument pending(&psramAllocator);
+        AtomicFile::recoverPending(
+            path, readJsonPath(temporaryPath, pending, flashLease));
+    }
+    if (readJsonPath(path, document, flashLease)) {
+        AtomicFile::discardBackup(path);
+        return true;
+    }
+    const String backupPath = AtomicFile::backupPath(path);
+    if (LittleFSUtil::existsQuietly(backupPath) &&
+        readJsonPath(backupPath, document, flashLease)) {
+        AtomicFile::restoreBackup(path);
+        return true;
+    }
+    return false;
 }
 
 static bool jsonEpoch(JsonVariantConst value, std::int64_t &output) {
@@ -69,6 +115,7 @@ static bool jsonEpoch(JsonVariantConst value, std::int64_t &output) {
 } // namespace
 
 bool ensureDirectory(const char *path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (LittleFSUtil::existsQuietly(path)) {
         return true;
     }
@@ -80,6 +127,7 @@ String recordPath(const char *directory, const String &recordId) {
 }
 
 bool writeJson(const String &path, const JsonDocument &document) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const String temporaryPath = AtomicFile::temporaryPath(path);
     if (!LittleFSUtil::removeIfExists(temporaryPath)) {
         return false;
@@ -94,7 +142,8 @@ bool writeJson(const String &path, const JsonDocument &document) {
     file.close();
 
     JsonDocument verification(&psramAllocator);
-    if (written != expected || !readJsonPath(temporaryPath, verification)) {
+    if (written != expected ||
+        !readJsonPath(temporaryPath, verification, flashLease)) {
         LittleFSUtil::removeIfExists(temporaryPath);
         return false;
     }
@@ -102,26 +151,14 @@ bool writeJson(const String &path, const JsonDocument &document) {
 }
 
 bool readJson(const String &path, JsonDocument &document) {
-    const String temporaryPath = AtomicFile::temporaryPath(path);
-    if (LittleFSUtil::existsQuietly(temporaryPath)) {
-        JsonDocument pending(&psramAllocator);
-        AtomicFile::recoverPending(path, readJsonPath(temporaryPath, pending));
-    }
-    if (readJsonPath(path, document)) {
-        AtomicFile::discardBackup(path);
-        return true;
-    }
-    const String backupPath = AtomicFile::backupPath(path);
-    if (LittleFSUtil::existsQuietly(backupPath) && readJsonPath(backupPath, document)) {
-        AtomicFile::restoreBackup(path);
-        return true;
-    }
-    return false;
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    return readJsonUnlocked(path, document, flashLease);
 }
 
 void recoverDirectory(const char *directory) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     std::vector<String> paths;
-    if (!listRegularPaths(directory, paths)) {
+    if (!listRegularPaths(directory, paths, flashLease)) {
         return;
     }
     std::vector<String> temporaryPaths;
@@ -137,7 +174,9 @@ void recoverDirectory(const char *directory) {
     for (const String &temporaryPath : temporaryPaths) {
         JsonDocument pending(&psramAllocator);
         const String finalPath = temporaryPath.substring(0, temporaryPath.length() - 4);
-        AtomicFile::recoverPending(finalPath, readJsonPath(temporaryPath, pending));
+        AtomicFile::recoverPending(
+            finalPath, readJsonPath(temporaryPath, pending, flashLease));
+        flashLease.checkpoint();
     }
     for (const String &backupPath : backupPaths) {
         const String finalPath = backupPath.substring(0, backupPath.length() - 4);
@@ -146,28 +185,23 @@ void recoverDirectory(const char *directory) {
         } else {
             AtomicFile::restoreBackup(finalPath);
         }
+        flashLease.checkpoint();
     }
 }
 
 bool listRecordPaths(const char *directory, std::vector<String> &paths) {
-    std::vector<String> allPaths;
-    if (!listRegularPaths(directory, allPaths)) {
-        return false;
-    }
-    for (const String &path : allPaths) {
-        if (path.endsWith(".json")) {
-            paths.push_back(path);
-        }
-    }
-    return true;
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    return listRecordPathsUnlocked(directory, paths, flashLease);
 }
 
 DirectoryStats directoryStats(const char *directory) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     DirectoryStats result;
     std::vector<String> paths;
-    if (!listRecordPaths(directory, paths)) {
+    if (!listRecordPathsUnlocked(directory, paths, flashLease)) {
         return result;
     }
+    size_t scanned = 0;
     for (const String &path : paths) {
         File file = LittleFS.open(path, FILE_READ);
         if (file) {
@@ -175,13 +209,17 @@ DirectoryStats directoryStats(const char *directory) {
             result.bytes += file.size();
             file.close();
         }
+        if (++scanned % 8 == 0) {
+            flashLease.checkpoint();
+        }
     }
     return result;
 }
 
 std::int64_t fileTimestamp(const String &path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     JsonDocument document(&psramAllocator);
-    if (!readJson(path, document)) {
+    if (!readJsonUnlocked(path, document, flashLease)) {
         return 0;
     }
     JsonObjectConst root = document.as<JsonObjectConst>();
@@ -194,36 +232,75 @@ std::int64_t fileTimestamp(const String &path) {
 }
 
 bool findOldestFile(const char *directory, String &oldestPath, std::int64_t &oldestTimestamp) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     std::vector<String> paths;
-    if (!listRecordPaths(directory, paths)) {
+    if (!listRecordPathsUnlocked(directory, paths, flashLease)) {
         return false;
     }
     bool found = false;
+    size_t scanned = 0;
     for (const String &path : paths) {
-        const std::int64_t timestamp = fileTimestamp(path);
+        JsonDocument document(&psramAllocator);
+        std::int64_t timestamp = 0;
+        if (readJsonUnlocked(path, document, flashLease)) {
+            JsonObjectConst root = document.as<JsonObjectConst>();
+            jsonEpoch(root["updated_at"], timestamp) ||
+                jsonEpoch(root["timestamp"], timestamp) ||
+                jsonEpoch(root["created_at"], timestamp);
+        }
         if (!found || timestamp < oldestTimestamp) {
             found = true;
             oldestPath = path;
             oldestTimestamp = timestamp;
+        }
+        if (++scanned % 8 == 0) {
+            flashLease.checkpoint();
         }
     }
     return found;
 }
 
 bool removeOldestFile(const char *directory) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     String oldestPath;
     std::int64_t oldestTimestamp = std::numeric_limits<std::int64_t>::max();
-    return findOldestFile(directory, oldestPath, oldestTimestamp) && LittleFS.remove(oldestPath);
+    std::vector<String> paths;
+    if (!listRecordPathsUnlocked(directory, paths, flashLease)) {
+        return false;
+    }
+    bool found = false;
+    for (const String &path : paths) {
+        JsonDocument document(&psramAllocator);
+        std::int64_t timestamp = 0;
+        if (readJsonUnlocked(path, document, flashLease)) {
+            JsonObjectConst root = document.as<JsonObjectConst>();
+            jsonEpoch(root["updated_at"], timestamp) ||
+                jsonEpoch(root["timestamp"], timestamp) ||
+                jsonEpoch(root["created_at"], timestamp);
+        }
+        if (!found || timestamp < oldestTimestamp) {
+            found = true;
+            oldestPath = path;
+            oldestTimestamp = timestamp;
+        }
+        flashLease.checkpoint();
+    }
+    return found && LittleFS.remove(oldestPath);
 }
 
 bool clearDirectory(const char *directory) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     std::vector<String> paths;
-    if (!listRegularPaths(directory, paths)) {
+    if (!listRegularPaths(directory, paths, flashLease)) {
         return true;
     }
     bool success = true;
+    size_t removed = 0;
     for (const String &path : paths) {
         success = LittleFS.remove(path) && success;
+        if (++removed % 8 == 0) {
+            flashLease.checkpoint();
+        }
     }
     return success;
 }

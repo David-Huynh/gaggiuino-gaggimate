@@ -1,6 +1,7 @@
 #include "LittleFSUtil.h"
 
 #include <LittleFS.h>
+#include <display/core/StorageCoordinator.h>
 #ifndef GAGGIMATE_SIM
 #include <sys/stat.h>
 #endif
@@ -28,6 +29,7 @@ String pathFromEntry(const char *directory, const String &entryName) {
 }
 
 bool existsQuietly(const String &path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
 #ifdef GAGGIMATE_SIM
     return LittleFS.exists(path);
 #else
@@ -39,6 +41,9 @@ bool existsQuietly(const String &path) {
 #endif
 }
 
-bool removeIfExists(const String &path) { return !existsQuietly(path) || LittleFS.remove(path); }
+bool removeIfExists(const String &path) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    return !existsQuietly(path) || LittleFS.remove(path);
+}
 
 } // namespace LittleFSUtil

@@ -10,11 +10,13 @@
 #include "PluginManager.h"
 #include "ScaleSourceResolver.h"
 #include "Settings.h"
+#include "StorageCoordinator.h"
 #include "SystemInfo.h"
 #include <WiFi.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/process/Process.h>
 #include <mutex>
+#include <optional>
 #include <vector>
 #ifndef GAGGIMATE_HEADLESS
 #include <display/drivers/Driver.h>
@@ -118,6 +120,12 @@ class Controller {
     AutoTuning::OptimizerTransportPort const *getOptimizerTransport() const { return optimizerTransport; }
     void setAutoTuningRecordStore(AutoTuning::AutoTuningRecordStorePort *store) { autoTuningRecordStore = store; }
     AutoTuning::AutoTuningRecordStorePort *getAutoTuningRecordStore() const { return autoTuningRecordStore; }
+    void setCompletedShotProjection(AutoTuning::CompletedShotProjectionPort *projection) {
+        completedShotProjection = projection;
+    }
+    AutoTuning::CompletedShotProjectionPort *getCompletedShotProjection() const {
+        return completedShotProjection;
+    }
     void setCommunityUpload(AutoTuning::CommunityUploadPort *upload) { communityUpload = upload; }
     AutoTuning::CommunityUploadPort *getCommunityUpload() const { return communityUpload; }
     ProfileManager *getProfileManager() { return profileManager; }
@@ -241,7 +249,7 @@ class Controller {
     // Process lifecycle (GM-147): the *Locked helpers assume processMutex is held
     // and collect events for dispatch after unlocking.
     bool isActiveLocked() const { return currentProcess != nullptr && currentProcess->isActive(); }
-    void startProcessLocked(Process *process, DeferredProcessEvents &events);
+    bool startProcessLocked(Process *process, DeferredProcessEvents &events);
     bool deactivateLocked(DeferredProcessEvents &events);
     void clearLocked(DeferredProcessEvents &events);
     void dispatchEvents(const DeferredProcessEvents &events);
@@ -268,7 +276,10 @@ class Controller {
     ProfileManager *profileManager{};
     AutoTuning::OptimizerTransportPort *optimizerTransport{};
     AutoTuning::AutoTuningRecordStorePort *autoTuningRecordStore{};
+    AutoTuning::CompletedShotProjectionPort *completedShotProjection{};
     AutoTuning::CommunityUploadPort *communityUpload{};
+    std::optional<StorageCoordinator::ProcessLease> processStorageLease;
+    std::optional<StorageCoordinator::ProcessLease> pendingProcessStorageLease;
 
     int mode = MODE_BREW;
     // Sensor scalars written from the UART poll callback (Arduino loop task) and

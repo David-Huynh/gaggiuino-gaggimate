@@ -3,10 +3,12 @@
 #include "CommunityPayloadValidator.h"
 #include <display/util/AtomicFile.h>
 #include <display/util/LittleFSUtil.h>
+#include <display/core/StorageCoordinator.h>
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <algorithm>
+#include <array>
 #include <display/core/AutoTuningModels.h>
 #include <display/core/EpochTime.h>
 #include <display/util/PsramAllocator.h>
@@ -67,7 +69,9 @@ static bool jsonNumber(JsonVariantConst value) {
            (value.is<int>() || value.is<long>() || value.is<float>() || value.is<double>());
 }
 
-static bool listRegularPaths(const char *directory, std::vector<String> &paths) {
+static bool listRegularPaths(const char *directory, std::vector<String> &paths,
+                             StorageCoordinator::FlashLease &flashLease) {
+    StorageCoordinator::instance().assertFlashLease();
     if (!LittleFSUtil::existsQuietly(directory)) {
         return false;
     }
@@ -76,12 +80,16 @@ static bool listRegularPaths(const char *directory, std::vector<String> &paths) 
         return false;
     }
     File file = root.openNextFile();
+    size_t scanned = 0;
     while (file) {
         const String path = LittleFSUtil::pathFromEntry(directory, file.name());
         const bool regularFile = !file.isDirectory();
         file.close();
         if (regularFile) {
             paths.push_back(path);
+        }
+        if (++scanned % 8 == 0) {
+            flashLease.checkpoint();
         }
         file = root.openNextFile();
     }
@@ -141,15 +149,26 @@ bool CommunityUploadQueue::begin() {
         mutex = xSemaphoreCreateRecursiveMutex();
     }
     QueueLock lock(mutex);
-    return lock.locked && ensureDirectoryUnlocked();
+    if (!lock.locked) {
+        return false;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    return ensureDirectoryUnlocked(flashLease);
 }
 
 bool CommunityUploadQueue::storageAvailable() const {
     QueueLock lock(mutex);
-    return lock.locked && ensureDirectoryUnlocked();
+    if (!lock.locked) {
+        return false;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    return ensureDirectoryUnlocked(flashLease);
 }
 
-bool CommunityUploadQueue::ensureDirectoryUnlocked() const {
+bool CommunityUploadQueue::ensureDirectoryUnlocked(
+    StorageCoordinator::FlashLease &flashLease) const {
+    (void)flashLease;
+    StorageCoordinator::instance().assertFlashLease();
     if (LittleFSUtil::existsQuietly(QUEUE_DIR)) {
         return true;
     }
@@ -158,12 +177,16 @@ bool CommunityUploadQueue::ensureDirectoryUnlocked() const {
 
 void CommunityUploadQueue::recover() {
     QueueLock lock(mutex);
-    if (!lock.locked || !ensureDirectoryUnlocked()) {
+    if (!lock.locked) {
+        return;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    if (!ensureDirectoryUnlocked(flashLease)) {
         return;
     }
 
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return;
     }
     std::vector<String> temporaryPaths;
@@ -180,8 +203,11 @@ void CommunityUploadQueue::recover() {
         Item pending;
         String payload;
         const String finalPath = temporaryPath.substring(0, temporaryPath.length() - 4);
-        const bool valid = readItemUnlocked(temporaryPath, pending, &payload) && !payload.isEmpty();
+        const bool valid =
+            readItemUnlocked(temporaryPath, pending, flashLease, &payload) &&
+            !payload.isEmpty();
         AtomicFile::recoverPending(finalPath, valid);
+        flashLease.checkpoint();
     }
     for (const String &backup : backupPaths) {
         const String finalPath = backup.substring(0, backup.length() - 4);
@@ -190,15 +216,23 @@ void CommunityUploadQueue::recover() {
         } else {
             AtomicFile::restoreBackup(finalPath);
         }
+        flashLease.checkpoint();
     }
 }
 
-bool CommunityUploadQueue::readItemUnlocked(const String &path, Item &item, String *payloadJson) const {
+bool CommunityUploadQueue::readItemUnlocked(
+    const String &path, Item &item, StorageCoordinator::FlashLease &flashLease,
+    String *payloadJson) const {
+    StorageCoordinator::instance().assertFlashLease();
     File file = LittleFS.open(path, FILE_READ);
     if (!file) {
         return false;
     }
     const String metadataLine = file.readStringUntil('\n');
+    if (metadataLine.length() > 2048) {
+        file.close();
+        return false;
+    }
     JsonDocument metadata(&psramAllocator);
     if (deserializeJson(metadata, metadataLine) || !metadata.is<JsonObject>()) {
         file.close();
@@ -216,13 +250,41 @@ bool CommunityUploadQueue::readItemUnlocked(const String &path, Item &item, Stri
     item.attemptCount = metadata["attempt_count"] | 0;
     item.bytes = file.size();
     if (payloadJson) {
-        *payloadJson = file.readString();
+        const size_t payloadBytes =
+            file.size() > file.position() ? file.size() - file.position() : 0;
+        if (payloadBytes > CommunityPayloadValidator::MAX_PAYLOAD_BYTES) {
+            file.close();
+            return false;
+        }
+        payloadJson->remove(0);
+        payloadJson->reserve(payloadBytes);
+        std::array<std::uint8_t,
+                   StorageCoordinator::MAX_FLASH_QUANTUM_BYTES>
+            buffer{};
+        size_t remaining = payloadBytes;
+        while (remaining > 0) {
+            const size_t requested = std::min(buffer.size(), remaining);
+            const size_t read = file.read(buffer.data(), requested);
+            if (read == 0 ||
+                !payloadJson->concat(
+                    reinterpret_cast<const char *>(buffer.data()), read)) {
+                file.close();
+                return false;
+            }
+            remaining -= read;
+            if (remaining > 0) {
+                flashLease.checkpoint();
+            }
+        }
     }
     file.close();
     return !item.uploadId.isEmpty() && !item.recordType.isEmpty() && !item.recordId.isEmpty();
 }
 
-bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &payloadJson) const {
+bool CommunityUploadQueue::writeItemUnlocked(
+    const Item &item, const String &payloadJson,
+    StorageCoordinator::FlashLease &flashLease) const {
+    StorageCoordinator::instance().assertFlashLease();
     JsonDocument metadata(&psramAllocator);
     metadata["upload_id"] = item.uploadId;
     metadata["record_type"] = item.recordType;
@@ -244,7 +306,25 @@ bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &pay
         return false;
     }
     const size_t metadataBytes = file.println(metadataJson);
-    const size_t payloadBytes = file.print(payloadJson);
+    size_t payloadBytes = 0;
+    while (payloadBytes < payloadJson.length()) {
+        const size_t chunk =
+            std::min(StorageCoordinator::MAX_FLASH_QUANTUM_BYTES,
+                     payloadJson.length() - payloadBytes);
+        const size_t written = file.write(
+            reinterpret_cast<const std::uint8_t *>(payloadJson.c_str()) +
+                payloadBytes,
+            chunk);
+        if (written != chunk) {
+            file.close();
+            LittleFSUtil::removeIfExists(temporaryPath);
+            return false;
+        }
+        payloadBytes += written;
+        if (payloadBytes < payloadJson.length()) {
+            flashLease.checkpoint();
+        }
+    }
     file.flush();
     file.close();
     if (metadataBytes == 0 || payloadBytes != payloadJson.length()) {
@@ -254,7 +334,9 @@ bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &pay
 
     Item verification;
     String verifiedPayload;
-    if (!readItemUnlocked(temporaryPath, verification, &verifiedPayload) || verifiedPayload != payloadJson ||
+    if (!readItemUnlocked(temporaryPath, verification, flashLease,
+                          &verifiedPayload) ||
+        verifiedPayload != payloadJson ||
         verification.uploadId != item.uploadId) {
         LittleFSUtil::removeIfExists(temporaryPath);
         return false;
@@ -262,27 +344,32 @@ bool CommunityUploadQueue::writeItemUnlocked(const Item &item, const String &pay
     return AtomicFile::commit(item.path);
 }
 
-bool CommunityUploadQueue::removeRecordUnlocked(const String &recordType, const String &recordId, const String &exceptPath) {
-    if (!ensureDirectoryUnlocked()) {
+bool CommunityUploadQueue::removeRecordUnlocked(
+    const String &recordType, const String &recordId,
+    StorageCoordinator::FlashLease &flashLease, const String &exceptPath) {
+    if (!ensureDirectoryUnlocked(flashLease)) {
         return false;
     }
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return false;
     }
     std::vector<String> matchingPaths;
     for (const String &path : paths) {
         if (isQueuePath(path) && path != exceptPath) {
             Item item;
-            if (readItemUnlocked(path, item) && item.recordType == recordType && item.recordId == recordId) {
+            if (readItemUnlocked(path, item, flashLease) &&
+                item.recordType == recordType && item.recordId == recordId) {
                 matchingPaths.push_back(path);
             }
+            flashLease.checkpoint();
         }
     }
 
     bool removed = true;
     for (const String &path : matchingPaths) {
         removed = LittleFS.remove(path) && removed;
+        flashLease.checkpoint();
     }
     return removed;
 }
@@ -291,7 +378,11 @@ bool CommunityUploadQueue::enqueue(const String &uploadId, const String &recordT
                                    const String &payloadJson, const String &endpoint, std::int64_t createdAt,
                                    std::int64_t nextRetryAt, bool replaceRecord) {
     QueueLock lock(mutex);
-    if (!lock.locked || !ensureDirectoryUnlocked() || uploadId.isEmpty() || recordType.isEmpty() || recordId.isEmpty() ||
+    if (!lock.locked) {
+        return false;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    if (!ensureDirectoryUnlocked(flashLease) || uploadId.isEmpty() || recordType.isEmpty() || recordId.isEmpty() ||
         payloadJson.isEmpty() || payloadJson.length() > CommunityPayloadValidator::MAX_PAYLOAD_BYTES) {
         return false;
     }
@@ -303,11 +394,15 @@ bool CommunityUploadQueue::enqueue(const String &uploadId, const String &recordT
                                     : (LittleFSUtil::existsQuietly(legacyPath) ? legacyPath : String());
     if (!existingPath.isEmpty()) {
         Item existing;
-        if (!readItemUnlocked(existingPath, existing) || existing.uploadId != uploadId || existing.recordType != recordType ||
+        if (!readItemUnlocked(existingPath, existing, flashLease) ||
+            existing.uploadId != uploadId || existing.recordType != recordType ||
             existing.recordId != recordId) {
             return false;
         }
-        return (!replaceRecord || removeRecordUnlocked(recordType, recordId, existingPath)) && pruneUnlocked();
+        return (!replaceRecord ||
+                removeRecordUnlocked(recordType, recordId, flashLease,
+                                     existingPath)) &&
+               pruneUnlocked(flashLease);
     }
 
     Item item;
@@ -318,13 +413,14 @@ bool CommunityUploadQueue::enqueue(const String &uploadId, const String &recordT
     item.endpoint = endpoint;
     item.createdAt = createdAt;
     item.nextRetryAt = nextRetryAt;
-    if (!writeItemUnlocked(item, payloadJson)) {
+    if (!writeItemUnlocked(item, payloadJson, flashLease)) {
         return false;
     }
-    if (replaceRecord && !removeRecordUnlocked(recordType, recordId, path)) {
+    if (replaceRecord &&
+        !removeRecordUnlocked(recordType, recordId, flashLease, path)) {
         return false;
     }
-    if (pruneUnlocked()) {
+    if (pruneUnlocked(flashLease)) {
         return true;
     }
     if (!replaceRecord) {
@@ -336,23 +432,29 @@ bool CommunityUploadQueue::enqueue(const String &uploadId, const String &recordT
 bool CommunityUploadQueue::patchShotCorrection(const String &shotId, AutoTuning::ShotCorrection const &correction,
                                                std::int64_t updatedAt, std::int64_t nextRetryAt) {
     QueueLock lock(mutex);
+    if (!lock.locked) {
+        return false;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const bool hasCorrection = correction.grindFollowed.has_value() || correction.doseFollowed.has_value() ||
                                correction.yieldFollowed.has_value() || correction.relativeGrindStepsFromReference.has_value() ||
                                correction.currentAbsoluteStep.has_value() || correction.doseInG.has_value() ||
                                correction.targetYieldG.has_value() || correction.beverageOutG.has_value();
-    if (!lock.locked || !ensureDirectoryUnlocked() || !hasCorrection) {
+    if (!ensureDirectoryUnlocked(flashLease) || !hasCorrection) {
         return false;
     }
 
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return false;
     }
     bool patched = false;
     for (const String &path : paths) {
         Item item;
         String payloadJson;
-        if (isQueuePath(path) && readItemUnlocked(path, item, &payloadJson) && item.recordType == "shot" &&
+        if (isQueuePath(path) &&
+            readItemUnlocked(path, item, flashLease, &payloadJson) &&
+            item.recordType == "shot" &&
             item.recordId == shotId) {
             JsonDocument document(&psramAllocator);
             if (!deserializeJson(document, payloadJson) && document.is<JsonObject>()) {
@@ -434,35 +536,45 @@ bool CommunityUploadQueue::patchShotCorrection(const String &shotId, AutoTuning:
                 item.status = Status::Pending;
                 item.nextRetryAt = nextRetryAt;
                 item.attemptCount = 0;
-                patched = writeItemUnlocked(item, updatedPayload);
+                patched =
+                    writeItemUnlocked(item, updatedPayload, flashLease);
                 break;
             }
         }
+        flashLease.checkpoint();
     }
     return patched;
 }
 
 bool CommunityUploadQueue::selectReady(const String &endpoint, std::int64_t now, Item &item, String &payloadJson) const {
     QueueLock lock(mutex);
-    if (!lock.locked || !ensureDirectoryUnlocked()) {
+    if (!lock.locked) {
+        return false;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    if (!ensureDirectoryUnlocked(flashLease)) {
         return false;
     }
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return false;
     }
 
     bool found = false;
     for (const String &path : paths) {
         Item candidate;
-        if (isQueuePath(path) && readItemUnlocked(path, candidate) && candidate.endpoint == endpoint &&
+        if (isQueuePath(path) &&
+            readItemUnlocked(path, candidate, flashLease) &&
+            candidate.endpoint == endpoint &&
             (candidate.status == Status::Pending || candidate.status == Status::Failed) && candidate.nextRetryAt <= now &&
             (!found || candidate.createdAt < item.createdAt)) {
             item = candidate;
             found = true;
         }
+        flashLease.checkpoint();
     }
-    return found && readItemUnlocked(item.path, item, &payloadJson);
+    return found &&
+           readItemUnlocked(item.path, item, flashLease, &payloadJson);
 }
 
 CommunityUploadQueue::MutationResult CommunityUploadQueue::replaceIfCurrent(Item const &expected, const String &expectedPayload,
@@ -471,16 +583,20 @@ CommunityUploadQueue::MutationResult CommunityUploadQueue::replaceIfCurrent(Item
     if (!lock.locked) {
         return MutationResult::Failed;
     }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     Item current;
     String currentPayload;
-    if (!readItemUnlocked(expected.path, current, &currentPayload)) {
+    if (!readItemUnlocked(expected.path, current, flashLease,
+                          &currentPayload)) {
         return MutationResult::Stale;
     }
     if (current.uploadId != expected.uploadId || currentPayload != expectedPayload) {
         return MutationResult::Stale;
     }
     replacement.path = expected.path;
-    return writeItemUnlocked(replacement, replacementPayload) ? MutationResult::Applied : MutationResult::Failed;
+    return writeItemUnlocked(replacement, replacementPayload, flashLease)
+               ? MutationResult::Applied
+               : MutationResult::Failed;
 }
 
 CommunityUploadQueue::MutationResult CommunityUploadQueue::removeIfCurrent(Item const &expected, const String &expectedPayload) {
@@ -488,9 +604,11 @@ CommunityUploadQueue::MutationResult CommunityUploadQueue::removeIfCurrent(Item 
     if (!lock.locked) {
         return MutationResult::Failed;
     }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     Item current;
     String currentPayload;
-    if (!readItemUnlocked(expected.path, current, &currentPayload)) {
+    if (!readItemUnlocked(expected.path, current, flashLease,
+                          &currentPayload)) {
         return MutationResult::Stale;
     }
     if (current.uploadId != expected.uploadId || currentPayload != expectedPayload) {
@@ -502,16 +620,21 @@ CommunityUploadQueue::MutationResult CommunityUploadQueue::removeIfCurrent(Item 
 CommunityUploadQueue::Stats CommunityUploadQueue::stats() const {
     QueueLock lock(mutex);
     Stats result;
-    if (!lock.locked || !ensureDirectoryUnlocked()) {
+    if (!lock.locked) {
+        return result;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    if (!ensureDirectoryUnlocked(flashLease)) {
         return result;
     }
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return result;
     }
     for (const String &path : paths) {
         Item item;
-        if (isQueuePath(path) && readItemUnlocked(path, item)) {
+        if (isQueuePath(path) &&
+            readItemUnlocked(path, item, flashLease)) {
             result.bytes += item.bytes;
             if (item.status == Status::Failed) {
                 ++result.failed;
@@ -521,25 +644,30 @@ CommunityUploadQueue::Stats CommunityUploadQueue::stats() const {
                 ++result.pending;
             }
         }
+        flashLease.checkpoint();
     }
     return result;
 }
 
 bool CommunityUploadQueue::discardMismatched(const String &endpoint, bool hasCredentials, const String &installId) {
     QueueLock lock(mutex);
-    if (!lock.locked || !ensureDirectoryUnlocked() || endpoint.isEmpty()) {
+    if (!lock.locked) {
+        return false;
+    }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    if (!ensureDirectoryUnlocked(flashLease) || endpoint.isEmpty()) {
         return false;
     }
     bool removed = false;
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return false;
     }
     for (const String &path : paths) {
         if (isQueuePath(path)) {
             Item item;
             String payloadJson;
-            if (!readItemUnlocked(path, item, &payloadJson)) {
+            if (!readItemUnlocked(path, item, flashLease, &payloadJson)) {
                 LittleFS.remove(path);
                 removed = true;
             } else if (item.endpoint.isEmpty()) {
@@ -548,7 +676,7 @@ bool CommunityUploadQueue::discardMismatched(const String &endpoint, bool hasCre
                     !deserializeJson(payload, payloadJson) ? payload["install_id"].as<String>() : String();
                 if (hasCredentials && queuedInstallId == installId) {
                     item.endpoint = endpoint;
-                    writeItemUnlocked(item, payloadJson);
+                    writeItemUnlocked(item, payloadJson, flashLease);
                 } else {
                     LittleFS.remove(path);
                     removed = true;
@@ -558,28 +686,32 @@ bool CommunityUploadQueue::discardMismatched(const String &endpoint, bool hasCre
                 removed = true;
             }
         }
+        flashLease.checkpoint();
     }
     return removed;
 }
 
-bool CommunityUploadQueue::pruneUnlocked() {
-    if (!ensureDirectoryUnlocked()) {
+bool CommunityUploadQueue::pruneUnlocked(
+    StorageCoordinator::FlashLease &flashLease) {
+    if (!ensureDirectoryUnlocked(flashLease)) {
         return false;
     }
     std::vector<Item> items;
     size_t totalBytes = 0;
     std::vector<String> paths;
-    if (!listRegularPaths(QUEUE_DIR, paths)) {
+    if (!listRegularPaths(QUEUE_DIR, paths, flashLease)) {
         return false;
     }
     for (const String &path : paths) {
         Item item;
-        if (isQueuePath(path) && readItemUnlocked(path, item)) {
+        if (isQueuePath(path) &&
+            readItemUnlocked(path, item, flashLease)) {
             items.push_back(item);
             totalBytes += item.bytes;
         } else if (isQueuePath(path)) {
             LittleFS.remove(path);
         }
+        flashLease.checkpoint();
     }
 
     std::sort(items.begin(), items.end(), [](Item const &left, Item const &right) { return left.createdAt < right.createdAt; });
@@ -596,6 +728,7 @@ bool CommunityUploadQueue::pruneUnlocked() {
             return false;
         }
         items.erase(removable);
+        flashLease.checkpoint();
     }
     return items.size() <= MAX_QUEUE_ITEMS && totalBytes <= MAX_QUEUE_BYTES;
 }
@@ -603,7 +736,8 @@ bool CommunityUploadQueue::pruneUnlocked() {
 void CommunityUploadQueue::prune() {
     QueueLock lock(mutex);
     if (lock.locked) {
-        pruneUnlocked();
+        auto flashLease = StorageCoordinator::instance().acquireFlash();
+        pruneUnlocked(flashLease);
     }
 }
 
@@ -612,8 +746,10 @@ void CommunityUploadQueue::removeOneLegacyItem() {
     if (!lock.locked) {
         return;
     }
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     std::vector<String> paths;
-    if (!listRegularPaths(LEGACY_QUEUE_DIR, paths) || paths.empty()) {
+    if (!listRegularPaths(LEGACY_QUEUE_DIR, paths, flashLease) ||
+        paths.empty()) {
         return;
     }
     LittleFS.remove(paths.front());

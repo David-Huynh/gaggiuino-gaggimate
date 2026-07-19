@@ -3,6 +3,7 @@
 #include "LocalAutoTuningFiles.h"
 
 #include <LittleFS.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/core/AutoTuningModels.h>
 #include <display/core/AutoTuningPorts.h>
 #include <display/core/EpochTime.h>
@@ -82,6 +83,7 @@ static bool removeOldestAcrossSummaryStores() {
 } // namespace
 
 bool LocalAutoTuningSummaryStore::begin() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const bool available = LocalAutoTuningFiles::ensureDirectory(STORE_DIR) && LocalAutoTuningFiles::ensureDirectory(SHOT_DIR) &&
                            LocalAutoTuningFiles::ensureDirectory(RECOMMENDATION_DIR);
     if (available) {
@@ -92,10 +94,12 @@ bool LocalAutoTuningSummaryStore::begin() const {
 }
 
 bool LocalAutoTuningSummaryStore::reset() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     return begin() && LocalAutoTuningFiles::clearDirectory(SHOT_DIR) && LocalAutoTuningFiles::clearDirectory(RECOMMENDATION_DIR);
 }
 
 LocalAutoTuningSummaryStore::Stats LocalAutoTuningSummaryStore::stats() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     Stats result;
     const LocalAutoTuningFiles::DirectoryStats shots = LocalAutoTuningFiles::directoryStats(SHOT_DIR);
     const LocalAutoTuningFiles::DirectoryStats recommendations = LocalAutoTuningFiles::directoryStats(RECOMMENDATION_DIR);
@@ -106,10 +110,12 @@ LocalAutoTuningSummaryStore::Stats LocalAutoTuningSummaryStore::stats() const {
 }
 
 bool LocalAutoTuningSummaryStore::loadShot(const String &shotId, JsonDocument &document) const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     return !shotId.isEmpty() && LocalAutoTuningFiles::readJson(LocalAutoTuningFiles::recordPath(SHOT_DIR, shotId), document);
 }
 
 bool LocalAutoTuningSummaryStore::removeShot(const String &shotId) const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (shotId.isEmpty()) {
         return false;
     }
@@ -118,6 +124,7 @@ bool LocalAutoTuningSummaryStore::removeShot(const String &shotId) const {
 }
 
 bool LocalAutoTuningSummaryStore::upsertShot(JsonObjectConst raw) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!begin() || raw.isNull()) {
         return false;
     }
@@ -204,6 +211,7 @@ bool LocalAutoTuningSummaryStore::upsertShot(JsonObjectConst raw) {
 }
 
 bool LocalAutoTuningSummaryStore::upsertRecommendation(JsonObjectConst raw) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!begin() || raw.isNull()) {
         return false;
     }
@@ -271,7 +279,8 @@ bool LocalAutoTuningSummaryStore::upsertRecommendation(JsonObjectConst raw) {
 }
 
 bool LocalAutoTuningSummaryStore::patchShotCorrection(const String &shotId,
-                                                      AutoTuning::ShotCorrection const &correction) {
+                                                       AutoTuning::ShotCorrection const &correction) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     JsonDocument doc(&psramAllocator);
     const String path = LocalAutoTuningFiles::recordPath(SHOT_DIR, shotId);
     if (!LocalAutoTuningFiles::readJson(path, doc)) {
@@ -360,7 +369,8 @@ bool LocalAutoTuningSummaryStore::patchShotCorrection(const String &shotId,
 }
 
 bool LocalAutoTuningSummaryStore::patchRecommendationStatus(const String &recommendationId, const String &status,
-                                                            const char *timestampKey) {
+                                                             const char *timestampKey) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     JsonDocument doc(&psramAllocator);
     const String path = LocalAutoTuningFiles::recordPath(RECOMMENDATION_DIR, recommendationId);
     if (!LocalAutoTuningFiles::readJson(path, doc)) {
@@ -375,6 +385,7 @@ bool LocalAutoTuningSummaryStore::patchRecommendationStatus(const String &recomm
 }
 
 void LocalAutoTuningSummaryStore::prune() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!begin()) {
         return;
     }

@@ -78,14 +78,27 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
         }
         const String shotId = event.getString("shot_id");
         const float targetG = event.getFloat("dose_target_g");
-        if (shotId.isEmpty() || !std::isfinite(targetG) || targetG <= 0.0f) {
+        const std::uint32_t promptRevision =
+            static_cast<std::uint32_t>(std::max<std::int64_t>(
+                event.getInt64("prompt_revision"), 0));
+        if (shotId.isEmpty() || promptRevision == 0 ||
+            !std::isfinite(targetG) || targetG <= 0.0f) {
             return;
         }
         if (shotId == pendingDoseShotId) {
+            if (promptRevision > pendingDosePromptRevision &&
+                activateDosePrompt(event)) {
+                showDoseConfirmationOverlay();
+            }
             return;
         }
-        for (Event const &pending : pendingDosePrompts) {
+        for (Event &pending : pendingDosePrompts) {
             if (pending.getString("shot_id") == shotId) {
+                if (promptRevision >
+                    static_cast<std::uint32_t>(std::max<std::int64_t>(
+                        pending.getInt64("prompt_revision"), 0))) {
+                    pending = event;
+                }
                 return;
             }
         }
@@ -98,10 +111,13 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
 
     pm->on("rl:dose-confirmation:resolved", [this](Event const &event) {
-        if (event.getString("shot_id") != pendingDoseShotId) {
+        if (event.getString("shot_id") != pendingDoseShotId ||
+            event.getInt64("prompt_revision") !=
+                static_cast<std::int64_t>(pendingDosePromptRevision)) {
             return;
         }
         pendingDoseShotId = "";
+        pendingDosePromptRevision = 0;
         pendingDoseTargetG = 0.0f;
         if (overlayMode == AutoTuningOverlayMode::DOSE_CONFIRMATION) {
             clearOverlay(false);
@@ -114,11 +130,26 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
             return;
         }
         const String shotId = event.getString("shot_id");
-        if (shotId == pendingShotId) {
+        const std::uint32_t promptRevision =
+            static_cast<std::uint32_t>(std::max<std::int64_t>(
+                event.getInt64("prompt_revision"), 0));
+        if (shotId.isEmpty() || promptRevision == 0) {
             return;
         }
-        for (Event const &pending : pendingPreferencePrompts) {
+        if (shotId == pendingShotId) {
+            if (promptRevision > pendingPreferencePromptRevision &&
+                activatePreferencePrompt(event)) {
+                showPreferenceOverlay();
+            }
+            return;
+        }
+        for (Event &pending : pendingPreferencePrompts) {
             if (pending.getString("shot_id") == shotId) {
+                if (promptRevision >
+                    static_cast<std::uint32_t>(std::max<std::int64_t>(
+                        pending.getInt64("prompt_revision"), 0))) {
+                    pending = event;
+                }
                 return;
             }
         }
@@ -132,7 +163,9 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("rl:preference", [this](Event const &event) {
         if (event.getInt("decision_persisted") == 1 && event.getString("install_id") == pendingPreferenceInstallId &&
             event.getString("optimization_run_id") == pendingPreferenceRunId && event.getString("new_shot_id") == pendingShotId &&
-            event.getString("anchor_shot_id") == pendingPreferenceAnchorShotId) {
+            event.getString("anchor_shot_id") == pendingPreferenceAnchorShotId &&
+            event.getInt64("prompt_revision") ==
+                static_cast<std::int64_t>(pendingPreferencePromptRevision)) {
             closeOverlay();
             showNextPendingOverlay();
         }
@@ -147,6 +180,7 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
             pendingDosePrompts.clear();
             pendingPreferencePrompts.clear();
             pendingDoseShotId = "";
+            pendingDosePromptRevision = 0;
             pendingDoseTargetG = 0.0f;
             closeOverlay();
             return;
@@ -154,6 +188,7 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
 
         if (pendingDoseShotId == shotId) {
             pendingDoseShotId = "";
+            pendingDosePromptRevision = 0;
             pendingDoseTargetG = 0.0f;
             if (overlayMode == AutoTuningOverlayMode::DOSE_CONFIRMATION) {
                 clearOverlay(false);
@@ -188,6 +223,7 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
             pendingDosePrompts.clear();
             pendingPreferencePrompts.clear();
             pendingDoseShotId = "";
+            pendingDosePromptRevision = 0;
             pendingDoseTargetG = 0.0f;
             closeOverlay();
         }
@@ -199,38 +235,47 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
 bool AutoTuningPreferencePlugin::activateDosePrompt(Event const &event) {
     const String shotId = event.getString("shot_id");
     const float targetG = event.getFloat("dose_target_g");
-    if (shotId.isEmpty() || !std::isfinite(targetG) || targetG <= 0.0f) {
+    const std::uint32_t promptRevision =
+        static_cast<std::uint32_t>(std::max<std::int64_t>(
+            event.getInt64("prompt_revision"), 0));
+    if (shotId.isEmpty() || promptRevision == 0 ||
+        !std::isfinite(targetG) || targetG <= 0.0f) {
         return false;
     }
     pendingDoseShotId = shotId;
+    pendingDosePromptRevision = promptRevision;
     pendingDoseTargetG = targetG;
     return true;
 }
 
 bool AutoTuningPreferencePlugin::activatePreferencePrompt(Event const &event) {
     AutoTuning::ShotCompletion const *completion = event.getPayload<AutoTuning::ShotCompletion>();
-    if (!completion || !completion->recommendation.preferenceFeedbackRequired) {
+    if (!completion || !completion->preferenceRequest.has_value()) {
         return false;
     }
-    AutoTuning::RecommendationReference const &recommendation = completion->recommendation;
+    AutoTuning::PreferenceRequest const &preference = *completion->preferenceRequest;
     const String shotId = completion->shotId.c_str();
-    const String installId = recommendation.installId.c_str();
-    const String runId = recommendation.optimizationRunId.c_str();
-    const String anchorShotId = recommendation.anchorShotId.c_str();
-    const String comparisonMode = AutoTuning::comparisonModeKey(recommendation.comparisonMode);
+    const String installId = preference.installId.c_str();
+    const String runId = preference.optimizationRunId.c_str();
+    const String anchorShotId = preference.anchorShotId.c_str();
+    const String comparisonMode = AutoTuning::comparisonModeKey(preference.comparisonMode);
+    const std::uint32_t promptRevision =
+        static_cast<std::uint32_t>(std::max<std::int64_t>(
+            event.getInt64("prompt_revision"), 0));
     const bool validMode = comparisonMode == "global_previous" || comparisonMode == "best_incumbent";
     if (shotId.isEmpty() || installId.isEmpty() || runId.isEmpty() || anchorShotId.isEmpty() || anchorShotId == shotId ||
-        !validMode) {
+        promptRevision == 0 || !validMode) {
         return false;
     }
     pendingShotId = shotId;
-    pendingShotRecommendationId = recommendation.recommendationId.c_str();
+    pendingPreferencePromptRevision = promptRevision;
+    pendingShotRecommendationId = preference.recommendationId.c_str();
     pendingPreferenceInstallId = installId;
     pendingPreferenceRunId = runId;
     pendingPreferenceAnchorShotId = anchorShotId;
     pendingPreferenceComparisonMode = comparisonMode;
-    pendingPreferenceTasteGoal = recommendation.tasteGoal;
-    pendingPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(recommendation.tasteGoal);
+    pendingPreferenceTasteGoal = preference.tasteGoal;
+    pendingPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(preference.tasteGoal);
     if (pendingPreferenceTasteGoalSummary.isEmpty()) {
         pendingPreferenceTasteGoalSummary = "Balanced";
     }
@@ -448,6 +493,7 @@ void AutoTuningPreferencePlugin::clearOverlay(bool clearShotContext) {
     overlayMode = AutoTuningOverlayMode::NONE;
     if (clearShotContext) {
         pendingShotId = "";
+        pendingPreferencePromptRevision = 0;
         pendingShotRecommendationId = "";
         pendingPreferenceInstallId = "";
         pendingPreferenceRunId = "";
@@ -462,7 +508,8 @@ void AutoTuningPreferencePlugin::closeOverlay() { clearOverlay(true); }
 
 void AutoTuningPreferencePlugin::selectPreference(const String &label) {
     if (pendingShotId.isEmpty() || pendingPreferenceInstallId.isEmpty() || pendingPreferenceRunId.isEmpty() ||
-        pendingPreferenceAnchorShotId.isEmpty()) {
+        pendingPreferenceAnchorShotId.isEmpty() ||
+        pendingPreferencePromptRevision == 0) {
         return;
     }
     if (label != "new_better" && label != "anchor_better" && label != "tie") {
@@ -472,6 +519,16 @@ void AutoTuningPreferencePlugin::selectPreference(const String &label) {
     const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
     const auto parsedMode = AutoTuning::comparisonModeFromKey(pendingPreferenceComparisonMode.c_str());
     if (!parsedLabel || !parsedMode) {
+        return;
+    }
+    const String shotId = pendingShotId;
+    const std::uint32_t promptRevision = pendingPreferencePromptRevision;
+    Event claim;
+    claim.id = "rl:prompt:claim";
+    claim.setString("shot_id", shotId);
+    claim.setInt64("prompt_revision", promptRevision);
+    pluginManager->trigger(claim);
+    if (claim.getInt("claimed") != 1) {
         return;
     }
     AutoTuning::PreferenceFeedback feedback;
@@ -493,20 +550,39 @@ void AutoTuningPreferencePlugin::selectPreference(const String &label) {
     event.setString("label", label);
     event.setString("comparison_mode", pendingPreferenceComparisonMode);
     event.setString("recommendation_id", pendingShotRecommendationId);
+    event.setInt64("prompt_revision", promptRevision);
+    event.setInt("prompt_claimed", 1);
     event.setPayload(feedback);
     pluginManager->trigger(event);
     if (event.getInt("decision_persisted") == 1) {
         hasPendingRecommendation = false;
+    } else {
+        Event release;
+        release.id = "rl:prompt:release";
+        release.setString("shot_id", shotId);
+        release.setInt64("prompt_revision", promptRevision);
+        pluginManager->trigger(release);
     }
 }
 
 void AutoTuningPreferencePlugin::selectDoseConfirmation(bool followed) {
-    if (!pluginManager || pendingDoseShotId.isEmpty()) {
+    if (!pluginManager || pendingDoseShotId.isEmpty() ||
+        pendingDosePromptRevision == 0) {
+        return;
+    }
+    Event claim;
+    claim.id = "rl:prompt:claim";
+    claim.setString("shot_id", pendingDoseShotId);
+    claim.setInt64("prompt_revision", pendingDosePromptRevision);
+    pluginManager->trigger(claim);
+    if (claim.getInt("claimed") != 1) {
         return;
     }
     Event event;
     event.id = "rl:dose-confirmation";
     event.setString("shot_id", pendingDoseShotId);
+    event.setInt64("prompt_revision", pendingDosePromptRevision);
+    event.setInt("prompt_claimed", 1);
     event.setInt("has_followed", 1);
     event.setInt("followed", followed ? 1 : 0);
     pluginManager->trigger(event);

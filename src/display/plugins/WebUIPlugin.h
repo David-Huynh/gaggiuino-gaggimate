@@ -136,6 +136,12 @@ class WebUIPlugin : public Plugin {
     String rlOptimizerFallbackReason = "";
     String rlCPBOEffectiveProfileName = "";
     String rlCPBOEffectiveComparisonMode = "";
+    String rlCPBOOptimizationRunId = "";
+    bool rlCPBOLocallyConverged = false;
+    float rlCPBOTrustRegionLength = 0.0f;
+    int rlCPBOTrustRegionSuccessCount = 0;
+    int rlCPBOTrustRegionFailureCount = 0;
+    String rlCPBOLastTransitionAction = "";
     int rlLocalShotCount = 0;
     String rlRuntimeHealthStatus = "";
     String rlRuntimeHealthSummary = "";
@@ -165,6 +171,7 @@ class WebUIPlugin : public Plugin {
     // truth so the WebUI can restore minimized prompt pills after a timeout, a
     // minimize, or a full page reload. Empty string = nothing pending.
     String _pendingPreferenceShotId = "";
+    std::uint32_t _pendingPreferencePromptRevision = 0;
     String _pendingPreferenceRecommendationId = "";
     String _pendPreferenceInstallId = "";
     String _pendPreferenceRunId = "";
@@ -173,6 +180,7 @@ class WebUIPlugin : public Plugin {
     AutoTuning::TasteGoal _pendPreferenceTasteGoal = AutoTuning::TasteGoal::balanced();
     String _pendPreferenceTasteGoalSummary = "Balanced";
     String _pendingDoseShotId = "";
+    std::uint32_t _pendingDosePromptRevision = 0;
     float _pendingDoseTargetG = 0.0f;
     std::deque<Event> _queuedPreferencePrompts;
     std::deque<Event> _queuedDoseConfirmations;

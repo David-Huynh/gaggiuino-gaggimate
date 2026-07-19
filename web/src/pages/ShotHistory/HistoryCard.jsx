@@ -420,28 +420,27 @@ export default function HistoryCard({ shot, onDelete, onLoad, onNotesChanged }) 
 
             {expanded && (
               <div className='border-base-content/20 mt-4 border-t pt-4'>
-                {!shot.loaded && (
+                {!shot.loaded && !shot.loadError && (
                   <div className='flex items-center justify-center py-8'>
                     <span className='text-base-content/70 text-sm'>Loading shot data...</span>
                   </div>
                 )}
+                {shot.loadError && (
+                  <div className='alert alert-warning mb-4 text-sm'>Graph data is unavailable for this shot.</div>
+                )}
                 {shot.loaded && <HistoryChart shot={shot} />}
-                {shot.loaded && (
-                  <AutoTuningContext
-                    summary={autoTuningSummary}
-                    shot={shot}
-                    onReprocess={reprocessShot}
-                    reprocessStatus={reprocessStatus}
-                  />
-                )}
-                {shot.loaded && (
-                  <ShotNotesCard
-                    shot={shot}
-                    onNotesLoaded={handleNotesLoaded}
-                    onNotesUpdate={handleNotesUpdate}
-                    onAutoTuningLoaded={setAutoTuningSummary}
-                  />
-                )}
+                <AutoTuningContext
+                  summary={autoTuningSummary}
+                  shot={shot}
+                  onReprocess={reprocessShot}
+                  reprocessStatus={reprocessStatus}
+                />
+                <ShotNotesCard
+                  shot={shot}
+                  onNotesLoaded={handleNotesLoaded}
+                  onNotesUpdate={handleNotesUpdate}
+                  onAutoTuningLoaded={setAutoTuningSummary}
+                />
               </div>
             )}
           </div>

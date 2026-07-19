@@ -11,6 +11,7 @@
 #include <display/core/EpochTime.h>
 #include <display/core/FeatureFlags.h>
 #include <display/core/ProfileManager.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/process/GrindProcess.h>
 #include <display/models/profile.h>
@@ -30,6 +31,7 @@
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <mbedtls/platform.h>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,6 +45,78 @@ using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllo
 static std::unordered_map<uint32_t, PsramString> rxBuffers;
 static std::unordered_map<uint32_t, unsigned long> rxBufferLastActivity;
 static constexpr unsigned long RXBUFFER_IDLE_EVICT_MS = 5UL * 60UL * 1000UL;
+
+namespace {
+constexpr size_t MAX_HISTORY_HTTP_FILE_BYTES = 512 * 1024;
+
+void sendStorageSnapshot(AsyncWebServerRequest *request, FS &fs, const String &path, const char *contentType) {
+    auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+    if (!flashLease) {
+        request->send(503, "text/plain", "Storage is busy");
+        return;
+    }
+
+    File file = fs.open(path, FILE_READ);
+    if (!file) {
+        request->send(404, "text/plain", "Not found");
+        return;
+    }
+    const size_t size = file.size();
+    if (size > MAX_HISTORY_HTTP_FILE_BYTES) {
+        file.close();
+        request->send(413, "text/plain", "History file is too large");
+        return;
+    }
+
+    std::shared_ptr<uint8_t> bytes;
+    if (size > 0) {
+        auto *allocation = static_cast<uint8_t *>(ps_malloc(size));
+        if (!allocation) {
+            file.close();
+            request->send(503, "text/plain", "Insufficient memory");
+            return;
+        }
+        bytes = std::shared_ptr<uint8_t>(allocation, [](uint8_t *value) { free(value); });
+    }
+    const size_t read = size > 0 ? file.read(bytes.get(), size) : 0;
+    file.close();
+    if (read != size) {
+        request->send(500, "text/plain", "Unable to read history file");
+        return;
+    }
+    flashLease.reset();
+
+    AsyncWebServerResponse *response =
+        request->beginResponse(contentType, size, [bytes, size](uint8_t *target, size_t maxLength, size_t offset) {
+            if (offset >= size) {
+                return size_t{0};
+            }
+            const size_t length = std::min(maxLength, size - offset);
+            memcpy(target, bytes.get() + offset, length);
+            return length;
+        });
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+}
+
+bool validShotLogRequest(const String &url, String &path) {
+    constexpr const char *PREFIX = "/api/history/";
+    if (!url.startsWith(PREFIX)) {
+        return false;
+    }
+    const String name = url.substring(strlen(PREFIX));
+    if (name.length() != 11 || !name.endsWith(".slog")) {
+        return false;
+    }
+    for (size_t index = 0; index < 6; ++index) {
+        if (name[index] < '0' || name[index] > '9') {
+            return false;
+        }
+    }
+    path = "/h/" + name;
+    return true;
+}
+} // namespace
 static WebUIPlugin *g_webUIPlugin = nullptr;
 
 // Serialize a JsonDocument straight into a PSRAM-backed WebSocket message
@@ -646,11 +720,26 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             return;
         }
         const String shotId = event.getString("shot_id");
-        if (shotId == _pendingPreferenceShotId) {
+        const std::uint32_t promptRevision =
+            static_cast<std::uint32_t>(std::max<std::int64_t>(
+                event.getInt64("prompt_revision"), 0));
+        if (shotId.isEmpty() || promptRevision == 0) {
             return;
         }
-        for (Event const &pending : _queuedPreferencePrompts) {
+        if (shotId == _pendingPreferenceShotId) {
+            if (promptRevision > _pendingPreferencePromptRevision &&
+                activatePreferencePrompt(event)) {
+                sendPreferencePrompt(nullptr);
+            }
+            return;
+        }
+        for (Event &pending : _queuedPreferencePrompts) {
             if (pending.getString("shot_id") == shotId) {
+                if (promptRevision >
+                    static_cast<std::uint32_t>(std::max<std::int64_t>(
+                        pending.getInt64("prompt_revision"), 0))) {
+                    pending = event;
+                }
                 return;
             }
         }
@@ -671,14 +760,27 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         }
         const String shotId = event.getString("shot_id");
         const float targetG = event.getFloat("dose_target_g");
-        if (shotId.isEmpty() || !std::isfinite(targetG) || targetG <= 0.0f) {
+        const std::uint32_t promptRevision =
+            static_cast<std::uint32_t>(std::max<std::int64_t>(
+                event.getInt64("prompt_revision"), 0));
+        if (shotId.isEmpty() || promptRevision == 0 ||
+            !std::isfinite(targetG) || targetG <= 0.0f) {
             return;
         }
         if (shotId == _pendingDoseShotId) {
+            if (promptRevision > _pendingDosePromptRevision &&
+                activateDoseConfirmation(event)) {
+                sendDoseConfirmationPrompt(nullptr);
+            }
             return;
         }
-        for (Event const &pending : _queuedDoseConfirmations) {
+        for (Event &pending : _queuedDoseConfirmations) {
             if (pending.getString("shot_id") == shotId) {
+                if (promptRevision >
+                    static_cast<std::uint32_t>(std::max<std::int64_t>(
+                        pending.getInt64("prompt_revision"), 0))) {
+                    pending = event;
+                }
                 return;
             }
         }
@@ -691,7 +793,11 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
 
     pluginManager->on("rl:dose-confirmation:resolved", [this](Event const &event) {
-        if (event.getString("shot_id") == _pendingDoseShotId) {
+        const std::uint32_t revision =
+            static_cast<std::uint32_t>(std::max<std::int64_t>(
+                event.getInt64("prompt_revision"), 0));
+        if (event.getString("shot_id") == _pendingDoseShotId &&
+            (revision == 0 || revision == _pendingDosePromptRevision)) {
             clearPendingDoseConfirmation();
             advanceDoseConfirmation();
         }
@@ -743,7 +849,9 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             event.getString("install_id") == _pendPreferenceInstallId &&
             event.getString("optimization_run_id") == _pendPreferenceRunId &&
             event.getString("new_shot_id") == _pendingPreferenceShotId &&
-            event.getString("anchor_shot_id") == _pendPreferenceAnchorShotId) {
+            event.getString("anchor_shot_id") == _pendPreferenceAnchorShotId &&
+            event.getInt64("prompt_revision") ==
+                static_cast<std::int64_t>(_pendingPreferencePromptRevision)) {
             clearPendingPreferencePrompt();
             advancePreferencePrompt();
         }
@@ -778,6 +886,12 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlOptimizerFallbackReason = event.getString("optimizer_fallback_reason");
         rlCPBOEffectiveProfileName = event.getString("cpbo_profile_name");
         rlCPBOEffectiveComparisonMode = event.getString("cpbo_comparison_mode");
+        rlCPBOOptimizationRunId = event.getString("cpbo_optimization_run_id");
+        rlCPBOLocallyConverged = event.getInt("cpbo_locally_converged") > 0;
+        rlCPBOTrustRegionLength = event.getString("cpbo_trust_region_length").toFloat();
+        rlCPBOTrustRegionSuccessCount = event.getInt("cpbo_trust_region_success_count");
+        rlCPBOTrustRegionFailureCount = event.getInt("cpbo_trust_region_failure_count");
+        rlCPBOLastTransitionAction = event.getString("cpbo_last_transition_action");
         rlLocalShotCount = event.getInt("local_shot_count");
         rlRuntimeHealthStatus = event.getString("runtime_health_status");
         rlRuntimeHealthSummary = event.getString("runtime_health_summary");
@@ -857,6 +971,12 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlCPBOComparisonMode"] = settings.getRLCPBOComparisonMode();
         doc["rlCPBOEffectiveProfileName"] = rlCPBOEffectiveProfileName;
         doc["rlCPBOEffectiveComparisonMode"] = rlCPBOEffectiveComparisonMode;
+        doc["rlCPBOOptimizationRunId"] = rlCPBOOptimizationRunId;
+        doc["rlCPBOLocallyConverged"] = rlCPBOLocallyConverged;
+        doc["rlCPBOTrustRegionLength"] = rlCPBOTrustRegionLength;
+        doc["rlCPBOTrustRegionSuccessCount"] = rlCPBOTrustRegionSuccessCount;
+        doc["rlCPBOTrustRegionFailureCount"] = rlCPBOTrustRegionFailureCount;
+        doc["rlCPBOLastTransitionAction"] = rlCPBOLastTransitionAction;
         doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
         addRLRecipeDomain(doc.as<JsonObject>(), settings);
         doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
@@ -1438,14 +1558,7 @@ void WebUIPlugin::setupServer() {
         fs = &SD_MMC;
     }
     server.on("/api/history/index.bin", HTTP_GET, [fs](AsyncWebServerRequest *request) {
-        // Serve the binary index file directly
-        const bool indexExists =
-            fs == &LittleFS ? LittleFSUtil::existsQuietly("/h/index.bin") : fs->exists("/h/index.bin");
-        if (indexExists) {
-            request->send(*fs, "/h/index.bin", "application/octet-stream");
-        } else {
-            request->send(404, "text/plain", "Index not found");
-        }
+        sendStorageSnapshot(request, *fs, "/h/index.bin", "application/octet-stream");
     });
     server.on("/api/history/recent.bin", HTTP_GET, [this](AsyncWebServerRequest *request) {
         // The most recent non-deleted shots, newest first, as a regular shot
@@ -1457,6 +1570,11 @@ void WebUIPlugin::setupServer() {
             limit = constrain(request->arg("limit").toInt(), 1L, MAX_RECENT_LIMIT);
         }
 
+        auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+        if (!flashLease) {
+            request->send(503, "text/plain", "Storage is busy");
+            return;
+        }
         auto *entries = static_cast<ShotIndexEntry *>(ps_malloc(limit * sizeof(ShotIndexEntry)));
         if (entries == nullptr) {
             request->send(500, "text/plain", "Out of memory");
@@ -1479,9 +1597,15 @@ void WebUIPlugin::setupServer() {
         request->send(response);
     });
     // Exact generated endpoints must be registered before this broad file route.
-    // Shot logs are raw binary files, so checking a nonexistent .gz sibling only
-    // adds LittleFS opens and error logging for every history request.
-    server.serveStatic("/api/history/", *fs, "/h/").setTryGzipFirst(false).setCacheControl("no-store");
+    // Snapshot shot logs into PSRAM so AsyncTCP never owns an open LittleFS file.
+    server.on(AsyncURIMatcher::dir("/api/history"), HTTP_GET, [fs](AsyncWebServerRequest *request) {
+        String path;
+        if (!validShotLogRequest(request->url(), path)) {
+            request->send(404, "text/plain", "Not found");
+            return;
+        }
+        sendStorageSnapshot(request, *fs, path, "application/octet-stream");
+    });
     server.on("/api/core-dump", HTTP_GET, [this](AsyncWebServerRequest *request) { handleCoreDumpDownload(request); });
     // The web UI is embedded in firmware flash and served from the memory-mapped blob (see serveWebAsset). It is no
     // longer in LittleFS, so OTA never touches the partition holding profiles/shots. The catch-all onNotFound handles
@@ -1564,6 +1688,7 @@ void WebUIPlugin::stop() {
 
 void WebUIPlugin::clearPendingPreferencePrompt() {
     _pendingPreferenceShotId = "";
+    _pendingPreferencePromptRevision = 0;
     _pendingPreferenceRecommendationId = "";
     _pendPreferenceInstallId = "";
     _pendPreferenceRunId = "";
@@ -1575,28 +1700,32 @@ void WebUIPlugin::clearPendingPreferencePrompt() {
 
 bool WebUIPlugin::activatePreferencePrompt(Event const &event) {
     AutoTuning::ShotCompletion const *completion = event.getPayload<AutoTuning::ShotCompletion>();
-    if (!completion || !completion->recommendation.preferenceFeedbackRequired) {
+    if (!completion || !completion->preferenceRequest.has_value()) {
         return false;
     }
-    AutoTuning::RecommendationReference const &recommendation = completion->recommendation;
+    AutoTuning::PreferenceRequest const &preference = *completion->preferenceRequest;
     const String shotId = completion->shotId.c_str();
-    const String installId = recommendation.installId.c_str();
-    const String runId = recommendation.optimizationRunId.c_str();
-    const String anchorShotId = recommendation.anchorShotId.c_str();
-    const String comparisonMode = AutoTuning::comparisonModeKey(recommendation.comparisonMode);
+    const String installId = preference.installId.c_str();
+    const String runId = preference.optimizationRunId.c_str();
+    const String anchorShotId = preference.anchorShotId.c_str();
+    const String comparisonMode = AutoTuning::comparisonModeKey(preference.comparisonMode);
+    const std::uint32_t promptRevision =
+        static_cast<std::uint32_t>(std::max<std::int64_t>(
+            event.getInt64("prompt_revision"), 0));
     const bool validMode = comparisonMode == "global_previous" || comparisonMode == "best_incumbent";
     if (shotId.isEmpty() || installId.isEmpty() || runId.isEmpty() || anchorShotId.isEmpty() || anchorShotId == shotId ||
-        !validMode) {
+        promptRevision == 0 || !validMode) {
         return false;
     }
     _pendingPreferenceShotId = shotId;
-    _pendingPreferenceRecommendationId = recommendation.recommendationId.c_str();
+    _pendingPreferencePromptRevision = promptRevision;
+    _pendingPreferenceRecommendationId = preference.recommendationId.c_str();
     _pendPreferenceInstallId = installId;
     _pendPreferenceRunId = runId;
     _pendPreferenceAnchorShotId = anchorShotId;
     _pendPreferenceComparisonMode = comparisonMode;
-    _pendPreferenceTasteGoal = recommendation.tasteGoal;
-    _pendPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(recommendation.tasteGoal);
+    _pendPreferenceTasteGoal = preference.tasteGoal;
+    _pendPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(preference.tasteGoal);
     if (_pendPreferenceTasteGoalSummary.isEmpty()) {
         _pendPreferenceTasteGoalSummary = "Balanced";
     }
@@ -1616,16 +1745,22 @@ void WebUIPlugin::advancePreferencePrompt() {
 
 void WebUIPlugin::clearPendingDoseConfirmation() {
     _pendingDoseShotId = "";
+    _pendingDosePromptRevision = 0;
     _pendingDoseTargetG = 0.0f;
 }
 
 bool WebUIPlugin::activateDoseConfirmation(Event const &event) {
     const String shotId = event.getString("shot_id");
     const float targetG = event.getFloat("dose_target_g");
-    if (shotId.isEmpty() || !std::isfinite(targetG) || targetG <= 0.0f) {
+    const std::uint32_t promptRevision =
+        static_cast<std::uint32_t>(std::max<std::int64_t>(
+            event.getInt64("prompt_revision"), 0));
+    if (shotId.isEmpty() || promptRevision == 0 ||
+        !std::isfinite(targetG) || targetG <= 0.0f) {
         return false;
     }
     _pendingDoseShotId = shotId;
+    _pendingDosePromptRevision = promptRevision;
     _pendingDoseTargetG = targetG;
     return true;
 }
@@ -1648,6 +1783,7 @@ void WebUIPlugin::sendDoseConfirmationPrompt(AsyncWebSocketClient *client) {
     JsonDocument doc;
     doc["tp"] = "evt:rl:dose-confirmation";
     doc["shot_id"] = _pendingDoseShotId;
+    doc["prompt_revision"] = _pendingDosePromptRevision;
     doc["dose_target_g"] = _pendingDoseTargetG;
     const String payload = doc.as<String>();
     if (client) {
@@ -1664,6 +1800,7 @@ void WebUIPlugin::sendPreferencePrompt(AsyncWebSocketClient *client) {
     JsonDocument doc;
     doc["tp"] = "evt:rl:shot-complete";
     doc["shot_id"] = _pendingPreferenceShotId;
+    doc["prompt_revision"] = _pendingPreferencePromptRevision;
     doc["recommendation_id"] = _pendingPreferenceRecommendationId;
     doc["preference_feedback_required"] = true;
     doc["install_id"] = _pendPreferenceInstallId;
@@ -1810,11 +1947,24 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                     client->text(msg);
                 } else if (msgType == "req:rl:dose-confirmation") {
                     const String shotId = doc["shot_id"].as<String>();
+                    const std::uint32_t promptRevision =
+                        doc["prompt_revision"] | 0U;
                     if (rlParticipationEnabled(controller) && !_pendingDoseShotId.isEmpty() && shotId == _pendingDoseShotId &&
-                        doc["followed"].is<bool>()) {
+                        promptRevision == _pendingDosePromptRevision &&
+                        promptRevision > 0 && doc["followed"].is<bool>()) {
+                        Event claim;
+                        claim.id = "rl:prompt:claim";
+                        claim.setString("shot_id", shotId);
+                        claim.setInt64("prompt_revision", promptRevision);
+                        pluginManager->trigger(claim);
+                        if (claim.getInt("claimed") != 1) {
+                            return;
+                        }
                         Event event;
                         event.id = "rl:dose-confirmation";
                         event.setString("shot_id", shotId);
+                        event.setInt64("prompt_revision", promptRevision);
+                        event.setInt("prompt_claimed", 1);
                         event.setInt("has_followed", 1);
                         event.setInt("followed", doc["followed"].as<bool>() ? 1 : 0);
                         pluginManager->trigger(event);
@@ -1827,15 +1977,27 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         const String anchorShotId = doc["anchor_shot_id"].as<String>();
                         const String comparisonMode = doc["comparison_mode"].as<String>();
                         const String label = doc["label"].as<String>();
+                        const std::uint32_t promptRevision =
+                            doc["prompt_revision"] | 0U;
                         const bool validLabel = label == "new_better" || label == "anchor_better" || label == "tie";
                         const bool matchesPending = installId == _pendPreferenceInstallId && runId == _pendPreferenceRunId &&
                                                     newShotId == _pendingPreferenceShotId &&
                                                     anchorShotId == _pendPreferenceAnchorShotId &&
-                                                    comparisonMode == _pendPreferenceComparisonMode;
+                                                    comparisonMode == _pendPreferenceComparisonMode &&
+                                                    promptRevision == _pendingPreferencePromptRevision &&
+                                                    promptRevision > 0;
                         if (validLabel && matchesPending && newShotId != anchorShotId) {
                             const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
                             const auto parsedMode = AutoTuning::comparisonModeFromKey(comparisonMode.c_str());
                             if (!parsedLabel || !parsedMode) {
+                                return;
+                            }
+                            Event claim;
+                            claim.id = "rl:prompt:claim";
+                            claim.setString("shot_id", newShotId);
+                            claim.setInt64("prompt_revision", promptRevision);
+                            pluginManager->trigger(claim);
+                            if (claim.getInt("claimed") != 1) {
                                 return;
                             }
                             AutoTuning::PreferenceFeedback feedback;
@@ -1856,8 +2018,17 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                             event.setString("label", label);
                             event.setString("comparison_mode", comparisonMode);
                             event.setString("recommendation_id", _pendingPreferenceRecommendationId);
+                            event.setInt64("prompt_revision", promptRevision);
+                            event.setInt("prompt_claimed", 1);
                             event.setPayload(feedback);
                             pluginManager->trigger(event);
+                            if (event.getInt("decision_persisted") != 1) {
+                                Event release;
+                                release.id = "rl:prompt:release";
+                                release.setString("shot_id", newShotId);
+                                release.setInt64("prompt_revision", promptRevision);
+                                pluginManager->trigger(release);
+                            }
                         }
                     }
                 } else if (msgType == "req:process:activate") {
@@ -2401,6 +2572,23 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             settings.setRLLocalOptimizationEnabled(true);
             settings.save(true);
             changed = true;
+        } else if (type == "req:rl:optimization:resume-exploration") {
+            if (rlCPBOOptimizationRunId.isEmpty()) {
+                response["error"] = F("No converged CPBO run is available");
+            } else {
+                Event event;
+                event.id = "rl:optimization:control";
+                event.setString("action", "resume_local_exploration");
+                event.setString("optimization_run_id", rlCPBOOptimizationRunId);
+                event.setString(
+                    "request_id",
+                    String("resume_") + String(static_cast<long long>(EpochTime::now())) + "_" +
+                        String(static_cast<unsigned long>(millis())));
+                pluginManager->trigger(event);
+                if (event.getInt("control_persisted") <= 0) {
+                    response["error"] = F("Unable to queue the resume command");
+                }
+            }
         } else if (type == "req:rl:local-reset") {
             settings.setRLBeanContextId("");
             settings.setRLBeanContextName("");
@@ -2760,6 +2948,12 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlCPBOComparisonMode"] = settings.getRLCPBOComparisonMode();
     doc["rlCPBOEffectiveProfileName"] = rlCPBOEffectiveProfileName;
     doc["rlCPBOEffectiveComparisonMode"] = rlCPBOEffectiveComparisonMode;
+    doc["rlCPBOOptimizationRunId"] = rlCPBOOptimizationRunId;
+    doc["rlCPBOLocallyConverged"] = rlCPBOLocallyConverged;
+    doc["rlCPBOTrustRegionLength"] = rlCPBOTrustRegionLength;
+    doc["rlCPBOTrustRegionSuccessCount"] = rlCPBOTrustRegionSuccessCount;
+    doc["rlCPBOTrustRegionFailureCount"] = rlCPBOTrustRegionFailureCount;
+    doc["rlCPBOLastTransitionAction"] = rlCPBOLastTransitionAction;
     doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
     addRLRecipeDomain(doc.as<JsonObject>(), settings);
     doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
@@ -2992,14 +3186,17 @@ void WebUIPlugin::updateOTAStatus(const String &version) {
     doc["updating"] = updating;
     // LittleFS usage metrics
     {
-        size_t total = LittleFS.totalBytes();
-        size_t used = LittleFS.usedBytes();
-        size_t freeBytes = total > used ? (total - used) : 0;
-        doc["spiffsTotal"] = static_cast<uint32_t>(total);
-        doc["spiffsUsed"] = static_cast<uint32_t>(used);
-        doc["spiffsFree"] = static_cast<uint32_t>(freeBytes);
-        if (total > 0) {
-            doc["spiffsUsedPct"] = static_cast<uint8_t>((used * 100) / total);
+        auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+        if (flashLease) {
+            size_t total = LittleFS.totalBytes();
+            size_t used = LittleFS.usedBytes();
+            size_t freeBytes = total > used ? (total - used) : 0;
+            doc["spiffsTotal"] = static_cast<uint32_t>(total);
+            doc["spiffsUsed"] = static_cast<uint32_t>(used);
+            doc["spiffsFree"] = static_cast<uint32_t>(freeBytes);
+            if (total > 0) {
+                doc["spiffsUsedPct"] = static_cast<uint8_t>((used * 100) / total);
+            }
         }
     }
     // Memory usage metrics

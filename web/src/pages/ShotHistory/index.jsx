@@ -73,7 +73,7 @@ export function ShotHistory() {
         const existingMap = new Map(prev.map(shot => [shot.id, shot]));
         return shotList.map(newShot => {
           const existing = existingMap.get(newShot.id);
-          if (existing && existing.loaded) {
+          if (existing && (existing.loaded || existing.loadError)) {
             // Preserve loaded data but update metadata from index
             return {
               ...existing,
@@ -283,13 +283,14 @@ export function ShotHistory() {
             onLoad={async id => {
               // Fetch binary only if not loaded
               const target = history.find(h => h.id === id);
-              if (!target || target.loaded) return;
+              if (!target || target.loaded || target.loadError) return;
               try {
                 // Pad ID to 6 digits with zeros to match backend filename format
                 const paddedId = id.padStart(6, '0');
                 const resp = await fetch(`/api/history/${paddedId}.slog`);
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const buf = await resp.arrayBuffer();
+                if (buf.byteLength === 0) throw new Error('Shot graph file is empty');
                 const parsed = parseBinaryShot(buf, id);
                 parsed.incomplete = (target?.incomplete ?? false) || parsed.incomplete;
                 if (target?.notes) parsed.notes = target.notes;
@@ -304,12 +305,23 @@ export function ShotHistory() {
                           rating: h.rating ?? parsed.rating, // Use index rating if available
                           incomplete: h.incomplete ?? parsed.incomplete,
                           loaded: true,
+                          loadError: null,
                         }
                       : h,
                   ),
                 );
               } catch (e) {
                 console.error('Failed loading shot', e);
+                setHistory(prev =>
+                  prev.map(h =>
+                    h.id === id
+                      ? {
+                          ...h,
+                          loadError: e?.message || 'Shot graph data is unavailable',
+                        }
+                      : h,
+                  ),
+                );
               }
             }}
           />

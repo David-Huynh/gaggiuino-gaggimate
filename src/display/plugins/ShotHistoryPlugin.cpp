@@ -6,6 +6,7 @@
 #include <cmath>
 #include <display/core/Controller.h>
 #include <display/core/ProfileManager.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
@@ -104,13 +105,15 @@ bool readOptionalCorrectionFloat(JsonObjectConst source, const char *key, std::o
 ShotHistoryPlugin ShotHistory;
 
 void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     controller = c;
     pluginManager = pm;
+    controller->setCompletedShotProjection(this);
     if (controller->isSDCard()) {
         fs = &SD_MMC;
         ESP_LOGI("ShotHistoryPlugin", "Logging shot history to SD card");
     }
-    pm->on("controller:brew:start", [this](Event const &) { startRecording(); });
+    pm->on("controller:brew:start", [this](Event const &event) { startRecording(event); });
     pm->on("controller:brew:end", [this](Event const &) { endRecording(); });
     pm->on("controller:brew:clear", [this](Event const &) { endExtendedRecording(); });
     pm->on("rl:shot:captured", [this](Event const &event) { rememberRLShotHistoryMapping(event); });
@@ -126,6 +129,7 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
     pm->on("pump:puck-resistance:change", [this](Event const &event) { currentPuckResistance = event.getFloat("value"); });
     // Initialize rebuild state
     rebuildInProgress = false;
+    bufferedSamples.reserve(240);
     // Leftover from the abandoned separate recent-shots index; aggregates now live in index.bin.
     const bool recentIndexExists =
         fs == &LittleFS ? LittleFSUtil::existsQuietly("/h/recent.bin") : fs->exists("/h/recent.bin");
@@ -136,6 +140,225 @@ void ShotHistoryPlugin::setup(Controller *c, PluginManager *pm) {
 }
 
 void ShotHistoryPlugin::loop() {}
+
+bool ShotHistoryPlugin::ensureProjection(AutoTuning::CompletedShotArtifact const &artifact) {
+    AutoTuning::ShotHistoryMetadata const &history = artifact.record.history;
+    if (!history.reserved || history.id == 0 || artifact.record.shotId.empty() ||
+        artifact.record.samples.empty() || history.phaseTransitionCount > history.phaseTransitions.size()) {
+        return false;
+    }
+    const std::uint32_t durationMs =
+        artifact.record.samples[artifact.record.samples.size() - 1].elapsedMs > 0
+            ? artifact.record.samples[artifact.record.samples.size() - 1].elapsedMs
+            : static_cast<std::uint32_t>(std::max(0.0f, artifact.record.shotTimeS) * 1000.0f + 0.5f);
+    if (durationMs <= 7500) {
+        return true;
+    }
+
+    const String historyId = padId(String(history.id));
+    const String finalPath = "/h/" + historyId + ".slog";
+    const String temporaryPath = finalPath + ".tmp";
+    const size_t expectedSize =
+        sizeof(ShotLogHeader) + artifact.record.samples.size() * sizeof(ShotLogSample);
+    bool existingValid = false;
+    {
+        auto lease = StorageCoordinator::instance().acquireFlash();
+        if (!fs->exists("/h") && !fs->mkdir("/h")) {
+            return false;
+        }
+        File existing = fs->open(finalPath, FILE_READ);
+        if (existing && existing.size() == expectedSize) {
+            ShotLogHeader existingHeader{};
+            existingValid =
+                existing.read(reinterpret_cast<std::uint8_t *>(&existingHeader), sizeof(existingHeader)) ==
+                    sizeof(existingHeader) &&
+                existingHeader.magic == SHOT_LOG_MAGIC &&
+                existingHeader.version == SHOT_LOG_VERSION &&
+                existingHeader.sampleCount == artifact.record.samples.size();
+        }
+        if (existing) {
+            existing.close();
+        }
+        if (fs->exists(temporaryPath)) {
+            fs->remove(temporaryPath);
+        }
+    }
+
+    ShotLogHeader projectedHeader{};
+    projectedHeader.magic = SHOT_LOG_MAGIC;
+    projectedHeader.version = SHOT_LOG_VERSION;
+    projectedHeader.reserved0 = static_cast<std::uint8_t>(SHOT_LOG_SAMPLE_SIZE);
+    projectedHeader.headerSize = SHOT_LOG_HEADER_SIZE;
+    projectedHeader.sampleInterval = SHOT_LOG_SAMPLE_INTERVAL_MS;
+    projectedHeader.fieldsMask = SHOT_LOG_FIELDS_MASK_ALL;
+    projectedHeader.sampleCount = artifact.record.samples.size();
+    projectedHeader.durationMs = durationMs;
+    projectedHeader.startEpoch =
+        artifact.record.timestamp > UINT32_MAX ? UINT32_MAX
+                                               : static_cast<std::uint32_t>(std::max<AutoTuning::Timestamp>(
+                                                     artifact.record.timestamp, 0));
+    strncpy(projectedHeader.profileId, artifact.record.profile.id.c_str(),
+            sizeof(projectedHeader.profileId) - 1);
+    strncpy(projectedHeader.profileName, artifact.record.profile.label.c_str(),
+            sizeof(projectedHeader.profileName) - 1);
+    projectedHeader.finalWeight =
+        encodeUnsigned(history.finalMeasuredWeightG, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+    projectedHeader.finalExitReason = history.finalExitReason;
+    projectedHeader.brewDelayMs = history.brewDelayMs;
+    projectedHeader.phaseTransitionCount = static_cast<std::uint8_t>(history.phaseTransitionCount);
+    for (size_t index = 0; index < history.phaseTransitionCount; ++index) {
+        AutoTuning::ShotPhaseTransition const &source = history.phaseTransitions[index];
+        PhaseTransition &target = projectedHeader.phaseTransitions[index];
+        target.sampleIndex = source.sampleIndex;
+        target.phaseNumber = source.phaseNumber;
+        target.transitionReason = source.exitReason;
+        strncpy(target.phaseName, source.phaseName.c_str(), sizeof(target.phaseName) - 1);
+    }
+
+    std::uint64_t temperatureTotal = 0;
+    std::uint64_t positiveFlowTotal = 0;
+    std::uint32_t positiveFlowCount = 0;
+    std::uint16_t maximumPressure = 0;
+    if (!existingValid) {
+        {
+            auto lease = StorageCoordinator::instance().acquireFlash();
+            File file = fs->open(temporaryPath, FILE_WRITE);
+            if (!file ||
+                file.write(reinterpret_cast<const std::uint8_t *>(&projectedHeader),
+                           sizeof(projectedHeader)) != sizeof(projectedHeader)) {
+                if (file) {
+                    file.close();
+                }
+                return false;
+            }
+            file.close();
+        }
+
+        constexpr size_t SAMPLES_PER_CHUNK =
+            StorageCoordinator::MAX_FLASH_QUANTUM_BYTES / sizeof(ShotLogSample);
+        std::array<ShotLogSample, SAMPLES_PER_CHUNK> encoded{};
+        for (size_t offset = 0; offset < artifact.record.samples.size();
+             offset += SAMPLES_PER_CHUNK) {
+            const size_t count =
+                std::min(SAMPLES_PER_CHUNK, artifact.record.samples.size() - offset);
+            for (size_t index = 0; index < count; ++index) {
+                AutoTuning::ShotSample const &source = artifact.record.samples[offset + index];
+                ShotLogSample &target = encoded[index];
+                target = ShotLogSample{};
+                target.t = static_cast<std::uint16_t>(
+                    std::min<size_t>(offset + index, UINT16_MAX));
+                target.tt = encodeUnsigned(source.targetTemperature, TEMP_SCALE, TEMP_MAX_VALUE);
+                target.ct = encodeUnsigned(source.temperature, TEMP_SCALE, TEMP_MAX_VALUE);
+                target.tp = encodeUnsigned(source.targetPressure, PRESSURE_SCALE, PRESSURE_MAX_VALUE);
+                target.cp = encodeUnsigned(source.pressure, PRESSURE_SCALE, PRESSURE_MAX_VALUE);
+                target.fl = encodeSigned(source.pumpFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+                target.tf = encodeSigned(source.targetFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+                target.pf = encodeSigned(source.puckFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+                target.vf = encodeSigned(source.measuredFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+                target.v = encodeUnsigned(source.measuredWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+                target.ev = encodeUnsigned(source.estimatedWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+                target.pr = encodeUnsigned(source.puckResistance, RESISTANCE_SCALE, RESISTANCE_MAX_VALUE);
+                target.si = source.systemInfo;
+                temperatureTotal += target.ct;
+                maximumPressure = std::max(maximumPressure, target.cp);
+                if (target.fl > 0) {
+                    positiveFlowTotal += static_cast<std::uint16_t>(target.fl);
+                    ++positiveFlowCount;
+                }
+            }
+            auto lease = StorageCoordinator::instance().acquireFlash();
+            File file = fs->open(temporaryPath, FILE_APPEND);
+            const size_t bytes = count * sizeof(ShotLogSample);
+            if (!file ||
+                file.write(reinterpret_cast<const std::uint8_t *>(encoded.data()), bytes) != bytes) {
+                if (file) {
+                    file.close();
+                }
+                fs->remove(temporaryPath);
+                return false;
+            }
+            file.close();
+        }
+
+        auto lease = StorageCoordinator::instance().acquireFlash();
+        File verification = fs->open(temporaryPath, FILE_READ);
+        const bool valid = verification && verification.size() == expectedSize;
+        if (verification) {
+            verification.close();
+        }
+        if (!valid || (fs->exists(finalPath) && !fs->remove(finalPath)) ||
+            !fs->rename(temporaryPath.c_str(), finalPath.c_str())) {
+            fs->remove(temporaryPath);
+            return false;
+        }
+    } else {
+        for (AutoTuning::ShotSample const &source : artifact.record.samples) {
+            const std::uint16_t temperature =
+                encodeUnsigned(source.temperature, TEMP_SCALE, TEMP_MAX_VALUE);
+            const std::uint16_t pressure =
+                encodeUnsigned(source.pressure, PRESSURE_SCALE, PRESSURE_MAX_VALUE);
+            const std::int16_t flow =
+                encodeSigned(source.pumpFlow, FLOW_SCALE, FLOW_MIN_VALUE, FLOW_MAX_VALUE);
+            temperatureTotal += temperature;
+            maximumPressure = std::max(maximumPressure, pressure);
+            if (flow > 0) {
+                positiveFlowTotal += static_cast<std::uint16_t>(flow);
+                ++positiveFlowCount;
+            }
+        }
+    }
+
+    ShotIndexEntry indexEntry{};
+    indexEntry.id = history.id;
+    indexEntry.timestamp = projectedHeader.startEpoch;
+    indexEntry.duration = durationMs;
+    indexEntry.volume = projectedHeader.finalWeight;
+    indexEntry.flags = SHOT_FLAG_COMPLETED;
+    strncpy(indexEntry.profileId, projectedHeader.profileId, sizeof(indexEntry.profileId) - 1);
+    strncpy(indexEntry.profileName, projectedHeader.profileName, sizeof(indexEntry.profileName) - 1);
+    indexEntry.avgTemp =
+        artifact.record.samples.empty()
+            ? 0
+            : static_cast<std::uint16_t>(temperatureTotal / artifact.record.samples.size());
+    indexEntry.maxPressure = maximumPressure;
+    indexEntry.avgFlow =
+        positiveFlowCount == 0
+            ? 0
+            : static_cast<std::uint16_t>(positiveFlowTotal / positiveFlowCount);
+    if (!appendToIndex(indexEntry)) {
+        return false;
+    }
+
+    JsonDocument notes(&psramAllocator);
+    loadNotes(String(history.id), notes);
+    notes["id"] = String(history.id);
+    notes["rlShotId"] = artifact.record.shotId.c_str();
+    if (artifact.record.recommendation.present()) {
+        notes["rlRecommendationId"] = artifact.record.recommendation.recommendationId.c_str();
+    }
+    saveNotes(String(history.id), notes);
+    return true;
+}
+
+bool ShotHistoryPlugin::removeProjection(const std::uint32_t historyId) {
+    if (historyId == 0) {
+        return false;
+    }
+    const String id = String(historyId);
+    const String padded = padId(id);
+    auto lease = StorageCoordinator::instance().acquireFlash();
+    bool removed = false;
+    const String shotPath = "/h/" + padded + ".slog";
+    const String notesPath = "/h/" + padded + ".json";
+    if (fs->exists(shotPath)) {
+        removed = fs->remove(shotPath) || removed;
+    }
+    if (fs->exists(notesPath)) {
+        removed = fs->remove(notesPath) || removed;
+    }
+    markIndexDeleted(historyId);
+    return removed;
+}
 
 float ShotHistoryPlugin::sourceWeight(VolumetricMeasurementSource source) const {
     switch (source) {
@@ -187,35 +410,6 @@ void ShotHistoryPlugin::record() {
     }
 
     if (shouldRecord && (controller->getMode() == MODE_BREW || extendedRecording)) {
-        if (!isFileOpen) {
-            if (!fs->exists("/h")) {
-                fs->mkdir("/h");
-            }
-            currentFile = fs->open("/h/" + currentId + ".slog", FILE_WRITE);
-            if (currentFile) {
-                isFileOpen = true;
-                // Prepare header
-                memset(&header, 0, sizeof(header));
-                header.magic = SHOT_LOG_MAGIC;
-                header.version = SHOT_LOG_VERSION;
-                header.reserved0 = (uint8_t)SHOT_LOG_SAMPLE_SIZE; // record sample size actually used
-                header.headerSize = SHOT_LOG_HEADER_SIZE;
-                header.sampleInterval = SHOT_LOG_SAMPLE_INTERVAL_MS;
-                header.fieldsMask = SHOT_LOG_FIELDS_MASK_ALL;
-                header.startEpoch = getTime();
-                Profile profile = controller->getProfileManager()->getSelectedProfile();
-                strncpy(header.profileId, profile.id.c_str(), sizeof(header.profileId) - 1);
-                header.profileId[sizeof(header.profileId) - 1] = '\0';
-                strncpy(header.profileName, profile.label.c_str(), sizeof(header.profileName) - 1);
-                header.profileName[sizeof(header.profileName) - 1] = '\0';
-                header.phaseTransitionCount = 0; // Initialize phase transition count
-                // Brew delay (ms) the shot ran with; round and clamp into the uint16_t field
-                double delayMs = currentBrewDelay > 0.0 ? currentBrewDelay + 0.5 : 0.0;
-                header.brewDelayMs = delayMs > 65535.0 ? 65535 : static_cast<uint16_t>(delayMs);
-                // Write header placeholder
-                currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
-            }
-        }
         // v/vf are measured scale channels. Predictive output remains separate in ev.
         const float loggedScaleWeight = measuredScaleSource && scaleWeight > 0.0f ? scaleWeight : 0.0f;
         const float scaleDiff = loggedScaleWeight - lastScaleWeight;
@@ -258,31 +452,20 @@ void ShotHistoryPlugin::record() {
             }
         }
 
-        if (isFileOpen) {
-            if (ioBufferPos + sizeof(sample) > sizeof(ioBuffer)) {
-                flushBuffer();
-            }
-            memcpy(ioBuffer + ioBufferPos, &sample, sizeof(sample));
-            ioBufferPos += sizeof(sample);
-            sampleCount++;
+        bufferedSamples.push_back(sample);
+        sampleCount = static_cast<uint32_t>(bufferedSamples.size());
 
-            // Track running aggregates for the rolling recent-shots buffer.
-            tempSumScaled += sample.ct;
-            tempSampleCount++;
-            if (sample.cp > maxPressureScaled) {
-                maxPressureScaled = sample.cp;
-            }
-            if (sample.fl > 0) {
-                flowSumScaled += sample.fl;
-                positiveFlowCount++;
-            }
-            lastLoggedElapsedMs = millis() - shotStart;
+        // Track running aggregates for the rolling recent-shots buffer.
+        tempSumScaled += sample.ct;
+        tempSampleCount++;
+        if (sample.cp > maxPressureScaled) {
+            maxPressureScaled = sample.cp;
         }
-
-        // Check for early index insertion (once per shot after 7.5s)
-        if (!indexEntryCreated && (millis() - shotStart) > 7500) {
-            indexEntryCreated = createEarlyIndexEntry();
+        if (sample.fl > 0) {
+            flowSumScaled += sample.fl;
+            positiveFlowCount++;
         }
+        lastLoggedElapsedMs = millis() - shotStart;
 
         // Check for weight stabilization during extended recording
         if (extendedRecording) {
@@ -321,28 +504,28 @@ void ShotHistoryPlugin::record() {
             }
         }
     }
-    if (!recording && !extendedRecording && isFileOpen) {
-        flushBuffer();
+    if (!recording && !extendedRecording && persistencePending.exchange(false, std::memory_order_acq_rel)) {
         // Patch header with sampleCount and duration
         header.sampleCount = sampleCount;
         header.durationMs = lastLoggedElapsedMs > 0 ? lastLoggedElapsedMs : millis() - shotStart;
         header.finalExitReason = finalExitReason; // why the shot ended (last phase exit or manual abort)
         float finalWeight = sampleCount > 0 ? lastScaleWeight : scaleWeight;
         header.finalWeight = finalWeight > 0.0f ? encodeUnsigned(finalWeight, WEIGHT_SCALE, WEIGHT_MAX_VALUE) : 0;
-        currentFile.seek(0, SeekSet);
-        currentFile.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header));
-        currentFile.close();
-        isFileOpen = false;
+        const String shotPath = "/h/" + currentId + ".slog";
+        const size_t expectedSize = sizeof(header) + static_cast<size_t>(sampleCount) * sizeof(ShotLogSample);
+        const bool shotLogValid = !shotLogWriteFailed && persistBufferedShot();
         unsigned long duration = header.durationMs;
         if (duration <= 7500) { // Exclude failed shots and flushes
-            fs->remove("/h/" + currentId + ".slog");
-
-            // If we created an early index entry, mark it as deleted
-            if (indexEntryCreated) {
-                markIndexDeleted(currentId.toInt());
+            auto lease = StorageCoordinator::instance().acquireFlash();
+            if (fs->exists(shotPath)) {
+                fs->remove(shotPath);
             }
         } else {
-            controller->getSettings().setHistoryIndex(controller->getSettings().getHistoryIndex() + 1);
+            if (!shotLogValid) {
+                ESP_LOGE("ShotHistoryPlugin", "Shot %s log is incomplete; expected %u bytes", currentId.c_str(),
+                         static_cast<unsigned>(expectedSize));
+                fs->remove(shotPath);
+            }
             cleanupHistory();
 
             // Always create a complete index entry via upsert.
@@ -354,7 +537,7 @@ void ShotHistoryPlugin::record() {
             indexEntry.duration = header.durationMs;
             indexEntry.volume = header.finalWeight;
             indexEntry.rating = ratingFromNotes(String(currentId.toInt(), 10));
-            indexEntry.flags = SHOT_FLAG_COMPLETED;
+            indexEntry.flags = shotLogValid ? SHOT_FLAG_COMPLETED : 0;
             if (indexEntry.rating > 0) {
                 indexEntry.flags |= SHOT_FLAG_HAS_NOTES;
             }
@@ -382,10 +565,11 @@ void ShotHistoryPlugin::record() {
                 pluginManager->trigger(savedEvent);
             }
         }
+        bufferedSamples.clear();
     }
 }
 
-void ShotHistoryPlugin::startRecording() {
+void ShotHistoryPlugin::startRecording(Event const &event) {
     {
         // Deref under the process lock — other tasks delete the process at any time (GM-147).
         std::lock_guard<std::recursive_mutex> guard(controller->getProcessLock());
@@ -401,7 +585,22 @@ void ShotHistoryPlugin::startRecording() {
             currentBrewDelay = brewProcess->brewDelay;
         }
     }
-    currentId = padId(String(controller->getSettings().getHistoryIndex()));
+    currentId = padId(String(std::max(0, event.getInt("history_id"))));
+    memset(&header, 0, sizeof(header));
+    header.magic = SHOT_LOG_MAGIC;
+    header.version = SHOT_LOG_VERSION;
+    header.reserved0 = static_cast<uint8_t>(SHOT_LOG_SAMPLE_SIZE);
+    header.headerSize = SHOT_LOG_HEADER_SIZE;
+    header.sampleInterval = SHOT_LOG_SAMPLE_INTERVAL_MS;
+    header.fieldsMask = SHOT_LOG_FIELDS_MASK_ALL;
+    header.startEpoch = getTime();
+    Profile profile = controller->getProfileManager()->getSelectedProfile();
+    strncpy(header.profileId, profile.id.c_str(), sizeof(header.profileId) - 1);
+    header.profileId[sizeof(header.profileId) - 1] = '\0';
+    strncpy(header.profileName, profile.label.c_str(), sizeof(header.profileName) - 1);
+    header.profileName[sizeof(header.profileName) - 1] = '\0';
+    const double delayMs = currentBrewDelay > 0.0 ? currentBrewDelay + 0.5 : 0.0;
+    header.brewDelayMs = delayMs > 65535.0 ? 65535 : static_cast<uint16_t>(delayMs);
     shotStart = millis();
     lastWeightChangeTime = 0;
     extendedRecordingStart = 0;
@@ -420,9 +619,10 @@ void ShotHistoryPlugin::startRecording() {
     shotSource = controller ? controller->getCurrentVolumetricSource() : VolumetricMeasurementSource::INACTIVE;
     recording = true;
     extendedRecording = false;
-    indexEntryCreated = false; // Reset flag for new shot
     sampleCount = 0;
-    ioBufferPos = 0;
+    bufferedSamples.clear();
+    persistencePending.store(true, std::memory_order_release);
+    shotLogWriteFailed = false;
     tempSumScaled = 0;
     tempSampleCount = 0;
     maxPressureScaled = 0;
@@ -492,7 +692,7 @@ void ShotHistoryPlugin::endExtendedRecording() {
 
 void ShotHistoryPlugin::recordPhaseTransition(uint8_t phaseNumber, uint16_t sampleIndex, uint8_t reason) {
     // Only record if we have space and a valid header
-    if (header.phaseTransitionCount >= 12 || !isFileOpen) {
+    if (header.phaseTransitionCount >= 12 || !persistencePending.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -525,7 +725,7 @@ void ShotHistoryPlugin::rememberRLShotHistoryMapping(Event const &event) {
         return;
 
     PendingRLShotHistoryMapping mapping;
-    mapping.historyId = String(currentId.toInt(), 10);
+    mapping.historyId = String(std::max(0, event.getInt("history_id")), 10);
     mapping.shotId = shotId;
     mapping.recommendationId = event.getString("recommendation_id");
     std::lock_guard<std::mutex> guard(pendingRLMappingMutex);
@@ -535,7 +735,7 @@ void ShotHistoryPlugin::rememberRLShotHistoryMapping(Event const &event) {
 void ShotHistoryPlugin::persistNextRLShotHistoryMapping() {
     // The recorder task owns the open .slog file. Wait until it has flushed and
     // closed so notes never enter LittleFS concurrently with shot finalization.
-    if (isFileOpen)
+    if (persistencePending.load(std::memory_order_acquire))
         return;
 
     PendingRLShotHistoryMapping mapping;
@@ -624,16 +824,22 @@ void ShotHistoryPlugin::cleanupHistory() {
     }
 
     // Collect and sort .slog files to find the oldest
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File directory = fs->open("/h");
     std::vector<String> slogFiles;
     String filename = directory.getNextFileName();
+    size_t scanned = 0;
     while (filename != "") {
         if (filename.endsWith(".slog")) {
             slogFiles.push_back(filename);
         }
         filename = directory.getNextFileName();
+        if (++scanned % 8 == 0) {
+            flashLease.checkpoint();
+        }
     }
     directory.close();
+    flashLease.reset();
 
     if (slogFiles.empty()) {
         return;
@@ -663,9 +869,12 @@ void ShotHistoryPlugin::cleanupHistory() {
         }
 
         // Remove .slog and associated .json notes file
-        fs->remove(fname);
-        String notesPath = fname.substring(0, fname.lastIndexOf('.')) + ".json";
-        fs->remove(notesPath);
+        {
+            auto lease = StorageCoordinator::instance().acquireFlash();
+            fs->remove(fname);
+            String notesPath = fname.substring(0, fname.lastIndexOf('.')) + ".json";
+            fs->remove(notesPath);
+        }
         removed++;
     }
 
@@ -675,6 +884,7 @@ void ShotHistoryPlugin::cleanupHistory() {
 }
 
 size_t ShotHistoryPlugin::getFreeSpace() {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (controller->isSDCard()) {
         uint64_t total = SD_MMC.totalBytes();
         uint64_t used = SD_MMC.usedBytes();
@@ -688,6 +898,11 @@ size_t ShotHistoryPlugin::getFreeSpace() {
 }
 
 void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &response) {
+    auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+    if (!flashLease) {
+        response["error"] = "Storage is busy while a machine process is active";
+        return;
+    }
     String type = request["tp"].as<String>();
     response["tp"] = String("res:") + type.substring(4);
     response["rid"] = request["rid"].as<String>();
@@ -703,12 +918,14 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         const String rlShotId = notes["rlShotId"].as<String>();
         fs->remove("/h/" + paddedId + ".slog");
         fs->remove("/h/" + paddedId + ".json");
+        if (id != paddedId) {
+            fs->remove("/h/" + id + ".json");
+        }
+        markIndexDeleted(id.toInt());
+        flashLease.reset();
         if (!rlShotId.isEmpty()) {
             LocalAutoTuningStore.removeShotData(rlShotId, true);
         }
-
-        // Mark as deleted in index
-        markIndexDeleted(id.toInt());
 
         response["msg"] = "Ok";
     } else if (type == "req:history:rl:reprocess") {
@@ -716,6 +933,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         JsonDocument notes(&psramAllocator);
         loadNotes(id, notes);
         const String shotId = notes["rlShotId"].as<String>();
+        flashLease.reset();
         if (shotId.isEmpty() || !LocalAutoTuningStore.hasShotReplay(shotId)) {
             response["error"] = "Shot replay data is unavailable";
         } else {
@@ -723,14 +941,19 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
             replay.id = "rl:shot:reprocess";
             replay.setString("shot_id", shotId);
             pluginManager->trigger(replay);
-            response["msg"] = "Shot queued for reprocessing";
-            response["shot_id"] = shotId;
+            if (replay.getInt("queued") != 1) {
+                response["error"] = "Shot reprocessing worker is unavailable";
+            } else {
+                response["msg"] = "Shot queued for reprocessing";
+                response["shot_id"] = shotId;
+            }
         }
     } else if (type == "req:history:notes:get") {
         auto id = request["id"].as<String>();
         JsonDocument notes(&psramAllocator);
         loadNotes(id, notes);
         response["notes"] = notes;
+        flashLease.reset();
         attachAutoTuningSummary(response, notes.as<JsonObjectConst>());
     } else if (type == "req:history:notes:save") {
         auto id = request["id"].as<String>();
@@ -742,6 +965,9 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
         loadNotes(id, existingNotes);
         const String rlShotId = existingNotes["rlShotId"].as<String>();
         const String rlRecommendationId = existingNotes["rlRecommendationId"].as<String>();
+        // Auto-tuning and community stores acquire their own mutex before the
+        // flash lease. Do not hold the flash lease while entering either store.
+        flashLease.reset();
 
         JsonDocument notes(&psramAllocator); // variant->const JsonDocument& is ambiguous on clang
         notes.set(request["notes"]);
@@ -786,6 +1012,9 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
                     if (!store || !store->correctShot(correction, corrected, reason)) {
                         response["error"] = reason.empty() ? "Unable to correct the stored shot" : reason.c_str();
                     } else {
+                        if (correction.doseInG.has_value() && corrected.record.doseFollowed.has_value()) {
+                            correction.doseFollowed = corrected.record.doseFollowed;
+                        }
                         Event correctionEvent;
                         correctionEvent.id = "rl:shot:correction";
                         correctionEvent.setString("shot_id", rlShotId);
@@ -833,6 +1062,7 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
 }
 
 void ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File file = fs->open("/h/" + id + ".json", FILE_WRITE);
     if (file) {
         String notesStr;
@@ -843,6 +1073,7 @@ void ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
 }
 
 void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File file = fs->open("/h/" + id + ".json", "r");
     if (file) {
         String notesStr = file.readString();
@@ -861,15 +1092,64 @@ void ShotHistoryPlugin::loopTask(void *arg) {
     }
 }
 
-void ShotHistoryPlugin::flushBuffer() {
-    if (isFileOpen && ioBufferPos > 0) {
-        currentFile.write(ioBuffer, ioBufferPos);
-        ioBufferPos = 0;
+bool ShotHistoryPlugin::persistBufferedShot() {
+    const String finalPath = "/h/" + currentId + ".slog";
+    const String temporaryPath = finalPath + ".tmp";
+    {
+        auto lease = StorageCoordinator::instance().acquireFlash();
+        if (!fs->exists("/h") && !fs->mkdir("/h")) {
+            return false;
+        }
+        if (fs->exists(temporaryPath)) {
+            fs->remove(temporaryPath);
+        }
+        File file = fs->open(temporaryPath, FILE_WRITE);
+        if (!file || file.write(reinterpret_cast<const uint8_t *>(&header), sizeof(header)) != sizeof(header)) {
+            if (file) {
+                file.close();
+            }
+            return false;
+        }
+        file.close();
     }
+
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(bufferedSamples.data());
+    const size_t byteCount = bufferedSamples.size() * sizeof(ShotLogSample);
+    for (size_t offset = 0; offset < byteCount; offset += StorageCoordinator::MAX_FLASH_QUANTUM_BYTES) {
+        const size_t chunk = std::min(StorageCoordinator::MAX_FLASH_QUANTUM_BYTES, byteCount - offset);
+        auto lease = StorageCoordinator::instance().acquireFlash();
+        File file = fs->open(temporaryPath, FILE_APPEND);
+        if (!file || file.write(bytes + offset, chunk) != chunk) {
+            if (file) {
+                file.close();
+            }
+            fs->remove(temporaryPath);
+            return false;
+        }
+        file.close();
+    }
+
+    auto lease = StorageCoordinator::instance().acquireFlash();
+    File verification = fs->open(temporaryPath, FILE_READ);
+    const size_t expectedSize = sizeof(header) + byteCount;
+    const bool valid = verification && verification.size() == expectedSize;
+    if (verification) {
+        verification.close();
+    }
+    if (!valid) {
+        fs->remove(temporaryPath);
+        return false;
+    }
+    if (fs->exists(finalPath) && !fs->remove(finalPath)) {
+        fs->remove(temporaryPath);
+        return false;
+    }
+    return fs->rename(temporaryPath.c_str(), finalPath.c_str());
 }
 
 // Index management methods
 bool ShotHistoryPlugin::ensureIndexExists() {
+    auto lease = StorageCoordinator::instance().acquireFlash();
     if (fs->exists("/h/index.bin")) {
         // Validate existing index header
         File indexFile = fs->open("/h/index.bin", "r");
@@ -908,6 +1188,7 @@ bool ShotHistoryPlugin::ensureIndexExists() {
 }
 
 bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!ensureIndexExists()) {
         return false;
     }
@@ -958,6 +1239,7 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
 }
 
 void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uint16_t volume) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File indexFile = fs->open("/h/index.bin", "r+");
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for metadata update");
@@ -994,6 +1276,7 @@ void ShotHistoryPlugin::updateIndexMetadata(uint32_t shotId, uint8_t rating, uin
 }
 
 void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File indexFile = fs->open("/h/index.bin", "r+");
     if (!indexFile) {
         ESP_LOGE("ShotHistoryPlugin", "Failed to open index file for deletion marking");
@@ -1036,6 +1319,10 @@ void ShotHistoryPlugin::markIndexDeleted(uint32_t shotId) {
 }
 
 size_t ShotHistoryPlugin::readRecentEntries(ShotIndexEntry *outEntries, size_t maxCount) {
+    auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+    if (!flashLease) {
+        return 0;
+    }
     File indexFile = fs->open("/h/index.bin", "r");
     if (!indexFile) {
         return 0;
@@ -1075,7 +1362,9 @@ void ShotHistoryPlugin::startAsyncRebuild() {
             [](void *param) {
                 auto *plugin = static_cast<ShotHistoryPlugin *>(param);
                 ESP_LOGI("ShotHistoryPlugin", "Rebuild task started");
-                plugin->rebuildIndex();
+                while (!plugin->rebuildIndex()) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
                 plugin->rebuildInProgress = false;
                 ESP_LOGI("ShotHistoryPlugin", "Rebuild task completed");
                 vTaskDelete(NULL); // Delete this task when done
@@ -1090,7 +1379,27 @@ void ShotHistoryPlugin::startAsyncRebuild() {
     }
 }
 
-void ShotHistoryPlugin::rebuildIndex() {
+bool ShotHistoryPlugin::rebuildIndex() {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
+    const std::uint64_t processGeneration =
+        StorageCoordinator::instance().processGeneration();
+    const auto yieldForProcess = [&flashLease, processGeneration]() {
+        return flashLease.checkpoint() &&
+               StorageCoordinator::instance().processGeneration() ==
+                   processGeneration;
+    };
+    const auto publishPaused = [this]() {
+        ESP_LOGI("ShotHistoryPlugin",
+                 "Pausing index rebuild for a machine process");
+        if (pluginManager) {
+            Event pausedEvent;
+            pausedEvent.id = "evt:history-rebuild-progress";
+            pausedEvent.setInt("total", 0);
+            pausedEvent.setInt("current", 0);
+            pausedEvent.setString("status", "paused");
+            pluginManager->trigger(pausedEvent);
+        }
+    };
     ESP_LOGI("ShotHistoryPlugin", "Starting index rebuild...");
 
     // Send scanning event
@@ -1118,7 +1427,7 @@ void ShotHistoryPlugin::rebuildIndex() {
             errorEvent.setString("status", "error");
             pluginManager->trigger(errorEvent);
         }
-        return;
+        return true;
     }
 
     File directory = fs->open("/h");
@@ -1135,12 +1444,13 @@ void ShotHistoryPlugin::rebuildIndex() {
             completedEvent.setString("status", "completed");
             pluginManager->trigger(completedEvent);
         }
-        return;
+        return true;
     }
 
     // Collect all .slog files
     std::vector<String> slogFiles;
     File file = directory.openNextFile();
+    size_t scanned = 0;
     while (file) {
         String fname = String(file.name());
         if (fname.endsWith(".slog")) {
@@ -1148,8 +1458,20 @@ void ShotHistoryPlugin::rebuildIndex() {
         }
         file.close();
         file = directory.openNextFile();
+        if (++scanned % 8 == 0 && !yieldForProcess()) {
+            if (file) {
+                file.close();
+            }
+            directory.close();
+            publishPaused();
+            return false;
+        }
     }
     directory.close();
+    if (!yieldForProcess()) {
+        publishPaused();
+        return false;
+    }
 
     // Sort files to maintain order
     std::sort(slogFiles.begin(), slogFiles.end());
@@ -1172,6 +1494,10 @@ void ShotHistoryPlugin::rebuildIndex() {
         currentIndex++;
         File shotFile = fs->open("/h/" + fileName, "r");
         if (!shotFile) {
+            if (!yieldForProcess()) {
+                publishPaused();
+                return false;
+            }
             continue;
         }
 
@@ -1180,6 +1506,10 @@ void ShotHistoryPlugin::rebuildIndex() {
         if (shotFile.read(reinterpret_cast<uint8_t *>(&shotHeader), sizeof(shotHeader)) != sizeof(shotHeader) ||
             shotHeader.magic != SHOT_LOG_MAGIC) {
             shotFile.close();
+            if (!yieldForProcess()) {
+                publishPaused();
+                return false;
+            }
             continue;
         }
 
@@ -1229,6 +1559,15 @@ void ShotHistoryPlugin::rebuildIndex() {
                     flowSum += sample.fl;
                     flowCount++;
                 }
+                constexpr std::size_t SAMPLES_PER_QUANTUM =
+                    StorageCoordinator::MAX_FLASH_QUANTUM_BYTES /
+                    sizeof(ShotLogSample);
+                if ((s + 1) % SAMPLES_PER_QUANTUM == 0 &&
+                    !yieldForProcess()) {
+                    shotFile.close();
+                    publishPaused();
+                    return false;
+                }
             }
             entry.avgTemp = tempCount ? static_cast<uint16_t>(tempSum / tempCount) : 0;
             entry.maxPressure = maxPressure;
@@ -1277,8 +1616,18 @@ void ShotHistoryPlugin::rebuildIndex() {
             pluginManager->trigger(progressEvent);
             ESP_LOGI("ShotHistoryPlugin", "Rebuild progress: %d/%d", currentIndex, (int)slogFiles.size());
 
-            // Small delay to allow UI updates and prevent overwhelming the system
+            flashLease.reset();
             vTaskDelay(pdMS_TO_TICKS(10));
+            flashLease =
+                StorageCoordinator::instance().acquireFlash();
+            if (StorageCoordinator::instance().processGeneration() !=
+                processGeneration) {
+                publishPaused();
+                return false;
+            }
+        } else if (!yieldForProcess()) {
+            publishPaused();
+            return false;
         }
     }
 
@@ -1297,6 +1646,7 @@ void ShotHistoryPlugin::rebuildIndex() {
     }
 
     ESP_LOGI("ShotHistoryPlugin", "Index rebuild completed");
+    return true;
 }
 
 // Index helper functions
@@ -1346,28 +1696,4 @@ bool ShotHistoryPlugin::writeEntryAtPosition(File &indexFile, size_t position, c
         return false;
     }
     return true;
-}
-
-bool ShotHistoryPlugin::createEarlyIndexEntry() {
-    Profile profile = controller->getProfileManager()->getSelectedProfile();
-
-    ShotIndexEntry indexEntry{};
-    indexEntry.id = currentId.toInt();
-    indexEntry.timestamp = header.startEpoch;
-    indexEntry.duration = 0; // Will be overwritten on completion
-    indexEntry.volume = 0;   // Will be overwritten on completion
-    indexEntry.rating = 0;
-    indexEntry.flags = 0; // No SHOT_FLAG_COMPLETED - indicates in-progress shot
-    strncpy(indexEntry.profileId, profile.id.c_str(), sizeof(indexEntry.profileId) - 1);
-    indexEntry.profileId[sizeof(indexEntry.profileId) - 1] = '\0';
-    strncpy(indexEntry.profileName, profile.label.c_str(), sizeof(indexEntry.profileName) - 1);
-    indexEntry.profileName[sizeof(indexEntry.profileName) - 1] = '\0';
-
-    bool success = appendToIndex(indexEntry);
-    if (success) {
-        ESP_LOGD("ShotHistoryPlugin", "Created early index entry for shot %u", indexEntry.id);
-    } else {
-        ESP_LOGE("ShotHistoryPlugin", "Failed to create early index entry for shot %u", indexEntry.id);
-    }
-    return success;
 }

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <limits>
 #include <display/config.h>
 #include <display/core/PredictiveDelayPolicy.h>
 #include <display/core/constants.h>
@@ -206,6 +207,7 @@ void Controller::setup() {
 #ifndef GAGGIMATE_SIM
     pluginManager->registerPlugin(&AutoTuningCapture);
 #endif
+    pluginManager->registerPlugin(&ShotHistory);
     pluginManager->registerPlugin(&LocalAutoTuningStore);
 #ifndef GAGGIMATE_SIM
     pluginManager->registerPlugin(new CommunityUploadPlugin());
@@ -215,7 +217,6 @@ void Controller::setup() {
     pluginManager->registerPlugin(new WifiStaWatchdogPlugin());
     pluginManager->registerPlugin(new ImprovPlugin());
 #endif
-    pluginManager->registerPlugin(&ShotHistory);
 #ifndef GAGGIMATE_SIM
     pluginManager->registerPlugin(&BLEScales);
 #if defined(GAGGIMATE_UART_COMMS) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
@@ -285,6 +286,7 @@ void Controller::setupPanel() {
 #else
     // The panel can't change after flashing, so cache the detection result in NVS
     // and skip the multi-second probing chain on subsequent boots (GM-140).
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     Preferences panelPrefs;
     panelPrefs.begin("panel", false);
     uint8_t model = panelPrefs.getUChar("driver", PANEL_UNKNOWN);
@@ -929,24 +931,43 @@ void Controller::autotune(int testTime, int samples, int heaterWattage) {
 }
 
 void Controller::startProcess(Process *process) {
+    StorageCoordinator::ProcessLease lease;
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        if (pendingProcessStorageLease.has_value()) {
+            lease = std::move(*pendingProcessStorageLease);
+            pendingProcessStorageLease.reset();
+        }
+    }
+    if (!lease) {
+        lease = StorageCoordinator::instance().acquireProcess();
+    }
+    if (!lease) {
+        delete process;
+        return;
+    }
+
     DeferredProcessEvents events;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
-        startProcessLocked(process, events);
+        if (startProcessLocked(process, events)) {
+            processStorageLease.emplace(std::move(lease));
+        }
     }
     dispatchEvents(events);
 }
 
-void Controller::startProcessLocked(Process *process, DeferredProcessEvents &events) {
+bool Controller::startProcessLocked(Process *process, DeferredProcessEvents &events) {
     if (isActiveLocked() || !isReady()) {
         delete process;
-        return;
+        return false;
     }
     processCompleted = false;
     this->currentProcess = process;
     applyConnectionPriority(); // shot started -> tight BLE interval
     events.push_back({"controller:process:start"});
     updateLastAction();
+    return true;
 }
 
 void Controller::dispatchEvents(const DeferredProcessEvents &events) {
@@ -1010,7 +1031,17 @@ void Controller::startBrewProcess() {
     }
     ESP_LOGI(LOG_TAG, "startBrewProcess: procType=%d startedBrew=%d", procType, startedBrew);
     if (startedBrew) {
-        pluginManager->trigger("controller:brew:start", "utility", startedUtility ? 1 : 0);
+        Event startedEvent;
+        startedEvent.id = "controller:brew:start";
+        startedEvent.setInt("utility", startedUtility ? 1 : 0);
+        if (!startedUtility) {
+            const int historyId = std::max(0, settings.getHistoryIndex());
+            startedEvent.setInt("history_id", historyId);
+            if (historyId < std::numeric_limits<int>::max()) {
+                settings.setHistoryIndex(historyId + 1);
+            }
+        }
+        pluginManager->trigger(startedEvent);
     }
 }
 
@@ -1049,12 +1080,21 @@ void Controller::cancelHardwareScaleBrewTare(const char *reason) {
     pendingHardwareScaleBrewStartReady.store(false, std::memory_order_release);
     pendingHardwareScaleBrewTareStartedAt = 0;
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
+    std::optional<StorageCoordinator::ProcessLease> cancelledLease;
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        if (pendingProcessStorageLease.has_value()) {
+            cancelledLease.emplace(std::move(*pendingProcessStorageLease));
+            pendingProcessStorageLease.reset();
+        }
+    }
 
     ESP_LOGW(LOG_TAG, "Cancelled hardware-scale brew start: %s", reason != nullptr ? reason : "unknown");
     Event ev;
     ev.id = "controller:brew:scale-tare:failed";
     ev.setString("reason", reason != nullptr ? String(reason) : String("unknown"));
     pluginManager->trigger(ev);
+    cancelledLease.reset();
 }
 
 void Controller::pollHardwareScaleBrewTare() {
@@ -1395,6 +1435,14 @@ void Controller::activate() {
         return;
     }
 #endif
+    if (mode == MODE_BREW || mode == MODE_STEAM || mode == MODE_WATER) {
+        auto lease = StorageCoordinator::instance().acquireProcess();
+        if (!lease) {
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        pendingProcessStorageLease.emplace(std::move(lease));
+    }
     clear();
     // clear() already resets this under the process lock, but state in activate()
     // is the operative invariant for the rest of this function — keep it explicit.
@@ -1437,6 +1485,17 @@ void Controller::activate() {
         break;
     default:;
     }
+
+    bool keepPendingLease = false;
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    keepPendingLease = pendingHardwareScaleBrewStart.load(std::memory_order_acquire);
+#endif
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        if (currentProcess == nullptr && !keepPendingLease) {
+            pendingProcessStorageLease.reset();
+        }
+    }
 }
 
 void Controller::deactivate() {
@@ -1448,9 +1507,14 @@ void Controller::deactivate() {
 #endif
     DeferredProcessEvents events;
     bool processEnded = false;
+    std::optional<StorageCoordinator::ProcessLease> endedLease;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
         processEnded = deactivateLocked(events);
+        if (processEnded && processStorageLease.has_value()) {
+            endedLease.emplace(std::move(*processStorageLease));
+            processStorageLease.reset();
+        }
     }
     if (!processEnded) {
         return;
@@ -1462,6 +1526,7 @@ void Controller::deactivate() {
     // its acknowledgement and retransmission outside the physical shutdown path.
     loopControl(true);
     applyConnectionPriority(); // shot ended -> relaxed BLE interval
+    endedLease.reset();
     dispatchEvents(events);
 }
 
@@ -1515,6 +1580,13 @@ void Controller::clearLocked(DeferredProcessEvents &events) {
 void Controller::activateGrind() {
     if (isGrindActive())
         return;
+    auto lease = StorageCoordinator::instance().acquireProcess();
+    if (!lease)
+        return;
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        pendingProcessStorageLease.emplace(std::move(lease));
+    }
     clear();
     // Grind-by-weight can only use a movable Bluetooth scale. The hardware scale
     // is fixed in the brew path, and predictive pump-flow is meaningless while
@@ -1529,6 +1601,12 @@ void Controller::activateGrind() {
             new GrindProcess(ProcessTarget::TIME, settings.getTargetGrindDuration(), settings.getTargetGrindVolume(), 0.0));
     }
     pluginManager->trigger("controller:grind:start");
+    {
+        std::lock_guard<std::recursive_mutex> guard(processMutex);
+        if (currentProcess == nullptr) {
+            pendingProcessStorageLease.reset();
+        }
+    }
 }
 
 void Controller::deactivateGrind() {
@@ -1696,6 +1774,10 @@ void Controller::onFlush() {
         cancelHardwareScaleBrewTare("flush_started");
     }
 #endif
+    auto lease = StorageCoordinator::instance().acquireProcess();
+    if (!lease) {
+        return;
+    }
     // Allocate outside the lock; reachable from the UI, AsyncTCP and BLE tasks (GM-147).
     auto *flush = new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay());
     DeferredProcessEvents events;
@@ -1706,8 +1788,10 @@ void Controller::onFlush() {
             return;
         }
         clearLocked(events);
-        startProcessLocked(flush, events);
-        events.push_back({"controller:brew:start", 1});
+        if (startProcessLocked(flush, events)) {
+            processStorageLease.emplace(std::move(lease));
+            events.push_back({"controller:brew:start", 1});
+        }
     }
     dispatchEvents(events);
 }

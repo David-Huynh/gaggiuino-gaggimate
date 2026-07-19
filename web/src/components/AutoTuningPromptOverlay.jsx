@@ -87,15 +87,35 @@ export function AutoTuningPromptOverlay() {
 
     const doseConfirmationListener = apiService.on('evt:rl:dose-confirmation', message => {
       const target = Number(message.dose_target_g);
-      if (!message.shot_id || !Number.isFinite(target) || target <= 0) {
+      const revision = Number(message.prompt_revision);
+      if (
+        !message.shot_id ||
+        !Number.isInteger(revision) ||
+        revision <= 0 ||
+        !Number.isFinite(target) ||
+        target <= 0
+      ) {
         return;
       }
-      setPendingDose({ ...message, dose_target_g: target });
+      setPendingDose(current => {
+        if (
+          current?.shot_id === message.shot_id &&
+          Number(current.prompt_revision) >= revision
+        ) {
+          return current;
+        }
+        return { ...message, prompt_revision: revision, dose_target_g: target };
+      });
       setView('dose');
     });
 
     const doseResolvedListener = apiService.on('evt:rl:dose-confirmation-resolved', message => {
-      setPendingDose(current => (current?.shot_id === message.shot_id ? null : current));
+      setPendingDose(current =>
+        current?.shot_id === message.shot_id &&
+        Number(current.prompt_revision) === Number(message.prompt_revision)
+          ? null
+          : current,
+      );
       setView(current => (current === 'dose' ? null : current));
     });
 
@@ -103,9 +123,12 @@ export function AutoTuningPromptOverlay() {
       if (!message.preference_feedback_required) {
         return;
       }
+      const revision = Number(message.prompt_revision);
       const validMode = ['global_previous', 'best_incumbent'].includes(message.comparison_mode);
       if (
         !message.shot_id ||
+        !Number.isInteger(revision) ||
+        revision <= 0 ||
         !message.install_id ||
         !message.optimization_run_id ||
         !message.anchor_shot_id ||
@@ -114,9 +137,17 @@ export function AutoTuningPromptOverlay() {
       ) {
         return;
       }
-      const prompt = { ...message };
-      setPendingPreference(prompt);
-      const key = `preference:${message.optimization_run_id}:${message.shot_id}`;
+      const prompt = { ...message, prompt_revision: revision };
+      setPendingPreference(current => {
+        if (
+          current?.shot_id === message.shot_id &&
+          Number(current.prompt_revision) >= revision
+        ) {
+          return current;
+        }
+        return prompt;
+      });
+      const key = `preference:${message.optimization_run_id}:${message.shot_id}:${revision}`;
       const firstSeen = !seenRef.current.has(key);
       markSeen(key);
       if (firstSeen) {
@@ -174,6 +205,7 @@ export function AutoTuningPromptOverlay() {
         new_shot_id: pendingPreference.shot_id,
         anchor_shot_id: pendingPreference.anchor_shot_id,
         comparison_mode: pendingPreference.comparison_mode,
+        prompt_revision: pendingPreference.prompt_revision,
         label,
       });
       setPendingPreference(null);
@@ -190,6 +222,7 @@ export function AutoTuningPromptOverlay() {
       apiService.send({
         tp: 'req:rl:dose-confirmation',
         shot_id: pendingDose.shot_id,
+        prompt_revision: pendingDose.prompt_revision,
         followed: Boolean(followed),
       });
       setView(null);

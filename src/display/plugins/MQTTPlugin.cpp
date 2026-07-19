@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <display/core/EpochTime.h>
 #include <display/core/ProfileManager.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/models/profile.h>
 #include <display/util/AtomicFile.h>
 #include <display/util/LittleFSUtil.h>
@@ -54,6 +55,10 @@ struct ActiveGrinderPosition {
     std::optional<float> absoluteStep;
     std::optional<float> micronsPerStep;
     float directionSign = 1.0f;
+    std::string calibrationMode;
+    std::string adjustmentMode;
+    std::string stepDirection = "higher_is_finer";
+    std::string referenceLabel;
 };
 
 static bool closeEnough(float left, float right) {
@@ -95,47 +100,48 @@ static bool loadActiveGrinderPosition(Settings const &settings, ActiveGrinderPos
         active["microns_per_step"].as<float>() > 0.0f) {
         position.micronsPerStep = active["microns_per_step"].as<float>();
     }
-    position.directionSign = active["step_direction"].as<String>() == "higher_is_coarser" ? -1.0f : 1.0f;
+    position.calibrationMode = active["grinder_calibration_mode"].as<String>().c_str();
+    position.adjustmentMode = active["grinder_adjustment_mode"].as<String>().c_str();
+    position.stepDirection = active["step_direction"].as<String>() == "higher_is_coarser" ? "higher_is_coarser"
+                                                                                           : "higher_is_finer";
+    position.referenceLabel = active["reference_label"].as<String>().c_str();
+    position.directionSign = position.stepDirection == "higher_is_coarser" ? -1.0f : 1.0f;
     return true;
 }
 
-static bool validateRecommendationGrindProjection(AutoTuning::Recommendation const &recommendation, Settings const &settings,
-                                                  String &reason) {
+static bool rebaseRecommendationGrindProjection(AutoTuning::Recommendation &recommendation, Settings const &settings,
+                                                String &reason) {
     ActiveGrinderPosition position;
     if (!loadActiveGrinderPosition(settings, position) || !position.relativeAvailable) {
         reason = "active grinder position is unavailable";
         return false;
     }
-    if (!closeEnough(position.relativeStep + recommendation.grindDeltaStepsFromCurrent,
-                     recommendation.projectedRelativeStepFromReference)) {
-        reason = "recommended relative grinder position is inconsistent";
+    const float projectedRelativeStep = recommendation.projectedRelativeStepFromReference;
+    const AutoTuning::RecipeDomain domain = settings.getRLRecipeDomain();
+    if (!std::isfinite(projectedRelativeStep) || std::fabs(projectedRelativeStep) > domain.grindRadiusSteps) {
+        reason = "recommended grind setting is outside the configured recipe domain";
         return false;
     }
-    if (recommendation.currentAbsoluteStep.has_value() &&
-        (!position.absoluteStep.has_value() || !closeEnough(*position.absoluteStep, *recommendation.currentAbsoluteStep))) {
-        reason = "recommendation uses a stale absolute grinder position";
-        return false;
-    }
-    if (recommendation.projectedAbsoluteStep.has_value() &&
-        (!position.absoluteStep.has_value() || !closeEnough(*position.absoluteStep + recommendation.grindDeltaStepsFromCurrent,
-                                                            *recommendation.projectedAbsoluteStep))) {
-        reason = "recommended absolute grinder position is inconsistent";
-        return false;
-    }
-    if (recommendation.absoluteReferenceStep.has_value() &&
-        (!position.absoluteStep.has_value() ||
-         !closeEnough(*position.absoluteStep - position.relativeStep, *recommendation.absoluteReferenceStep))) {
-        reason = "recommendation uses an inconsistent absolute grinder reference";
-        return false;
-    }
+    recommendation.grindDeltaStepsFromCurrent = projectedRelativeStep - position.relativeStep;
+    recommendation.grinderCalibrationMode = position.calibrationMode;
+    recommendation.grinderAdjustmentMode = position.adjustmentMode;
+    recommendation.stepDirection = position.stepDirection;
+    recommendation.referenceLabel = position.referenceLabel;
+    recommendation.micronsPerStep = position.micronsPerStep;
     if (position.micronsPerStep.has_value()) {
         const float micronScale = *position.micronsPerStep * position.directionSign;
-        if (!closeEnough(recommendation.grindDeltaStepsFromCurrent * micronScale, recommendation.grindDeltaMicronsFromCurrent) ||
-            !closeEnough(recommendation.projectedRelativeStepFromReference * micronScale,
-                         recommendation.projectedRelativeMicronsFromReference)) {
-            reason = "recommended grinder micron projection is inconsistent";
-            return false;
-        }
+        recommendation.grindDeltaMicronsFromCurrent = recommendation.grindDeltaStepsFromCurrent * micronScale;
+        recommendation.projectedRelativeMicronsFromReference = projectedRelativeStep * micronScale;
+    }
+    if (position.absoluteStep.has_value()) {
+        const float absoluteReferenceStep = *position.absoluteStep - position.relativeStep;
+        recommendation.currentAbsoluteStep = *position.absoluteStep;
+        recommendation.absoluteReferenceStep = absoluteReferenceStep;
+        recommendation.projectedAbsoluteStep = absoluteReferenceStep + projectedRelativeStep;
+    } else {
+        recommendation.currentAbsoluteStep.reset();
+        recommendation.absoluteReferenceStep.reset();
+        recommendation.projectedAbsoluteStep.reset();
     }
     reason = "";
     return true;
@@ -204,6 +210,21 @@ static EpochTime::Seconds mqttJsonEpochOrZero(JsonVariantConst value) {
     return mqttJsonEpoch(value, parsed) ? parsed : 0;
 }
 
+static bool mqttSha256Hex(const String &value) {
+    if (value.length() != 64) {
+        return false;
+    }
+    for (size_t index = 0; index < value.length(); ++index) {
+        const char character = value.charAt(index);
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f') ||
+              (character >= 'A' && character <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void MQTTPlugin::markConnected() {
     mqttWasConnected.store(true, std::memory_order_release);
     nextReconnectAttemptMs = 0;
@@ -228,7 +249,8 @@ bool MQTTPlugin::connectOnce() {
     }
     const String ip = configuration.host;
     const int mqttPort = configuration.port;
-    const String clientId = "GaggiMate";
+    String clientId = "GaggiMate-" + machineTopicId();
+    clientId.replace("_", "");
     const String mqttUser = configuration.user;
     const String mqttPassword = configuration.password;
 
@@ -241,6 +263,8 @@ bool MQTTPlugin::connectOnce() {
     client.setKeepAlive(10);
     ESP_LOGI(LOG_TAG.c_str(), "Connecting to %s:%d", ip.c_str(), mqttPort);
     if (!client.connect(clientId.c_str(), mqttUser.c_str(), mqttPassword.c_str())) {
+        ESP_LOGW(LOG_TAG.c_str(), "MQTT connect failed: error=%d return_code=%d", static_cast<int>(client.lastError()),
+                 static_cast<int>(client.returnCode()));
         return false;
     }
 
@@ -392,8 +416,10 @@ void MQTTPlugin::serviceWorker() {
         connectionGeneration.fetch_add(1, std::memory_order_release);
     }
 
-    client.loop();
-    if (!client.connected()) {
+    const bool loopSucceeded = client.loop();
+    if (!loopSucceeded || !client.connected()) {
+        ESP_LOGW(LOG_TAG.c_str(), "MQTT loop failed: error=%d return_code=%d", static_cast<int>(client.lastError()),
+                 static_cast<int>(client.returnCode()));
         markDisconnected();
         return;
     }
@@ -510,7 +536,7 @@ bool MQTTPlugin::enqueuePublish(const String &topic, const String &message, cons
     {
         std::lock_guard<std::mutex> guard(queueMutex);
         if (outboundMessages.size() >= MAX_OUTBOUND_MESSAGES) {
-            outboundMessages.pop_front();
+            return false;
         }
         outboundMessages.push_back(OutboundMessage{topic, message, retained, std::clamp(qos, 0, 2)});
     }
@@ -529,6 +555,7 @@ bool MQTTPlugin::publishNow(const String &topic, const String &message, const bo
 }
 
 bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &message, const bool retained, const int qos) {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     MqttOutboxLock lock(outboxMutex);
     if (!lock.locked) {
         return false;
@@ -600,6 +627,7 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
 }
 
 void MQTTPlugin::recoverDurablePublishes() {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     MqttOutboxLock lock(outboxMutex);
     if (!lock.locked) {
         return;
@@ -653,6 +681,10 @@ bool MQTTPlugin::flushDurablePublishes() {
     bool retained = false;
     int qos = 0;
     {
+        auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+        if (!flashLease) {
+            return false;
+        }
         MqttOutboxLock lock(outboxMutex);
         if (!lock.locked) {
             return false;
@@ -709,6 +741,11 @@ bool MQTTPlugin::flushDurablePublishes() {
     }
     nextDurablePublishAttemptMs = 0;
     {
+        auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+        if (!flashLease) {
+            durablePublishPending.store(true, std::memory_order_release);
+            return true;
+        }
         MqttOutboxLock lock(outboxMutex);
         if (lock.locked) {
             LittleFSUtil::removeIfExists(selectedPath);
@@ -910,7 +947,7 @@ void MQTTPlugin::publishMachineState(const char *state, const bool force) {
 
     String json;
     serializeJson(doc, json);
-    publish("machine/state", json.c_str());
+    publish("machine/state", json.c_str(), true, 1);
 }
 
 void MQTTPlugin::publishOptimizerSettings() {
@@ -948,6 +985,30 @@ void MQTTPlugin::publishOptimizerSettings() {
     String json;
     serializeJson(doc, json);
     publish("rl/settings", json.c_str(), true);
+}
+
+bool MQTTPlugin::publishOptimizerControl(Event const &event) {
+    if (!controller || !isAutoTuningEnabled())
+        return false;
+    const String action = event.getString("action");
+    const String runId = event.getString("optimization_run_id");
+    const String requestId = event.getString("request_id");
+    if (action.isEmpty() || runId.isEmpty() || requestId.isEmpty())
+        return false;
+
+    JsonDocument doc;
+    doc["event_type"] = "optimizer_control";
+    doc["schema_version"] = 1;
+    doc["request_id"] = requestId;
+    doc["optimization_run_id"] = runId;
+    doc["action"] = action;
+    doc["machine_id"] = machineId();
+    doc["timestamp"] = EpochTime::now();
+    doc["source"] = "gaggimate_mqtt";
+
+    String json;
+    serializeJson(doc, json);
+    return publish("rl/control", json.c_str(), false, 1, true);
 }
 
 void MQTTPlugin::loop() {
@@ -1051,20 +1112,20 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
         return;
     }
 
+    String grindProjectionReason;
+    const bool grindProjectionValid =
+        actionableStatus ? rebaseRecommendationGrindProjection(recommendation, settings, grindProjectionReason)
+                         : validateAppliedRecommendationGrindProjection(recommendation, settings, grindProjectionReason);
+    if (!grindProjectionValid) {
+        ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid recommendation: %s", grindProjectionReason.c_str());
+        clearLatestRecommendationAndNotify();
+        return;
+    }
     const AutoTuning::RecommendationTargets targets{recommendation.nextDoseG, recommendation.targetYieldG,
                                                     recommendation.targetRatio, recommendation.grindDeltaStepsFromCurrent};
     std::string validationReason;
     if (!AutoTuning::validateRecommendationTargets(targets, settings.getRLRecipeDomain(), validationReason)) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid recommendation: %s", validationReason.c_str());
-        clearLatestRecommendationAndNotify();
-        return;
-    }
-    String grindProjectionReason;
-    const bool grindProjectionValid =
-        actionableStatus ? validateRecommendationGrindProjection(recommendation, settings, grindProjectionReason)
-                         : validateAppliedRecommendationGrindProjection(recommendation, settings, grindProjectionReason);
-    if (!grindProjectionValid) {
-        ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid recommendation: %s", grindProjectionReason.c_str());
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1101,7 +1162,13 @@ void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
         return;
     }
     JsonDocument doc;
-    if (deserializeJson(doc, payload) || !doc.is<JsonObject>() || doc.as<JsonObjectConst>().size() != 8) {
+    if (deserializeJson(doc, payload) || !doc.is<JsonObject>()) {
+        ESP_LOGW(LOG_TAG.c_str(), "Rejected malformed shot delivery acknowledgement");
+        return;
+    }
+    JsonObjectConst acknowledgement = doc.as<JsonObjectConst>();
+    const bool hasPreferenceRequest = !acknowledgement["preference_request"].isNull();
+    if (acknowledgement.size() != (hasPreferenceRequest ? 13U : 12U)) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected malformed shot delivery acknowledgement");
         return;
     }
@@ -1110,6 +1177,11 @@ void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
     const String acknowledgedMachineId = doc["machine_id"].as<String>();
     const String outcome = doc["outcome"].as<String>();
     const String reason = doc["reason"].as<String>();
+    const String attemptId = doc["attempt_id"].as<String>();
+    const String payloadHash = doc["payload_hash"].as<String>();
+    const std::uint32_t artifactRevision = doc["artifact_revision"] | 0U;
+    const std::uint16_t encodingVersion =
+        static_cast<std::uint16_t>(doc["encoding_version"] | 0U);
     const bool retryableType = doc["retryable"].is<bool>();
     const bool retryable = retryableType && doc["retryable"].as<bool>();
     const bool validOutcome = outcome == "accepted" || outcome == "already_processed" || outcome == "transient_failure" ||
@@ -1119,12 +1191,37 @@ void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
                              reason == "not_optimizable";
     EpochTime::Seconds acknowledgementTimestamp = 0;
     const bool integerTimestamp = mqttJsonEpoch(doc["timestamp"], acknowledgementTimestamp);
-    if (eventType != "shot_delivery_ack" || !doc["schema_version"].is<int>() || doc["schema_version"].as<int>() != 1 ||
+    if (eventType != "shot_delivery_ack" || !doc["schema_version"].is<int>() || doc["schema_version"].as<int>() != 2 ||
         shotId.isEmpty() || shotId.length() > 256 || acknowledgedMachineId != machineId() || !validOutcome || !validReason ||
         !retryableType || retryable != (outcome == "transient_failure") || reason.isEmpty() || reason.length() > 80 ||
+        attemptId.isEmpty() || attemptId.length() > 96 || !mqttSha256Hex(payloadHash) ||
+        !doc["artifact_revision"].is<unsigned int>() || artifactRevision == 0 ||
+        !doc["encoding_version"].is<unsigned int>() || encodingVersion != 1 ||
         !integerTimestamp || !EpochTime::plausible(acknowledgementTimestamp)) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid shot delivery acknowledgement");
         return;
+    }
+
+    AutoTuning::ShotDeliveryAcknowledgement deliveryAcknowledgement;
+    deliveryAcknowledgement.shotId = shotId.c_str();
+    deliveryAcknowledgement.attemptId = attemptId.c_str();
+    deliveryAcknowledgement.payloadHash = payloadHash.c_str();
+    deliveryAcknowledgement.artifactRevision = artifactRevision;
+    deliveryAcknowledgement.encodingVersion = encodingVersion;
+    deliveryAcknowledgement.outcome = outcome.c_str();
+    deliveryAcknowledgement.reason = reason.c_str();
+    deliveryAcknowledgement.timestamp = acknowledgementTimestamp;
+    if (hasPreferenceRequest) {
+        AutoTuning::PreferenceRequest preferenceRequest;
+        String preferenceError;
+        if ((outcome != "accepted" && outcome != "already_processed") ||
+            !AutoTuningJsonCodec::parsePreferenceRequest(acknowledgement["preference_request"], preferenceRequest,
+                                                         preferenceError) ||
+            preferenceRequest.newShotId != deliveryAcknowledgement.shotId) {
+            ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid shot comparison request: %s", preferenceError.c_str());
+            return;
+        }
+        deliveryAcknowledgement.preferenceRequest = std::move(preferenceRequest);
     }
 
     Event event;
@@ -1134,6 +1231,7 @@ void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
     event.setString("reason", reason);
     event.setInt("retryable", retryable ? 1 : 0);
     event.setInt64("timestamp", acknowledgementTimestamp);
+    event.setPayload(std::move(deliveryAcknowledgement));
     pluginManager->trigger(event);
 }
 
@@ -1168,6 +1266,12 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusOptimizerFallbackReason = mqttJsonString(doc["optimizer_fallback_reason"]);
     latestStatusCPBOProfileName = mqttJsonString(doc["cpbo_profile_name"]);
     latestStatusCPBOComparisonMode = mqttJsonString(doc["cpbo_comparison_mode"]);
+    latestStatusCPBOOptimizationRunId = mqttJsonString(doc["cpbo_optimization_run_id"]);
+    latestStatusCPBOLocallyConverged = doc["cpbo_locally_converged"] | false;
+    latestStatusCPBOTrustRegionLength = doc["cpbo_trust_region_length"] | 0.0f;
+    latestStatusCPBOTrustRegionSuccessCount = doc["cpbo_trust_region_success_count"] | 0;
+    latestStatusCPBOTrustRegionFailureCount = doc["cpbo_trust_region_failure_count"] | 0;
+    latestStatusCPBOLastTransitionAction = mqttJsonString(doc["cpbo_last_transition_action"]);
     latestStatusLocalShotCount = doc["local_shot_count"] | 0;
     latestStatusUploadQueueCount = doc["upload_queue_count"] | 0;
     latestStatusUploadQueueRejectedCount = doc["upload_queue_rejected_count"] | 0;
@@ -1239,6 +1343,12 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setString("optimizer_fallback_reason", latestStatusOptimizerFallbackReason);
     event.setString("cpbo_profile_name", latestStatusCPBOProfileName);
     event.setString("cpbo_comparison_mode", latestStatusCPBOComparisonMode);
+    event.setString("cpbo_optimization_run_id", latestStatusCPBOOptimizationRunId);
+    event.setInt("cpbo_locally_converged", latestStatusCPBOLocallyConverged ? 1 : 0);
+    event.setString("cpbo_trust_region_length", String(latestStatusCPBOTrustRegionLength, 8));
+    event.setInt("cpbo_trust_region_success_count", latestStatusCPBOTrustRegionSuccessCount);
+    event.setInt("cpbo_trust_region_failure_count", latestStatusCPBOTrustRegionFailureCount);
+    event.setString("cpbo_last_transition_action", latestStatusCPBOLastTransitionAction);
     event.setInt("local_shot_count", latestStatusLocalShotCount);
     event.setInt("upload_queue_count", latestStatusUploadQueueCount);
     event.setInt("upload_queue_rejected_count", latestStatusUploadQueueRejectedCount);
@@ -1375,7 +1485,7 @@ bool MQTTPlugin::ignoreLatestRecommendation() {
     return true;
 }
 
-bool MQTTPlugin::validateLatestRecommendation(String &reason) const {
+bool MQTTPlugin::validateLatestRecommendation(String &reason) {
     if (!hasRecommendation || !controller) {
         reason = "no active recommendation";
         return false;
@@ -1396,13 +1506,16 @@ bool MQTTPlugin::validateLatestRecommendation(String &reason) const {
         reason = "recommendation has expired";
         return false;
     }
+    if (!rebaseRecommendationGrindProjection(latestRecommendation, settings, reason)) {
+        return false;
+    }
     AutoTuning::RecommendationTargets targets{latestRecommendation.nextDoseG, latestRecommendation.targetYieldG,
                                               latestRecommendation.targetRatio, latestRecommendation.grindDeltaStepsFromCurrent};
     std::string validationReason;
     const bool valid =
         AutoTuning::validateRecommendationTargets(targets, controller->getSettings().getRLRecipeDomain(), validationReason);
     reason = validationReason.c_str();
-    return valid && validateRecommendationGrindProjection(latestRecommendation, settings, reason);
+    return valid;
 }
 
 void MQTTPlugin::clearLatestRecommendationAndNotify() {
@@ -1633,13 +1746,50 @@ bool MQTTPlugin::configured() const {
 
 bool MQTTPlugin::connected() const { return mqttWasConnected.load(std::memory_order_acquire); }
 
-bool MQTTPlugin::publishShot(AutoTuning::ShotRecord const &shot, bool) {
+AutoTuning::ShotSubmissionResult
+MQTTPlugin::publishShot(AutoTuning::ShotRecord const &shot,
+                        AutoTuning::ShotDeliveryAttempt const &attempt) {
     if (!controller ||
         !AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).routeOffBoardTransport()) {
-        return false;
+        return {AutoTuning::ShotSubmissionOutcome::NotConnected,
+                "optimizer_transport_disabled"};
+    }
+    if (!attempt.valid() || attempt.shotId != shot.shotId) {
+        return {AutoTuning::ShotSubmissionOutcome::PermanentFailure,
+                "invalid_delivery_attempt"};
+    }
+    if (!connected()) {
+        return {AutoTuning::ShotSubmissionOutcome::NotConnected,
+                "mqtt_disconnected"};
+    }
+    JsonDocument document(&psramAllocator);
+    if (!AutoTuningJsonCodec::writeShotRecord(shot, document)) {
+        return {AutoTuning::ShotSubmissionOutcome::PermanentFailure,
+                "shot_serialization_failed"};
+    }
+    JsonObject delivery = document["delivery"].to<JsonObject>();
+    delivery["attempt_id"] = attempt.attemptId.c_str();
+    delivery["payload_hash"] = attempt.payloadHash.c_str();
+    delivery["artifact_revision"] = attempt.artifactRevision;
+    delivery["encoding_version"] = attempt.encodingVersion;
+    delivery["reprocess"] = attempt.reprocess;
+    const size_t measured = measureJson(document);
+    constexpr size_t MQTT_PACKET_HEADROOM = 512;
+    if (measured == 0 || measured > MQTT_WRITE_BUFFER_SIZE - MQTT_PACKET_HEADROOM) {
+        return {AutoTuning::ShotSubmissionOutcome::PayloadTooLarge,
+                "shot_payload_too_large"};
     }
     String payload;
-    return AutoTuningJsonCodec::serializeShotRecord(shot, payload) && publish("shot/profile", payload.c_str(), false, 1);
+    payload.reserve(measured);
+    if (serializeJson(document, payload) != measured) {
+        return {AutoTuning::ShotSubmissionOutcome::PermanentFailure,
+                "shot_serialization_failed"};
+    }
+    if (!publish("shot/profile", payload.c_str(), false, 1)) {
+        return {AutoTuning::ShotSubmissionOutcome::RetryableFailure,
+                "mqtt_submission_queue_full"};
+    }
+    return {AutoTuning::ShotSubmissionOutcome::Submitted, "submitted"};
 }
 
 bool MQTTPlugin::publishLiveShotStarted(AutoTuning::LiveShotStarted const &event) {
@@ -1822,6 +1972,10 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         requestReconnect();
         publishOptimizerSettings();
         publishMachineState("idle", true);
+    });
+
+    pm->on("rl:optimization:control", [this](Event &event) {
+        event.setInt("control_persisted", publishOptimizerControl(event) ? 1 : 0);
     });
 
     pm->on("rl:taste-goal:changed", [this](Event const &) {

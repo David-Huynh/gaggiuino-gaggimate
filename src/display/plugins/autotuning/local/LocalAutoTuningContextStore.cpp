@@ -4,6 +4,7 @@
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <display/core/StorageCoordinator.h>
 #include <display/core/AutoTuning.h>
 #include <display/core/EpochTime.h>
 #include <display/core/Settings.h>
@@ -30,6 +31,7 @@ static void addParsedContextJson(JsonObject target, const char *key, const Strin
 } // namespace
 
 bool LocalAutoTuningContextStore::begin() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     const bool available = LocalAutoTuningFiles::ensureDirectory(STORE_DIR);
     if (available) {
         LocalAutoTuningFiles::recoverDirectory(STORE_DIR);
@@ -38,6 +40,7 @@ bool LocalAutoTuningContextStore::begin() const {
 }
 
 bool LocalAutoTuningContextStore::save(Settings const &settings) const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!begin()) {
         return false;
     }
@@ -63,6 +66,7 @@ bool LocalAutoTuningContextStore::save(Settings const &settings) const {
 }
 
 bool LocalAutoTuningContextStore::clear() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!LittleFSUtil::existsQuietly(CONTEXT_PATH)) {
         return true;
     }
@@ -70,6 +74,7 @@ bool LocalAutoTuningContextStore::clear() const {
 }
 
 size_t LocalAutoTuningContextStore::bytes() const {
+    auto flashLease = StorageCoordinator::instance().acquireFlash();
     File file = LittleFS.open(CONTEXT_PATH, FILE_READ);
     if (!file) {
         return 0;

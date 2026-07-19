@@ -11,6 +11,8 @@
 
 namespace AutoTuning {
 
+constexpr float DOSE_FOLLOW_THROUGH_TOLERANCE_G = 0.2f;
+
 using Timestamp = std::int64_t;
 
 constexpr int TASTE_GOAL_SCHEMA_VERSION = 1;
@@ -79,9 +81,33 @@ struct ShotSample {
     float temperature = 0.0f;
     float targetTemperature = 0.0f;
     float weight = 0.0f;
+    float measuredWeight = 0.0f;
+    float estimatedWeight = 0.0f;
+    float measuredFlow = 0.0f;
+    float puckFlow = 0.0f;
+    float puckResistance = 0.0f;
     PumpTargetMode pumpTargetMode = PumpTargetMode::Simple;
     bool valveOpen = false;
+    std::uint16_t systemInfo = 0;
     std::uint16_t elapsedMs = 0;
+};
+
+struct ShotPhaseTransition {
+    std::uint16_t sampleIndex = 0;
+    std::uint8_t phaseNumber = 0;
+    std::uint8_t exitReason = 0;
+    std::string phaseName;
+};
+
+struct ShotHistoryMetadata {
+    std::uint32_t id = 0;
+    bool reserved = false;
+    bool startedVolumetric = false;
+    std::uint16_t brewDelayMs = 0;
+    std::uint8_t finalExitReason = 0;
+    float finalMeasuredWeightG = 0.0f;
+    std::array<ShotPhaseTransition, 12> phaseTransitions{};
+    std::size_t phaseTransitionCount = 0;
 };
 
 struct LiveShotStarted {
@@ -182,6 +208,21 @@ struct RecommendationReference {
     bool present() const { return !recommendationId.empty(); }
 };
 
+struct PreferenceRequest {
+    std::string recommendationId;
+    std::string installId;
+    std::string optimizationRunId;
+    std::string newShotId;
+    std::string anchorShotId;
+    ComparisonMode comparisonMode = ComparisonMode::None;
+    TasteGoal tasteGoal = TasteGoal::balanced();
+
+    bool valid() const;
+};
+
+std::optional<PreferenceRequest> preferenceRequestFromRecommendation(RecommendationReference const &recommendation,
+                                                                     std::string const &newShotId);
+
 struct FinalPhaseSnapshot {
     bool available = false;
     std::size_t index = 0;
@@ -212,6 +253,7 @@ struct ShotRecord {
     ProfileSnapshot profile;
     RecommendationReference recommendation;
     FinalPhaseSnapshot finalPhase;
+    ShotHistoryMetadata history;
 
     std::optional<float> measuredDoseG;
     bool doseObserved = false;
@@ -253,13 +295,68 @@ struct CorrectedShotRecord {
 struct ShotCompletion {
     std::string shotId;
     RecommendationReference recommendation;
+    std::optional<PreferenceRequest> preferenceRequest;
     float doseTargetG = 0.0f;
+};
+
+struct ShotDeliveryAcknowledgement {
+    std::string shotId;
+    std::string attemptId;
+    std::string payloadHash;
+    std::uint32_t artifactRevision = 0;
+    std::uint16_t encodingVersion = 0;
+    std::string outcome;
+    std::string reason;
+    Timestamp timestamp = 0;
+    std::optional<PreferenceRequest> preferenceRequest;
+};
+
+struct ShotDeliveryAttempt {
+    std::string shotId;
+    std::string attemptId;
+    std::string payloadHash;
+    std::uint32_t artifactRevision = 0;
+    std::uint16_t encodingVersion = 1;
+    bool reprocess = false;
+
+    bool valid() const;
+};
+
+enum class ShotSubmissionOutcome : std::uint8_t {
+    Submitted,
+    NotConnected,
+    RetryableFailure,
+    PayloadTooLarge,
+    PermanentFailure,
+};
+
+struct ShotSubmissionResult {
+    ShotSubmissionOutcome outcome = ShotSubmissionOutcome::RetryableFailure;
+    std::string reason;
+
+    bool submitted() const { return outcome == ShotSubmissionOutcome::Submitted; }
+    bool retryable() const {
+        return outcome == ShotSubmissionOutcome::NotConnected ||
+               outcome == ShotSubmissionOutcome::RetryableFailure;
+    }
 };
 
 struct ShotCaptureDisposition {
     bool doseConfirmationRequired = false;
     bool optimizerDeliveryRequired = false;
     bool communityUploadRequired = false;
+};
+
+struct CompletedShotArtifact {
+    ShotRecord record;
+    ShotCompletion completion;
+    ShotCaptureDisposition disposition;
+    std::vector<ShotSample> samples;
+    std::uint32_t revision = 1;
+    Timestamp committedAt = 0;
+    std::string payloadHash;
+
+    void bindSamples() { record.samples = ArrayView<const ShotSample>(samples.data(), samples.size()); }
 };
 
 struct Recommendation {
@@ -322,6 +419,24 @@ enum class DeliveryStatus : std::uint8_t {
     PermanentRejection,
 };
 
+enum class PromptStatus : std::uint8_t {
+    Processing,
+    DeliveryRetrying,
+    AwaitingAcknowledgement,
+    AwaitingComparison,
+    ComparisonAvailable,
+    RecommendationAvailable,
+    DeliveryError,
+    Resolved,
+    Dismissed,
+};
+
+struct PromptState {
+    PromptStatus status = PromptStatus::Processing;
+    std::uint32_t revision = 1;
+    Timestamp updatedAt = 0;
+};
+
 struct DeliveryState {
     DeliveryStatus status = DeliveryStatus::NotRequired;
     int attemptCount = 0;
@@ -373,6 +488,8 @@ const char *recommendationStatusKey(RecommendationStatus status);
 std::optional<RecommendationStatus> recommendationStatusFromKey(std::string_view key);
 const char *deliveryStatusKey(DeliveryStatus status);
 std::optional<DeliveryStatus> deliveryStatusFromKey(std::string_view key);
+const char *promptStatusKey(PromptStatus status);
+std::optional<PromptStatus> promptStatusFromKey(std::string_view key);
 const char *preferenceLabelKey(PreferenceLabel label);
 std::optional<PreferenceLabel> preferenceLabelFromKey(std::string_view key);
 const char *followThroughStatusKey(FollowThroughStatus status);
