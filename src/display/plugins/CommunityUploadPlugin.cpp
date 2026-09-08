@@ -220,6 +220,9 @@ bool CommunityUploadPlugin::enqueueRecommendation(AutoTuning::Recommendation con
 }
 
 bool CommunityUploadPlugin::enqueuePreference(AutoTuning::PreferenceFeedback const &preference) {
+    if (preference.label == AutoTuning::PreferenceLabel::Abstain) {
+        return false; // No subjective comparison was made.
+    }
     if (!uploadRequested() || !uploadConfigured()) {
         return false;
     }

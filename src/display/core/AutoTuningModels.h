@@ -208,6 +208,17 @@ struct RecommendationReference {
     bool present() const { return !recommendationId.empty(); }
 };
 
+struct PreferenceAnchorSummary {
+    Timestamp timestamp = 0;
+    float relativeGrindSteps = 0.0f;
+    float doseG = 0.0f;
+    float targetYieldG = 0.0f;
+    std::optional<float> beverageOutG;
+    std::optional<float> absoluteStep;
+    std::string profileLabel;
+    bool valid() const;
+};
+
 struct PreferenceRequest {
     std::string recommendationId;
     std::string installId;
@@ -216,6 +227,7 @@ struct PreferenceRequest {
     std::string anchorShotId;
     ComparisonMode comparisonMode = ComparisonMode::None;
     TasteGoal tasteGoal = TasteGoal::balanced();
+    std::optional<PreferenceAnchorSummary> anchor;
 
     bool valid() const;
 };
@@ -301,10 +313,8 @@ struct ShotCompletion {
 
 struct ShotDeliveryAcknowledgement {
     std::string shotId;
-    std::string attemptId;
-    std::string payloadHash;
-    std::uint32_t artifactRevision = 0;
-    std::uint16_t encodingVersion = 0;
+    std::string machineId;
+    std::uint32_t recordRevision = 0;
     std::string outcome;
     std::string reason;
     Timestamp timestamp = 0;
@@ -313,10 +323,7 @@ struct ShotDeliveryAcknowledgement {
 
 struct ShotDeliveryAttempt {
     std::string shotId;
-    std::string attemptId;
-    std::string payloadHash;
-    std::uint32_t artifactRevision = 0;
-    std::uint16_t encodingVersion = 1;
+    std::uint32_t recordRevision = 0;
     bool reprocess = false;
 
     bool valid() const;
@@ -450,15 +457,17 @@ struct DeliveryState {
     bool canTransitionTo(DeliveryStatus next) const;
 };
 
-enum class PreferenceLabel : std::uint8_t { NewBetter, AnchorBetter, Tie };
+// Abstain is a feedback action, never a community/optimizer preference label.
+enum class PreferenceLabel : std::uint8_t { NewBetter, AnchorBetter, Tie, Abstain };
 enum class FollowThroughStatus : std::uint8_t { Unknown, Followed, NotFollowed, PartiallyFollowed };
 
 struct PreferenceFeedback {
+    explicit PreferenceFeedback(PreferenceLabel selectedLabel) : label(selectedLabel) {}
     std::string installId;
     std::string optimizationRunId;
     std::string newShotId;
     std::string anchorShotId;
-    PreferenceLabel label = PreferenceLabel::Tie;
+    PreferenceLabel label;
     ComparisonMode comparisonMode = ComparisonMode::None;
     TasteGoal tasteGoal = TasteGoal::balanced();
     std::string recommendationId;

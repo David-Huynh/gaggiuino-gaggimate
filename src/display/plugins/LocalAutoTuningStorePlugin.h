@@ -44,8 +44,7 @@ class LocalAutoTuningStorePlugin : public Plugin,
     void handleShotDeliveryAck(Event const &event);
     void processShotDeliveryAck(const String &shotId, const String &outcome, const String &reason,
                                 std::int64_t acknowledgementTimestamp,
-                                const String &attemptId, const String &payloadHash,
-                                std::uint32_t artifactRevision, std::uint16_t encodingVersion,
+                                std::uint32_t recordRevision,
                                 std::optional<AutoTuning::PreferenceRequest> const &preferenceRequest);
     void handleShotCorrection(Event const &event);
     void handleRecommendationApply(Event const &event);
@@ -103,10 +102,7 @@ class LocalAutoTuningStorePlugin : public Plugin,
         String outcome;
         String reason;
         std::int64_t timestamp = 0;
-        String attemptId;
-        String payloadHash;
-        std::uint32_t artifactRevision = 0;
-        std::uint16_t encodingVersion = 0;
+        std::uint32_t recordRevision = 0;
         std::uint32_t promptRevision = 0;
         std::optional<AutoTuning::PreferenceRequest> preferenceRequest;
         bool reprocess = false;

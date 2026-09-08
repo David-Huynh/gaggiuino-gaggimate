@@ -1,4 +1,5 @@
 #include "AutoTuningModels.h"
+#include <cmath>
 
 namespace AutoTuning {
 namespace {
@@ -30,7 +31,7 @@ constexpr std::array<const char *, 9> PROMPT_STATUS_KEYS = {
     "awaiting_comparison", "comparison_available",   "recommendation_available",
     "delivery_error",      "resolved",               "dismissed",
 };
-constexpr std::array<const char *, 3> PREFERENCE_LABEL_KEYS = {"new_better", "anchor_better", "tie"};
+constexpr std::array<const char *, 4> PREFERENCE_LABEL_KEYS = {"new_better", "anchor_better", "tie", "abstain"};
 constexpr std::array<const char *, 4> FOLLOW_THROUGH_STATUS_KEYS = {"", "followed", "not_followed", "partially_followed"};
 
 } // namespace
@@ -54,9 +55,19 @@ bool TasteGoal::valid() const {
 
 bool TasteGoal::operator==(TasteGoal const &other) const { return mode == other.mode && targets == other.targets; }
 
+bool PreferenceAnchorSummary::valid() const {
+    return timestamp >= 0 && std::isfinite(relativeGrindSteps) && std::fabs(relativeGrindSteps) <= 10000.0f &&
+           std::isfinite(doseG) && doseG > 0.0f && doseG <= 100.0f &&
+           std::isfinite(targetYieldG) && targetYieldG > 0.0f && targetYieldG <= 1000.0f &&
+           (!beverageOutG || (std::isfinite(*beverageOutG) && *beverageOutG > 0.0f && *beverageOutG <= 1000.0f)) &&
+           (!absoluteStep || (std::isfinite(*absoluteStep) && std::fabs(*absoluteStep) <= 10000.0f)) &&
+           profileLabel.size() <= 640; // Up to 160 Unicode characters, four UTF-8 bytes each.
+}
+
 bool PreferenceRequest::valid() const {
     return !installId.empty() && !optimizationRunId.empty() && !newShotId.empty() && !anchorShotId.empty() &&
-           newShotId != anchorShotId && comparisonMode != ComparisonMode::None && tasteGoal.valid();
+           newShotId != anchorShotId && comparisonMode != ComparisonMode::None && tasteGoal.valid() &&
+           (!anchor || anchor->valid());
 }
 
 std::optional<PreferenceRequest> preferenceRequestFromRecommendation(RecommendationReference const &recommendation,
@@ -76,19 +87,7 @@ std::optional<PreferenceRequest> preferenceRequestFromRecommendation(Recommendat
 }
 
 bool ShotDeliveryAttempt::valid() const {
-    if (shotId.empty() || shotId.size() > 256 || attemptId.empty() || attemptId.size() > 96 ||
-        payloadHash.size() != 64 || artifactRevision == 0 || encodingVersion == 0) {
-        return false;
-    }
-    for (char character : payloadHash) {
-        const bool hex = (character >= '0' && character <= '9') ||
-                         (character >= 'a' && character <= 'f') ||
-                         (character >= 'A' && character <= 'F');
-        if (!hex) {
-            return false;
-        }
-    }
-    return true;
+    return !shotId.empty() && shotId.size() <= 256 && recordRevision > 0;
 }
 
 const char *tasteAttributeKey(TasteAttribute attribute) {

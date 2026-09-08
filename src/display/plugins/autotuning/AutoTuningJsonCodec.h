@@ -21,7 +21,10 @@ bool serializeShotRecord(AutoTuning::ShotRecord const &record, String &json);
 bool parseShotRecord(JsonVariantConst source, DecodedShotRecord &decoded, String &error);
 bool deserializeShotRecord(String const &json, DecodedShotRecord &decoded, String &error);
 
+void writePreferenceAnchor(AutoTuning::PreferenceAnchorSummary const &summary, JsonObject output);
 bool writePreferenceRequest(AutoTuning::PreferenceRequest const &request, JsonObject output);
+bool writeShotDelivery(AutoTuning::ShotDeliveryAttempt const &attempt, JsonObject output);
+bool parseShotAcknowledgement(JsonVariantConst source, AutoTuning::ShotDeliveryAcknowledgement &ack, String &error);
 bool parsePreferenceRequest(JsonVariantConst source, AutoTuning::PreferenceRequest &request, String &error);
 bool writeShotCompletion(AutoTuning::ShotCompletion const &completion, JsonDocument &document);
 bool serializeShotCompletion(AutoTuning::ShotCompletion const &completion, String &json);

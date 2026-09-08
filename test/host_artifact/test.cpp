@@ -2,6 +2,9 @@
 #include <LittleFS.h>
 #include <cassert>
 #include <limits>
+#include <fstream>
+#include <iterator>
+#include <type_traits>
 #include <display/plugins/autotuning/local/CompletedShotArtifactStore.h>
 #include <display/plugins/autotuning/AutoTuningJsonCodec.h>
 #include <display/util/AtomicFile.h>
@@ -42,11 +45,66 @@ static AutoTuning::CompletedShotArtifact fixture() {
     return artifact;
 }
 
-int main() {
+int main(int argc, char **argv) {
+    static_assert(!std::is_default_constructible<AutoTuning::PreferenceFeedback>::value,
+                  "Feedback must require an explicit choice, never default to a tie");
+    if (argc == 2 && std::string(argv[1]) == "--export-shot") {
+        auto artifact = fixture();
+        artifact.bindSamples();
+        artifact.record.machineId = "gaggimate:AA_BB";
+        JsonDocument document;
+        assert(AutoTuningJsonCodec::writeShotRecord(artifact.record, document));
+        AutoTuning::ShotDeliveryAttempt attempt{artifact.record.shotId, 7, false};
+        assert(AutoTuningJsonCodec::writeShotDelivery(attempt, document["delivery"].to<JsonObject>()));
+        std::string encoded;
+        serializeJson(document, encoded);
+        puts(encoded.c_str());
+        return 0;
+    }
+    if (argc == 3 && std::string(argv[1]) == "--verify-receipt") {
+        std::ifstream file(argv[2]);
+        std::string encoded((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        JsonDocument document;
+        assert(!deserializeJson(document, encoded));
+        AutoTuning::ShotDeliveryAcknowledgement ack;
+        String error;
+        assert(AutoTuningJsonCodec::parseShotAcknowledgement(document.as<JsonVariantConst>(), ack, error));
+        assert(ack.recordRevision == 7 && ack.shotId == "recovery-fixture");
+        assert(ack.preferenceRequest && ack.preferenceRequest->anchor);
+        assert(ack.preferenceRequest->anchor->doseG == 18);
+        assert(ack.preferenceRequest->anchor->profileLabel.find("espresso") != std::string::npos);
+        // Keep the receipt envelope strict and reject changes to its orientation.
+        document["record_revision"] = true;
+        assert(!AutoTuningJsonCodec::parseShotAcknowledgement(document.as<JsonVariantConst>(), ack, error));
+        document["record_revision"] = 7;
+        document["preference_request"]["new_shot_id"] = "different-shot";
+        assert(!AutoTuningJsonCodec::parseShotAcknowledgement(document.as<JsonVariantConst>(), ack, error));
+        document["preference_request"]["new_shot_id"] = "recovery-fixture";
+        document["preference_request"]["anchor"]["dose_g"] = -1;
+        assert(!AutoTuningJsonCodec::parseShotAcknowledgement(document.as<JsonVariantConst>(), ack, error));
+        document["preference_request"]["anchor"]["dose_g"] = 18;
+        document["attempt_id"] = "obsolete";
+        assert(!AutoTuningJsonCodec::parseShotAcknowledgement(document.as<JsonVariantConst>(), ack, error));
+        puts("PASS Python receipt parsed by firmware; invalid envelopes rejected");
+        return 0;
+    }
     CompletedShotArtifactStore store;
     assert(store.begin());
     auto artifact = fixture();
     artifact.bindSamples();
+    AutoTuning::PreferenceRequest request;
+    request.installId = "install";
+    request.optimizationRunId = "run";
+    request.newShotId = artifact.record.shotId;
+    request.anchorShotId = "anchor";
+    request.comparisonMode = AutoTuning::ComparisonMode::BestIncumbent;
+    AutoTuning::PreferenceAnchorSummary anchor;
+    anchor.timestamp = 1720000000;
+    anchor.doseG = 18;
+    anchor.targetYieldG = 36;
+    anchor.profileLabel = "Morning espresso";
+    request.anchor = anchor;
+    artifact.completion.preferenceRequest = request;
     assert(store.write(artifact));
     auto path = store.pathFor(artifact.record.shotId.c_str());
     assert(LittleFS.open(path).size() > 4096); // exercises chunked IO and validation
@@ -67,6 +125,8 @@ int main() {
         assert(loaded.record.history.id == 42 && loaded.record.history.phaseTransitions[0].phaseName == "extraction");
         assert(loaded.record.history.phaseTransitions[0].exitReason == 7);
         assert(loaded.payloadHash == hash);
+        assert(loaded.completion.preferenceRequest && loaded.completion.preferenceRequest->anchor);
+        assert(loaded.completion.preferenceRequest->anchor->profileLabel == "Morning espresso");
     }
     // Invalid pending write must not replace the valid prior artifact.
     assert(LittleFS.rename(path, AtomicFile::backupPath(path)));

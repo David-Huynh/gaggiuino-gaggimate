@@ -1,4 +1,5 @@
 #include "WebUIPlugin.h"
+#include "autotuning/AutoTuningJsonCodec.h"
 #include "autotuning/AutoTuningTasteGoalJson.h"
 #include <DNSServer.h>
 #include <LittleFS.h>
@@ -852,6 +853,12 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             event.getString("anchor_shot_id") == _pendPreferenceAnchorShotId &&
             event.getInt64("prompt_revision") ==
                 static_cast<std::int64_t>(_pendingPreferencePromptRevision)) {
+            JsonDocument resolved;
+            resolved["tp"] = "evt:rl:preference-resolved";
+            resolved["shot_id"] = _pendingPreferenceShotId;
+            resolved["optimization_run_id"] = _pendPreferenceRunId;
+            resolved["prompt_revision"] = _pendingPreferencePromptRevision;
+            ws.textAll(resolved.as<String>());
             clearPendingPreferencePrompt();
             advancePreferencePrompt();
         }
@@ -1726,6 +1733,7 @@ void WebUIPlugin::clearPendingPreferencePrompt() {
     _pendPreferenceInstallId = "";
     _pendPreferenceRunId = "";
     _pendPreferenceAnchorShotId = "";
+    _pendPreferenceAnchor.reset();
     _pendPreferenceComparisonMode = "";
     _pendPreferenceTasteGoal = AutoTuning::TasteGoal::balanced();
     _pendPreferenceTasteGoalSummary = "Balanced";
@@ -1756,6 +1764,7 @@ bool WebUIPlugin::activatePreferencePrompt(Event const &event) {
     _pendPreferenceInstallId = installId;
     _pendPreferenceRunId = runId;
     _pendPreferenceAnchorShotId = anchorShotId;
+    _pendPreferenceAnchor = preference.anchor;
     _pendPreferenceComparisonMode = comparisonMode;
     _pendPreferenceTasteGoal = preference.tasteGoal;
     _pendPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(preference.tasteGoal);
@@ -1839,6 +1848,9 @@ void WebUIPlugin::sendPreferencePrompt(AsyncWebSocketClient *client) {
     doc["install_id"] = _pendPreferenceInstallId;
     doc["optimization_run_id"] = _pendPreferenceRunId;
     doc["anchor_shot_id"] = _pendPreferenceAnchorShotId;
+    if (_pendPreferenceAnchor) {
+        AutoTuningJsonCodec::writePreferenceAnchor(*_pendPreferenceAnchor, doc["anchor"].to<JsonObject>());
+    }
     doc["comparison_mode"] = _pendPreferenceComparisonMode;
     AutoTuning::writeTasteGoal(_pendPreferenceTasteGoal, doc["taste_goal"].to<JsonObject>());
     doc["taste_goal_summary"] = _pendPreferenceTasteGoalSummary;
@@ -2012,14 +2024,13 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         const String label = doc["label"].as<String>();
                         const std::uint32_t promptRevision =
                             doc["prompt_revision"] | 0U;
-                        const bool validLabel = label == "new_better" || label == "anchor_better" || label == "tie";
                         const bool matchesPending = installId == _pendPreferenceInstallId && runId == _pendPreferenceRunId &&
                                                     newShotId == _pendingPreferenceShotId &&
                                                     anchorShotId == _pendPreferenceAnchorShotId &&
                                                     comparisonMode == _pendPreferenceComparisonMode &&
                                                     promptRevision == _pendingPreferencePromptRevision &&
                                                     promptRevision > 0;
-                        if (validLabel && matchesPending && newShotId != anchorShotId) {
+                        if (matchesPending && newShotId != anchorShotId) {
                             const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
                             const auto parsedMode = AutoTuning::comparisonModeFromKey(comparisonMode.c_str());
                             if (!parsedLabel || !parsedMode) {
@@ -2033,12 +2044,11 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                             if (claim.getInt("claimed") != 1) {
                                 return;
                             }
-                            AutoTuning::PreferenceFeedback feedback;
+                            AutoTuning::PreferenceFeedback feedback(*parsedLabel);
                             feedback.installId = installId.c_str();
                             feedback.optimizationRunId = runId.c_str();
                             feedback.newShotId = newShotId.c_str();
                             feedback.anchorShotId = anchorShotId.c_str();
-                            feedback.label = *parsedLabel;
                             feedback.comparisonMode = *parsedMode;
                             feedback.tasteGoal = _pendPreferenceTasteGoal;
                             feedback.recommendationId = _pendingPreferenceRecommendationId.c_str();

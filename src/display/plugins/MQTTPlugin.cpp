@@ -210,21 +210,6 @@ static EpochTime::Seconds mqttJsonEpochOrZero(JsonVariantConst value) {
     return mqttJsonEpoch(value, parsed) ? parsed : 0;
 }
 
-static bool mqttSha256Hex(const String &value) {
-    if (value.length() != 64) {
-        return false;
-    }
-    for (size_t index = 0; index < value.length(); ++index) {
-        const char character = value.charAt(index);
-        if (!((character >= '0' && character <= '9') ||
-              (character >= 'a' && character <= 'f') ||
-              (character >= 'A' && character <= 'F'))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 void MQTTPlugin::markConnected() {
     mqttWasConnected.store(true, std::memory_order_release);
     nextReconnectAttemptMs = 0;
@@ -1166,72 +1151,22 @@ void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected malformed shot delivery acknowledgement");
         return;
     }
-    JsonObjectConst acknowledgement = doc.as<JsonObjectConst>();
-    const bool hasPreferenceRequest = !acknowledgement["preference_request"].isNull();
-    if (acknowledgement.size() != (hasPreferenceRequest ? 13U : 12U)) {
-        ESP_LOGW(LOG_TAG.c_str(), "Rejected malformed shot delivery acknowledgement");
+    AutoTuning::ShotDeliveryAcknowledgement acknowledgement;
+    String error;
+    if (!AutoTuningJsonCodec::parseShotAcknowledgement(doc.as<JsonVariantConst>(), acknowledgement, error) ||
+        acknowledgement.machineId != machineId().c_str() ||
+        !EpochTime::plausible(acknowledgement.timestamp)) {
+        ESP_LOGW(LOG_TAG.c_str(), "Rejected shot receipt: %s", error.c_str());
         return;
     }
-    const String eventType = doc["event_type"].as<String>();
-    const String shotId = doc["shot_id"].as<String>();
-    const String acknowledgedMachineId = doc["machine_id"].as<String>();
-    const String outcome = doc["outcome"].as<String>();
-    const String reason = doc["reason"].as<String>();
-    const String attemptId = doc["attempt_id"].as<String>();
-    const String payloadHash = doc["payload_hash"].as<String>();
-    const std::uint32_t artifactRevision = doc["artifact_revision"] | 0U;
-    const std::uint16_t encodingVersion =
-        static_cast<std::uint16_t>(doc["encoding_version"] | 0U);
-    const bool retryableType = doc["retryable"].is<bool>();
-    const bool retryable = retryableType && doc["retryable"].as<bool>();
-    const bool validOutcome = outcome == "accepted" || outcome == "already_processed" || outcome == "transient_failure" ||
-                              outcome == "permanent_rejection";
-    const bool validReason = reason == "stored" || reason == "already_processed" || reason == "invalid_shot" ||
-                             reason == "ingest_unavailable" || reason == "local_optimization_disabled" ||
-                             reason == "not_optimizable";
-    EpochTime::Seconds acknowledgementTimestamp = 0;
-    const bool integerTimestamp = mqttJsonEpoch(doc["timestamp"], acknowledgementTimestamp);
-    if (eventType != "shot_delivery_ack" || !doc["schema_version"].is<int>() || doc["schema_version"].as<int>() != 2 ||
-        shotId.isEmpty() || shotId.length() > 256 || acknowledgedMachineId != machineId() || !validOutcome || !validReason ||
-        !retryableType || retryable != (outcome == "transient_failure") || reason.isEmpty() || reason.length() > 80 ||
-        attemptId.isEmpty() || attemptId.length() > 96 || !mqttSha256Hex(payloadHash) ||
-        !doc["artifact_revision"].is<unsigned int>() || artifactRevision == 0 ||
-        !doc["encoding_version"].is<unsigned int>() || encodingVersion != 1 ||
-        !integerTimestamp || !EpochTime::plausible(acknowledgementTimestamp)) {
-        ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid shot delivery acknowledgement");
-        return;
-    }
-
-    AutoTuning::ShotDeliveryAcknowledgement deliveryAcknowledgement;
-    deliveryAcknowledgement.shotId = shotId.c_str();
-    deliveryAcknowledgement.attemptId = attemptId.c_str();
-    deliveryAcknowledgement.payloadHash = payloadHash.c_str();
-    deliveryAcknowledgement.artifactRevision = artifactRevision;
-    deliveryAcknowledgement.encodingVersion = encodingVersion;
-    deliveryAcknowledgement.outcome = outcome.c_str();
-    deliveryAcknowledgement.reason = reason.c_str();
-    deliveryAcknowledgement.timestamp = acknowledgementTimestamp;
-    if (hasPreferenceRequest) {
-        AutoTuning::PreferenceRequest preferenceRequest;
-        String preferenceError;
-        if ((outcome != "accepted" && outcome != "already_processed") ||
-            !AutoTuningJsonCodec::parsePreferenceRequest(acknowledgement["preference_request"], preferenceRequest,
-                                                         preferenceError) ||
-            preferenceRequest.newShotId != deliveryAcknowledgement.shotId) {
-            ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid shot comparison request: %s", preferenceError.c_str());
-            return;
-        }
-        deliveryAcknowledgement.preferenceRequest = std::move(preferenceRequest);
-    }
-
     Event event;
     event.id = "rl:shot:delivery:ack";
-    event.setString("shot_id", shotId);
-    event.setString("outcome", outcome);
-    event.setString("reason", reason);
-    event.setInt("retryable", retryable ? 1 : 0);
-    event.setInt64("timestamp", acknowledgementTimestamp);
-    event.setPayload(std::move(deliveryAcknowledgement));
+    event.setString("shot_id", acknowledgement.shotId.c_str());
+    event.setString("outcome", acknowledgement.outcome.c_str());
+    event.setString("reason", acknowledgement.reason.c_str());
+    event.setInt("retryable", acknowledgement.outcome == "transient_failure" ? 1 : 0);
+    event.setInt64("timestamp", acknowledgement.timestamp);
+    event.setPayload(std::move(acknowledgement));
     pluginManager->trigger(event);
 }
 
@@ -1767,12 +1702,9 @@ MQTTPlugin::publishShot(AutoTuning::ShotRecord const &shot,
         return {AutoTuning::ShotSubmissionOutcome::PermanentFailure,
                 "shot_serialization_failed"};
     }
-    JsonObject delivery = document["delivery"].to<JsonObject>();
-    delivery["attempt_id"] = attempt.attemptId.c_str();
-    delivery["payload_hash"] = attempt.payloadHash.c_str();
-    delivery["artifact_revision"] = attempt.artifactRevision;
-    delivery["encoding_version"] = attempt.encodingVersion;
-    delivery["reprocess"] = attempt.reprocess;
+    if (!AutoTuningJsonCodec::writeShotDelivery(attempt, document["delivery"].to<JsonObject>())) {
+        return {AutoTuning::ShotSubmissionOutcome::PermanentFailure, "invalid_delivery_attempt"};
+    }
     const size_t measured = measureJson(document);
     constexpr size_t MQTT_PACKET_HEADROOM = 512;
     if (measured == 0 || measured > MQTT_WRITE_BUFFER_SIZE - MQTT_PACKET_HEADROOM) {

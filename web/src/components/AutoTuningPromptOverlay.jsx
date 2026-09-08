@@ -1,6 +1,11 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { ApiServiceContext } from '../services/ApiService.js';
 import { formatGrinderSettingTransition } from '../utils/grinderRecommendation.js';
+import {
+  PREFERENCE_ACTIONS,
+  preferenceAnchorDetails,
+  preferenceGoalSummary,
+} from '../utils/preferencePrompt.js';
 
 const PREFERENCE_DISMISS_MS = 45000;
 const RECOMMENDATION_STATUSES = new Set(['', 'pending', 'shown']);
@@ -41,6 +46,8 @@ export function AutoTuningPromptOverlay() {
   const apiService = useContext(ApiServiceContext);
   const [pendingDose, setPendingDose] = useState(null);
   const [pendingPreference, setPendingPreference] = useState(null);
+  const [preferenceSending, setPreferenceSending] = useState(false);
+  const [preferenceError, setPreferenceError] = useState('');
   const [pendingRecommendation, setPendingRecommendation] = useState(null);
   const [view, setView] = useState(null);
   const seenRef = useRef(loadSeen());
@@ -98,10 +105,7 @@ export function AutoTuningPromptOverlay() {
         return;
       }
       setPendingDose(current => {
-        if (
-          current?.shot_id === message.shot_id &&
-          Number(current.prompt_revision) >= revision
-        ) {
+        if (current?.shot_id === message.shot_id && Number(current.prompt_revision) >= revision) {
           return current;
         }
         return { ...message, prompt_revision: revision, dose_target_g: target };
@@ -139,10 +143,7 @@ export function AutoTuningPromptOverlay() {
       }
       const prompt = { ...message, prompt_revision: revision };
       setPendingPreference(current => {
-        if (
-          current?.shot_id === message.shot_id &&
-          Number(current.prompt_revision) >= revision
-        ) {
+        if (current?.shot_id === message.shot_id && Number(current.prompt_revision) >= revision) {
           return current;
         }
         return prompt;
@@ -153,6 +154,21 @@ export function AutoTuningPromptOverlay() {
       if (firstSeen) {
         setView('preference');
       }
+    });
+
+    const preferenceResolvedListener = apiService.on('evt:rl:preference-resolved', message => {
+      setPendingPreference(current => {
+        if (
+          current?.shot_id !== message.shot_id ||
+          current?.optimization_run_id !== message.optimization_run_id ||
+          current?.prompt_revision !== message.prompt_revision
+        )
+          return current;
+        setPreferenceSending(false);
+        setPreferenceError('');
+        setView(view => (view === 'preference' ? null : view));
+        return null;
+      });
     });
 
     const brewStartListener = apiService.on('evt:status', message => {
@@ -180,10 +196,20 @@ export function AutoTuningPromptOverlay() {
       apiService.off('evt:rl:dose-confirmation', doseConfirmationListener);
       apiService.off('evt:rl:dose-confirmation-resolved', doseResolvedListener);
       apiService.off('evt:rl:shot-complete', shotCompleteListener);
+      apiService.off('evt:rl:preference-resolved', preferenceResolvedListener);
       apiService.off('evt:status', brewStartListener);
       apiService.off('evt:rl:prompts-clear', clearListener);
     };
   }, [apiService, markSeen]);
+
+  useEffect(() => {
+    setPreferenceSending(false);
+    setPreferenceError('');
+  }, [
+    pendingPreference?.shot_id,
+    pendingPreference?.optimization_run_id,
+    pendingPreference?.prompt_revision,
+  ]);
 
   useEffect(() => {
     if (view !== 'preference') {
@@ -193,11 +219,22 @@ export function AutoTuningPromptOverlay() {
     return () => window.clearTimeout(timeout);
   }, [view]);
 
+  useEffect(() => {
+    if (!preferenceSending) return undefined;
+    const timeout = window.setTimeout(() => {
+      setPreferenceSending(false);
+      setPreferenceError('Answer not confirmed. Check the connection and try again.');
+    }, 5000);
+    return () => window.clearTimeout(timeout);
+  }, [preferenceSending]);
+
   const submitPreference = useCallback(
     label => {
-      if (!pendingPreference || !['new_better', 'anchor_better', 'tie'].includes(label)) {
+      if (!pendingPreference || preferenceSending || !PREFERENCE_ACTIONS.includes(label)) {
         return;
       }
+      setPreferenceSending(true);
+      setPreferenceError('');
       apiService.send({
         tp: 'req:rl:preference',
         install_id: pendingPreference.install_id,
@@ -208,10 +245,8 @@ export function AutoTuningPromptOverlay() {
         prompt_revision: pendingPreference.prompt_revision,
         label,
       });
-      setPendingPreference(null);
-      setView(null);
     },
-    [apiService, pendingPreference],
+    [apiService, pendingPreference, preferenceSending],
   );
 
   const submitDoseConfirmation = useCallback(
@@ -291,6 +326,7 @@ export function AutoTuningPromptOverlay() {
     );
   }
 
+  const anchor = preferenceAnchorDetails(pendingPreference);
   return (
     <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 pb-[calc(1rem_+_env(safe-area-inset-bottom))]'>
       <div
@@ -344,27 +380,49 @@ export function AutoTuningPromptOverlay() {
               <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
                 Shot comparison
               </div>
-              <h2 className='text-xl font-bold'>Which tasted better?</h2>
+              <h2 className='text-xl font-bold'>Which is closer to your goal?</h2>
+              <p className='text-sm'>Goal: {preferenceGoalSummary(pendingPreference)}</p>
               <p className='text-base-content/60 text-sm'>
-                Compare this shot with the{' '}
-                {pendingPreference.comparison_mode === 'best_incumbent'
-                  ? 'current best'
-                  : 'previous'}{' '}
-                shot.
+                Compare this shot with the reference below. Choose “Can't compare” if you did not
+                taste it or do not remember it.
               </p>
             </div>
+            <div className='bg-base-200 rounded p-3 text-sm'>
+              <strong>Reference shot</strong>
+              {anchor.available ? (
+                <div>
+                  <div>{anchor.date}</div>
+                  {anchor.profile && <div>{anchor.profile}</div>}
+                  <div>Grind: {anchor.grind}</div>
+                  <div>
+                    Dose: {formatDose(anchor.dose)} · Target: {formatYield(anchor.targetYield)}
+                  </div>
+                  <div>Actual output: {formatYield(anchor.actualYield)}</div>
+                </div>
+              ) : (
+                <div>Recipe details unavailable.</div>
+              )}
+              <div className='text-xs break-all'>ID: {anchor.id}</div>
+            </div>
+            {preferenceError && (
+              <p role='alert' className='text-error text-sm'>
+                {preferenceError}
+              </p>
+            )}
             <div className='grid grid-cols-1 gap-2'>
               <button
                 type='button'
                 className='btn btn-primary min-h-12'
                 onClick={() => submitPreference('new_better')}
+                disabled={preferenceSending}
               >
-                New shot is better
+                New shot is closer
               </button>
               <button
                 type='button'
                 className='btn btn-outline min-h-12'
                 onClick={() => submitPreference('tie')}
+                disabled={preferenceSending}
               >
                 No noticeable difference
               </button>
@@ -372,10 +430,17 @@ export function AutoTuningPromptOverlay() {
                 type='button'
                 className='btn btn-outline min-h-12'
                 onClick={() => submitPreference('anchor_better')}
+                disabled={preferenceSending}
               >
-                {pendingPreference.comparison_mode === 'best_incumbent'
-                  ? 'Current best is better'
-                  : 'Previous shot is better'}
+                Reference shot is closer
+              </button>
+              <button
+                type='button'
+                className='btn btn-ghost min-h-12'
+                onClick={() => submitPreference('abstain')}
+                disabled={preferenceSending}
+              >
+                Can't compare / don't remember
               </button>
             </div>
           </div>

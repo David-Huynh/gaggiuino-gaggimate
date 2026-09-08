@@ -8,10 +8,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 
 namespace {
 constexpr lv_coord_t CARD_MAX_W = 360;
-constexpr lv_coord_t PREFERENCE_CARD_H = 330;
+constexpr lv_coord_t PREFERENCE_CARD_H = 448;
 constexpr lv_coord_t RECOMMENDATION_CARD_H = 250;
 constexpr lv_coord_t DOSE_CONFIRMATION_CARD_H = 220;
 
@@ -273,6 +274,7 @@ bool AutoTuningPreferencePlugin::activatePreferencePrompt(Event const &event) {
     pendingPreferenceInstallId = installId;
     pendingPreferenceRunId = runId;
     pendingPreferenceAnchorShotId = anchorShotId;
+    pendingPreferenceAnchor = preference.anchor;
     pendingPreferenceComparisonMode = comparisonMode;
     pendingPreferenceTasteGoal = preference.tasteGoal;
     pendingPreferenceTasteGoalSummary = AutoTuning::tasteGoalSummary(preference.tasteGoal);
@@ -386,44 +388,58 @@ void AutoTuningPreferencePlugin::showDoseConfirmationOverlay() {
 void AutoTuningPreferencePlugin::showPreferenceOverlay() {
     clearOverlay(false);
     overlayMode = AutoTuningOverlayMode::PREFERENCE;
-    lv_obj_t *card = createOverlayCard(overlay, PREFERENCE_CARD_H);
-    const lv_coord_t cardWidth = overlayCardWidth();
-
-    lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text(title, "Which is closer to your goal?");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 14);
-
-    lv_obj_t *goal = lv_label_create(card);
-    String goalText = "Goal: " + pendingPreferenceTasteGoalSummary;
-    lv_label_set_text(goal, goalText.c_str());
-    lv_label_set_long_mode(goal, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(goal, cardWidth - 56);
-    lv_obj_set_style_text_align(goal, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(goal, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(goal, LV_ALIGN_TOP_MID, 0, 43);
-
-    lv_obj_t *subtitle = lv_label_create(card);
-    lv_label_set_text(subtitle, pendingPreferenceComparisonMode == "best_incumbent" ? "Compare with the current best"
-                                                                                    : "Compare with the previous shot");
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 70);
+    lv_obj_t *card = createOverlayCard(overlay, std::min<lv_coord_t>(PREFERENCE_CARD_H, LV_VER_RES - 32));
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_set_style_pad_row(card, 10, 0);
+    const auto addText = [card](const String &text) {
+        lv_obj_t *label = lv_label_create(card);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(label, text.c_str());
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    };
+    addText("Which is closer to your goal?");
+    addText("Goal: " + pendingPreferenceTasteGoalSummary);
+    String reference = "Reference: " + pendingPreferenceAnchorShotId;
+    if (pendingPreferenceAnchor) {
+        const auto &anchor = *pendingPreferenceAnchor;
+        const time_t epoch = static_cast<time_t>(anchor.timestamp);
+        struct tm utc{};
+        char date[40] = "Date unavailable";
+        if (anchor.timestamp > 0 && gmtime_r(&epoch, &utc)) strftime(date, sizeof(date), "%Y-%m-%d %H:%M UTC", &utc);
+        char recipe[120];
+        snprintf(recipe, sizeof(recipe), "\nGrind %.1f%s; dose %.1fg\nTarget %.1fg",
+                 anchor.absoluteStep.value_or(anchor.relativeGrindSteps), anchor.absoluteStep ? "" : " rel.",
+                 anchor.doseG, anchor.targetYieldG);
+        reference = String(date) + recipe;
+        if (anchor.beverageOutG) reference += " / actual " + String(*anchor.beverageOutG, 1) + "g";
+        if (!anchor.profileLabel.empty()) reference += "\n" + String(anchor.profileLabel.c_str());
+        reference += "\nID: " + pendingPreferenceAnchorShotId;
+    } else {
+        reference += "\nRecipe details unavailable";
+    }
+    addText(reference);
 
     const char *labels[] = {
-        "New shot is better",
+        "New shot is closer",
         "No noticeable difference",
-        pendingPreferenceComparisonMode == "best_incumbent" ? "Current best is better" : "Previous shot is better",
+        "Reference shot is closer",
+        "Can't compare / don't remember",
     };
-    const uint32_t colors[] = {0x2E7D32, 0x3E4A59, 0x7A3E24};
-    for (int index = 0; index < 3; index++) {
+    const uint32_t colors[] = {0x2E7D32, 0x3E4A59, 0x7A3E24, 0x333333};
+    for (int index = 0; index < 4; index++) {
         lv_obj_t *button = lv_btn_create(card);
-        lv_obj_set_size(button, cardWidth - 64, 48);
-        lv_obj_align(button, LV_ALIGN_TOP_MID, 0, 102 + index * 58);
+        lv_obj_set_size(button, LV_PCT(100), 48);
         lv_obj_set_style_radius(button, 7, 0);
         lv_obj_set_style_bg_color(button, lv_color_hex(colors[index]), 0);
         lv_obj_set_user_data(button, reinterpret_cast<void *>(static_cast<intptr_t>(index)));
         lv_obj_add_event_cb(button, preferenceButtonCallback, LV_EVENT_CLICKED, this);
         lv_obj_t *label = lv_label_create(button);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
         lv_label_set_text(label, labels[index]);
         lv_obj_center(label);
     }
@@ -512,10 +528,6 @@ void AutoTuningPreferencePlugin::selectPreference(const String &label) {
         pendingPreferencePromptRevision == 0) {
         return;
     }
-    if (label != "new_better" && label != "anchor_better" && label != "tie") {
-        return;
-    }
-
     const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
     const auto parsedMode = AutoTuning::comparisonModeFromKey(pendingPreferenceComparisonMode.c_str());
     if (!parsedLabel || !parsedMode) {
@@ -531,12 +543,11 @@ void AutoTuningPreferencePlugin::selectPreference(const String &label) {
     if (claim.getInt("claimed") != 1) {
         return;
     }
-    AutoTuning::PreferenceFeedback feedback;
+    AutoTuning::PreferenceFeedback feedback(*parsedLabel);
     feedback.installId = pendingPreferenceInstallId.c_str();
     feedback.optimizationRunId = pendingPreferenceRunId.c_str();
     feedback.newShotId = pendingShotId.c_str();
     feedback.anchorShotId = pendingPreferenceAnchorShotId.c_str();
-    feedback.label = *parsedLabel;
     feedback.comparisonMode = *parsedMode;
     feedback.tasteGoal = pendingPreferenceTasteGoal;
     feedback.recommendationId = pendingShotRecommendationId.c_str();
@@ -627,7 +638,8 @@ void preferenceButtonCallback(lv_event_t *event) {
     auto *plugin = static_cast<AutoTuningPreferencePlugin *>(lv_event_get_user_data(event));
     auto *button = static_cast<lv_obj_t *>(lv_event_get_target(event));
     const int selection = static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(button)));
-    plugin->selectPreference(selection == 0 ? "new_better" : (selection == 1 ? "tie" : "anchor_better"));
+    static constexpr const char *actions[] = {"new_better", "tie", "anchor_better", "abstain"};
+    if (selection >= 0 && selection < 4) plugin->selectPreference(actions[selection]);
 }
 
 void doseConfirmationButtonCallback(lv_event_t *event) {

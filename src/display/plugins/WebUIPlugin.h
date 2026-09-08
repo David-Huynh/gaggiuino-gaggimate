@@ -176,6 +176,7 @@ class WebUIPlugin : public Plugin {
     String _pendPreferenceInstallId = "";
     String _pendPreferenceRunId = "";
     String _pendPreferenceAnchorShotId = "";
+    std::optional<AutoTuning::PreferenceAnchorSummary> _pendPreferenceAnchor;
     String _pendPreferenceComparisonMode = "";
     AutoTuning::TasteGoal _pendPreferenceTasteGoal = AutoTuning::TasteGoal::balanced();
     String _pendPreferenceTasteGoalSummary = "Balanced";

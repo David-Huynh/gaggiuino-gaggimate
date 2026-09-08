@@ -251,34 +251,6 @@ void LocalAutoTuningStorePlugin::setup(Controller *ctrl, PluginManager *pm) {
     requestStatusRefresh();
 }
 
-static String deliveryAttemptId(const String &payloadHash, const std::uint32_t revision,
-                                const int attemptCount, const EpochSeconds timestamp) {
-    char value[88];
-    snprintf(value, sizeof(value), "a-%08x-%08x-%016llx-%.16s", revision,
-             static_cast<unsigned int>(std::max(attemptCount, 0)),
-             static_cast<unsigned long long>(std::max<EpochSeconds>(timestamp, 0)),
-             payloadHash.c_str());
-    return value;
-}
-
-static String legacyPayloadIdentity(const String &shotId, const std::uint32_t revision) {
-    std::uint64_t hash = 1469598103934665603ULL;
-    for (size_t index = 0; index < shotId.length(); ++index) {
-        hash ^= static_cast<std::uint8_t>(shotId.charAt(index));
-        hash *= 1099511628211ULL;
-    }
-    hash ^= revision;
-    hash *= 1099511628211ULL;
-    char chunk[17];
-    snprintf(chunk, sizeof(chunk), "%016llx", static_cast<unsigned long long>(hash));
-    String result;
-    result.reserve(64);
-    for (int index = 0; index < 4; ++index) {
-        result += chunk;
-    }
-    return result;
-}
-
 bool LocalAutoTuningStorePlugin::enqueueShot(AutoTuning::ShotRecord const &shot,
                                              AutoTuning::ShotCompletion const &completion,
                                              AutoTuning::ShotCaptureDisposition const &disposition) {
@@ -1081,17 +1053,9 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
                 ? root["local_attempt_count"].as<int>()
                 : (root["dispatch_count"] | 0);
         const int attemptCount = previousAttempts + 1;
-        const String payloadHash =
-            artifact.payloadHash.empty()
-                ? legacyPayloadIdentity(shotId, artifact.revision)
-                : String(artifact.payloadHash.c_str());
         attempt.shotId = artifact.record.shotId;
-        attempt.payloadHash = payloadHash.c_str();
-        attempt.artifactRevision = artifact.revision;
-        attempt.encodingVersion = 1;
+        attempt.recordRevision = artifact.revision;
         attempt.reprocess = reprocess;
-        attempt.attemptId =
-            deliveryAttemptId(payloadHash, artifact.revision, attemptCount, now).c_str();
         if (!attempt.valid()) {
             return false;
         }
@@ -1103,10 +1067,11 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
         root["local_last_attempt_at"] = now;
         root["local_next_retry_at"] = 0;
         root["local_last_error"] = nullptr;
-        root["active_attempt_id"] = attempt.attemptId.c_str();
-        root["active_payload_hash"] = attempt.payloadHash.c_str();
-        root["active_artifact_revision"] = attempt.artifactRevision;
-        root["active_encoding_version"] = attempt.encodingVersion;
+        root["active_record_revision"] = attempt.recordRevision;
+        root.remove("active_attempt_id");
+        root.remove("active_payload_hash");
+        root.remove("active_artifact_revision");
+        root.remove("active_encoding_version");
         root["local_delivery_state"] =
             localDeliveryRequired ? "pending" : "not_required";
         if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), envelope)) {
@@ -1140,9 +1105,8 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
             return false;
         }
         JsonObject root = latest.as<JsonObject>();
-        if (jsonStringOrEmpty(root["active_attempt_id"]) != attempt.attemptId.c_str() ||
-            jsonStringOrEmpty(root["active_payload_hash"]) != attempt.payloadHash.c_str() ||
-            (root["active_artifact_revision"] | 0U) != attempt.artifactRevision) {
+        if ((root["active_record_revision"] | 0U) != attempt.recordRevision ||
+            (root["artifact_revision"] | (root["payload_revision"] | 1U)) != attempt.recordRevision) {
             return false;
         }
         const int attemptCount = root["local_attempt_count"] | 1;
@@ -1338,19 +1302,14 @@ void LocalAutoTuningStorePlugin::handleShotDeliveryAck(Event const &event) {
     work.outcome = acknowledgement->outcome.c_str();
     work.reason = acknowledgement->reason.c_str();
     work.timestamp = acknowledgement->timestamp;
-    work.attemptId = acknowledgement->attemptId.c_str();
-    work.payloadHash = acknowledgement->payloadHash.c_str();
-    work.artifactRevision = acknowledgement->artifactRevision;
-    work.encodingVersion = acknowledgement->encodingVersion;
+    work.recordRevision = acknowledgement->recordRevision;
     work.preferenceRequest = acknowledgement->preferenceRequest;
     enqueueWork(std::move(work));
 }
 
 void LocalAutoTuningStorePlugin::processShotDeliveryAck(const String &shotId, const String &outcome, const String &reason,
                                                         const std::int64_t acknowledgementTimestamp,
-                                                        const String &attemptId, const String &payloadHash,
-                                                        const std::uint32_t artifactRevision,
-                                                        const std::uint16_t encodingVersion,
+                                                        const std::uint32_t recordRevision,
                                                          std::optional<AutoTuning::PreferenceRequest> const &preferenceRequest) {
     LocalStoreLock lock(storeMutex);
     JsonDocument envelope(&psramAllocator);
@@ -1359,13 +1318,10 @@ void LocalAutoTuningStorePlugin::processShotDeliveryAck(const String &shotId, co
     }
     JsonObject root = envelope.as<JsonObject>();
     const AutoTuning::DeliveryState currentDelivery = deliveryState(root);
-    const String expectedHash = jsonStringOrEmpty(root["active_payload_hash"]);
-    const std::uint32_t expectedRevision = root["active_artifact_revision"] | 0U;
-    const std::uint16_t expectedEncoding =
-        static_cast<std::uint16_t>(root["active_encoding_version"] | 0U);
+    const std::uint32_t currentRevision = root["artifact_revision"] | (root["payload_revision"] | 1U);
+    const std::uint32_t submittedRevision = root["active_record_revision"] | 0U;
     if (currentDelivery.terminal() || acknowledgementTimestamp < EpochTime::MIN_VALID ||
-        attemptId.isEmpty() || payloadHash != expectedHash ||
-        artifactRevision != expectedRevision || encodingVersion != expectedEncoding) {
+        recordRevision == 0 || recordRevision != currentRevision || recordRevision != submittedRevision) {
         return;
     }
     const EpochSeconds now = nowEpoch();
@@ -1718,8 +1674,7 @@ bool LocalAutoTuningStorePlugin::processOneWorkItem() {
         break;
     case WorkKind::DeliveryAcknowledgement:
         processShotDeliveryAck(work.shotId, work.outcome, work.reason, work.timestamp,
-                               work.attemptId, work.payloadHash, work.artifactRevision,
-                               work.encodingVersion, work.preferenceRequest);
+                               work.recordRevision, work.preferenceRequest);
         break;
     case WorkKind::DeliverySweep:
         processDueDelivery();

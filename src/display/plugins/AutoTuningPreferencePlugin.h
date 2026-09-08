@@ -49,6 +49,7 @@ class AutoTuningPreferencePlugin : public Plugin {
     String pendingPreferenceInstallId;
     String pendingPreferenceRunId;
     String pendingPreferenceAnchorShotId;
+    std::optional<AutoTuning::PreferenceAnchorSummary> pendingPreferenceAnchor;
     String pendingPreferenceComparisonMode;
     AutoTuning::TasteGoal pendingPreferenceTasteGoal = AutoTuning::TasteGoal::balanced();
     String pendingPreferenceTasteGoalSummary = "Balanced";

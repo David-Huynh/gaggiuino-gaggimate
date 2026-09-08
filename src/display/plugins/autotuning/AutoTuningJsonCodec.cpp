@@ -185,6 +185,72 @@ void DecodedShotRecord::bindSamples() {
     record.samples = AutoTuning::ArrayView<const AutoTuning::ShotSample>(samples.data(), samples.size());
 }
 
+bool writeShotDelivery(AutoTuning::ShotDeliveryAttempt const &attempt, JsonObject output) {
+    if (!attempt.valid()) return false;
+    output["record_revision"] = attempt.recordRevision;
+    output["reprocess"] = attempt.reprocess;
+    return true;
+}
+
+bool parseShotAcknowledgement(JsonVariantConst source, AutoTuning::ShotDeliveryAcknowledgement &ack, String &error) {
+    JsonObjectConst input = source.as<JsonObjectConst>();
+    const bool hasPreference = input.containsKey("preference_request");
+    if (input.isNull() || input.size() != (hasPreference ? 10U : 9U) ||
+        input["event_type"] != "shot_delivery_ack" || !input["schema_version"].is<int>() ||
+        input["schema_version"].as<int>() != 3 || !input["record_revision"].is<unsigned int>() ||
+        input["record_revision"].is<bool>() || input["record_revision"].as<unsigned int>() == 0 ||
+        !input["shot_id"].is<const char *>() || !input["machine_id"].is<const char *>() ||
+        !input["outcome"].is<const char *>() || !input["reason"].is<const char *>() ||
+        !input["timestamp"].is<std::int64_t>() || input["timestamp"].is<bool>() ||
+        !input["retryable"].is<bool>()) {
+        error = "Shot receipt fields are invalid";
+        return false;
+    }
+    AutoTuning::ShotDeliveryAcknowledgement parsed;
+    parsed.shotId = text(input["shot_id"]);
+    parsed.machineId = text(input["machine_id"]);
+    parsed.recordRevision = input["record_revision"].as<unsigned int>();
+    parsed.outcome = text(input["outcome"]);
+    parsed.reason = text(input["reason"]);
+    parsed.timestamp = input["timestamp"].as<std::int64_t>();
+    const bool accepted = parsed.outcome == "accepted" || parsed.outcome == "already_processed";
+    const bool transient = parsed.outcome == "transient_failure";
+    const bool validReason = parsed.reason == "stored" || parsed.reason == "already_processed" ||
+        parsed.reason == "invalid_shot" || parsed.reason == "ingest_unavailable" ||
+        parsed.reason == "local_optimization_disabled" || parsed.reason == "not_optimizable";
+    if (parsed.shotId.empty() || parsed.shotId.size() > 256 || parsed.machineId.empty() ||
+        parsed.machineId.size() > 160 || parsed.timestamp < 0 || !validReason ||
+        (!accepted && !transient && parsed.outcome != "permanent_rejection") ||
+        input["retryable"].as<bool>() != transient) {
+        error = "Shot receipt values are invalid";
+        return false;
+    }
+    if (hasPreference) {
+        AutoTuning::PreferenceRequest preference;
+        if (!accepted || !parsePreferenceRequest(input["preference_request"], preference, error) ||
+            preference.newShotId != parsed.shotId) {
+            error = "Shot receipt comparison is invalid";
+            return false;
+        }
+        parsed.preferenceRequest = std::move(preference);
+    }
+    ack = std::move(parsed);
+    return true;
+}
+
+void writePreferenceAnchor(AutoTuning::PreferenceAnchorSummary const &summary, JsonObject anchor) {
+    anchor["timestamp"] = summary.timestamp;
+    anchor["relative_grind_steps_from_reference"] = summary.relativeGrindSteps;
+    anchor["dose_g"] = summary.doseG;
+    anchor["target_yield_g"] = summary.targetYieldG;
+    if (summary.beverageOutG) anchor["beverage_out_g"] = *summary.beverageOutG;
+    else anchor["beverage_out_g"] = nullptr;
+    if (summary.absoluteStep) anchor["current_absolute_step"] = *summary.absoluteStep;
+    else anchor["current_absolute_step"] = nullptr;
+    if (!summary.profileLabel.empty()) anchor["profile_label"] = summary.profileLabel.c_str();
+    else anchor["profile_label"] = nullptr;
+}
+
 bool writePreferenceRequest(AutoTuning::PreferenceRequest const &request, JsonObject output) {
     if (!request.valid()) {
         return false;
@@ -200,6 +266,9 @@ bool writePreferenceRequest(AutoTuning::PreferenceRequest const &request, JsonOb
     output["anchor_shot_id"] = request.anchorShotId.c_str();
     output["comparison_mode"] = AutoTuning::comparisonModeKey(request.comparisonMode);
     AutoTuning::writeTasteGoal(request.tasteGoal, output["taste_goal"].to<JsonObject>());
+    if (request.anchor) {
+        writePreferenceAnchor(*request.anchor, output["anchor"].to<JsonObject>());
+    }
     return true;
 }
 
@@ -209,7 +278,8 @@ bool parsePreferenceRequest(JsonVariantConst source, AutoTuning::PreferenceReque
         return false;
     }
     JsonObjectConst input = source.as<JsonObjectConst>();
-    if (input.size() != 7 || (!input["recommendation_id"].isNull() && !input["recommendation_id"].is<const char *>()) ||
+    const bool hasAnchor = input.containsKey("anchor");
+    if (input.size() != (hasAnchor ? 8U : 7U) || (!input["recommendation_id"].isNull() && !input["recommendation_id"].is<const char *>()) ||
         !input["install_id"].is<const char *>() || !input["optimization_run_id"].is<const char *>() ||
         !input["new_shot_id"].is<const char *>() || !input["anchor_shot_id"].is<const char *>() ||
         !input["comparison_mode"].is<const char *>() || !input["taste_goal"].is<JsonObjectConst>()) {
@@ -235,6 +305,36 @@ bool parsePreferenceRequest(JsonVariantConst source, AutoTuning::PreferenceReque
         return false;
     }
     parsed.comparisonMode = *comparisonMode;
+    if (hasAnchor) {
+        JsonObjectConst anchor = input["anchor"].as<JsonObjectConst>();
+        const auto number = [](JsonVariantConst value) {
+            return !value.is<bool>() && (value.is<double>() || value.is<std::int64_t>());
+        };
+        if (anchor.isNull() || anchor.size() != 7 || !anchor.containsKey("beverage_out_g") ||
+            !anchor.containsKey("current_absolute_step") || !anchor.containsKey("profile_label") ||
+            !anchor["timestamp"].is<std::int64_t>() ||
+            anchor["timestamp"].is<bool>() || !number(anchor["relative_grind_steps_from_reference"]) ||
+            !number(anchor["dose_g"]) || !number(anchor["target_yield_g"]) ||
+            (!anchor["beverage_out_g"].isNull() && !number(anchor["beverage_out_g"])) ||
+            (!anchor["current_absolute_step"].isNull() && !number(anchor["current_absolute_step"])) ||
+            (!anchor["profile_label"].isNull() && !anchor["profile_label"].is<const char *>())) {
+            error = "Preference anchor fields are invalid";
+            return false;
+        }
+        AutoTuning::PreferenceAnchorSummary summary;
+        summary.timestamp = anchor["timestamp"].as<std::int64_t>();
+        summary.relativeGrindSteps = anchor["relative_grind_steps_from_reference"].as<float>();
+        summary.doseG = anchor["dose_g"].as<float>();
+        summary.targetYieldG = anchor["target_yield_g"].as<float>();
+        if (!anchor["beverage_out_g"].isNull()) summary.beverageOutG = anchor["beverage_out_g"].as<float>();
+        if (!anchor["current_absolute_step"].isNull()) summary.absoluteStep = anchor["current_absolute_step"].as<float>();
+        summary.profileLabel = text(anchor["profile_label"]);
+        if (!summary.valid()) {
+            error = "Preference anchor values are invalid";
+            return false;
+        }
+        parsed.anchor = std::move(summary);
+    }
     if (!AutoTuning::parseTasteGoal(input["taste_goal"], parsed.tasteGoal, error)) {
         return false;
     }
