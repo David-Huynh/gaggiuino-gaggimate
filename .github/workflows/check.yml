@@ -71,5 +71,9 @@ jobs:
         run: platformio run -e display-headless-uart
       - name: Build UART ESP32 N16R8 display
         run: platformio run -e display-headless-uart-n16r8
+      - name: Test saved-shot recovery with firmware codecs
+        run: python scripts/test_artifact_recovery.py
+      - name: Check ESP32 saved-shot decoder stack budgets
+        run: python scripts/test_artifact_stack.py
       - name: Build UART STM32 controller
         run: platformio run -e stm32f4

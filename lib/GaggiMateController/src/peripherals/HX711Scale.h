@@ -81,7 +81,7 @@ class HX711Scale {
     // Runtime gain change (32, 64, 128). Triggers a soft-reset of the filter.
     void setGain(uint8_t gain);
 
-    // Async 20-reading tare. requestTare() returns immediately; tare progress
+    // Async 10-reading tare. requestTare() returns immediately; tare progress
     // and completion arrive via callbacks.
     void requestTare(uint32_t requestId = 0);
 
@@ -171,9 +171,10 @@ class HX711Scale {
     // ----- per-rate sample-window constants (filled at setup) -----
     uint16_t _calWarmupSamples = 6;
     uint16_t _calTargetSamples = 32;
-    static constexpr uint16_t TARE_TARGET_SAMPLES = 20;
+    static constexpr uint16_t TARE_TARGET_SAMPLES = 10;
     static constexpr float TARE_STDDEV_THRESHOLD_G = 0.05f;
-    static constexpr uint32_t TARE_TIMEOUT_MS = 3000;
+    // Failure deadline only: finish as soon as ten valid paired reads arrive.
+    static constexpr uint32_t TARE_TIMEOUT_MS = 6000;
     static constexpr uint32_t CAL_TIMEOUT_MS = 5000;
     static constexpr float CAL_STDDEV_THRESHOLD_G = 0.5f;
     static constexpr float CAL_FACTOR_MIN = 100.0f;

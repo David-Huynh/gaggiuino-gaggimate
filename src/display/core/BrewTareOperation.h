@@ -8,7 +8,18 @@
 class BrewTareOperation {
   public:
     enum class Outcome { IDLE, WAITING, SUCCEEDED, FAILED, TIMED_OUT };
-    static constexpr uint32_t TIMEOUT_MS = 4000;
+    // Allow the scale's six-second deadline plus UART/result scheduling time.
+    static constexpr uint32_t TIMEOUT_MS = 7000;
+    struct Snapshot {
+        uint32_t requestId;
+        uint32_t startedAt;
+        Outcome state;
+    };
+
+    Snapshot snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return {requestId, startedAt, state};
+    }
 
     uint32_t begin(uint32_t now) {
         std::lock_guard<std::mutex> lock(mutex);

@@ -1547,6 +1547,38 @@ void WebUIPlugin::setupServer() {
         doc["mode"] = controller->getMode();
         doc["tt"] = controller->getTargetTemp();
         doc["ct"] = controller->getCurrentTemp();
+        // Read-only hang/tare diagnostics. No filesystem access or process lock:
+        // this remains useful while another task is waiting for shot storage.
+        doc["uptime_ms"] = millis();
+        doc["ready"] = controller->isReady();
+        doc["controller_connected"] = controller->getClientController()->isConnected();
+        doc["brew_start_error"] = controller->getBrewStartError();
+        doc["brew_start_pending"] = controller->isBrewStartPending();
+        auto &storage = StorageCoordinator::instance();
+        doc["process_lease"] = storage.processActive();
+        doc["process_waiting_for_flash"] = storage.processPending();
+        doc["flash_lease"] = storage.flashActive();
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        const auto tare = controller->getTareDiagnostics();
+        JsonObject t = doc["tare"].to<JsonObject>();
+        t["request_id"] = tare.operation.requestId;
+        t["started_at_ms"] = tare.operation.startedAt;
+        t["state"] = static_cast<unsigned>(tare.operation.state);
+        t["result_id"] = tare.result.requestId;
+        t["result_at_ms"] = tare.receivedAt;
+        t["result_accepted"] = tare.accepted;
+        t["result_success"] = tare.result.success;
+        t["result_valid"] = tare.result.validSuccess();
+        t["result_health"] = tare.result.healthBits;
+        t["stddev1"] = tare.result.stddev1;
+        t["stddev2"] = tare.result.stddev2;
+        const auto sample = controller->getScaleSample();
+        t["sample_health"] = sample.healthBits;
+        t["sample_seq"] = sample.sampleSeq;
+        t["weight_g"] = sample.weightG;
+        t["calibration1"] = controller->getSettings().getScaleCalibration1();
+        t["calibration2"] = controller->getSettings().getScaleCalibration2();
+#endif
         serializeJson(doc, *response);
         request->send(response);
     });

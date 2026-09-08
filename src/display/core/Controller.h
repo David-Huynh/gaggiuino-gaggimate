@@ -93,6 +93,18 @@ class Controller {
     bool isAutotuning() const;
     bool isReady() const;
     const char *getBrewStartError() const { return brewStartError.load(); }
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    struct TareDiagnostics {
+        BrewTareOperation::Snapshot operation;
+        ScaleTareResult result;
+        uint32_t receivedAt;
+        bool accepted;
+    };
+    TareDiagnostics getTareDiagnostics() const {
+        std::lock_guard<std::mutex> lock(tareDiagnosticsMutex);
+        return {brewTare.snapshot(), lastTareResult, lastTareResultAt, lastTareResultAccepted};
+    }
+#endif
     bool isVolumetricAvailable() const;
     bool isSDCard() const { return sdcard; }
     virtual float getTargetPressure() const { return targetPressure; }
@@ -329,6 +341,10 @@ class Controller {
     static constexpr float HARDWARE_SCALE_MAX_ABS_G = 5000.0f;
     static constexpr float HARDWARE_SCALE_MAX_STDDEV_G = 5.0f;
     BrewTareOperation brewTare;
+    mutable std::mutex tareDiagnosticsMutex;
+    ScaleTareResult lastTareResult{};
+    uint32_t lastTareResultAt = 0;
+    bool lastTareResultAccepted = false;
 #endif
 
     unsigned long grindActiveUntil = 0;

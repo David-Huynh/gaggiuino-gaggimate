@@ -13,6 +13,8 @@
 
 unsigned long clockMs = 100;
 bool driverReady = true, driverSaturated = false;
+bool driverReadValid = true;
+long driverRaw1 = 1000, driverRaw2 = 2000;
 void HX711Dual::begin(uint8_t, uint8_t, uint8_t, uint8_t, uint32_t) {}
 void HX711Dual::power_up() {}
 void HX711Dual::power_down() {}
@@ -24,8 +26,8 @@ bool HX711Dual::wait_ready_timeout(unsigned long timeout, unsigned long) {
 }
 uint16_t HX711Dual::detect_rate() { return 10; }
 HxResult HX711Dual::try_read(long raw[2], bool valid[2], bool sat[2]) {
-    raw[0] = 1000; raw[1] = 2000;
-    valid[0] = valid[1] = true;
+    raw[0] = driverRaw1; raw[1] = driverRaw2;
+    valid[0] = valid[1] = driverReadValid;
     sat[0] = sat[1] = driverSaturated;
     return HxResult::OK;
 }
@@ -147,31 +149,35 @@ struct Controller {
 #include "controller_methods.inc"
 
 static void testOperation() {
+    static_assert(BrewTareOperation::TIMEOUT_MS == 7000);
     BrewTareOperation op;
     const auto a = op.begin(100);
+    assert(op.snapshot().requestId == a && op.snapshot().startedAt == 100);
+    assert(op.snapshot().state == BrewTareOperation::Outcome::WAITING);
     assert(a && !op.begin(101));
     assert(!op.complete(0, true, 102) && !op.complete(a + 1, true, 102));
-    assert(op.outcome(4099) == BrewTareOperation::Outcome::WAITING);
-    assert(op.outcome(4100) == BrewTareOperation::Outcome::TIMED_OUT);
-    assert(!op.complete(a, true, 4101));
+    assert(op.outcome(7099) == BrewTareOperation::Outcome::WAITING);
+    assert(op.outcome(7100) == BrewTareOperation::Outcome::TIMED_OUT);
+    assert(!op.complete(a, true, 7101));
     op.cancel();
-    const auto b = op.begin(5000);
-    assert(a != b && !op.complete(a, true, 5001));
-    assert(op.complete(b, true, 5001));
-    assert(!op.complete(b, false, 5002));
-    assert(op.outcome(5002) == BrewTareOperation::Outcome::SUCCEEDED);
+    const auto b = op.begin(8000);
+    assert(a != b && !op.complete(a, true, 14000));
+    assert(op.complete(b, true, 14999)); // Accept a delayed result before seven seconds.
+    assert(!op.complete(b, false, 14999));
+    assert(op.outcome(14999) == BrewTareOperation::Outcome::SUCCEEDED);
     op.cancel();
     op.seed(UINT32_MAX);
     const auto wrapped = op.begin(UINT32_MAX - 100);
     assert(wrapped == 1);
-    assert(op.outcome(3899) == BrewTareOperation::Outcome::TIMED_OUT);
+    assert(op.outcome(6898) == BrewTareOperation::Outcome::WAITING);
+    assert(op.outcome(6899) == BrewTareOperation::Outcome::TIMED_OUT);
     op.cancel();
     const auto c = op.begin(10);
     op.cancel();
     assert(!op.complete(c, true, 11));
     const auto d = op.begin(20);
-    assert(op.complete(d, true, 4020));
-    assert(op.outcome(4020) == BrewTareOperation::Outcome::TIMED_OUT);
+    assert(op.complete(d, true, 7020));
+    assert(op.outcome(7020) == BrewTareOperation::Outcome::TIMED_OUT);
     puts("PASS operation: correlation, duplicate/late replies, cancellation, deadlines, counter/clock wrap");
 }
 
@@ -189,6 +195,8 @@ static void testResultValidation() {
 }
 
 static void testDriver() {
+    static_assert(HX711Scale::TARE_TIMEOUT_MS == 6000);
+    static_assert(BrewTareOperation::TIMEOUT_MS > HX711Scale::TARE_TIMEOUT_MS);
     std::vector<ScaleTareResult> results;
     HX711Scale scale(1, 2, 3, [](const ScaleSnapshot &) {}, 100, 100);
     scale.setTareDoneCallback([&](const ScaleTareResult &r) { results.push_back(r); });
@@ -198,32 +206,59 @@ static void testDriver() {
     scale.requestTare(11);
     assert(results.size() == 1 && results.back().requestId == 11 && !results.back().success);
     driverReady = false;
-    for (int i = 0; i < 21; ++i) scale.loop();
+    for (int i = 0; i < 39; ++i) scale.loop();
+    assert(results.size() == 1); // 5850 ms without a ready ADC is still pending.
+    scale.loop(); // Exactly six seconds: explicit failure, never stuck busy.
     assert(results.size() == 2 && results.back().requestId == 10 && !results.back().success);
     assert(!(scale.snapshot().healthBits & SCALE_HEALTH_TARING));
     driverReady = true;
+    const auto normalStart = clockMs;
     scale.requestTare(12);
-    for (int i = 0; i < 20; ++i) { clockMs += 100; scale.loop(); }
+    for (int i = 0; i < 9; ++i) {
+        driverRaw1 = 1000 + i * 2; driverRaw2 = -2000 - i * 4;
+        clockMs += 100; scale.loop();
+    }
+    assert(results.size() == 2); // Nine fresh pairs cannot authorize a shot.
+    driverRaw1 = 1018; driverRaw2 = -2036;
+    clockMs += 100; scale.loop();
     assert(results.size() == 3 && results.back().requestId == 12 && results.back().validSuccess());
+    assert(clockMs - normalStart == 1000);
+    assert(results.back().offset1 == 1009 && results.back().offset2 == -2018);
+    driverRaw1 = 1000; driverRaw2 = 2000;
     scale.requestTare(); // manual tare remains supported
-    for (int i = 0; i < 20; ++i) { clockMs += 100; scale.loop(); }
+    for (int i = 0; i < 9; ++i) { clockMs += 100; scale.loop(); }
+    assert(results.size() == 3);
+    clockMs += 100; scale.loop();
     assert(results.back().requestId == 0 && results.back().validSuccess());
+    assert(results.back().offset1 == 1000 && results.back().offset2 == 2000);
     driverSaturated = true;
     scale.requestTare(13);
-    for (int i = 0; i < 31; ++i) { clockMs += 100; scale.loop(); }
+    for (int i = 0; i < 60; ++i) { clockMs += 100; scale.loop(); }
     assert(results.back().requestId == 13 && !results.back().success);
     driverSaturated = false;
     scale.requestTare(14); // Deadline also applies before the first successful read.
     driverReady = false;
-    for (int i = 0; i < 21; ++i) scale.loop();
+    for (int i = 0; i < 40; ++i) scale.loop();
     assert(results.back().requestId == 14 && !results.back().success);
     driverReady = true;
     scale.requestTare(15);
-    for (int i = 0; i < 19; ++i) { clockMs += 100; scale.loop(); }
-    clockMs += 1100; // The twentieth read exactly at the deadline must not succeed.
+    for (int i = 0; i < 9; ++i) { clockMs += 100; scale.loop(); }
+    clockMs += 5100; // The tenth read exactly at the deadline must not succeed.
     scale.loop();
     assert(results.back().requestId == 15 && !results.back().success);
-    puts("PASS actual HX711 driver: progress, busy, no-read timeout, recovery, manual tare, saturation");
+    // Delayed valid conversions must not force a manual tare or second attempt:
+    // 4.5 s of invalid reads plus ten good pairs finishes before six seconds.
+    scale.requestTare(16);
+    driverReadValid = false;
+    const auto beforeSettling = results.size();
+    for (int i = 0; i < 45; ++i) { clockMs += 100; scale.loop(); }
+    assert(results.size() == beforeSettling);
+    driverReadValid = true;
+    for (int i = 0; i < 9; ++i) { clockMs += 100; scale.loop(); }
+    assert(results.size() == beforeSettling); // Invalid conversions were not counted.
+    clockMs += 100; scale.loop();
+    assert(results.back().requestId == 16 && results.back().validSuccess());
+    puts("PASS actual HX711 driver: ten-pair mean, one-second tare, six-second timeout, delayed reads and recovery");
 }
 
 static void testController() {

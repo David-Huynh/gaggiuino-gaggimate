@@ -502,9 +502,18 @@ void Controller::setupBluetooth() {
     });
     comms.onScaleOffsets([this](const ScaleTareResult &result) {
         const bool success = result.validSuccess();
+        const uint32_t receivedAt = millis();
+        const bool accepted = result.requestId == 0 ||
+                              (isReady() && brewTare.complete(result.requestId,
+                                  success && !(result.healthBits & SCALE_HEALTH_NOT_CALIBRATED), receivedAt));
+        {
+            std::lock_guard<std::mutex> lock(tareDiagnosticsMutex);
+            lastTareResult = result;
+            lastTareResultAt = receivedAt;
+            lastTareResultAccepted = accepted;
+        }
         if (result.requestId != 0) {
-            if (!isReady() || !brewTare.complete(result.requestId,
-                                               success && !(result.healthBits & SCALE_HEALTH_NOT_CALIBRATED), millis()))
+            if (!accepted)
                 return;
             if (logicTaskHandle != nullptr)
                 xTaskNotifyGive(logicTaskHandle);

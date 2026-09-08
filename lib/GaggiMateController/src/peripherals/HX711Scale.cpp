@@ -367,9 +367,8 @@ void HX711Scale::advanceTareSm(long raw[2], bool valid[2], bool sat[2]) {
         return;
     }
 
-    // WeighMyBru2 uses the arithmetic mean of 20 readings. Keep the same
-    // behavior independently for both tray halves, while rejecting clipped or
-    // incomplete synchronized reads.
+    // Match WeighMyBru2's remote tare: average ten fresh readings independently
+    // for both tray halves, rejecting clipped or incomplete synchronized reads.
     if (valid[0] && valid[1] && !sat[0] && !sat[1] && _tareCollected < TARE_RING_MAX) {
         _tareBuf1[_tareCollected] = raw[0];
         _tareBuf2[_tareCollected] = raw[1];
