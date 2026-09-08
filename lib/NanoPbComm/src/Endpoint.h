@@ -83,8 +83,8 @@ class Endpoint {
     // previously registered handler for that tag.
     void on(pb_size_t which, Handler handler);
 
-    // Invoked (with the mutex released) whenever the link connects/disconnects,
-    // after internal state has been reset. Used to push connect-time messages.
+    // Invoked on the dispatch task, serialized with payload callbacks, after
+    // link state has been reset. Used to push connect-time messages.
     void onConnection(ConnectionHandler handler) { _connHandler = std::move(handler); }
 
     bool isConnected() const { return _transport.isConnected(); }
@@ -141,8 +141,14 @@ class Endpoint {
 
     ConnectionHandler _connHandler = nullptr;
 
-    // Inbound payloads decoded on the transport thread, drained by the dispatch
-    // task so handlers never run on the BLE host task.
+    // Serialize session changes with payload callbacks (upstream #873). A slow
+    // result from the previous session must finish before readiness is reset.
+    struct DispatchEvent {
+        bool isConnection = false;
+        bool connected = false;
+        gm::Payload payload{};
+    };
+    // Inbound events are drained off the transport task.
     QueueHandle_t _rxQueue = nullptr;
     TaskHandle_t _dispatchTask = nullptr;
 

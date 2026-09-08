@@ -35,6 +35,7 @@ export function ActionCard({
   beanContextName,
   hasBeanContext,
   toggleLocalOptimization,
+  brewStartError,
 }) {
   const [preheated, setPreheated] = useState(false);
   const showPrimary = mode === 1 || mode === 3 || mode === 4;
@@ -75,6 +76,11 @@ export function ActionCard({
             hasContext={hasBeanContext}
             onToggle={toggleLocalOptimization}
           />
+        </div>
+      )}
+      {brewStartError && (
+        <div role='alert' className='text-error col-span-full mb-2 text-center text-xs'>
+          {brewStartError}
         </div>
       )}
       {isGrinding && (
@@ -146,4 +152,5 @@ ActionCard.propTypes = {
   beanContextName: PropTypes.string,
   hasBeanContext: PropTypes.bool.isRequired,
   toggleLocalOptimization: PropTypes.func.isRequired,
+  brewStartError: PropTypes.string,
 };

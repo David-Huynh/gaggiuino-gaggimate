@@ -2,6 +2,26 @@
 
 #include <cassert>
 #include <utility>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
+
+StorageCoordinator::FlashOwner StorageCoordinator::currentFlashOwner() {
+#if defined(ARDUINO_ARCH_ESP32)
+    // Settings acquires flash during global construction, before the scheduler
+    // starts. Later callers include native Arduino/FreeRTOS tasks, which also
+    // lack a pthread identity. pthread_self()/std::this_thread::get_id() assert
+    // on both paths in ESP-IDF. Global constructors run serially on CPU0.
+    if (xTaskGetSchedulerState() == taskSCHEDULER_NOT_STARTED)
+        return nullptr;
+    const TaskHandle_t task = xTaskGetCurrentTaskHandle();
+    assert(task != nullptr);
+    return task;
+#else
+    return std::this_thread::get_id();
+#endif
+}
 
 StorageCoordinator::ProcessLease::ProcessLease(ProcessLease &&other) noexcept
     : owner(std::exchange(other.owner, nullptr)) {}
@@ -73,7 +93,7 @@ StorageCoordinator::ProcessLease StorageCoordinator::acquireProcess() {
 
 StorageCoordinator::FlashLease StorageCoordinator::acquireFlash() {
     std::unique_lock<std::mutex> lock(mutex);
-    const std::thread::id caller = std::this_thread::get_id();
+    const FlashOwner caller = currentFlashOwner();
     if (flashOwned && flashOwner == caller) {
         ++flashDepth;
         return FlashLease(this);
@@ -87,7 +107,7 @@ StorageCoordinator::FlashLease StorageCoordinator::acquireFlash() {
 
 StorageCoordinator::FlashLease StorageCoordinator::tryAcquireFlash() {
     std::lock_guard<std::mutex> lock(mutex);
-    const std::thread::id caller = std::this_thread::get_id();
+    const FlashOwner caller = currentFlashOwner();
     if (flashOwned && flashOwner == caller) {
         ++flashDepth;
         return FlashLease(this);
@@ -123,7 +143,7 @@ bool StorageCoordinator::flashActive() const {
 
 bool StorageCoordinator::currentThreadOwnsFlash() const {
     std::lock_guard<std::mutex> lock(mutex);
-    return flashOwned && flashOwner == std::this_thread::get_id();
+    return flashOwned && flashOwner == currentFlashOwner();
 }
 
 void StorageCoordinator::assertFlashLease() const { assert(currentThreadOwnsFlash()); }
@@ -140,12 +160,12 @@ void StorageCoordinator::releaseProcess() {
 void StorageCoordinator::releaseFlash() {
     {
         std::lock_guard<std::mutex> lock(mutex);
-        assert(flashOwned && flashOwner == std::this_thread::get_id() && flashDepth > 0);
+        assert(flashOwned && flashOwner == currentFlashOwner() && flashDepth > 0);
         if (--flashDepth > 0) {
             return;
         }
         flashOwned = false;
-        flashOwner = std::thread::id{};
+        flashOwner = FlashOwner{};
     }
     changed.notify_all();
 }

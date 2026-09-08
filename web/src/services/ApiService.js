@@ -177,6 +177,7 @@ export default class ApiService {
       targetFlow: message.tf || 0,
       mode: message.m,
       brewStartPending: !!message.bsp,
+      brewStartError: message.bse || '',
       selectedProfile: message.p,
       selectedProfileId: message.puid,
       brewTarget: !!message.bt,

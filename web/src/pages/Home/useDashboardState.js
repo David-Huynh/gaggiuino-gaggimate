@@ -2,6 +2,7 @@ import { computed } from '@preact/signals';
 import { useContext, useEffect, useState } from 'preact/hooks';
 import { useQuery } from 'preact-fetching';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
+import { brewStartErrorMessage } from '../../utils/brewStartError.js';
 
 const status = computed(() => machine.value.status);
 const capabilities = computed(() => machine.value.capabilities);
@@ -10,6 +11,7 @@ export function useDashboardState() {
   const apiService = useContext(ApiServiceContext);
   const [isFlushing, setIsFlushing] = useState(false);
   const [localOptimizationEnabled, setLocalOptimizationEnabled] = useState(true);
+  const [sendError, setSendError] = useState('');
 
   const s = status.value;
   const caps = capabilities.value;
@@ -56,7 +58,14 @@ export function useDashboardState() {
       : null;
 
   // ── handlers ─────────────────────────────────────────────
-  const send = tp => apiService.send({ tp });
+  const send = tp => {
+    setSendError('');
+    try {
+      apiService.send({ tp });
+    } catch {
+      setSendError('Connection lost. Wait for reconnection, then try again.');
+    }
+  };
 
   const changeMode = mode => apiService.send({ tp: 'req:change-mode', mode });
 
@@ -95,6 +104,7 @@ export function useDashboardState() {
   };
 
   return {
+    brewStartError: sendError || brewStartErrorMessage(s.brewStartError),
     // raw status
     mode: s.mode,
     currentTemperature: s.currentTemperature,

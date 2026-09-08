@@ -140,20 +140,15 @@ void GaggiMateController::setup() {
     }
 #if defined(ARDUINO_ARCH_STM32) && !defined(GAGGIMATE_DISABLE_HARDWARE_SCALE)
     if (_config.capabilites.scale && scale != nullptr) {
-        scale->setup();
-        scale->setTareDoneCallback([this](long o1, long o2, float, float, bool success, uint16_t) {
-            if (success) {
-                _comms.sendScaleOffsets(o1, o2);
-            }
-        });
+        scale->setTareDoneCallback([this](const ScaleTareResult &result) { _comms.sendScaleOffsets(result); });
         scale->setCalDoneCallback([this](uint8_t channel, float factor, float, bool success, uint8_t) {
             if (success) {
                 _comms.sendScaleCalibrationResult(channel, factor);
             }
         });
-        _comms.onScaleTare([this]() {
+        _comms.onScaleTare([this](uint32_t requestId) {
             handlePing();
-            scale->requestTare();
+            scale->requestTare(requestId);
         });
         _comms.onScaleCalibration([this](float c1, float c2, long offset1, long offset2) {
             handlePing();
@@ -164,6 +159,7 @@ void GaggiMateController::setup() {
             handlePing();
             scale->requestCalibration(channel, refWeight);
         });
+        scale->setup();
     }
 #endif
     // Set up thermal feedforward for main heater if pressure/dimming capability exists

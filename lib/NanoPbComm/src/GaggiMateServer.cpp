@@ -214,11 +214,16 @@ gm::Payload GaggiMateServer::buildScaleSample(const ScaleSample &sample) {
     return p;
 }
 
-gm::Payload GaggiMateServer::buildScaleOffsets(long offset1, long offset2) {
+gm::Payload GaggiMateServer::buildScaleOffsets(const ScaleTareResult &result) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_scale_offsets_tag;
-    p.content.scale_offsets.offset1 = static_cast<int32_t>(offset1);
-    p.content.scale_offsets.offset2 = static_cast<int32_t>(offset2);
+    p.content.scale_offsets.offset1 = result.offset1;
+    p.content.scale_offsets.offset2 = result.offset2;
+    p.content.scale_offsets.request_id = result.requestId;
+    p.content.scale_offsets.success = result.success;
+    p.content.scale_offsets.health_bits = result.healthBits;
+    p.content.scale_offsets.stddev1 = result.stddev1;
+    p.content.scale_offsets.stddev2 = result.stddev2;
     return p;
 }
 
@@ -255,7 +260,7 @@ void GaggiMateServer::sendWeightMeasurement(float weight) { _endpoint.sendUnreli
 
 void GaggiMateServer::sendScaleSample(const ScaleSample &sample) { _endpoint.sendUnreliable(buildScaleSample(sample)); }
 
-void GaggiMateServer::sendScaleOffsets(long offset1, long offset2) { _endpoint.send(buildScaleOffsets(offset1, offset2)); }
+void GaggiMateServer::sendScaleOffsets(const ScaleTareResult &result) { _endpoint.send(buildScaleOffsets(result)); }
 
 void GaggiMateServer::sendScaleCalibrationResult(uint8_t channel, float calibration) {
     _endpoint.send(buildScaleCalibrationResult(channel, calibration));
@@ -311,9 +316,9 @@ void GaggiMateServer::registerHandlers() {
             _ledCb(static_cast<uint8_t>(p.content.led.channels[i].channel),
                    static_cast<uint8_t>(p.content.led.channels[i].brightness));
     });
-    _endpoint.on(gaggimate_Payload_scale_tare_tag, [this](const gm::Payload &) {
+    _endpoint.on(gaggimate_Payload_scale_tare_tag, [this](const gm::Payload &p) {
         if (_scaleTareCb)
-            _scaleTareCb();
+            _scaleTareCb(p.content.scale_tare.request_id);
     });
     _endpoint.on(gaggimate_Payload_scale_calibration_tag, [this](const gm::Payload &p) {
         if (_scaleCalibrationCb)

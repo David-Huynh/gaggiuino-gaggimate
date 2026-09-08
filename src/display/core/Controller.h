@@ -2,6 +2,7 @@
 #define CONTROLLER_H
 
 #include "AutoTuning.h"
+#include "BrewTareOperation.h"
 #include "GaggiMateClient.h"
 
 #include <atomic>
@@ -83,7 +84,7 @@ class Controller {
     bool isGrindActive() const;
     bool isBrewStartPending() const {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-        return pendingHardwareScaleBrewStart.load(std::memory_order_acquire);
+        return brewTare.pending();
 #else
         return false;
 #endif
@@ -91,6 +92,7 @@ class Controller {
     bool isUpdating() const;
     bool isAutotuning() const;
     bool isReady() const;
+    const char *getBrewStartError() const { return brewStartError.load(); }
     bool isVolumetricAvailable() const;
     bool isSDCard() const { return sdcard; }
     virtual float getTargetPressure() const { return targetPressure; }
@@ -235,7 +237,6 @@ class Controller {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     void onHardwareScaleSample(const ScaleSample &sample);
     bool armHardwareScaleBrewTare();
-    void markHardwareScaleBrewTareDone();
     void pollHardwareScaleBrewTare();
     void cancelHardwareScaleBrewTare(const char *reason);
 #endif
@@ -327,10 +328,7 @@ class Controller {
     ScaleSample lastScaleSample{};
     static constexpr float HARDWARE_SCALE_MAX_ABS_G = 5000.0f;
     static constexpr float HARDWARE_SCALE_MAX_STDDEV_G = 5.0f;
-    static constexpr unsigned long HARDWARE_SCALE_BREW_TARE_TIMEOUT_MS = 4000;
-    std::atomic<bool> pendingHardwareScaleBrewStart{false};
-    std::atomic<bool> pendingHardwareScaleBrewStartReady{false};
-    unsigned long pendingHardwareScaleBrewTareStartedAt = 0;
+    BrewTareOperation brewTare;
 #endif
 
     unsigned long grindActiveUntil = 0;
@@ -363,9 +361,10 @@ class Controller {
     // INFO/capability payload has been read and applied (capability latched,
     // calibration sent, controller:ready fired). Decoupled from `connected` so a
     // PING that latches the connection early can't skip capability detection.
-    bool infoApplied = false;
+    std::atomic<bool> infoApplied{false};
     // controller:bluetooth:connect has been announced for this connection.
     bool connectionAnnounced = false;
+    std::atomic<const char *> brewStartError{""};
     bool processCompleted = false;
     bool steamReady = false;
     bool sdcard = false;

@@ -78,6 +78,13 @@ components:
         m:
           type: integer
           description: Machine mode
+        bsp:
+          type: integer
+          enum: [0, 1]
+          description: Brew start is waiting for its hardware-scale tare result
+        bse:
+          type: string
+          description: Last brew-start error or cancellation code; empty after a new accepted start
         p:
           type: string
           description: Selected profile label

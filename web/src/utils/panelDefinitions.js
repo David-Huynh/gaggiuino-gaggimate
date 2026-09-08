@@ -131,6 +131,7 @@ export const PANEL_DEFINITIONS = [
       beanContextName: ds.beanContextName,
       hasBeanContext: ds.hasBeanContext,
       toggleLocalOptimization: ds.toggleLocalOptimization,
+      brewStartError: ds.brewStartError,
     }),
   },
 ];

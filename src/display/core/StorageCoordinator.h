@@ -5,7 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#if !defined(ARDUINO_ARCH_ESP32)
 #include <thread>
+#endif
 
 class StorageCoordinator {
   public:
@@ -64,6 +66,12 @@ class StorageCoordinator {
     void assertFlashLease() const;
 
   private:
+#if defined(ARDUINO_ARCH_ESP32)
+    using FlashOwner = void *; // FreeRTOS task handle; nullptr during global construction
+#else
+    using FlashOwner = std::thread::id;
+#endif
+    static FlashOwner currentFlashOwner();
     void releaseProcess();
     void releaseFlash();
 
@@ -73,7 +81,7 @@ class StorageCoordinator {
     unsigned processWaiters = 0;
     std::uint64_t processEpoch = 0;
     bool flashOwned = false;
-    std::thread::id flashOwner;
+    FlashOwner flashOwner{};
     unsigned flashDepth = 0;
 };
 

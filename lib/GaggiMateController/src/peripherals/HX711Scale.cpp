@@ -174,10 +174,20 @@ void HX711Scale::setGain(uint8_t gain) {
     _filter.reset();
 }
 
-void HX711Scale::requestTare() {
-    // Just set the flag — the loop picks it up on the next iteration. Multiple
-    // requests collapse into one.
-    _tareRequested = true;
+void HX711Scale::requestTare(uint32_t requestId) {
+    bool idle = false;
+    if (!_present || !_tareBusy.compare_exchange_strong(idle, true)) {
+        if (_tareDoneCb) {
+            ScaleTareResult result;
+            result.requestId = requestId;
+            result.healthBits = SCALE_HEALTH_TARE_FAILED;
+            _tareDoneCb(result);
+        }
+        return;
+    }
+    _tareRequestId = requestId;
+    _tareRequestedAt = millis();
+    _tareRequested.store(true, std::memory_order_release);
 }
 
 void HX711Scale::requestCalibration(uint8_t channel, float refWeight) {
@@ -187,6 +197,19 @@ void HX711Scale::requestCalibration(uint8_t channel, float refWeight) {
 }
 
 void HX711Scale::loop() {
+    // Service the operation independently of ADC readiness. Its deadline starts
+    // when the request is accepted, not when a first successful sample arrives.
+    if (_tareRequested.exchange(false, std::memory_order_acq_rel)) {
+        _tareState = TareState::COLLECT;
+        _tareCollected = 0;
+        _tareStartMs = _tareRequestedAt;
+        _tareLastProgMs = 0;
+        _healthBits |= SCALE_HEALTH_TARING;
+        _healthBits &= static_cast<uint16_t>(~(SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_TARE_NOISY));
+        if (_calState != CalState::IDLE)
+            finishTare(false, SCALE_HEALTH_TARE_FAILED);
+        publishSnapshot();
+    }
     if (!_drv) {
         return;
     }
@@ -206,6 +229,8 @@ void HX711Scale::loop() {
         if (_lastOkRead != 0 && (now - _lastOkRead) > STALE_TIMEOUT_MS) {
             _healthBits |= SCALE_HEALTH_STALE;
         }
+        advanceTareSm(raw, valid, sat);
+        publishSnapshot();
         return;
     }
 
@@ -215,6 +240,8 @@ void HX711Scale::loop() {
         if (_lastOkRead != 0 && (now - _lastOkRead) > STALE_TIMEOUT_MS) {
             _healthBits |= SCALE_HEALTH_STALE;
         }
+        advanceTareSm(raw, valid, sat);
+        publishSnapshot();
         return;
     }
 
@@ -223,16 +250,6 @@ void HX711Scale::loop() {
 
     // Pick up async requests synchronously here so they only mutate state on the
     // scale task. Latch the request → run state machine.
-    if (_tareRequested && _tareState == TareState::IDLE && _calState == CalState::IDLE) {
-        _tareRequested = false;
-        _tareState = TareState::COLLECT;
-        _tareCollected = 0;
-        _tareStartMs = millis();
-        _tareLastProgMs = 0;
-        _healthBits |= SCALE_HEALTH_TARING;
-        _healthBits &= static_cast<uint16_t>(~(SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_TARE_NOISY));
-        ESP_LOGI(LOG_TAG, "Tare requested");
-    }
     if (_calRequested && _calState == CalState::IDLE && _tareState == TareState::IDLE) {
         _calRequested = false;
         const uint8_t ch = _calRequestChannel;
@@ -294,6 +311,7 @@ void HX711Scale::processOneRawSample(long raw[2], bool valid[2], bool sat[2]) {
     // While taring or calibrating, do not advance the public sample pipeline —
     // the caller is in a settling phase and should not get half-applied state.
     if (_tareState != TareState::IDLE || _calState != CalState::IDLE) {
+        publishSnapshot();
         return;
     }
 
@@ -344,7 +362,10 @@ void HX711Scale::advanceTareSm(long raw[2], bool valid[2], bool sat[2]) {
     }
 
     const uint32_t now = millis();
-    const bool timedOut = (now - _tareStartMs) > TARE_TIMEOUT_MS;
+    if (now - _tareStartMs >= TARE_TIMEOUT_MS) {
+        finishTare(false, SCALE_HEALTH_TARE_FAILED);
+        return;
+    }
 
     // WeighMyBru2 uses the arithmetic mean of 20 readings. Keep the same
     // behavior independently for both tray halves, while rejecting clipped or
@@ -386,9 +407,6 @@ void HX711Scale::advanceTareSm(long raw[2], bool valid[2], bool sat[2]) {
         return;
     }
 
-    if (timedOut) {
-        finishTare(false, SCALE_HEALTH_TARE_FAILED);
-    }
 }
 
 void HX711Scale::finishTare(bool success, uint16_t flagsToAdd) {
@@ -406,10 +424,23 @@ void HX711Scale::finishTare(bool success, uint16_t flagsToAdd) {
     const float std2 = _tareCollected >= 2 ? stddevLong(_tareBuf2, _tareCollected) / scale2 : 0.0f;
     ESP_LOGI(LOG_TAG, "Tare done: success=%d offsets=(%ld,%ld) std=(%.3f,%.3f) g samples=%u flags=0x%04x",
              success ? 1 : 0, _offset1, _offset2, std1, std2, _tareCollected, _healthBits);
-    if (_tareDoneCb) {
-        _tareDoneCb(_offset1, _offset2, std1, std2, success, _healthBits);
-    }
+    const ScaleTareResult result{_tareRequestId, success, static_cast<int32_t>(_offset1),
+                                 static_cast<int32_t>(_offset2), _healthBits, std1, std2};
     _tareCollected = 0;
+    _tareBusy.store(false, std::memory_order_release);
+    if (_tareDoneCb)
+        _tareDoneCb(result);
+}
+
+void HX711Scale::publishSnapshot() {
+    if (_snapMutex && xSemaphoreTake(_snapMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        _snapshot.healthBits = _healthBits;
+        // Health-only updates must not masquerade as a new weight measurement.
+        const ScaleSnapshot copy = _snapshot;
+        xSemaphoreGive(_snapMutex);
+        if (_sampleCb)
+            _sampleCb(copy);
+    }
 }
 
 void HX711Scale::advanceCalSm(long raw[2], bool valid[2], bool sat[2]) {

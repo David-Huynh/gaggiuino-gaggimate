@@ -121,6 +121,7 @@ export default function CompactProcessControls() {
     beanContextName,
     hasBeanContext,
     toggleLocalOptimization,
+    brewStartError,
   } = ds;
 
   const showPrimary = mode === 1 || mode === 3 || (isGrinding && isGrindAvailable);
@@ -246,6 +247,11 @@ export default function CompactProcessControls() {
       )}
 
       <div className='flex min-h-0 w-full min-w-0 flex-1 flex-col items-center justify-center overflow-x-hidden overflow-y-auto'>
+        {brewStartError && (
+          <div role='alert' className='text-error px-2 text-center text-xs'>
+            {brewStartError}
+          </div>
+        )}
         {renderContent()}
       </div>
 

@@ -396,7 +396,8 @@ bool parseShotRecord(JsonVariantConst source, DecodedShotRecord &decoded, String
         return false;
     }
     JsonObjectConst input = source.as<JsonObjectConst>();
-    AutoTuning::ShotRecord record;
+    auto recordStorage = makePsramUnique<AutoTuning::ShotRecord>();
+    AutoTuning::ShotRecord &record = *recordStorage;
     record.shotId = text(input["shot_id"]);
     record.machineId = text(input["machine_id"]);
     record.machineAdapter = text(input["machine_adapter"]);

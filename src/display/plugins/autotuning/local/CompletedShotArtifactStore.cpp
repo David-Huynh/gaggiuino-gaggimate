@@ -232,7 +232,8 @@ bool decodeArtifact(const ByteBuffer &encoded, AutoTuning::CompletedShotArtifact
         return false;
     }
 
-    AutoTuningJsonCodec::DecodedShotRecord decoded;
+    auto decodedStorage = makePsramUnique<AutoTuningJsonCodec::DecodedShotRecord>();
+    auto &decoded = *decodedStorage;
     if (!AutoTuningJsonCodec::parseShotRecord(root["shot"], decoded, error)) {
         return false;
     }
@@ -323,7 +324,9 @@ bool decodeArtifact(const ByteBuffer &encoded, AutoTuning::CompletedShotArtifact
         sample.systemInfo = systemInfo;
     }
 
-    artifact = AutoTuning::CompletedShotArtifact{};
+    // Every field is replaced below. Avoid constructing a multi-kilobyte reset
+    // temporary on the caller's stack during startup recovery or write validation.
+    artifact.payloadHash.clear();
     artifact.record = std::move(decoded.record);
     artifact.record.history = std::move(metadata);
     artifact.completion = std::move(completion);
@@ -339,9 +342,9 @@ bool decodeArtifact(const ByteBuffer &encoded, AutoTuning::CompletedShotArtifact
 
 bool validArtifactFile(const String &path) {
     ByteBuffer bytes;
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifact = makePsramUnique<AutoTuning::CompletedShotArtifact>();
     String error;
-    return readFile(path, bytes) && decodeArtifact(bytes, artifact, error);
+    return readFile(path, bytes) && decodeArtifact(bytes, *artifact, error);
 }
 
 } // namespace
@@ -380,17 +383,17 @@ bool CompletedShotArtifactStore::write(AutoTuning::CompletedShotArtifact &artifa
     const String path = pathFor(artifact.record.shotId.c_str());
     if (LittleFSUtil::existsQuietly(path)) {
         ByteBuffer existingBytes;
-        AutoTuning::CompletedShotArtifact existing;
+        auto existing = makePsramUnique<AutoTuning::CompletedShotArtifact>();
         String error;
         if (readFile(path, existingBytes) &&
-            decodeArtifact(existingBytes, existing, error)) {
+            decodeArtifact(existingBytes, *existing, error)) {
             const String existingHash =
                 payloadHash(existingBytes.data(), existingBytes.size());
             if (existingHash == hash) {
                 artifact.payloadHash = hash.c_str();
                 return true;
             }
-            if (artifact.revision <= existing.revision) {
+            if (artifact.revision <= existing->revision) {
                 ESP_LOGE(LOG_TAG,
                          "Refusing conflicting or regressive artifact revision for %s",
                          artifact.record.shotId.c_str());

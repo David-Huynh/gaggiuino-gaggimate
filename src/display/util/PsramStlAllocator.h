@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <memory>
+#include <utility>
 #include <esp_heap_caps.h>
 
 // Minimal C++11 STL allocator that places storage in PSRAM, falling back to
@@ -36,6 +38,20 @@ template <typename T, typename U> bool operator==(const PsramStlAllocator<T> &, 
 }
 template <typename T, typename U> bool operator!=(const PsramStlAllocator<T> &, const PsramStlAllocator<U> &) noexcept {
     return false;
+}
+
+template <typename T> struct PsramDeleter {
+    void operator()(T *value) const noexcept {
+        value->~T();
+        PsramStlAllocator<T>{}.deallocate(value, 1);
+    }
+};
+
+// Large adapter scratch objects must not accumulate on the small firmware task
+// stacks. Construct directly in allocated storage, without a stack temporary.
+template <typename T, typename... Args> std::unique_ptr<T, PsramDeleter<T>> makePsramUnique(Args &&...args) {
+    T *storage = PsramStlAllocator<T>{}.allocate(1);
+    return std::unique_ptr<T, PsramDeleter<T>>(new (storage) T(std::forward<Args>(args)...));
 }
 
 #endif // PSRAMSTLALLOCATOR_H

@@ -161,7 +161,9 @@ message LedControl {
     repeated LedChannel channels = 1;
 }
 
-message ScaleTare {}
+message ScaleTare {
+    uint32 request_id = 1; // zero is a manual tare, never a brew-start authorization
+}
 
 message ScaleCalibration {
     float calibration1 = 1;
@@ -299,6 +301,11 @@ message ScaleSample {
 message ScaleOffsets {
     int32 offset1 = 1;
     int32 offset2 = 2;
+    uint32 request_id = 3;
+    bool success = 4;
+    uint32 health_bits = 5;
+    float stddev1 = 6;
+    float stddev2 = 7;
 }
 
 message ScaleCalibrationResult {

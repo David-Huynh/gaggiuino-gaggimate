@@ -163,9 +163,10 @@ gm::Payload GaggiMateClient::buildTare() {
     return p;
 }
 
-gm::Payload GaggiMateClient::buildScaleTare() {
+gm::Payload GaggiMateClient::buildScaleTare(uint32_t requestId) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_scale_tare_tag;
+    p.content.scale_tare.request_id = requestId;
     return p;
 }
 
@@ -233,7 +234,7 @@ void GaggiMateClient::sendPressureScale(float scale) { _endpoint.send(buildPress
 
 void GaggiMateClient::tare() { _endpoint.send(buildTare()); }
 
-void GaggiMateClient::scaleTare() { _endpoint.send(buildScaleTare()); }
+void GaggiMateClient::scaleTare(uint32_t requestId) { _endpoint.send(buildScaleTare(requestId)); }
 
 void GaggiMateClient::sendScaleCalibration(float calibration1, float calibration2, long offset1, long offset2) {
     _endpoint.send(buildScaleCalibration(calibration1, calibration2, offset1, offset2));
@@ -344,8 +345,14 @@ void GaggiMateClient::registerHandlers() {
         _scaleSampleCb(sample);
     });
     _endpoint.on(gaggimate_Payload_scale_offsets_tag, [this](const gm::Payload &p) {
-        if (_scaleOffsetsCb)
-            _scaleOffsetsCb(p.content.scale_offsets.offset1, p.content.scale_offsets.offset2);
+        if (_scaleOffsetsCb) {
+            const auto &wire = p.content.scale_offsets;
+            ScaleTareResult result{wire.request_id, wire.success, wire.offset1, wire.offset2,
+                                   static_cast<uint16_t>(wire.health_bits), wire.stddev1, wire.stddev2};
+            if (wire.health_bits > 0xFFu)
+                result.success = false;
+            _scaleOffsetsCb(result);
+        }
     });
     _endpoint.on(gaggimate_Payload_scale_calibration_result_tag, [this](const gm::Payload &p) {
         if (_scaleCalibrationResultCb)

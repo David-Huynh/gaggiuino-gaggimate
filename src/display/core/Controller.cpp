@@ -74,10 +74,14 @@ struct CtrlCmdMsg {
 
 void Controller::postCommand(CtrlCmd cmd, int32_t arg) {
     if (cmdQueue == nullptr) {
+        if (cmd == CtrlCmd::ACTIVATE)
+            brewStartError.store("controller_not_ready");
         return;
     }
     CtrlCmdMsg msg{cmd, arg};
     if (xQueueSend(cmdQueue, &msg, 0) != pdTRUE) {
+        if (cmd == CtrlCmd::ACTIVATE)
+            brewStartError.store("queue_full");
         ESP_LOGW(LOG_TAG.c_str(), "Controller cmdQueue full, dropped cmd=%u", static_cast<unsigned>(cmd));
         return;
     }
@@ -371,8 +375,11 @@ void Controller::setupBluetooth() {
     ESP_LOGI(LOG_TAG, "UART controller link initialized at %d baud (RX=%d, TX=%d)", GAGGIMATE_UART_BAUD,
              GAGGIMATE_UART_RX_PIN, GAGGIMATE_UART_TX_PIN);
 #endif
-    comms.init("GPBLC");
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+    brewTare.seed(esp_random());
+#endif
     comms.onConnectionChanged([this](bool connected) {
+        infoApplied.store(false);
         // Force a full control resend after any (re)connect -- the controller
         // starts with no state and updateControl() otherwise only sends deltas.
         controlStateSent = false;
@@ -383,7 +390,7 @@ void Controller::setupBluetooth() {
         } else if (initialized) {
             pluginManager->trigger("controller:bluetooth:disconnect");
             waitingForController = true;
-            setMode(MODE_STANDBY);
+            postCommand(CtrlCmd::CHANGE_MODE, MODE_STANDBY);
         }
     });
     comms.onSystemInfo([this](const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
@@ -493,19 +500,27 @@ void Controller::setupBluetooth() {
         sample.healthBits = SCALE_HEALTH_OK;
         onHardwareScaleSample(sample);
     });
-    comms.onScaleOffsets([this](long offset1, long offset2) {
-        settings.setScaleOffset1(offset1);
-        settings.setScaleOffset2(offset2);
-        ESP_LOGI(LOG_TAG, "Scale offsets received and saved: %ld, %ld", offset1, offset2);
+    comms.onScaleOffsets([this](const ScaleTareResult &result) {
+        const bool success = result.validSuccess();
+        if (result.requestId != 0) {
+            if (!isReady() || !brewTare.complete(result.requestId,
+                                               success && !(result.healthBits & SCALE_HEALTH_NOT_CALIBRATED), millis()))
+                return;
+            if (logicTaskHandle != nullptr)
+                xTaskNotifyGive(logicTaskHandle);
+        }
+        if (success) {
+            settings.setScaleOffset1(result.offset1);
+            settings.setScaleOffset2(result.offset2);
+        }
         Event ev;
         ev.id = "controller:scale:tare:done";
-        ev.setInt("success", 1);
-        ev.setFloat("offset1", static_cast<float>(offset1));
-        ev.setFloat("offset2", static_cast<float>(offset2));
-        ev.setFloat("std1", 0.0f);
-        ev.setFloat("std2", 0.0f);
-        ev.setInt("healthBits", SCALE_HEALTH_OK);
-        markHardwareScaleBrewTareDone();
+        ev.setInt("success", success ? 1 : 0);
+        ev.setFloat("offset1", static_cast<float>(result.offset1));
+        ev.setFloat("offset2", static_cast<float>(result.offset2));
+        ev.setFloat("std1", result.stddev1);
+        ev.setFloat("std2", result.stddev2);
+        ev.setInt("healthBits", result.healthBits);
         pluginManager->trigger(ev);
     });
     comms.onScaleCalibrationResult([this](uint8_t channel, float calibration) {
@@ -544,6 +559,8 @@ void Controller::setupBluetooth() {
         }
 #endif
     });
+    // Register every callback before starting the UART receive task.
+    comms.init("GPBLC");
 #ifdef GAGGIMATE_UART_COMMS
     pluginManager->trigger("controller:uart:init");
 #else
@@ -595,6 +612,7 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
     systemInfo.capabilities.scale = false;
 #endif
 
+    infoApplied.store(!mismatch);
     if (!loaded) {
         loaded = true;
         if (!mismatch && settings.getStartupMode() == MODE_STANDBY)
@@ -798,6 +816,7 @@ void Controller::loopLogic() {
     // Process lifecycle under the lock (GM-147); events and NVS writes deferred past unlock.
     DeferredProcessEvents events;
     bool processEnded = false;
+    std::optional<StorageCoordinator::ProcessLease> endedLease;
     double newBrewDelay = -1.0;
     double newGrindDelay = -1.0;
     {
@@ -814,6 +833,10 @@ void Controller::loopLogic() {
             currentProcess->progress();
             if (!isActiveLocked()) {
                 processEnded = deactivateLocked(events);
+                if (processEnded && processStorageLease.has_value()) {
+                    endedLease.emplace(std::move(*processStorageLease));
+                    processStorageLease.reset();
+                }
             }
         }
 
@@ -841,6 +864,7 @@ void Controller::loopLogic() {
     if (processEnded) {
         loopControl(true);
         applyConnectionPriority();
+        endedLease.reset();
     }
     dispatchEvents(events);
     if (newBrewDelay >= 0) {
@@ -880,7 +904,10 @@ bool Controller::isUpdating() const { return updating; }
 
 bool Controller::isAutotuning() const { return autotuning; }
 
-bool Controller::isReady() const { return !isUpdating() && !isErrorState() && !isAutotuning(); }
+bool Controller::isReady() const {
+    return !isUpdating() && !isErrorState() && !isAutotuning() && comms.isConnected() && infoApplied.load() &&
+           !systemInfo.protocolMismatch;
+}
 
 ScaleAvailability Controller::scaleAvailability() const {
     ScaleAvailability a;
@@ -1047,38 +1074,21 @@ void Controller::startBrewProcess() {
 
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 bool Controller::armHardwareScaleBrewTare() {
-    if (pendingHardwareScaleBrewStart.exchange(true, std::memory_order_acq_rel)) {
+    const uint32_t requestId = brewTare.begin(millis());
+    if (requestId == 0)
         return true;
-    }
-
-    pendingHardwareScaleBrewStartReady.store(false, std::memory_order_release);
-    pendingHardwareScaleBrewTareStartedAt = millis();
-
-    const ScaleSample sample = getScaleSample();
-    ESP_LOGI(LOG_TAG, "Waiting for hardware scale tare before brew start: seq=%lu health=0x%04x",
-             static_cast<unsigned long>(sample.sampleSeq), sample.healthBits);
     pluginManager->trigger("controller:brew:scale-tare:start");
-
-    if ((sample.healthBits & SCALE_HEALTH_TARING) == 0) {
-        scaleTare();
-    }
+    // Always request our own operation, including when a manual tare is active.
+    // A busy result is a failure, never permission to reuse another tare.
+    comms.scaleTare(requestId);
     return true;
 }
 
-void Controller::markHardwareScaleBrewTareDone() {
-    if (!pendingHardwareScaleBrewStart.load(std::memory_order_acquire))
-        return;
-    pendingHardwareScaleBrewStartReady.store(true, std::memory_order_release);
-    if (logicTaskHandle != nullptr)
-        xTaskNotifyGive(logicTaskHandle);
-}
-
 void Controller::cancelHardwareScaleBrewTare(const char *reason) {
-    if (!pendingHardwareScaleBrewStart.exchange(false, std::memory_order_acq_rel)) {
+    if (!brewTare.cancel()) {
         return;
     }
-    pendingHardwareScaleBrewStartReady.store(false, std::memory_order_release);
-    pendingHardwareScaleBrewTareStartedAt = 0;
+    brewStartError.store(reason != nullptr ? reason : "tare_failed");
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
     std::optional<StorageCoordinator::ProcessLease> cancelledLease;
     {
@@ -1098,34 +1108,29 @@ void Controller::cancelHardwareScaleBrewTare(const char *reason) {
 }
 
 void Controller::pollHardwareScaleBrewTare() {
-    if (!pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+    if (!brewTare.pending())
+        return;
+    if (!isReady()) {
+        cancelHardwareScaleBrewTare("controller_not_ready");
         return;
     }
-
-    if (mode != MODE_BREW) {
+    if (mode != MODE_BREW || isActive()) {
         cancelHardwareScaleBrewTare("mode_changed");
         return;
     }
-    if (isActive()) {
-        cancelHardwareScaleBrewTare("process_started_elsewhere");
-        return;
-    }
-    if (pendingHardwareScaleBrewStartReady.exchange(false, std::memory_order_acq_rel)) {
-        pendingHardwareScaleBrewStart.store(false, std::memory_order_release);
-        pendingHardwareScaleBrewTareStartedAt = 0;
-        ESP_LOGI(LOG_TAG, "Hardware scale tare complete; starting brew");
+    switch (brewTare.outcome(millis())) {
+    case BrewTareOperation::Outcome::SUCCEEDED:
         startBrewProcess();
-        return;
-    }
-
-    const ScaleSample sample = getScaleSample();
-    if (sample.healthBits & SCALE_HEALTH_TARE_FAILED) {
+        brewTare.cancel();
+        break;
+    case BrewTareOperation::Outcome::FAILED:
         cancelHardwareScaleBrewTare("tare_failed");
-        return;
-    }
-    if (millis() - pendingHardwareScaleBrewTareStartedAt > HARDWARE_SCALE_BREW_TARE_TIMEOUT_MS) {
+        break;
+    case BrewTareOperation::Outcome::TIMED_OUT:
         cancelHardwareScaleBrewTare("tare_timeout");
-        return;
+        break;
+    default:
+        break;
     }
 }
 #endif
@@ -1424,13 +1429,18 @@ void Controller::updateControl(bool urgent) {
 }
 
 void Controller::activate() {
+    brewStartError.store("");
+    if (!isReady()) {
+        brewStartError.store("controller_not_ready");
+        return;
+    }
     const bool wasActive = isActive();
     ESP_LOGI(LOG_TAG, "activate entry: mode=%d isActive=%d src=%d volumetricAvailable=%d hwScalePresent=%d", mode, wasActive,
              settings.getScaleSource(), isVolumetricAvailable(), hardwareScalePresent);
     if (wasActive)
         return;
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+    if (brewTare.pending()) {
         ESP_LOGI(LOG_TAG, "Ignoring duplicate brew start while hardware scale tare is pending");
         return;
     }
@@ -1438,6 +1448,7 @@ void Controller::activate() {
     if (mode == MODE_BREW || mode == MODE_STEAM || mode == MODE_WATER) {
         auto lease = StorageCoordinator::instance().acquireProcess();
         if (!lease) {
+            brewStartError.store("process_busy");
             return;
         }
         std::lock_guard<std::recursive_mutex> guard(processMutex);
@@ -1488,7 +1499,7 @@ void Controller::activate() {
 
     bool keepPendingLease = false;
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    keepPendingLease = pendingHardwareScaleBrewStart.load(std::memory_order_acquire);
+    keepPendingLease = brewTare.pending();
 #endif
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
@@ -1500,7 +1511,7 @@ void Controller::activate() {
 
 void Controller::deactivate() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+    if (brewTare.pending()) {
         cancelHardwareScaleBrewTare("deactivated");
         return;
     }
@@ -1554,7 +1565,7 @@ bool Controller::deactivateLocked(DeferredProcessEvents &events) {
 
 void Controller::clear() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+    if (brewTare.pending()) {
         cancelHardwareScaleBrewTare("cleared");
     }
 #endif
@@ -1710,6 +1721,8 @@ void Controller::onVolumetricMeasurement(double measurement, VolumetricMeasureme
 
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
 void Controller::scaleTare() {
+    if (!isReady() || isBrewStartPending() || isActive())
+        return;
     comms.scaleTare();
 }
 
@@ -1770,7 +1783,7 @@ void Controller::noteBluetoothScaleMeasurement(ScaleRole role) {
 
 void Controller::onFlush() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-    if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+    if (brewTare.pending()) {
         cancelHardwareScaleBrewTare("flush_started");
     }
 #endif
@@ -1812,7 +1825,7 @@ void Controller::handleBrewButton(int brewButtonStatus) {
             break;
         case MODE_BREW:
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-            if (pendingHardwareScaleBrewStart.load(std::memory_order_acquire)) {
+            if (brewTare.pending()) {
                 ESP_LOGI(LOG_TAG, "Ignoring duplicate physical brew start while scale tare is pending");
                 break;
             }

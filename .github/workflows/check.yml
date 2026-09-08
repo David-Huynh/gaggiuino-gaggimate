@@ -1,6 +1,23 @@
 on: [push, pull_request]
 
 jobs:
+  brew-start-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test tare and process lifecycle without hardware
+        run: python scripts/test_brew_start.py
+      - name: Test boot and native-task storage ownership
+        run: python scripts/test_storage_ownership.py
+      - name: Test web startup error reporting
+        run: node --test web/src/utils/brewStartError.test.js
+
   test:
     runs-on: ubuntu-latest
     steps:

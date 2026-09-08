@@ -1187,6 +1187,7 @@ void WebUIPlugin::loop() {
         statusDoc["pt"] = controller->getTargetPressure();
         statusDoc["m"] = controller->getMode();
         statusDoc["bsp"] = controller->isBrewStartPending() ? 1 : 0;
+        statusDoc["bse"] = controller->getBrewStartError();
         statusDoc["p"] = controller->getProfileManager()->getSelectedProfile().label;
         statusDoc["puid"] = controller->getProfileManager()->getSelectedProfile().id;
         statusDoc["cp"] = controller->getSystemInfo().capabilities.pressure;

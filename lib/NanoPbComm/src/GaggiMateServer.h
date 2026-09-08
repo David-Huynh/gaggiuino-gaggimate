@@ -30,7 +30,7 @@ class GaggiMateServer {
     using PressureScaleCallback = std::function<void(float scale)>;
     using TareCallback = std::function<void()>;
     using LedCallback = std::function<void(uint8_t channel, uint8_t brightness)>;
-    using ScaleTareCallback = std::function<void()>;
+    using ScaleTareCallback = std::function<void(uint32_t requestId)>;
     using ScaleCalibrationCallback = std::function<void(float calibration1, float calibration2, long offset1, long offset2)>;
     using ScaleCalibrationStartCallback = std::function<void(uint8_t channel, float referenceWeight)>;
 
@@ -69,7 +69,7 @@ class GaggiMateServer {
     gm::Payload buildError(int code);
     gm::Payload buildWeightMeasurement(float weight);
     gm::Payload buildScaleSample(const ScaleSample &sample);
-    gm::Payload buildScaleOffsets(long offset1, long offset2);
+    gm::Payload buildScaleOffsets(const ScaleTareResult &result);
     gm::Payload buildScaleCalibrationResult(uint8_t channel, float calibration);
 
     // Responses (controller -> display)
@@ -82,7 +82,7 @@ class GaggiMateServer {
     void sendError(int code);
     void sendWeightMeasurement(float weight);
     void sendScaleSample(const ScaleSample &sample);
-    void sendScaleOffsets(long offset1, long offset2);
+    void sendScaleOffsets(const ScaleTareResult &result);
     void sendScaleCalibrationResult(uint8_t channel, float calibration);
 
     // Drop the current BLE link. The ping watchdog calls this so the display

@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <STM32FreeRTOS.h>
 #include <functional>
+#include <atomic>
 
 #include "DualScaleFilter.h"
 #include "GaggiMateComm.h"
@@ -49,8 +50,7 @@ enum class ScaleCalError : uint8_t {
 
 using scale_sample_cb_t = std::function<void(const ScaleSnapshot &)>;
 using scale_tare_progress_cb_t = std::function<void(uint16_t samples, float stddevG)>;
-using scale_tare_done_cb_t =
-    std::function<void(long offset1, long offset2, float stddev1, float stddev2, bool success, uint16_t healthBits)>;
+using scale_tare_done_cb_t = std::function<void(const ScaleTareResult &result)>;
 using scale_cal_progress_cb_t = std::function<void(uint8_t channel, uint16_t samples, float stddevG)>;
 using scale_cal_done_cb_t =
     std::function<void(uint8_t channel, float factor, float stddevG, bool success, uint8_t errorCode)>;
@@ -83,7 +83,7 @@ class HX711Scale {
 
     // Async 20-reading tare. requestTare() returns immediately; tare progress
     // and completion arrive via callbacks.
-    void requestTare();
+    void requestTare(uint32_t requestId = 0);
 
     // refWeight in grams; range checked. Channel = 1 or 2.
     void requestCalibration(uint8_t channel, float refWeight);
@@ -101,7 +101,7 @@ class HX711Scale {
     uint8_t _dout2_pin;
     uint8_t _sck_pin;
     HX711Dual *_drv = nullptr;
-    bool _present = false;
+    std::atomic<bool> _present{false};
 
     // ----- rate state -----
     uint16_t _nativeHz = 10; // detected at setup; 10 or 80
@@ -132,7 +132,10 @@ class HX711Scale {
 
     // ----- async tare worker state -----
     enum class TareState : uint8_t { IDLE, COLLECT };
-    volatile bool _tareRequested = false;
+    std::atomic<bool> _tareRequested{false};
+    std::atomic<bool> _tareBusy{false};
+    uint32_t _tareRequestId = 0;
+    uint32_t _tareRequestedAt = 0;
     TareState _tareState = TareState::IDLE;
     uint16_t _tareCollected = 0;
     uint32_t _tareStartMs = 0;

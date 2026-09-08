@@ -38,7 +38,7 @@ class GaggiMateClient {
     using ErrorCallback = std::function<void(int code)>;
     using WeightCallback = std::function<void(float weight)>;
     using ScaleSampleCallback = std::function<void(const ScaleSample &sample)>;
-    using ScaleOffsetsCallback = std::function<void(long offset1, long offset2)>;
+    using ScaleOffsetsCallback = std::function<void(const ScaleTareResult &result)>;
     using ScaleCalibrationResultCallback = std::function<void(uint8_t channel, float calibration)>;
 
     GaggiMateClient();
@@ -120,7 +120,7 @@ class GaggiMateClient {
     gm::Payload buildAutotune(uint32_t testTime, uint32_t samples, uint32_t heaterWattage);
     gm::Payload buildPressureScale(float scale);
     gm::Payload buildTare();
-    gm::Payload buildScaleTare();
+    gm::Payload buildScaleTare(uint32_t requestId = 0);
     gm::Payload buildScaleCalibration(float calibration1, float calibration2, long offset1, long offset2);
     gm::Payload buildScaleCalibrationStart(uint8_t channel, float referenceWeight);
     // Pack channel/brightness pairs into one LedControl payload; entries beyond
@@ -138,7 +138,7 @@ class GaggiMateClient {
     void sendAutotune(uint32_t testTime, uint32_t samples, uint32_t heaterWattage);
     void sendPressureScale(float scale);
     void tare();
-    void scaleTare();
+    void scaleTare(uint32_t requestId = 0);
     void sendScaleCalibration(float calibration1, float calibration2, long offset1, long offset2);
     void startScaleCalibration(uint8_t channel, float referenceWeight);
     // Drive several LED channels in one message (avoids per-channel sends that

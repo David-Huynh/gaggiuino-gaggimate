@@ -2,6 +2,7 @@
 #define GAGGIMATE_COMM_H
 
 #include <cstdint>
+#include <cmath>
 
 // Public protocol vocabulary shared by GaggiMateClient and GaggiMateServer.
 // Firmware code only ever sees these plain types -- never the nanopb structs.
@@ -126,6 +127,26 @@ constexpr uint16_t SCALE_HEALTH_TARE_FAILED = 1u << 4;
 constexpr uint16_t SCALE_HEALTH_TARE_NOISY = 1u << 5;
 constexpr uint16_t SCALE_HEALTH_TARING = 1u << 6;
 constexpr uint16_t SCALE_HEALTH_CALIBRATING = 1u << 7;
+
+// Typed result at the scale adapter boundary. Wire version 6 requires the
+// request identity and an explicit success bit, including for failed tares.
+struct ScaleTareResult {
+    uint32_t requestId = 0;
+    bool success = false;
+    int32_t offset1 = 0;
+    int32_t offset2 = 0;
+    uint16_t healthBits = 0;
+    float stddev1 = 0;
+    float stddev2 = 0;
+
+    bool validSuccess() const {
+        return success && healthBits <= 0xFFu && !(healthBits & (SCALE_HEALTH_TARE_FAILED | SCALE_HEALTH_STALE |
+                                          SCALE_HEALTH_SAT_CH1 | SCALE_HEALTH_SAT_CH2 |
+                                          SCALE_HEALTH_TARING | SCALE_HEALTH_CALIBRATING)) &&
+               offset1 >= -8388608 && offset1 <= 8388607 && offset2 >= -8388608 && offset2 <= 8388607 &&
+               std::isfinite(stddev1) && std::isfinite(stddev2) && stddev1 >= 0 && stddev2 >= 0;
+    }
+};
 
 // One LED output's target brightness. Several are packed into a single
 // LedControl message so a multi-channel update can't be split (and coalesced)
