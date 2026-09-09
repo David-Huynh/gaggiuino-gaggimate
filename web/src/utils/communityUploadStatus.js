@@ -5,10 +5,7 @@ export function communityUploadPipelineText(settings) {
   if (settings?.communityUploadEffective) {
     return Number(settings?.communityUploadRetryCount || 0) > 0 ? 'Retrying' : 'Ready';
   }
-  if (!settings?.rlUploadBaseUrl) {
-    return 'Needs Supabase URL';
-  }
-  return settings?.communityUploadConfigured ? 'Starting' : 'Registration pending';
+  return 'Waiting for EspressoRL container';
 }
 
 export function communityUploadQueueText(settings) {

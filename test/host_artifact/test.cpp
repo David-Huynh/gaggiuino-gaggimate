@@ -1,3 +1,4 @@
+#include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <cassert>
@@ -47,6 +48,32 @@ static AutoTuning::CompletedShotArtifact fixture() {
 }
 
 int main(int argc, char **argv) {
+    JsonDocument receipt;
+    const std::string digest(64, 'a');
+    receipt["event_type"] = "lifecycle_ack";
+    receipt["schema_version"] = 1;
+    receipt["machine_id"] = "machine";
+    receipt["delivery_id"] = digest;
+    receipt["outcome"] = "accepted";
+    const auto ack = [&]() { return AutoTuning::acceptedLifecycleReceipt(receipt.as<JsonObjectConst>(), "machine", digest); };
+    assert(ack() == true);
+    receipt["outcome"] = "permanent_rejection";
+    assert(ack() == false);
+    receipt["outcome"] = "broker_accepted";
+    assert(!ack().has_value());
+    receipt["outcome"] = "accepted";
+    receipt["machine_id"] = "another-machine";
+    assert(!ack().has_value());
+    receipt["machine_id"] = "machine";
+    receipt["delivery_id"] = std::string(64, 'b');
+    assert(!ack().has_value());
+    receipt["delivery_id"] = digest;
+    receipt["schema_version"] = "1";
+    assert(!ack().has_value());
+    receipt["schema_version"] = 1;
+    receipt["unexpected"] = true;
+    assert(!ack().has_value());
+
     AutoTuning::Recommendation recommendation;
     recommendation.machineId = "machine";
     recommendation.beanContextId = "bean";

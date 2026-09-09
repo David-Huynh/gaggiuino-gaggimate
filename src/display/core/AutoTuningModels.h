@@ -258,7 +258,7 @@ struct ShotRecord {
     bool excludeFromLocalOptimization = false;
     bool localOptimizationEnabled = false;
     bool communityUploadEnabled = false;
-    std::string communityUploadOwner = "gaggimate";
+    std::string communityUploadOwner = "espressorl";
     float optimizationWeight = 1.0f;
 
     RecipeSnapshot recipe;

@@ -32,7 +32,12 @@ function lastShotStatusText(formData) {
 
 function mqttConfigured(formData) {
   const port = Number(formData.haPort);
-  return Boolean(String(formData.haIP || '').trim()) && Number.isInteger(port) && port > 0 && port <= 65535;
+  return (
+    Boolean(String(formData.haIP || '').trim()) &&
+    Number.isInteger(port) &&
+    port > 0 &&
+    port <= 65535
+  );
 }
 
 function statusText(formData) {
@@ -120,28 +125,15 @@ function CommunityUploadSettings({ formData, onChange }) {
                 label='Storage'
                 value={
                   formData.communityUploadStorageAvailable
-                    ? formData.communityUploadStorageBackend || 'Device'
-                    : 'Unavailable'
+                    ? formData.communityUploadStorageBackend || 'Container'
+                    : 'Waiting for container'
                 }
               />
-              <div className='form-control'>
-                <label htmlFor='rlUploadBaseUrl' className='mb-2 block text-sm font-medium'>
-                  Supabase base URL
-                </label>
-                <input
-                  id='rlUploadBaseUrl'
-                  name='rlUploadBaseUrl'
-                  type='url'
-                  className='input input-bordered w-full'
-                  value={formData.rlUploadBaseUrl || ''}
-                  onChange={onChange('rlUploadBaseUrl')}
-                  placeholder='https://project-ref.supabase.co'
-                />
-              </div>
-              <StatusRow
-                label='Device credential'
-                value={formData.rlUploadCredentialConfigured ? 'Registered' : 'Pending'}
-              />
+              <p className='text-base-content/70 text-sm'>
+                Uploads are sent by your EspressoRL container. Enable community uploads and
+                configure its registration URL there. The machine only sends records over local
+                MQTT.
+              </p>
             </>
           )}
         </div>

@@ -140,8 +140,6 @@ class Controller {
     AutoTuning::CompletedShotProjectionPort *getCompletedShotProjection() const {
         return completedShotProjection;
     }
-    void setCommunityUpload(AutoTuning::CommunityUploadPort *upload) { communityUpload = upload; }
-    AutoTuning::CommunityUploadPort *getCommunityUpload() const { return communityUpload; }
     ProfileManager *getProfileManager() { return profileManager; }
 #ifndef GAGGIMATE_HEADLESS
     DefaultUI *getUI() const { return ui; }
@@ -290,7 +288,6 @@ class Controller {
     AutoTuning::OptimizerTransportPort *optimizerTransport{};
     AutoTuning::AutoTuningRecordStorePort *autoTuningRecordStore{};
     AutoTuning::CompletedShotProjectionPort *completedShotProjection{};
-    AutoTuning::CommunityUploadPort *communityUpload{};
     std::optional<StorageCoordinator::ProcessLease> processStorageLease;
     std::optional<StorageCoordinator::ProcessLease> pendingProcessStorageLease;
 

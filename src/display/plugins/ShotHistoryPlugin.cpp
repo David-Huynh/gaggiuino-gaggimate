@@ -1022,10 +1022,9 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
                         pluginManager->trigger(correctionEvent);
                         response["optimizer_persisted"] = correctionEvent.getInt("optimizer_persisted") == 1;
 
-                        AutoTuning::CommunityUploadPort *community = controller->getCommunityUpload();
-                        const bool hasCorrectedReplay = !corrected.record.shotId.empty();
-                        response["community_replacement_queued"] =
-                            hasCorrectedReplay && community && community->enqueueShot(corrected.record);
+                        // The container rebuilds its cloud record from this correction.
+                        response["community_replacement_queued"] = correctionEvent.getInt("optimizer_persisted") == 1;
+
                     }
                 }
             }

@@ -1,3 +1,4 @@
+#include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <display/core/RecommendationContext.h>
 #include "MQTTPlugin.h"
 #include "../core/AutoTuning.h"
@@ -19,6 +20,23 @@
 #include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
 #include <esp_log.h>
+#include <mbedtls/sha256.h>
+
+static String lifecycleDigest(const String &topic, const String &message) {
+    unsigned char digest[32];
+    mbedtls_sha256_context context;
+    mbedtls_sha256_init(&context);
+    mbedtls_sha256_starts_ret(&context, 0);
+    mbedtls_sha256_update_ret(&context, reinterpret_cast<const unsigned char *>(topic.c_str()), topic.length());
+    const unsigned char newline = '\n';
+    mbedtls_sha256_update_ret(&context, &newline, 1);
+    mbedtls_sha256_update_ret(&context, reinterpret_cast<const unsigned char *>(message.c_str()), message.length());
+    mbedtls_sha256_finish_ret(&context, digest);
+    mbedtls_sha256_free(&context);
+    char hex[65];
+    for (size_t i = 0; i < 32; ++i) snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    return String(hex);
+}
 
 const String LOG_TAG = F("MQTTPlugin");
 
@@ -37,7 +55,7 @@ struct MqttOutboxLock {
 
 constexpr const char *MQTT_OUTBOX_DIR = "/rlm";
 constexpr size_t MAX_MQTT_OUTBOX_ITEMS = 64;
-constexpr size_t MAX_MQTT_OUTBOX_BYTES = 128 * 1024;
+constexpr size_t MAX_MQTT_OUTBOX_BYTES = 512 * 1024;
 
 } // namespace
 
@@ -272,8 +290,8 @@ void MQTTPlugin::requestReconnect() {
     }
     Settings const &settings = controller->getSettings();
     ConnectionConfiguration next;
-    next.autoTuning = settings.isRLAutoTuningEnabled() &&
-                      settings.getRLAutoTuningProviderMode() == AutoTuning::PROVIDER_OFF_BOARD;
+    next.autoTuning = settings.isRLCommunityUploadEnabled() || (settings.isRLAutoTuningEnabled() &&
+                      settings.getRLAutoTuningProviderMode() == AutoTuning::PROVIDER_OFF_BOARD);
     next.legacyHomeAssistant = FeatureFlags::legacyHomeAssistantMqtt && settings.isHomeAssistant();
     next.host = settings.getHomeAssistantIP();
     next.port = settings.getHomeAssistantPort();
@@ -326,11 +344,13 @@ void MQTTPlugin::refreshAutoTuningSubscriptions(ConnectionConfiguration const &c
         const bool recommendation = client.subscribe(prefix + "/rl/recommendation", 1);
         const bool status = client.subscribe(prefix + "/rl/status", 1);
         const bool acknowledgement = client.subscribe(prefix + "/rl/shot/ack", 1);
-        autoTuningSubscribed = recommendation && status && acknowledgement;
+        const bool lifecycle = client.subscribe(prefix + "/rl/lifecycle/ack", 1);
+        autoTuningSubscribed = recommendation && status && acknowledgement && lifecycle;
     } else if (!configuration.autoTuning && autoTuningSubscribed) {
         client.unsubscribe(prefix + "/rl/recommendation");
         client.unsubscribe(prefix + "/rl/status");
         client.unsubscribe(prefix + "/rl/shot/ack");
+        client.unsubscribe(prefix + "/rl/lifecycle/ack");
         autoTuningSubscribed = false;
     }
 }
@@ -410,9 +430,9 @@ void MQTTPlugin::serviceWorker() {
         return;
     }
     refreshAutoTuningSubscriptions(configuration);
-    if (flushDurablePublishes())
-        return;
     if (publishLiveEvent())
+        return;
+    if (flushDurablePublishes())
         return;
     publishQueuedMessage();
 }
@@ -540,6 +560,10 @@ bool MQTTPlugin::publishNow(const String &topic, const String &message, const bo
     return client.publish(topic, message, retained, std::clamp(qos, 0, 2));
 }
 
+bool MQTTPlugin::enqueueCommunityHandoff(const std::string &payload) {
+    return publish("rl/community/handoff", payload.c_str(), false, 1, true);
+}
+
 bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &message, const bool retained, const int qos) {
     auto flashLease = StorageCoordinator::instance().acquireFlash();
     MqttOutboxLock lock(outboxMutex);
@@ -550,7 +574,7 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
         return false;
     }
 
-    JsonDocument doc;
+    JsonDocument doc(&psramAllocator);
     doc["topic"] = topic;
     doc["message"] = message;
     doc["retained"] = retained;
@@ -559,6 +583,8 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
     const size_t expected = measureJson(doc);
 
     unsigned long long nextSequence = 1;
+    const bool cloudHandoff = topic.endsWith("/rl/community/handoff");
+    bool cloudHandoffPending = false;
     size_t queuedCount = 0;
     size_t queuedBytes = 0;
     File directory = LittleFS.open(MQTT_OUTBOX_DIR);
@@ -569,7 +595,7 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
             const bool regularFile = !queued.isDirectory();
             const size_t bytes = queued.size();
             queued.close();
-            if (regularFile && name.endsWith(".json")) {
+            if (regularFile && (name.endsWith(".json") || name.endsWith(".rejected"))) {
                 ++queuedCount;
                 queuedBytes += bytes;
             }
@@ -577,18 +603,22 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
             if (slash >= 0) {
                 name = name.substring(slash + 1);
             }
-            const unsigned long long sequence = std::strtoull(name.c_str(), nullptr, 10);
+            cloudHandoffPending = cloudHandoffPending || (name.startsWith("c") && name.endsWith(".json"));
+            const unsigned long long sequence = std::strtoull(name.c_str() + (name.startsWith("c") ? 1 : 0), nullptr, 10);
             nextSequence = std::max(nextSequence, sequence + 1);
             queued = directory.openNextFile();
         }
         directory.close();
     }
+    // Keep room for user feedback and allow only one legacy cloud record in flight.
+    if (cloudHandoff && (cloudHandoffPending || queuedCount >= MAX_MQTT_OUTBOX_ITEMS - 8 ||
+                        queuedBytes + expected > MAX_MQTT_OUTBOX_BYTES - 64 * 1024)) return false;
     if (queuedCount >= MAX_MQTT_OUTBOX_ITEMS || queuedBytes + expected > MAX_MQTT_OUTBOX_BYTES) {
         ESP_LOGE(LOG_TAG.c_str(), "MQTT lifecycle outbox is full");
         return false;
     }
     char path[48];
-    snprintf(path, sizeof(path), "%s/%020llu.json", MQTT_OUTBOX_DIR, nextSequence);
+    snprintf(path, sizeof(path), "%s/%s%020llu.json", MQTT_OUTBOX_DIR, cloudHandoff ? "c" : "", nextSequence);
     const String tempPath = AtomicFile::temporaryPath(path);
     if (!LittleFSUtil::removeIfExists(tempPath)) {
         return false;
@@ -600,7 +630,7 @@ bool MQTTPlugin::enqueueDurablePublish(const String &topic, const String &messag
     const size_t written = serializeJson(doc, file);
     file.flush();
     file.close();
-    JsonDocument verification;
+    JsonDocument verification(&psramAllocator);
     File verificationFile = LittleFS.open(tempPath, FILE_READ);
     const bool valid = verificationFile && !deserializeJson(verification, verificationFile) && verification.is<JsonObject>();
     verificationFile.close();
@@ -630,7 +660,7 @@ void MQTTPlugin::recoverDurablePublishes() {
         entry.close();
         if (path.endsWith(".json.tmp")) {
             File tempFile = LittleFS.open(path, FILE_READ);
-            JsonDocument pendingDoc;
+            JsonDocument pendingDoc(&psramAllocator);
             const bool valid = tempFile && !deserializeJson(pendingDoc, tempFile) && pendingDoc.is<JsonObject>();
             tempFile.close();
             AtomicFile::recoverPending(path.substring(0, path.length() - 4), valid);
@@ -658,8 +688,10 @@ bool MQTTPlugin::flushDurablePublishes() {
         return false;
     }
     const unsigned long nowMs = millis();
-    if (nextDurablePublishAttemptMs != 0 && static_cast<long>(nowMs - nextDurablePublishAttemptMs) < 0) {
-        return false;
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        if (!lifecycleReceipt && nextDurablePublishAttemptMs != 0 &&
+            static_cast<long>(nowMs - nextDurablePublishAttemptMs) < 0) return false;
     }
     String selectedPath;
     String topic;
@@ -697,7 +729,7 @@ bool MQTTPlugin::flushDurablePublishes() {
         }
 
         File file = LittleFS.open(selectedPath, FILE_READ);
-        JsonDocument doc;
+        JsonDocument doc(&psramAllocator);
         const DeserializationError error = deserializeJson(doc, file);
         file.close();
         topic = doc["topic"].as<String>();
@@ -706,37 +738,47 @@ bool MQTTPlugin::flushDurablePublishes() {
         qos = doc["qos"] | 0;
         const String expectedPrefix = "gaggimate/" + machineTopicId() + "/";
         if (error || !topic.startsWith(expectedPrefix) || message.isEmpty() || qos < 0 || qos > 2) {
-            ESP_LOGE(LOG_TAG.c_str(), "Removing invalid MQTT outbox record %s", selectedPath.c_str());
-            LittleFS.remove(selectedPath);
+            ESP_LOGE(LOG_TAG.c_str(), "Quarantining invalid MQTT outbox record %s", selectedPath.c_str());
+            LittleFS.rename(selectedPath, selectedPath + ".rejected");
             return true;
         }
-        JsonDocument messageDoc;
-        EpochTime::Seconds queuedTimestamp = 0;
-        const EpochTime::Seconds now = EpochTime::now();
-        if (!deserializeJson(messageDoc, message) && messageDoc.is<JsonObject>() &&
-            (!mqttJsonEpoch(messageDoc["timestamp"], queuedTimestamp) || queuedTimestamp < EpochTime::MIN_VALID) &&
-            now >= EpochTime::MIN_VALID) {
-            messageDoc["timestamp"] = now;
-            message = "";
-            serializeJson(messageDoc, message);
+    }
+    const String digest = lifecycleDigest(topic, message);
+    std::optional<bool> accepted;
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        if (lifecycleReceipt && lifecycleReceipt->first == digest) accepted = lifecycleReceipt->second;
+        else lifecycleReceipt.reset(); // A higher-priority user event can preempt a legacy handoff.
+
+    }
+    if (accepted.has_value()) {
+        auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
+        if (!flashLease) return false;
+        MqttOutboxLock lock(outboxMutex);
+        if (!lock.locked) return false;
+        // Rejected input is quarantined for diagnosis, not retried indefinitely.
+        const bool resolved = *accepted ? LittleFSUtil::removeIfExists(selectedPath)
+                                       : LittleFS.rename(selectedPath, selectedPath + ".rejected");
+        if (resolved) {
+            std::lock_guard<std::mutex> guard(queueMutex);
+            lifecycleReceipt.reset();
+            awaitingLifecycleDigest = "";
         }
+        nextDurablePublishAttemptMs = 0;
+        return resolved;
+    }
+    {
+        std::lock_guard<std::mutex> guard(queueMutex);
+        awaitingLifecycleDigest = digest;
     }
     if (!publishNow(topic, message, retained, qos)) {
         nextDurablePublishAttemptMs = millis() + 1000;
         return false;
     }
-    nextDurablePublishAttemptMs = 0;
-    {
-        auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
-        if (!flashLease) {
-            durablePublishPending.store(true, std::memory_order_release);
-            return true;
-        }
-        MqttOutboxLock lock(outboxMutex);
-        if (lock.locked) {
-            LittleFSUtil::removeIfExists(selectedPath);
-        }
-    }
+    // PUBACK only confirms broker receipt. Keep the exact bytes until the
+    // container confirms processing; replay after disconnect or power loss.
+    nextDurablePublishAttemptMs = millis() + 10000;
+
     return true;
 }
 
@@ -925,8 +967,8 @@ void MQTTPlugin::publishMachineState(const char *state, const bool force) {
     doc["timestamp"] = EpochTime::now();
     doc["state"] = state;
     doc["local_optimization_enabled"] = localOptimizationEnabled();
-    doc["community_upload_enabled"] = false;
-    doc["community_upload_owner"] = "gaggimate";
+    doc["community_upload_enabled"] = settings.isRLCommunityUploadEnabled();
+    doc["community_upload_owner"] = "espressorl";
     AutoTuningPayloadMetadata::addRecipe(controller, doc);
     AutoTuningPayloadMetadata::addProfile(controller, doc);
     addUartDiagnostics(doc);
@@ -962,7 +1004,7 @@ void MQTTPlugin::publishOptimizerSettings() {
     AutoTuning::activeTasteGoal(settings, tasteGoal);
     doc["taste_goal"].set(tasteGoal.as<JsonVariantConst>());
     if (controller->getProfileManager()) {
-        Profile &profile = controller->getProfileManager()->getSelectedProfile();
+        Profile const &profile = controller->getProfileManager()->getSelectedProfile();
         doc["profile_id"] = profile.id;
         doc["profile_label"] = profile.label;
     }
@@ -1031,6 +1073,17 @@ void MQTTPlugin::drainInbound() {
             handleStatus(message.payload);
         } else if (message.topic.endsWith("/rl/shot/ack")) {
             handleShotDeliveryAck(message.payload);
+        } else if (message.topic.endsWith("/rl/lifecycle/ack")) {
+            JsonDocument receipt;
+            if (!deserializeJson(receipt, message.payload)) {
+                std::lock_guard<std::mutex> guard(queueMutex);
+                auto accepted = AutoTuning::acceptedLifecycleReceipt(receipt.as<JsonObjectConst>(),
+                    machineId().c_str(), awaitingLifecycleDigest.c_str());
+                if (accepted.has_value()) {
+                    lifecycleReceipt = std::make_pair(awaitingLifecycleDigest, *accepted);
+                    if (connectionTaskHandle) xTaskNotifyGive(connectionTaskHandle);
+                }
+            }
         }
     }
 }
@@ -1135,15 +1188,13 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     if (store) {
         store->storeRecommendation(recommendation);
     }
-    AutoTuning::CommunityUploadPort *upload = controller->getCommunityUpload();
-    if (upload) {
-        upload->enqueueRecommendation(recommendation);
-    }
+
 }
 
 void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
     if (!pluginManager || !controller ||
-        !AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).routeOffBoardTransport() ||
+        (!controller->getSettings().isRLCommunityUploadEnabled() &&
+         !AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).routeOffBoardTransport()) ||
         payload.isEmpty()) {
         return;
     }
@@ -1172,7 +1223,7 @@ void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
 }
 
 void MQTTPlugin::handleStatus(const String &payload) {
-    if (!pluginManager || !isAutoTuningEnabled())
+    if (!pluginManager || (!isAutoTuningEnabled() && !controller->getSettings().isRLCommunityUploadEnabled()))
         return;
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
@@ -1257,6 +1308,21 @@ void MQTTPlugin::handleStatus(const String &payload) {
             latestStatusRecentShotsJson = recent;
         }
     }
+    Event cloud;
+    cloud.id = "rl:community-upload:status";
+    cloud.setInt("requested", controller->getSettings().isRLCommunityUploadEnabled());
+    cloud.setInt("effective", latestStatusCommunityUploadEnabled && latestStatusRuntimeHealthUploadConfigured);
+    cloud.setInt("configured", latestStatusRuntimeHealthUploadConfigured);
+    cloud.setInt("storage_available", true);
+    cloud.setString("storage_backend", "container");
+    cloud.setInt("pending_count", latestStatusUploadQueueCount);
+    cloud.setInt("failed_count", doc["upload_queue_failed_count"] | 0);
+    cloud.setInt("rejected_count", latestStatusUploadQueueRejectedCount);
+    cloud.setString("status", latestStatusCommunityUploadEnabled && latestStatusRuntimeHealthUploadConfigured ? "ready" : "attention");
+    cloud.setString("summary", latestStatusCommunityUploadEnabled
+        ? (latestStatusRuntimeHealthUploadConfigured ? "EspressoRL container owns cloud delivery" : "Configure cloud registration in the EspressoRL container")
+        : "Enable community upload in the EspressoRL container");
+    pluginManager->trigger(cloud);
     Event event;
     event.id = "rl:status:received";
     event.setInt("seen", latestStatusSeen ? 1 : 0);
@@ -1565,7 +1631,7 @@ void MQTTPlugin::publishRecommendationApply(bool doseApplied, bool yieldApplied,
 }
 
 bool MQTTPlugin::publishShotCorrection(Event const &event) {
-    if (!isAutoTuningParticipating())
+    if (!controller || (!isAutoTuningParticipating() && !controller->getSettings().isRLCommunityUploadEnabled()))
         return false;
 
     AutoTuning::ShotCorrection const *correction = event.getPayload<AutoTuning::ShotCorrection>();
@@ -1686,7 +1752,7 @@ bool MQTTPlugin::configured() const {
                                     settings.getRLAutoTuningProviderMode() == AutoTuning::PROVIDER_OFF_BOARD;
     const int port = settings.getHomeAssistantPort();
     const bool legacyHomeAssistant = FeatureFlags::legacyHomeAssistantMqtt && settings.isHomeAssistant();
-    return (offBoardAutoTuning || legacyHomeAssistant) && !settings.getHomeAssistantIP().isEmpty() && port > 0 &&
+    return (offBoardAutoTuning || settings.isRLCommunityUploadEnabled() || legacyHomeAssistant) && !settings.getHomeAssistantIP().isEmpty() && port > 0 &&
            port <= 65535;
 }
 
@@ -1695,8 +1761,8 @@ bool MQTTPlugin::connected() const { return mqttWasConnected.load(std::memory_or
 AutoTuning::ShotSubmissionResult
 MQTTPlugin::publishShot(AutoTuning::ShotRecord const &shot,
                         AutoTuning::ShotDeliveryAttempt const &attempt) {
-    if (!controller ||
-        !AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).routeOffBoardTransport()) {
+    if (!controller || (!controller->getSettings().isRLCommunityUploadEnabled() &&
+        !AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), this).routeOffBoardTransport())) {
         return {AutoTuning::ShotSubmissionOutcome::NotConnected,
                 "optimizer_transport_disabled"};
     }

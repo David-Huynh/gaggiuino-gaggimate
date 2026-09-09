@@ -565,7 +565,7 @@ bool CommunityUploadQueue::selectReady(const String &endpoint, std::int64_t now,
         Item candidate;
         if (isQueuePath(path) &&
             readItemUnlocked(path, candidate, flashLease) &&
-            candidate.endpoint == endpoint &&
+            (endpoint.isEmpty() || candidate.endpoint == endpoint) &&
             (candidate.status == Status::Pending || candidate.status == Status::Failed) && candidate.nextRetryAt <= now &&
             (!found || candidate.createdAt < item.createdAt)) {
             item = candidate;

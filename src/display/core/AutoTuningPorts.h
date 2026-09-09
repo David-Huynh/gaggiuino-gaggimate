@@ -24,6 +24,7 @@ class OptimizerTransportPort {
   public:
     virtual ~OptimizerTransportPort() = default;
 
+    virtual bool enqueueCommunityHandoff(const std::string &payload) { return false; }
     virtual bool configured() const = 0;
     virtual bool connected() const = 0;
     virtual ShotSubmissionResult publishShot(ShotRecord const &shot, ShotDeliveryAttempt const &attempt) = 0;
@@ -56,16 +57,6 @@ class LocalOptimizationStorePort {
 
     virtual bool reset() = 0;
     virtual LocalStoreStats stats() const = 0;
-};
-
-class CommunityUploadPort {
-  public:
-    virtual ~CommunityUploadPort() = default;
-
-    virtual bool enqueueShot(ShotRecord const &shot) = 0;
-    virtual bool enqueueRecommendation(Recommendation const &recommendation) = 0;
-    virtual bool enqueuePreference(PreferenceFeedback const &preference) = 0;
-    virtual bool applyCorrection(ShotCorrection const &correction) = 0;
 };
 
 } // namespace AutoTuning

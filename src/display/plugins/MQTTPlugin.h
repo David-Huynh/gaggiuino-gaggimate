@@ -26,6 +26,7 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     bool connect(Controller *controller);
     void loop() override;
     bool configured() const override;
+    bool enqueueCommunityHandoff(const std::string &payload) override;
     bool connected() const override;
     AutoTuning::ShotSubmissionResult publishShot(AutoTuning::ShotRecord const &shot,
                                                   AutoTuning::ShotDeliveryAttempt const &attempt) override;
@@ -160,6 +161,8 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     enum class PendingMachineState : uint8_t { None, Idle, Brewing, Standby };
     std::atomic<PendingMachineState> pendingMachineState{PendingMachineState::None};
 
+    String awaitingLifecycleDigest;
+    std::optional<std::pair<String, bool>> lifecycleReceipt;
     bool hasRecommendation = false;
     AutoTuning::Recommendation latestRecommendation;
 

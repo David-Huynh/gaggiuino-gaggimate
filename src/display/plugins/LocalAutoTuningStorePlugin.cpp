@@ -896,15 +896,16 @@ bool LocalAutoTuningStorePlugin::prepareShotReprocess(const String &shotId) {
         }
         ESP_LOGI(LOG_TAG, "Restored the active taste goal while reprocessing shot %s", shotId.c_str());
     }
-    const bool localDeliveryRequired = controller && AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
-                                                                        controller->getOptimizerTransport())
-                                                         .optimizationActive();
+    const bool localDeliveryRequired = controller &&
+        (controller->getSettings().isRLCommunityUploadEnabled() ||
+         AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
+                           controller->getOptimizerTransport()).optimizationActive());
     root["local_delivery_required"] = localDeliveryRequired;
     root["local_delivery_state"] = localDeliveryRequired ? "pending" : "not_required";
     root["local_next_retry_at"] = 0;
     root["local_last_error"] = nullptr;
     root["community_dispatched"] = false;
-    root["community_required"] = controller && controller->getSettings().isRLCommunityUploadEnabled();
+    root["community_required"] = false;
     root["completion_emitted"] = !localDeliveryRequired;
     const EpochSeconds now = nowEpoch();
     root["updated_at"] = now;
@@ -1011,8 +1012,6 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
     AutoTuning::CompletedShotArtifact artifact;
     AutoTuning::ShotDeliveryAttempt attempt;
     bool localDeliveryRequired = false;
-    bool communityRequired = false;
-    bool communityDispatched = false;
     JsonDocument envelope(&psramAllocator);
     {
         LocalStoreLock lock(storeMutex);
@@ -1026,8 +1025,13 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
         localDeliveryRequired =
             root["local_delivery_required"].isNull() ? true
                                                      : root["local_delivery_required"].as<bool>();
-        communityRequired = root["community_required"] | false;
-        communityDispatched = root["community_dispatched"] | false;
+        // Migrate old device-owned delivery onto the acknowledged container path.
+        if ((root["community_required"] | false) && !(root["community_dispatched"] | false)) {
+            localDeliveryRequired = true;
+            root["local_delivery_required"] = true;
+            root["community_required"] = false;
+            root["community_dispatched"] = true;
+        }
 
         if (artifact.record.timestamp < EpochTime::MIN_VALID) {
             artifact.record.timestamp = now;
@@ -1092,11 +1096,6 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
                       "optimizer_transport_unavailable"};
     }
 
-    bool communityQueued = false;
-    if (!automaticRetry && communityRequired && !communityDispatched) {
-        AutoTuning::CommunityUploadPort *upload = controller ? controller->getCommunityUpload() : nullptr;
-        communityQueued = upload && upload->enqueueShot(artifact.record);
-    }
 
     {
         LocalStoreLock lock(storeMutex);
@@ -1112,9 +1111,6 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
         const int attemptCount = root["local_attempt_count"] | 1;
         root["dispatch_count"] = (root["dispatch_count"] | 0) + 1;
         root["updated_at"] = nowEpoch();
-        if (communityQueued) {
-            root["community_dispatched"] = true;
-        }
         if (!localDeliveryRequired) {
             root["dispatch_state"] = "not_required";
             root["local_delivery_state"] = "not_required";
@@ -1271,22 +1267,8 @@ void LocalAutoTuningStorePlugin::dispatchPendingCommunityUploads() {
                       loadCommittedShot(shotId, artifact);
             }
         }
-        AutoTuning::CommunityUploadPort *upload =
-            controller ? controller->getCommunityUpload() : nullptr;
-        if (due && upload && upload->enqueueShot(artifact.record)) {
-            LocalStoreLock lock(storeMutex);
-            JsonDocument latest(&psramAllocator);
-            if (loadReplaySnapshot(shotId, latest)) {
-                JsonObject root = latest.as<JsonObject>();
-                if ((root["community_required"] | false) &&
-                    !(root["community_dispatched"] | false)) {
-                    root["community_dispatched"] = true;
-                    root["updated_at"] = nowEpoch();
-                    LocalAutoTuningFiles::writeJson(
-                        LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), latest);
-                }
-            }
-        }
+        if (due) dispatchStoredShot(shotId, false);
+
     }
 }
 

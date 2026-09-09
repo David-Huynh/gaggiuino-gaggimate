@@ -520,8 +520,8 @@ void AutoTuningCapturePlugin::publishShotProfile() {
     completion.doseTargetG = configuredDoseG;
     AutoTuning::ShotCaptureDisposition disposition;
     disposition.doseConfirmationRequired = doseConfirmationRequired;
-    disposition.optimizerDeliveryRequired = localDeliveryRequired;
-    disposition.communityUploadRequired = shot.communityUploadEnabled;
+    disposition.optimizerDeliveryRequired = localDeliveryRequired || shot.communityUploadEnabled;
+    disposition.communityUploadRequired = false; // Container owns cloud delivery.
 
     if (!pluginManager) {
         return;
