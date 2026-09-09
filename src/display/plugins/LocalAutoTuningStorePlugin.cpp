@@ -1,3 +1,4 @@
+#include <display/core/RecipeConfirmation.h>
 #include "LocalAutoTuningStorePlugin.h"
 #include "autotuning/AutoTuningJsonCodec.h"
 #include "autotuning/AutoTuningTasteGoalJson.h"
@@ -718,7 +719,7 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
             event.getInt64("prompt_revision"), 0));
     if (shotId.isEmpty() || promptRevision == 0 ||
         event.getInt("prompt_claimed") != 1 ||
-        event.getInt("has_followed") != 1) {
+        !event.getPayload<AutoTuning::RecipeConfirmation>()) {
         return;
     }
     const auto releaseClaim = [this, &shotId, promptRevision]() {
@@ -758,13 +759,13 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
         releaseClaim();
         return;
     }
-    const bool followed = event.getInt("followed") == 1;
-    artifact.record.doseTargetConfirmed = followed;
-    artifact.record.doseFollowed = followed;
-    if (followed && !artifact.record.measuredDoseG.has_value() &&
-        artifact.record.recipe.doseTargetG.has_value()) {
-        artifact.record.measuredDoseG = artifact.record.recipe.doseTargetG;
+    const auto &answer = *event.getPayload<AutoTuning::RecipeConfirmation>();
+    if (!AutoTuning::confirmRecipe(artifact.record, answer)) {
+        releaseClaim();
+        return;
     }
+    const bool followed = answer.answer != AutoTuning::RecipeAnswer::Unknown;
+    artifact.disposition.doseConfirmationRequired = false;
     const bool canonicalArtifact = artifactStore.exists(shotId);
     JsonDocument payload(&psramAllocator);
     if (canonicalArtifact) {
@@ -786,7 +787,7 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
         root["payload"].set(payload.as<JsonObjectConst>());
     }
     const EpochSeconds now = nowEpoch();
-    root["dose_confirmation_status"] = followed ? "confirmed" : "not_followed";
+    root["dose_confirmation_status"] = followed ? "confirmed" : "unknown";
     root["dispatch_state"] = "ready";
     root["local_delivery_state"] = "pending";
     root["local_next_retry_at"] = 0;
@@ -1471,7 +1472,18 @@ void LocalAutoTuningStorePlugin::drainStoredShots() {
             Event confirmationEvent;
             confirmationEvent.id = "rl:dose-confirmation:required";
             confirmationEvent.setString("shot_id", notice.shotId);
-            confirmationEvent.setFloat("dose_target_g", notice.doseTargetG);
+            AutoTuning::CompletedShotArtifact artifact;
+            {
+                LocalStoreLock lock(storeMutex);
+                if (!loadCommittedShot(notice.shotId, artifact)) continue;
+            }
+            const auto grind = AutoTuning::displayedGrind(artifact.record);
+            const auto dose = AutoTuning::displayedDose(artifact.record);
+            confirmationEvent.setFloat("dose_target_g", dose.value_or(notice.doseTargetG));
+            confirmationEvent.setInt("has_grind_setting", grind.has_value());
+            if (grind) confirmationEvent.setFloat("grind_setting", *grind);
+            confirmationEvent.setInt("grind_is_absolute", AutoTuning::usesAbsoluteGrind(artifact.record));
+            confirmationEvent.setInt("dose_measured", artifact.record.doseObserved);
             confirmationEvent.setInt64("prompt_revision", notice.promptRevision);
             pluginManager->trigger(confirmationEvent);
         } else {

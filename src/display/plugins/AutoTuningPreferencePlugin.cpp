@@ -1,6 +1,8 @@
 #ifndef GAGGIMATE_HEADLESS
 
 #include "AutoTuningPreferencePlugin.h"
+#include <display/core/RecipeConfirmation.h>
+#include <cstdlib>
 #include "../core/AutoTuning.h"
 #include "../core/Controller.h"
 #include "../core/PluginManager.h"
@@ -112,6 +114,7 @@ void AutoTuningPreferencePlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
 
     pm->on("rl:dose-confirmation:resolved", [this](Event const &event) {
+        if (event.getInt("persisted") != 1) return;
         if (event.getString("shot_id") != pendingDoseShotId ||
             event.getInt64("prompt_revision") !=
                 static_cast<std::int64_t>(pendingDosePromptRevision)) {
@@ -246,6 +249,10 @@ bool AutoTuningPreferencePlugin::activateDosePrompt(Event const &event) {
     pendingDoseShotId = shotId;
     pendingDosePromptRevision = promptRevision;
     pendingDoseTargetG = targetG;
+    pendingRecipeGrind = event.getInt("has_grind_setting") == 1
+        ? std::optional<float>(event.getFloat("grind_setting")) : std::nullopt;
+    pendingRecipeAbsolute = event.getInt("grind_is_absolute") == 1;
+    editingRecipe = false;
     return true;
 }
 
@@ -357,26 +364,57 @@ bool AutoTuningPreferencePlugin::shouldPromptRecommendation() const {
 void AutoTuningPreferencePlugin::showDoseConfirmationOverlay() {
     clearOverlay(false);
     overlayMode = AutoTuningOverlayMode::DOSE_CONFIRMATION;
-    lv_obj_t *card = createOverlayCard(overlay, DOSE_CONFIRMATION_CARD_H);
-
-    lv_obj_t *title = lv_label_create(card);
-    lv_label_set_text_fmt(title, "Did you use %.1f g?", pendingDoseTargetG);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 22);
-
-    lv_obj_t *subtitle = lv_label_create(card);
-    lv_label_set_text(subtitle, "Dose was not measured by grind by weight");
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xB0B0B0), 0);
-    lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 58);
-
-    const char *labels[] = {"Yes", "No"};
-    const uint32_t colors[] = {0x2E7D32, 0x3E4A59};
-    for (int index = 0; index < 2; index++) {
+    lv_obj_t *card = createOverlayCard(overlay, std::min<lv_coord_t>(LV_VER_RES - 24, 440));
+    lv_obj_add_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_set_style_pad_row(card, 8, 0);
+    const auto text = [card](const String &value) {
+        lv_obj_t *label = lv_label_create(card);
+        lv_obj_set_width(label, LV_PCT(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(label, value.c_str());
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        return label;
+    };
+    text("Confirm the recipe you used");
+    text("Grind: " + (pendingRecipeGrind ? String(*pendingRecipeGrind, 1) : String("unknown")) +
+         (pendingRecipeAbsolute ? "" : " steps from reference") + " / Dose: " + String(pendingDoseTargetG, 1) + " g");
+    text("Not sure keeps the shot without using its recipe for optimization.");
+    recipeGrindInput = recipeDoseInput = recipeKeyboard = nullptr;
+    if (editingRecipe) {
+        const auto input = [card, &text](const char *name, const String &value) {
+            text(name);
+            lv_obj_t *field = lv_textarea_create(card);
+            lv_obj_set_width(field, LV_PCT(100));
+            lv_textarea_set_one_line(field, true);
+            lv_textarea_set_accepted_chars(field, "0123456789.-");
+            lv_textarea_set_max_length(field, 12);
+            lv_textarea_set_text(field, value.c_str());
+            return field;
+        };
+        recipeGrindInput = input(pendingRecipeAbsolute ? "Actual grind setting" : "Actual grind (steps from reference)",
+                                 pendingRecipeGrind ? String(*pendingRecipeGrind, 1) : String(""));
+        recipeDoseInput = input("Actual dose (g)", String(pendingDoseTargetG, 1));
+        recipeKeyboard = lv_keyboard_create(card);
+        lv_obj_set_width(recipeKeyboard, LV_PCT(100));
+        lv_obj_set_height(recipeKeyboard, 120);
+        lv_keyboard_set_mode(recipeKeyboard, LV_KEYBOARD_MODE_NUMBER);
+        lv_keyboard_set_textarea(recipeKeyboard, recipeGrindInput);
+        for (lv_obj_t *field : {recipeGrindInput, recipeDoseInput}) {
+            lv_obj_add_event_cb(field, [](lv_event_t *event) {
+                auto *keyboard = static_cast<lv_obj_t *>(lv_event_get_user_data(event));
+                lv_keyboard_set_textarea(keyboard, static_cast<lv_obj_t *>(lv_event_get_target(event)));
+            }, LV_EVENT_FOCUSED, recipeKeyboard);
+        }
+    }
+    recipeError = text("");
+    const char *labels[] = {editingRecipe ? "Save recipe" : "Yes", "Change values", "Not sure"};
+    for (int index = 0; index < 3; ++index) {
+        if (editingRecipe && index == 1) continue;
         lv_obj_t *button = lv_btn_create(card);
-        lv_obj_set_size(button, 150, 48);
-        lv_obj_align(button, index == 0 ? LV_ALIGN_BOTTOM_LEFT : LV_ALIGN_BOTTOM_RIGHT, index == 0 ? 30 : -30, -30);
-        lv_obj_set_style_radius(button, 7, 0);
-        lv_obj_set_style_bg_color(button, lv_color_hex(colors[index]), 0);
+        lv_obj_set_size(button, LV_PCT(100), 44);
+        if (index == 0 && !editingRecipe && !pendingRecipeGrind) lv_obj_add_state(button, LV_STATE_DISABLED);
         lv_obj_set_user_data(button, reinterpret_cast<void *>(static_cast<intptr_t>(index)));
         lv_obj_add_event_cb(button, doseConfirmationButtonCallback, LV_EVENT_CLICKED, this);
         lv_obj_t *label = lv_label_create(button);
@@ -576,7 +614,31 @@ void AutoTuningPreferencePlugin::selectPreference(const String &label) {
     }
 }
 
-void AutoTuningPreferencePlugin::selectDoseConfirmation(bool followed) {
+void AutoTuningPreferencePlugin::selectDoseConfirmation(int selection) {
+    if (selection == 1) {
+        editingRecipe = true;
+        showDoseConfirmationOverlay();
+        return;
+    }
+    AutoTuning::RecipeConfirmation answer;
+    answer.answer = selection == 2 ? AutoTuning::RecipeAnswer::Unknown
+        : editingRecipe ? AutoTuning::RecipeAnswer::Change : AutoTuning::RecipeAnswer::Confirm;
+    if (answer.answer == AutoTuning::RecipeAnswer::Change) {
+        const auto number = [](lv_obj_t *field) -> std::optional<float> {
+            if (!field) return {};
+            const char *value = lv_textarea_get_text(field);
+            char *end = nullptr;
+            const float result = std::strtof(value, &end);
+            return end != value && *end == '\0' && std::isfinite(result) ? std::optional<float>(result) : std::nullopt;
+        };
+        answer.grindSetting = number(recipeGrindInput);
+        answer.doseG = number(recipeDoseInput);
+        if (!answer.grindSetting || !answer.doseG || std::fabs(*answer.grindSetting) > 10000 ||
+            *answer.doseG < 0.1f || *answer.doseG > 100) {
+            lv_label_set_text(recipeError, "Enter a valid grind and dose (0.1-100 g).");
+            return;
+        }
+    }
     if (!pluginManager || pendingDoseShotId.isEmpty() ||
         pendingDosePromptRevision == 0) {
         return;
@@ -594,8 +656,7 @@ void AutoTuningPreferencePlugin::selectDoseConfirmation(bool followed) {
     event.setString("shot_id", pendingDoseShotId);
     event.setInt64("prompt_revision", pendingDosePromptRevision);
     event.setInt("prompt_claimed", 1);
-    event.setInt("has_followed", 1);
-    event.setInt("followed", followed ? 1 : 0);
+    event.setPayload(answer);
     pluginManager->trigger(event);
 }
 
@@ -646,7 +707,7 @@ void doseConfirmationButtonCallback(lv_event_t *event) {
     auto *plugin = static_cast<AutoTuningPreferencePlugin *>(lv_event_get_user_data(event));
     auto *button = static_cast<lv_obj_t *>(lv_event_get_target(event));
     const int selection = static_cast<int>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(button)));
-    plugin->selectDoseConfirmation(selection == 0);
+    plugin->selectDoseConfirmation(selection);
 }
 
 void useButtonCallback(lv_event_t *event) {

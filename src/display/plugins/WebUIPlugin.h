@@ -183,6 +183,9 @@ class WebUIPlugin : public Plugin {
     String _pendingDoseShotId = "";
     std::uint32_t _pendingDosePromptRevision = 0;
     float _pendingDoseTargetG = 0.0f;
+    std::optional<float> _pendingRecipeGrind;
+    bool _pendingRecipeAbsolute = false;
+    bool _pendingRecipeMeasuredDose = false;
     std::deque<Event> _queuedPreferencePrompts;
     std::deque<Event> _queuedDoseConfirmations;
     String _pendRecJson = "";

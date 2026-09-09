@@ -1,3 +1,4 @@
+#include <display/core/RecipeConfirmation.h>
 #include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -48,6 +49,60 @@ static AutoTuning::CompletedShotArtifact fixture() {
 }
 
 int main(int argc, char **argv) {
+    auto recipeArtifact = fixture();
+    recipeArtifact.bindSamples();
+    auto recipe = recipeArtifact.record;
+    recipe.recipe.grinder.currentAbsoluteStep = 12.5f;
+    recipe.recipe.grinder.absoluteReferenceStep = 10.0f;
+    recipe.recipe.grinder.relativeStepsFromReference = 2.5f;
+    recipe.recipe.grinder.micronsPerStep = 10.0f;
+    recipe.recipe.grinder.observed = false;
+    recipe.recipe.doseTargetG = 18.0f;
+    recipe.recipe.targetYieldG = 36.0f;
+    recipe.recommendation.recommendationId = "recommendation";
+    recipe.recommendation.projectedRelativeStepFromReference = 2.5f;
+    recipe.recommendation.nextDoseG = 18.0f;
+    auto confirmed = recipe;
+    assert(AutoTuning::confirmRecipe(confirmed, {AutoTuning::RecipeAnswer::Confirm}));
+    assert(confirmed.recipe.grinder.observed && confirmed.doseTargetConfirmed && !confirmed.doseObserved);
+    assert(confirmed.grindFollowed == true && confirmed.doseFollowed == true);
+    auto edited = recipe;
+    assert(AutoTuning::confirmRecipe(edited, {AutoTuning::RecipeAnswer::Change, 14.0f, 19.0f}));
+    assert(edited.recipe.grinder.relativeStepsFromReference == 4.0f);
+    assert(edited.recipe.grinder.relativeMicronsFromReference == 40.0f);
+    assert(edited.recipe.grinder.currentAbsoluteStep == 14.0f);
+    assert(edited.recipe.doseTargetG == 19.0f && edited.doseTargetConfirmed);
+    assert(edited.grindFollowed == false && edited.doseFollowed == false);
+    JsonDocument savedRecipe;
+    assert(AutoTuningJsonCodec::writeShotRecord(edited, savedRecipe));
+    AutoTuningJsonCodec::DecodedShotRecord decodedRecipe;
+    String recipeError;
+    assert(AutoTuningJsonCodec::parseShotRecord(savedRecipe.as<JsonObjectConst>(), decodedRecipe, recipeError));
+    assert(decodedRecipe.record.recipe.grinder.currentAbsoluteStep == 14.0f);
+    assert(decodedRecipe.record.doseTargetConfirmed);
+    auto relative = recipe;
+    relative.recipe.grinder.currentAbsoluteStep.reset();
+    relative.recipe.grinder.absoluteReferenceStep.reset();
+    relative.recipe.grinder.stepDirection = "higher_is_coarser";
+    assert(AutoTuning::confirmRecipe(relative, {AutoTuning::RecipeAnswer::Change, -1.5f, 17.0f}));
+    assert(relative.recipe.grinder.relativeStepsFromReference == -1.5f);
+    assert(relative.recipe.grinder.relativeMicronsFromReference == 15.0f);
+    auto unknown = confirmed;
+    assert(AutoTuning::confirmRecipe(unknown, {AutoTuning::RecipeAnswer::Unknown}));
+    assert(!unknown.recipe.grinder.observed && !unknown.doseTargetConfirmed && !unknown.grindFollowed);
+    auto invalid = recipe;
+    assert(!AutoTuning::confirmRecipe(invalid, {AutoTuning::RecipeAnswer::Change, 14.0f, -1.0f}));
+    assert(invalid.recipe.grinder.currentAbsoluteStep == 12.5f);
+    assert(!AutoTuning::confirmRecipe(invalid, {AutoTuning::RecipeAnswer::Change, std::numeric_limits<float>::quiet_NaN(), 18.0f}));
+    auto measured = recipe;
+    measured.doseObserved = true;
+    measured.measuredDoseG = 18.4f;
+    assert(AutoTuning::confirmRecipe(measured, {AutoTuning::RecipeAnswer::Confirm}));
+    assert(measured.doseObserved && measured.measuredDoseG == 18.4f && !measured.doseTargetConfirmed);
+    assert(AutoTuning::confirmRecipe(measured, {AutoTuning::RecipeAnswer::Change, 13.0f, 18.4f}));
+    assert(measured.doseObserved); // Editing grind alone does not erase measured dose provenance.
+
+
     JsonDocument receipt;
     const std::string digest(64, 'a');
     receipt["event_type"] = "lifecycle_ack";
@@ -95,6 +150,19 @@ int main(int argc, char **argv) {
     assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "A", goal));
     static_assert(!std::is_default_constructible<AutoTuning::PreferenceFeedback>::value,
                   "Feedback must require an explicit choice, never default to a tie");
+    if (argc == 2 && (std::string(argv[1]) == "--export-confirmed-recipe" ||
+                      std::string(argv[1]) == "--export-unknown-recipe")) {
+        auto exported = std::string(argv[1]) == "--export-confirmed-recipe" ? edited : unknown;
+        exported.machineId = "gaggimate:AA_BB";
+        exported.localOptimizationEnabled = true;
+        exported.excludeFromLocalOptimization = false;
+        JsonDocument document;
+        assert(AutoTuningJsonCodec::writeShotRecord(exported, document));
+        std::string encoded;
+        serializeJson(document, encoded);
+        puts(encoded.c_str());
+        return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--export-shot") {
         auto artifact = fixture();
         artifact.bindSamples();
@@ -137,6 +205,19 @@ int main(int argc, char **argv) {
     }
     CompletedShotArtifactStore store;
     assert(store.begin());
+    recipeArtifact.record = edited;
+    recipeArtifact.record.shotId = "confirmed-recipe";
+    recipeArtifact.completion.shotId = "confirmed-recipe";
+    recipeArtifact.disposition.doseConfirmationRequired = false;
+    recipeArtifact.bindSamples();
+    assert(store.write(recipeArtifact));
+    AutoTuning::CompletedShotArtifact recoveredRecipe;
+    assert(store.load("confirmed-recipe", recoveredRecipe));
+    assert(!recoveredRecipe.disposition.doseConfirmationRequired);
+    assert(recoveredRecipe.record.recipe.grinder.currentAbsoluteStep == 14.0f);
+    assert(recoveredRecipe.record.doseTargetConfirmed);
+    assert(store.remove("confirmed-recipe"));
+
     auto artifact = fixture();
     artifact.bindSamples();
     AutoTuning::PreferenceRequest request;

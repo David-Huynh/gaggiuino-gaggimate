@@ -1375,7 +1375,8 @@ void MQTTPlugin::handleStatus(const String &payload) {
     pluginManager->trigger(event);
 }
 
-bool MQTTPlugin::applyProjectedGrinderPosition() {
+// This stages the intended setting for the UI, not evidence of physical movement.
+bool MQTTPlugin::showIntendedGrinderPosition() {
     if (!controller || fabsf(latestRecommendation.grindDeltaStepsFromCurrent) < 0.001f) {
         return false;
     }
@@ -1449,7 +1450,7 @@ bool MQTTPlugin::applyLatestRecommendation() {
     }
     Profile profile = controller->getProfileManager()->getSelectedProfile();
     if (profile.id.c_str() != latestRecommendation.profileId) return false;
-    applyProjectedGrinderPosition();
+    showIntendedGrinderPosition();
 
     bool doseApplied = false;
     bool yieldApplied = false;

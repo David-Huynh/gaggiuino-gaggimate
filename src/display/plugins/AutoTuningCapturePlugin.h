@@ -79,6 +79,7 @@ class AutoTuningCapturePlugin : public Plugin {
     bool shotCommunityUploadRequired = false;
     bool shotHasRecommendation = false;
     AutoTuning::RecommendationReference shotRecommendation;
+    AutoTuning::RecipeSnapshot shotRecipe;
     AutoTuning::ShotHistoryMetadata shotHistory;
     std::uint8_t lastHistoryPhase = 0xFF;
 

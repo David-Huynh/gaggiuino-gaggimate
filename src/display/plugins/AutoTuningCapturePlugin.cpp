@@ -119,6 +119,8 @@ void AutoTuningCapturePlugin::setup(Controller *ctrl, PluginManager *pm) {
                 shotHasRecommendation = true;
                 shotRecommendation = latestRecommendation;
             }
+            AutoTuningPayloadMetadata::captureRecipe(controller, shotRecipe);
+            shotRecipe.grinder.observed = false; // The post-shot recipe answer confirms manual input.
             shotMeasuredDoseAvailable = pendingMeasuredDoseAvailable;
             shotMeasuredDoseG = pendingMeasuredDoseG;
             pendingMeasuredDoseAvailable = false;
@@ -467,9 +469,9 @@ void AutoTuningCapturePlugin::publishShotProfile() {
     }
     shot.beverageOutG = roundf(beverageOutG * 10.0f) / 10.0f;
     shot.shotTimeS = roundf((shotElapsedMs / 1000.0f) * 10.0f) / 10.0f;
-    AutoTuningPayloadMetadata::captureRecipe(controller, shot.recipe);
+    shot.recipe = shotRecipe;
     AutoTuningPayloadMetadata::captureProfile(controller, shot.profile);
-    const float configuredDoseG = doseTargetG();
+    const float configuredDoseG = shotRecipe.doseTargetG.value_or(0.0f);
     if (configuredDoseG > 0.0f) {
         shot.recipe.doseTargetG = roundf(configuredDoseG * 10.0f) / 10.0f;
     }
@@ -513,7 +515,7 @@ void AutoTuningCapturePlugin::publishShotProfile() {
     }
 
     const bool localDeliveryRequired = shotOptimizerDeliveryRequired;
-    const bool doseConfirmationRequired = localDeliveryRequired && !shotMeasuredDoseAvailable;
+    const bool doseConfirmationRequired = localDeliveryRequired && brew.finished;
     AutoTuning::ShotCompletion completion;
     completion.shotId = shot.shotId;
     completion.recommendation = shotRecommendation;

@@ -18,7 +18,7 @@ class AutoTuningPreferencePlugin : public Plugin {
     void loop() override {}
 
     void selectPreference(const String &label);
-    void selectDoseConfirmation(bool followed);
+    void selectDoseConfirmation(int selection);
     void useRecommendation();
     void ignoreRecommendation();
     void closeOverlay();
@@ -45,6 +45,13 @@ class AutoTuningPreferencePlugin : public Plugin {
     String pendingDoseShotId;
     std::uint32_t pendingDosePromptRevision = 0;
     float pendingDoseTargetG = 0.0f;
+    std::optional<float> pendingRecipeGrind;
+    bool pendingRecipeAbsolute = false;
+    bool editingRecipe = false;
+    lv_obj_t *recipeGrindInput = nullptr;
+    lv_obj_t *recipeDoseInput = nullptr;
+    lv_obj_t *recipeKeyboard = nullptr;
+    lv_obj_t *recipeError = nullptr;
     String pendingShotRecommendationId;
     String pendingPreferenceInstallId;
     String pendingPreferenceRunId;

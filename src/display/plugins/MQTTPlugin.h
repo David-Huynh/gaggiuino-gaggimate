@@ -97,10 +97,10 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     void handleRecommendation(const String &payload);
     void handleStatus(const String &payload);
     void handleShotDeliveryAck(const String &payload);
-    bool applyProjectedGrinderPosition();
     bool applyLatestRecommendation();
     bool ignoreLatestRecommendation();
     void clearLatestRecommendation();
+    bool showIntendedGrinderPosition();
     bool validateLatestRecommendation(String &reason);
     void clearLatestRecommendationAndNotify();
     bool publishRecommendationDecision(const char *decision, bool includeEditedFields);

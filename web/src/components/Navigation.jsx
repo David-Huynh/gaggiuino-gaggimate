@@ -237,12 +237,12 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
     <>
       {!collapsed && (
         <div
-          className='fixed end-0 top-0 bottom-0 left-0 z-9998 cursor-pointer backdrop-blur-sm backdrop-brightness-50 md:hidden'
+          className='fixed end-0 top-0 bottom-[calc(4.5rem_+_env(safe-area-inset-bottom))] left-0 z-9998 cursor-pointer backdrop-blur-sm backdrop-brightness-50 md:hidden landscape:hidden'
           onClick={onToggleCollapsed}
         />
       )}
       <aside
-        className={`sidebar border-base-300 bg-base-100 fixed top-0 left-0 z-9999 flex h-screen flex-col overflow-y-auto border-r p-5 md:static landscape:static ${
+        className={`sidebar border-base-300 bg-base-100 fixed top-0 left-0 z-9999 flex h-[calc(100dvh_-_4.5rem_-_env(safe-area-inset-bottom))] flex-col overflow-y-auto border-r p-5 md:static md:h-dvh landscape:static landscape:h-dvh ${
           collapsed ? 'hidden md:flex md:w-[90px] landscape:flex landscape:w-[90px]' : 'w-[290px]'
         }`}
       >

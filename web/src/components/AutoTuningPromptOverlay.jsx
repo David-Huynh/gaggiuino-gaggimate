@@ -1,3 +1,4 @@
+import { createPortal } from 'preact/compat';
 import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
 import { ApiServiceContext } from '../services/ApiService.js';
 import { formatGrinderSettingTransition } from '../utils/grinderRecommendation.js';
@@ -44,13 +45,22 @@ function loadSeen() {
 
 export function AutoTuningPromptOverlay() {
   const apiService = useContext(ApiServiceContext);
+  const [dock, setDock] = useState(null);
+  useEffect(() => setDock(document.getElementById('shot-prompt-dock')), []);
   const [pendingDose, setPendingDose] = useState(null);
   const [pendingPreference, setPendingPreference] = useState(null);
   const [preferenceSending, setPreferenceSending] = useState(false);
   const [preferenceError, setPreferenceError] = useState('');
+  const [recipeSending, setRecipeSending] = useState(false);
+  const [recipeError, setRecipeError] = useState('');
+  const [editingRecipe, setEditingRecipe] = useState(false);
+  const [recipeGrind, setRecipeGrind] = useState('');
+  const [recipeDose, setRecipeDose] = useState('');
   const [pendingRecommendation, setPendingRecommendation] = useState(null);
   const [view, setView] = useState(null);
   const seenRef = useRef(loadSeen());
+  const pendingDoseId = useRef(null);
+  pendingDoseId.current = pendingDose;
 
   const markSeen = useCallback(id => {
     if (!id || seenRef.current.has(id)) {
@@ -114,13 +124,20 @@ export function AutoTuningPromptOverlay() {
     });
 
     const doseResolvedListener = apiService.on('evt:rl:dose-confirmation-resolved', message => {
+      if (message.persisted !== true) return;
       setPendingDose(current =>
         current?.shot_id === message.shot_id &&
         Number(current.prompt_revision) === Number(message.prompt_revision)
           ? null
           : current,
       );
-      setView(current => (current === 'dose' ? null : current));
+      if (
+        message.shot_id === pendingDoseId.current?.shot_id &&
+        Number(message.prompt_revision) === Number(pendingDoseId.current?.prompt_revision)
+      ) {
+        setRecipeSending(false);
+        setView(current => (current === 'dose' ? null : current));
+      }
     });
 
     const shotCompleteListener = apiService.on('evt:rl:shot-complete', message => {
@@ -235,35 +252,83 @@ export function AutoTuningPromptOverlay() {
       }
       setPreferenceSending(true);
       setPreferenceError('');
-      apiService.send({
-        tp: 'req:rl:preference',
-        install_id: pendingPreference.install_id,
-        optimization_run_id: pendingPreference.optimization_run_id,
-        new_shot_id: pendingPreference.shot_id,
-        anchor_shot_id: pendingPreference.anchor_shot_id,
-        comparison_mode: pendingPreference.comparison_mode,
-        prompt_revision: pendingPreference.prompt_revision,
-        label,
-      });
+      try {
+        apiService.send({
+          tp: 'req:rl:preference',
+          install_id: pendingPreference.install_id,
+          optimization_run_id: pendingPreference.optimization_run_id,
+          new_shot_id: pendingPreference.shot_id,
+          anchor_shot_id: pendingPreference.anchor_shot_id,
+          comparison_mode: pendingPreference.comparison_mode,
+          prompt_revision: pendingPreference.prompt_revision,
+          label,
+        });
+      } catch {
+        setPreferenceSending(false);
+        setPreferenceError('Not connected. Your answer has not been sent; please try again.');
+      }
     },
     [apiService, pendingPreference, preferenceSending],
   );
 
-  const submitDoseConfirmation = useCallback(
-    followed => {
-      if (!pendingDose?.shot_id) {
+  useEffect(() => {
+    setRecipeSending(false);
+    setRecipeError('');
+    setEditingRecipe(false);
+    setRecipeGrind(pendingDose?.grind_setting == null ? '' : String(pendingDose.grind_setting));
+    setRecipeDose(pendingDose?.dose_target_g == null ? '' : String(pendingDose.dose_target_g));
+  }, [
+    pendingDose?.shot_id,
+    pendingDose?.prompt_revision,
+    pendingDose?.grind_setting,
+    pendingDose?.dose_target_g,
+  ]);
+
+  useEffect(() => {
+    if (!recipeSending) return undefined;
+    const timeout = window.setTimeout(() => {
+      setRecipeSending(false);
+      setRecipeError('Recipe not confirmed. Check the connection and try again.');
+    }, 5000);
+    return () => window.clearTimeout(timeout);
+  }, [recipeSending]);
+
+  const submitDoseConfirmation = action => {
+    if (!pendingDose?.shot_id || recipeSending) return;
+    const values = {};
+    if (action === 'change') {
+      const grind = Number(recipeGrind),
+        dose = Number(recipeDose);
+      if (
+        !recipeGrind.trim() ||
+        !recipeDose.trim() ||
+        !Number.isFinite(grind) ||
+        Math.abs(grind) > 10000 ||
+        !Number.isFinite(dose) ||
+        dose < 0.1 ||
+        dose > 100
+      ) {
+        setRecipeError('Enter a valid grinder setting and a dose between 0.1 and 100 g.');
         return;
       }
+      values.grind_setting = grind;
+      values.dose_g = dose;
+    }
+    setRecipeSending(true);
+    setRecipeError('');
+    try {
       apiService.send({
         tp: 'req:rl:dose-confirmation',
         shot_id: pendingDose.shot_id,
         prompt_revision: pendingDose.prompt_revision,
-        followed: Boolean(followed),
+        action,
+        ...values,
       });
-      setView(null);
-    },
-    [apiService, pendingDose],
-  );
+    } catch {
+      setRecipeSending(false);
+      setRecipeError('Not connected. Your recipe has not been saved; please try again.');
+    }
+  };
 
   const useRecommendation = useCallback(() => {
     if (!pendingRecommendation?.recommendation_id) {
@@ -293,42 +358,43 @@ export function AutoTuningPromptOverlay() {
     if (!pendingDose && !pendingPreference && !pendingRecommendation) {
       return null;
     }
-    return (
-      <div className='fixed right-4 bottom-[calc(1rem_+_env(safe-area-inset-bottom))] left-4 z-50 flex flex-col items-stretch gap-2 sm:left-auto sm:items-end'>
-        {pendingDose && (
-          <button
-            type='button'
-            className='btn btn-primary btn-sm shadow-lg'
-            onClick={() => setView('dose')}
+    if (!dock) return null;
+    const count = [pendingDose, pendingPreference, pendingRecommendation].filter(Boolean).length;
+    return createPortal(
+      <div className='flex items-center gap-3' aria-label='Pending shot prompts'>
+        <button
+          type='button'
+          className='btn btn-circle btn-secondary relative min-h-12 min-w-12 shrink-0'
+          aria-label={`Open shot prompts (${count} pending)`}
+          onClick={() =>
+            setView(pendingDose ? 'dose' : pendingPreference ? 'preference' : 'recommendation')
+          }
+        >
+          <svg
+            width='24'
+            height='24'
+            viewBox='0 0 24 24'
+            fill='none'
+            stroke='currentColor'
+            stroke-width='2'
+            aria-hidden='true'
           >
-            Confirm dose
-          </button>
-        )}
-        {pendingPreference && (
-          <button
-            type='button'
-            className='btn btn-primary btn-sm shadow-lg'
-            onClick={() => setView('preference')}
-          >
-            Compare last shot
-          </button>
-        )}
-        {pendingRecommendation && (
-          <button
-            type='button'
-            className='btn btn-secondary btn-sm shadow-lg'
-            onClick={() => setView('recommendation')}
-          >
-            Next recipe
-          </button>
-        )}
-      </div>
+            <path d='M4 4h16v12H9l-5 4V4z' />
+            <path d='M8 8h8M8 12h5' />
+          </svg>
+          <span className='badge badge-sm absolute -top-1 -right-1'>{count}</span>
+        </button>
+        <span className='truncate text-sm'>
+          {pendingDose ? 'Confirm recipe' : pendingPreference ? 'Compare shot' : 'Next recipe'}
+        </span>
+      </div>,
+      dock,
     );
   }
 
   const anchor = preferenceAnchorDetails(pendingPreference);
   return (
-    <div className='fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 pb-[calc(1rem_+_env(safe-area-inset-bottom))]'>
+    <div className='fixed inset-0 z-[10000] flex items-center justify-center bg-black/60 p-4 pb-[calc(1rem_+_env(safe-area-inset-bottom))]'>
       <div
         className='bg-base-100 border-base-300 relative max-h-[calc(100vh_-_2rem_-_env(safe-area-inset-bottom))] w-full max-w-md overflow-y-auto rounded-lg border p-5 shadow-xl'
         role='dialog'
@@ -336,7 +402,8 @@ export function AutoTuningPromptOverlay() {
       >
         <button
           type='button'
-          className='btn btn-ghost btn-xs absolute top-2 right-2'
+          className='btn btn-ghost btn-sm mb-3 ml-auto flex'
+          aria-label='Minimize shot prompt'
           onClick={() => setView(null)}
         >
           Minimize
@@ -344,31 +411,83 @@ export function AutoTuningPromptOverlay() {
 
         {view === 'dose' && pendingDose && (
           <div className='space-y-4'>
-            <div>
-              <div className='text-base-content/60 text-xs font-semibold tracking-wide uppercase'>
-                Shot dose
+            <h2 className='text-xl font-bold'>Confirm the recipe you used</h2>
+            <p>
+              Grind{' '}
+              {pendingDose.grind_setting == null
+                ? 'unknown'
+                : Number(pendingDose.grind_setting).toFixed(1)}
+              {pendingDose.grind_is_absolute ? '' : ' steps from reference'}
+              {' / Dose '}
+              {formatDose(pendingDose.dose_target_g)}
+            </p>
+            <p className='text-base-content/60 text-sm'>
+              {pendingDose.dose_measured
+                ? 'Dose was measured. Please confirm the manual grinder setting.'
+                : 'Did you use these settings? Your answer records the recipe for this shot.'}{' '}
+              Not sure keeps the shot without using its recipe for optimization.
+            </p>
+            {editingRecipe && (
+              <div className='space-y-3'>
+                <label className='block'>
+                  Grind {pendingDose.grind_is_absolute ? 'setting' : '(steps from reference)'}
+                  <input
+                    aria-label='Actual grinder setting'
+                    type='number'
+                    step='any'
+                    className='input input-bordered w-full'
+                    value={recipeGrind}
+                    onInput={event => setRecipeGrind(event.currentTarget.value)}
+                    disabled={recipeSending}
+                  />
+                </label>
+                <label className='block'>
+                  Dose (g)
+                  <input
+                    aria-label='Actual dose in grams'
+                    type='number'
+                    step='any'
+                    min='0.1'
+                    max='100'
+                    className='input input-bordered w-full'
+                    value={recipeDose}
+                    onInput={event => setRecipeDose(event.currentTarget.value)}
+                    disabled={recipeSending}
+                  />
+                </label>
               </div>
-              <h2 className='text-xl font-bold'>
-                Did you use {formatDose(pendingDose.dose_target_g)}?
-              </h2>
-              <p className='text-base-content/60 text-sm'>
-                The dose was not measured by grind by weight.
+            )}
+            {recipeError && (
+              <p role='alert' className='text-error text-sm'>
+                {recipeError}
               </p>
-            </div>
-            <div className='grid grid-cols-2 gap-2'>
+            )}
+            <div className='grid gap-2'>
               <button
                 type='button'
                 className='btn btn-primary min-h-12'
-                onClick={() => submitDoseConfirmation(true)}
+                disabled={recipeSending || (!editingRecipe && pendingDose.grind_setting == null)}
+                onClick={() => submitDoseConfirmation(editingRecipe ? 'change' : 'confirm')}
               >
-                Yes
+                {recipeSending ? 'Saving...' : editingRecipe ? 'Save recipe' : 'Yes'}
               </button>
+              {!editingRecipe && (
+                <button
+                  type='button'
+                  className='btn btn-outline min-h-12'
+                  disabled={recipeSending}
+                  onClick={() => setEditingRecipe(true)}
+                >
+                  Change values
+                </button>
+              )}
               <button
                 type='button'
-                className='btn btn-outline min-h-12'
-                onClick={() => submitDoseConfirmation(false)}
+                className='btn btn-ghost min-h-12'
+                disabled={recipeSending}
+                onClick={() => submitDoseConfirmation('unknown')}
               >
-                No
+                Not sure
               </button>
             </div>
           </div>
@@ -473,7 +592,8 @@ export function AutoTuningPromptOverlay() {
               </div>
             </div>
             <p className='text-base-content/70 text-sm'>
-              Grind remains manual. Use applies machine-controllable targets.
+              Use applies machine-controllable targets and shows the intended grind. Move the
+              grinder manually; confirm grind and dose after the shot.
             </p>
             <div className='grid grid-cols-3 gap-2'>
               <button type='button' className='btn btn-primary' onClick={useRecommendation}>

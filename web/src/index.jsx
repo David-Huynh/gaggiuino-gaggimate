@@ -15,7 +15,6 @@ import lazy from 'preact-iso/lazy';
 import { AutoTuningPromptOverlay } from './components/AutoTuningPromptOverlay.jsx';
 import ApiService, { ApiServiceContext } from './services/ApiService.js';
 import { Navigation } from './components/Navigation.jsx';
-import { Spinner } from './components/Spinner.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faBars } from '@fortawesome/free-solid-svg-icons/faBars';
 
@@ -44,11 +43,8 @@ const apiService = new ApiService();
 const DESKTOP_NAV_COLLAPSED_STORAGE_KEY = 'gaggimate.desktopNavCollapsed';
 
 function readInitialDesktopNavCollapsed() {
-  const storage = globalThis.window?.localStorage;
-  if (!storage) return true;
-
   try {
-    return storage.getItem(DESKTOP_NAV_COLLAPSED_STORAGE_KEY) === 'true';
+    return window.localStorage.getItem(DESKTOP_NAV_COLLAPSED_STORAGE_KEY) !== 'false';
   } catch {
     return true;
   }
@@ -63,23 +59,12 @@ const RedirectTo = to =>
     return null;
   };
 
-function RouteFallback() {
-  return (
-    <div className='flex w-full flex-row items-center justify-center py-16'>
-      <Spinner size={8} />
-    </div>
-  );
-}
-
 export function App() {
   const [navCollapsed, setNavCollapsed] = useState(readInitialDesktopNavCollapsed);
 
   useEffect(() => {
-    const storage = globalThis.window?.localStorage;
-    if (!storage) return;
-
     try {
-      storage.setItem(DESKTOP_NAV_COLLAPSED_STORAGE_KEY, String(navCollapsed));
+      window.localStorage.setItem(DESKTOP_NAV_COLLAPSED_STORAGE_KEY, String(navCollapsed));
     } catch {
       // Ignore storage write failures so the navigation still works in restricted browsers.
     }
@@ -94,13 +79,13 @@ export function App() {
   return (
     <LocationProvider>
       <ApiServiceContext.Provider value={apiService}>
-        <div className='bg-base-300 flex h-screen overflow-hidden'>
+        <div className='bg-base-300 flex h-dvh overflow-hidden'>
           <Navigation
             collapsed={navCollapsed}
             onToggleCollapsed={() => setNavCollapsed(collapsed => !collapsed)}
           />
-          <div className='flex flex-1 flex-col overflow-x-hidden overflow-y-auto'>
-            <div className='flex min-h-0 w-full flex-1 flex-col p-4'>
+          <div className='flex min-w-0 flex-1 flex-col overflow-hidden'>
+            <div className='flex min-h-0 w-full flex-1 flex-col overflow-auto p-4'>
               <div className='grid min-h-0 flex-1 grid-cols-1'>
                 <div className='min-h-0'>
                   <ErrorBoundary>
@@ -125,7 +110,7 @@ export function App() {
                         path='/statistics/:sourceAlias/:profileName'
                         component={StatisticsPage}
                       />
-                      <Route path='/analyzer/:source/:id' component={ShotAnalyzer} />{' '}
+                      <Route path='/analyzer/:source/:id' component={ShotAnalyzer} />
                       {/*deep-link route (sorce & ID)*/}
                       <Route default component={NotFound} />
                     </Router>
@@ -133,18 +118,22 @@ export function App() {
                 </div>
               </div>
             </div>
-            <AutoTuningPromptOverlay />
-          </div>
-          {navCollapsed && (
-            <div className='fab end-auto left-4 md:hidden landscape:hidden'>
+            <footer
+              className='border-base-300 bg-base-100 flex shrink-0 items-center gap-3 border-t px-4 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]'
+              aria-label='Navigation and shot prompts'
+            >
               <button
-                className='btn btn-lg btn-circle btn-primary'
-                onClick={() => setNavCollapsed(false)}
+                type='button'
+                className='btn btn-circle btn-primary min-h-12 min-w-12 shrink-0 md:hidden landscape:hidden'
+                aria-label={navCollapsed ? 'Open menu' : 'Close menu'}
+                onClick={() => setNavCollapsed(current => !current)}
               >
                 <FontAwesomeIcon icon={faBars} />
               </button>
-            </div>
-          )}
+              <div id='shot-prompt-dock' className='min-w-0 flex-1' />
+            </footer>
+            <AutoTuningPromptOverlay />
+          </div>
         </div>
       </ApiServiceContext.Provider>
     </LocationProvider>

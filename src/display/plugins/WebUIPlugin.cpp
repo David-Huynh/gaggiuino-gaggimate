@@ -1,3 +1,4 @@
+#include <display/core/RecipeConfirmation.h>
 #include "WebUIPlugin.h"
 #include "autotuning/AutoTuningJsonCodec.h"
 #include "autotuning/AutoTuningTasteGoalJson.h"
@@ -794,6 +795,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
 
     pluginManager->on("rl:dose-confirmation:resolved", [this](Event const &event) {
+        if (event.getInt("persisted") != 1) return;
         const std::uint32_t revision =
             static_cast<std::uint32_t>(std::max<std::int64_t>(
                 event.getInt64("prompt_revision"), 0));
@@ -804,6 +806,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         }
         JsonDocument doc;
         doc["tp"] = "evt:rl:dose-confirmation-resolved";
+        doc["prompt_revision"] = revision;
         doc["shot_id"] = event.getString("shot_id");
         doc["followed"] = event.getInt("followed") == 1;
         doc["persisted"] = event.getInt("persisted") == 1;
@@ -1804,6 +1807,10 @@ bool WebUIPlugin::activateDoseConfirmation(Event const &event) {
     _pendingDoseShotId = shotId;
     _pendingDosePromptRevision = promptRevision;
     _pendingDoseTargetG = targetG;
+    _pendingRecipeGrind = event.getInt("has_grind_setting") == 1
+        ? std::optional<float>(event.getFloat("grind_setting")) : std::nullopt;
+    _pendingRecipeAbsolute = event.getInt("grind_is_absolute") == 1;
+    _pendingRecipeMeasuredDose = event.getInt("dose_measured") == 1;
     return true;
 }
 
@@ -1827,6 +1834,9 @@ void WebUIPlugin::sendDoseConfirmationPrompt(AsyncWebSocketClient *client) {
     doc["shot_id"] = _pendingDoseShotId;
     doc["prompt_revision"] = _pendingDosePromptRevision;
     doc["dose_target_g"] = _pendingDoseTargetG;
+    if (_pendingRecipeGrind) doc["grind_setting"] = *_pendingRecipeGrind;
+    doc["grind_is_absolute"] = _pendingRecipeAbsolute;
+    doc["dose_measured"] = _pendingRecipeMeasuredDose;
     const String payload = doc.as<String>();
     if (client) {
         client->text(payload);
@@ -1996,7 +2006,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         doc["prompt_revision"] | 0U;
                     if (rlParticipationEnabled(controller) && !_pendingDoseShotId.isEmpty() && shotId == _pendingDoseShotId &&
                         promptRevision == _pendingDosePromptRevision &&
-                        promptRevision > 0 && doc["followed"].is<bool>()) {
+                        promptRevision > 0 && (doc["action"] == "confirm" || doc["action"] == "change" || doc["action"] == "unknown")) {
                         Event claim;
                         claim.id = "rl:prompt:claim";
                         claim.setString("shot_id", shotId);
@@ -2010,8 +2020,12 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         event.setString("shot_id", shotId);
                         event.setInt64("prompt_revision", promptRevision);
                         event.setInt("prompt_claimed", 1);
-                        event.setInt("has_followed", 1);
-                        event.setInt("followed", doc["followed"].as<bool>() ? 1 : 0);
+                        AutoTuning::RecipeConfirmation answer;
+                        answer.answer = doc["action"] == "confirm" ? AutoTuning::RecipeAnswer::Confirm
+                            : doc["action"] == "change" ? AutoTuning::RecipeAnswer::Change : AutoTuning::RecipeAnswer::Unknown;
+                        if (doc["grind_setting"].is<float>()) answer.grindSetting = doc["grind_setting"].as<float>();
+                        if (doc["dose_g"].is<float>()) answer.doseG = doc["dose_g"].as<float>();
+                        event.setPayload(answer);
                         pluginManager->trigger(event);
                     }
                 } else if (msgType == "req:rl:preference") {
