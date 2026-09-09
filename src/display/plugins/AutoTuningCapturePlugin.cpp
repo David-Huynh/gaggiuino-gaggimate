@@ -47,7 +47,7 @@ static const char *pumpTargetName(bool pumpIsSimple, PumpTarget pumpTarget) {
     }
 }
 
-static const char *shotEndStateName(bool finished) { return finished ? "finished" : "manual_or_interrupted"; }
+static const char *shotEndStateName(bool finished, bool manual) { return finished ? (manual ? "manual_finished" : "finished") : "interrupted"; }
 
 struct BrewProcessSnapshot {
     bool available = false;
@@ -68,6 +68,7 @@ struct BrewProcessSnapshot {
     bool valveOpen = false;
     float temperature = 0.0f;
     bool finished = false;
+    bool manuallyFinished = false;
     std::uint8_t finalExitReason = 0;
 };
 
@@ -154,13 +155,13 @@ void AutoTuningCapturePlugin::setup(Controller *ctrl, PluginManager *pm) {
             }
             trimShotSamplesToElapsed(shotStopElapsedMs);
             isBrewing = false;
-            const char *endState = "manual_or_interrupted";
+            const char *endState = "interrupted";
             if (controller) {
                 std::lock_guard<std::recursive_mutex> processGuard(controller->getProcessLock());
                 Process *lastProcess = controller->getLastProcess();
                 if (lastProcess && lastProcess->getType() == MODE_BREW &&
                     static_cast<BrewProcess *>(lastProcess)->processPhase == ProcessPhase::FINISHED) {
-                    endState = "finished";
+                    endState = static_cast<BrewProcess *>(lastProcess)->manuallyFinished ? "manual_finished" : "finished";
                 }
             }
             publishLiveShotEnded(endState);
@@ -437,6 +438,7 @@ void AutoTuningCapturePlugin::publishShotProfile() {
             brew.valveOpen = phase.valve > 0;
             brew.temperature = process->getTemperature();
             brew.finished = process->processPhase == ProcessPhase::FINISHED;
+            brew.manuallyFinished = process->manuallyFinished;
             brew.finalExitReason =
                 static_cast<std::uint8_t>(brew.finished ? process->lastExitReason : PhaseExitReason::ABORTED);
 
@@ -497,7 +499,7 @@ void AutoTuningCapturePlugin::publishShotProfile() {
         }
         shot.finalPhase.valveOpen = brew.valveOpen;
         shot.finalPhase.temperatureC = brew.temperature;
-        shot.finalPhase.shotEndState = shotEndStateName(brew.finished);
+        shot.finalPhase.shotEndState = shotEndStateName(brew.finished, brew.manuallyFinished);
         shotHistory.brewDelayMs =
             static_cast<std::uint16_t>(std::clamp(brew.brewDelay, 0.0, static_cast<double>(UINT16_MAX)));
         shotHistory.finalExitReason = brew.finalExitReason;

@@ -21,6 +21,7 @@ class BrewProcess : public Process {
     unsigned long currentPhaseStarted = 0;
     unsigned long previousPhaseFinished = 0;
     unsigned long finished = 0;
+    bool manuallyFinished = false;
     PhaseExitReason lastExitReason = PhaseExitReason::NONE; // why the most recent phase ended (for shot history)
     double currentVolume = 0;                               // most recent volume pushed
     float currentFlow = 0.0f;
@@ -210,6 +211,7 @@ class BrewProcess : public Process {
         }
 
         if (update.stopRequested) {
+            manuallyFinished = true; // Explicit live-control finish, not an interruption.
             processPhase = ProcessPhase::FINISHED;
             finished = millis();
             return;
