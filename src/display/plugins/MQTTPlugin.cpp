@@ -1,3 +1,4 @@
+#include <display/core/RecommendationContext.h>
 #include "MQTTPlugin.h"
 #include "../core/AutoTuning.h"
 #include "../core/Controller.h"
@@ -1089,10 +1090,10 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
         return;
     }
     Settings const &settings = controller->getSettings();
-    if (recommendation.tasteGoal != activeTasteGoal || recommendation.beanContextId != settings.getRLBeanContextId().c_str() ||
-        recommendation.grinderContextId != settings.getRLGrinderContextId().c_str() ||
-        (!recommendation.profileId.empty() && controller->getProfileManager() &&
-         recommendation.profileId != controller->getProfileManager()->getSelectedProfile().id.c_str())) {
+    auto *profiles = controller->getProfileManager();
+    if (!profiles || !AutoTuning::recommendationContextMatches(recommendation, machineId().c_str(),
+            settings.getRLBeanContextId().c_str(), settings.getRLGrinderContextId().c_str(),
+            profiles->getSelectedProfile().id.c_str(), activeTasteGoal)) {
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1375,6 +1376,13 @@ bool MQTTPlugin::applyLatestRecommendation() {
         return false;
     }
 
+    // Persistence can yield; validate again immediately before any mutation.
+    if (!validateLatestRecommendation(reason)) {
+        clearLatestRecommendationAndNotify();
+        return false;
+    }
+    Profile profile = controller->getProfileManager()->getSelectedProfile();
+    if (profile.id.c_str() != latestRecommendation.profileId) return false;
     applyProjectedGrinderPosition();
 
     bool doseApplied = false;
@@ -1387,7 +1395,6 @@ bool MQTTPlugin::applyLatestRecommendation() {
     }
 
     if (latestRecommendation.targetYieldG > 0.0f && controller->getProfileManager()) {
-        Profile &profile = controller->getProfileManager()->getSelectedProfile();
         if (profile.setFinalVolumetricTarget(latestRecommendation.targetYieldG)) {
             yieldApplied = controller->getProfileManager()->saveProfile(profile);
             yieldFailed = !yieldApplied;
@@ -1426,8 +1433,12 @@ bool MQTTPlugin::validateLatestRecommendation(String &reason) {
         return false;
     }
     Settings const &settings = controller->getSettings();
-    if (latestRecommendation.beanContextId != settings.getRLBeanContextId().c_str() ||
-        latestRecommendation.grinderContextId != settings.getRLGrinderContextId().c_str()) {
+    AutoTuning::TasteGoal goal;
+    auto *profiles = controller->getProfileManager();
+    if (!profiles || !AutoTuning::activeTasteGoal(settings, goal) ||
+        !AutoTuning::recommendationContextMatches(latestRecommendation, machineId().c_str(),
+            settings.getRLBeanContextId().c_str(), settings.getRLGrinderContextId().c_str(),
+            profiles->getSelectedProfile().id.c_str(), goal)) {
         reason = "recommendation context is no longer active";
         return false;
     }
@@ -1909,6 +1920,20 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pm->on("rl:optimization:control", [this](Event &event) {
         event.setInt("control_persisted", publishOptimizerControl(event) ? 1 : 0);
     });
+
+    const auto profileChanged = [this](Event const &) {
+        AutoTuning::TasteGoal goal;
+        auto *profiles = controller->getProfileManager();
+        const Settings &settings = controller->getSettings();
+        // Context invalidation must not rebase or otherwise mutate an apply in progress.
+        if (hasRecommendation && (!profiles || !AutoTuning::activeTasteGoal(settings, goal) ||
+            !AutoTuning::recommendationContextMatches(latestRecommendation, machineId().c_str(),
+                settings.getRLBeanContextId().c_str(), settings.getRLGrinderContextId().c_str(),
+                profiles->getSelectedProfile().id.c_str(), goal))) clearLatestRecommendationAndNotify();
+        publishMachineState("idle", true);
+    };
+    pm->on("profiles:profile:select", profileChanged);
+    pm->on("profiles:profile:save", profileChanged);
 
     pm->on("rl:taste-goal:changed", [this](Event const &) {
         clearLatestRecommendation();

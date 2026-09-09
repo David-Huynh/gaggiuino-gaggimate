@@ -8,6 +8,7 @@
 #include <display/plugins/autotuning/local/CompletedShotArtifactStore.h>
 #include <display/plugins/autotuning/AutoTuningJsonCodec.h>
 #include <display/util/AtomicFile.h>
+#include <display/core/RecommendationContext.h>
 
 extern "C" unsigned long millis() { return 1000; }
 extern "C" void delay(uint32_t) {}
@@ -46,6 +47,25 @@ static AutoTuning::CompletedShotArtifact fixture() {
 }
 
 int main(int argc, char **argv) {
+    AutoTuning::Recommendation recommendation;
+    recommendation.machineId = "machine";
+    recommendation.beanContextId = "bean";
+    recommendation.grinderContextId = "grinder";
+    recommendation.profileId = "A";
+    const auto goal = AutoTuning::TasteGoal::balanced();
+    auto otherGoal = goal;
+    otherGoal.mode = AutoTuning::TasteGoalMode::Custom;
+    otherGoal.targets[static_cast<size_t>(AutoTuning::TasteAttribute::Sweet)] = AutoTuning::TasteLevel::High;
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "A", otherGoal));
+
+    assert(AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "A", goal));
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "B", goal));
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "", goal));
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "other", "bean", "grinder", "A", goal));
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "other", "grinder", "A", goal));
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "other", "A", goal));
+    recommendation.profileId.clear();
+    assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "A", goal));
     static_assert(!std::is_default_constructible<AutoTuning::PreferenceFeedback>::value,
                   "Feedback must require an explicit choice, never default to a tie");
     if (argc == 2 && std::string(argv[1]) == "--export-shot") {
