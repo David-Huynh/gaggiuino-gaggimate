@@ -1,4 +1,5 @@
 #include <display/core/RecipeConfirmation.h>
+#include <display/plugins/autotuning/local/RecipePrompt.h>
 #include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -216,7 +217,38 @@ int main(int argc, char **argv) {
     assert(!recoveredRecipe.disposition.doseConfirmationRequired);
     assert(recoveredRecipe.record.recipe.grinder.currentAbsoluteStep == 14.0f);
     assert(recoveredRecipe.record.doseTargetConfirmed);
+    // The worker's copied prompt survives destruction of the loaded artifact;
+    // the UI must not need to reload it or retain sample/context references.
+    auto recipePrompt = RecipePrompt::fromShot(recoveredRecipe.record, 18.0f);
     assert(store.remove("confirmed-recipe"));
+    recoveredRecipe = {};
+    Event recipeEvent;
+    recipePrompt.writeTo(recipeEvent);
+    assert(recipeEvent.getFloat("grind_setting") == 14.0f);
+    assert(recipeEvent.getFloat("dose_target_g") == 19.0f);
+    assert(recipeEvent.getInt("has_grind_setting") == 1);
+    assert(recipeEvent.getInt("grind_is_absolute") == 1);
+    assert(recipeEvent.getInt("dose_measured") == 0);
+
+    auto promptShot = recipe;
+    promptShot.doseObserved = true;
+    promptShot.measuredDoseG = 18.7f;
+    promptShot.recipe.grinder.absoluteReferenceStep.reset();
+    Event measuredPrompt;
+    RecipePrompt::fromShot(promptShot, 18.0f).writeTo(measuredPrompt);
+    assert(measuredPrompt.getFloat("dose_target_g") == 18.7f);
+    assert(measuredPrompt.getInt("dose_measured") == 1);
+    assert(measuredPrompt.getFloat("grind_setting") == 2.5f);
+    assert(measuredPrompt.getInt("grind_is_absolute") == 0);
+
+    promptShot.doseObserved = false;
+    promptShot.recipe.doseTargetG.reset();
+    promptShot.recipe.grinder.relativeStepsFromReference.reset();
+    Event missingPrompt;
+    RecipePrompt::fromShot(promptShot, 17.5f).writeTo(missingPrompt);
+    assert(missingPrompt.getFloat("dose_target_g") == 17.5f);
+    assert(missingPrompt.getInt("has_grind_setting") == 0);
+    assert(missingPrompt.getInt("dose_measured") == 0);
 
     auto artifact = fixture();
     artifact.bindSamples();

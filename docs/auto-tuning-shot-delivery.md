@@ -11,8 +11,9 @@ Completed auto-tuning shots use this commit and delivery sequence:
    under `/rll/c`.
 6. Replay state, compact summaries, shot history, and community work are
    idempotent projections of that committed artifact.
-7. If grind by weight did not measure the dose, the user confirms whether the
-   configured dose was followed.
+7. The user confirms the captured grind and dose, supplies the values actually
+   used, or answers that they are unsure. A measured dose does not establish
+   that the manual grinder was moved.
 8. The shot is delivered to the local optimizer transport and independently
    queued for optional community upload.
 9. The comparison prompt is released only after EspressoRL acknowledges that
@@ -25,13 +26,34 @@ does not wait on network services.
 Capture transfers each completed typed shot into a bounded in-memory queue.
 One low-priority replay worker owns shot encoding, replay persistence, delivery
 and community scans, acknowledgement updates, and local-store status scans.
-The worker never invokes plugin callbacks directly. It returns small typed
-notices that the controller loop drains before emitting dose-confirmation,
-dispatch, and completion events. A pending or retrying replay therefore cannot
+Recipe confirmation reads and writes also run on this worker. It returns copied
+recipe values and confirmation result events that the controller loop drains
+before invoking UI callbacks. Restoring or displaying the recipe prompt must
+never load a full shot artifact on `loopTask`: the artifact and decoder frames
+can exhaust its 8 KB stack even when the heap has plenty of free memory.
+Migration-only decoded records use scoped heap storage instead of reserving
+large stack frames on every canonical load. A pending or retrying replay cannot
 hold up a later brew command. The queue accepts at most four unwritten shots;
 an exhausted queue is reported as a capture failure instead of falling back to
 synchronous filesystem work. Queue acceptance is not reported as durable
 commit; only the validated atomic artifact rename establishes durability.
+
+Recipe confirmation has three distinct milestones: the answer is saved on the
+machine, EspressoRL acknowledges the shot, and a comparison or recommendation
+becomes available. The browser displays these separately; saving the answer
+does not imply the optimizer received it or generated a recommendation.
+
+Display builds verify the embedded web bundle against hashes of its sources
+and generated files. Changed or missing assets trigger a web build and packing
+before firmware compilation. Install Node and run `npm ci` in `web/` once;
+`python scripts/build_webui.py` also builds and embeds explicitly on Windows.
+A failed web build stops firmware compilation instead of silently shipping an
+old UI that sends obsolete confirmation messages.
+
+Run `python scripts/check_recipe_stack.py --environment display` (or the
+headless environment) after building to check the Xtensa prompt/loader frame
+budgets. These checks do not replace a hardware test of pending-shot recovery,
+recipe confirmation, and delivery through to a comparison or recommendation.
 
 ## Flash Coordination
 

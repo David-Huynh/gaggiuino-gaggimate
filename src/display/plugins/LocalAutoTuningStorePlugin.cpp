@@ -540,6 +540,7 @@ bool LocalAutoTuningStorePlugin::persistRecommendation(
 }
 
 void LocalAutoTuningStorePlugin::loop() {
+    drainPromptEvents();
     drainStoredShots();
     drainShotCompletions();
     if (!pendingDoseRecoveryChecked.load(std::memory_order_acquire) && millis() >= 1000) {
@@ -612,6 +613,7 @@ bool LocalAutoTuningStorePlugin::reset() {
     {
         std::lock_guard<std::mutex> guard(workMutex);
         storedShotNotices.clear();
+        promptEvents.clear();
         completionNotices.clear();
         queuedCompletionShotIds.clear();
         claimablePrompts.clear();
@@ -674,6 +676,12 @@ bool LocalAutoTuningStorePlugin::removeShotData(const String &shotId, const bool
     if (removed) {
         {
             std::lock_guard<std::mutex> guard(workMutex);
+            promptEvents.erase(
+                std::remove_if(promptEvents.begin(), promptEvents.end(),
+                               [&shotId](Event const &event) {
+                                   return event.getString("shot_id") == shotId;
+                               }),
+                promptEvents.end());
             storedShotNotices.erase(
                 std::remove_if(storedShotNotices.begin(), storedShotNotices.end(),
                                [&shotId](StoredShotNotice const &notice) {
@@ -712,7 +720,6 @@ void LocalAutoTuningStorePlugin::handleShotDispatch(Event const &event) {
 }
 
 void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
-    LocalStoreLock lock(storeMutex);
     const String shotId = event.getString("shot_id");
     const std::uint32_t promptRevision =
         static_cast<std::uint32_t>(std::max<std::int64_t>(
@@ -722,12 +729,30 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
         !event.getPayload<AutoTuning::RecipeConfirmation>()) {
         return;
     }
-    const auto releaseClaim = [this, &shotId, promptRevision]() {
+    WorkItem work;
+    work.kind = WorkKind::DoseConfirmation;
+    work.shotId = shotId;
+    work.promptRevision = promptRevision;
+    work.recipeConfirmation = *event.getPayload<AutoTuning::RecipeConfirmation>();
+    if (!enqueueWork(std::move(work))) {
         Event release;
         release.id = "rl:prompt:release";
         release.setString("shot_id", shotId);
         release.setInt64("prompt_revision", promptRevision);
         pluginManager->trigger(release);
+    }
+}
+
+void LocalAutoTuningStorePlugin::processDoseConfirmation(
+    const String &shotId, const std::uint32_t promptRevision,
+    AutoTuning::RecipeConfirmation const &answer) {
+    LocalStoreLock lock(storeMutex);
+    const auto releaseClaim = [this, &shotId, promptRevision]() {
+        Event release;
+        release.id = "rl:prompt:release";
+        release.setString("shot_id", shotId);
+        release.setInt64("prompt_revision", promptRevision);
+        queuePromptEvent(std::move(release));
     };
     JsonDocument envelope(&psramAllocator);
     if (!loadReplaySnapshot(shotId, envelope)) {
@@ -741,9 +766,9 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
         resolved.id = "rl:dose-confirmation:resolved";
         resolved.setString("shot_id", shotId);
         resolved.setInt64("prompt_revision", promptRevision);
-        resolved.setInt("followed", event.getInt("followed") == 1 ? 1 : 0);
+        resolved.setInt("followed", answer.answer != AutoTuning::RecipeAnswer::Unknown ? 1 : 0);
         resolved.setInt("persisted", 0);
-        pluginManager->trigger(resolved);
+        queuePromptEvent(std::move(resolved));
         return;
     }
     JsonObject root = envelope.as<JsonObject>();
@@ -754,12 +779,12 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
         releaseClaim();
         return;
     }
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    auto &artifact = *artifactStorage;
     if (!loadCommittedShot(shotId, artifact)) {
         releaseClaim();
         return;
     }
-    const auto &answer = *event.getPayload<AutoTuning::RecipeConfirmation>();
     if (!AutoTuning::confirmRecipe(artifact.record, answer)) {
         releaseClaim();
         return;
@@ -812,6 +837,15 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
     resolved.setInt("persisted", 1);
     {
         std::lock_guard<std::mutex> guard(workMutex);
+        // A recovery notice may have been queued before this answer was saved.
+        // Do not reopen that obsolete prompt after emitting the saved result.
+        storedShotNotices.erase(
+            std::remove_if(storedShotNotices.begin(), storedShotNotices.end(),
+                           [&shotId, promptRevision](StoredShotNotice const &notice) {
+                               return notice.shotId == shotId &&
+                                      notice.promptRevision == promptRevision;
+                           }),
+            storedShotNotices.end());
         claimablePrompts.erase(
             std::remove_if(
                 claimablePrompts.begin(), claimablePrompts.end(),
@@ -821,7 +855,7 @@ void LocalAutoTuningStorePlugin::handleDoseConfirmation(Event const &event) {
                 }),
             claimablePrompts.end());
     }
-    pluginManager->trigger(resolved);
+    queuePromptEvent(std::move(resolved));
     deliveryWorkPending = true;
     nextDeliveryCheckAt = 0;
     WorkItem work;
@@ -851,14 +885,10 @@ bool LocalAutoTuningStorePlugin::prepareShotReprocess(const String &shotId) {
         StoredShotNotice notice;
         notice.shotId = shotId;
         notice.doseConfirmationRequired = true;
-        notice.doseTargetG = root["dose_target_g"] | 0.0f;
         notice.promptRevision = promptState(root).revision;
-        if (notice.doseTargetG <= 0.0f) {
-            AutoTuning::CompletedShotArtifact artifact;
-            if (loadCommittedShot(shotId, artifact)) {
-                notice.doseTargetG = artifact.completion.doseTargetG;
-            }
-        }
+        auto artifact = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+        if (!loadCommittedShot(shotId, *artifact)) return false;
+        notice.recipe = RecipePrompt::fromShot(artifact->record, artifact->completion.doseTargetG);
         std::lock_guard<std::mutex> guard(workMutex);
         storedShotNotices.push_back(std::move(notice));
         return true;
@@ -1165,22 +1195,21 @@ bool LocalAutoTuningStorePlugin::loadCommittedShot(
         return false;
     }
     JsonObjectConst root = replay.as<JsonObjectConst>();
-    AutoTuningJsonCodec::DecodedShotRecord decoded;
-    AutoTuning::ShotCompletion completion;
+    auto decoded = makePsramUnique<AutoTuningJsonCodec::DecodedShotRecord>();
+    auto migrated = makePsramUnique<AutoTuning::CompletedShotArtifact>();
     String error;
-    if (!AutoTuningJsonCodec::parseShotRecord(root["payload"], decoded, error) ||
-        !AutoTuningJsonCodec::parseShotCompletion(root["completion"], completion, error)) {
+    if (!AutoTuningJsonCodec::parseShotRecord(root["payload"], *decoded, error) ||
+        !AutoTuningJsonCodec::parseShotCompletion(root["completion"], migrated->completion, error)) {
         return false;
     }
-    artifact = AutoTuning::CompletedShotArtifact{};
-    artifact.record = std::move(decoded.record);
-    artifact.completion = std::move(completion);
+    artifact = std::move(*migrated);
+    artifact.record = std::move(decoded->record);
     artifact.disposition.doseConfirmationRequired =
         deliveryState(root).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation;
     artifact.disposition.optimizerDeliveryRequired =
         root["local_delivery_required"].isNull() || root["local_delivery_required"].as<bool>();
     artifact.disposition.communityUploadRequired = root["community_required"] | false;
-    artifact.samples.assign(decoded.samples.begin(), decoded.samples.end());
+    artifact.samples.assign(decoded->samples.begin(), decoded->samples.end());
     artifact.revision = std::max(1, root["payload_revision"] | 1);
     artifact.committedAt = jsonEpochOrZero(root["captured_at"]);
     artifact.bindSamples();
@@ -1443,6 +1472,24 @@ bool LocalAutoTuningStorePlugin::prepareShotComplete(const String &shotId, JsonD
     return true;
 }
 
+void LocalAutoTuningStorePlugin::queuePromptEvent(Event event) {
+    std::lock_guard<std::mutex> guard(workMutex);
+    promptEvents.push_back(std::move(event));
+}
+
+void LocalAutoTuningStorePlugin::drainPromptEvents() {
+    for (;;) {
+        Event event;
+        {
+            std::lock_guard<std::mutex> guard(workMutex);
+            if (promptEvents.empty()) return;
+            event = std::move(promptEvents.front());
+            promptEvents.pop_front();
+        }
+        pluginManager->trigger(event);
+    }
+}
+
 void LocalAutoTuningStorePlugin::drainStoredShots() {
     for (;;) {
         StoredShotNotice notice;
@@ -1472,18 +1519,7 @@ void LocalAutoTuningStorePlugin::drainStoredShots() {
             Event confirmationEvent;
             confirmationEvent.id = "rl:dose-confirmation:required";
             confirmationEvent.setString("shot_id", notice.shotId);
-            AutoTuning::CompletedShotArtifact artifact;
-            {
-                LocalStoreLock lock(storeMutex);
-                if (!loadCommittedShot(notice.shotId, artifact)) continue;
-            }
-            const auto grind = AutoTuning::displayedGrind(artifact.record);
-            const auto dose = AutoTuning::displayedDose(artifact.record);
-            confirmationEvent.setFloat("dose_target_g", dose.value_or(notice.doseTargetG));
-            confirmationEvent.setInt("has_grind_setting", grind.has_value());
-            if (grind) confirmationEvent.setFloat("grind_setting", *grind);
-            confirmationEvent.setInt("grind_is_absolute", AutoTuning::usesAbsoluteGrind(artifact.record));
-            confirmationEvent.setInt("dose_measured", artifact.record.doseObserved);
+            notice.recipe.writeTo(confirmationEvent);
             confirmationEvent.setInt64("prompt_revision", notice.promptRevision);
             pluginManager->trigger(confirmationEvent);
         } else {
@@ -1589,7 +1625,10 @@ bool LocalAutoTuningStorePlugin::enqueueWork(WorkItem work) {
         work.shotId.isEmpty()) {
         return false;
     }
-    if (work.kind == WorkKind::ResolvePrompt &&
+    if (work.kind == WorkKind::DoseConfirmation && !work.recipeConfirmation) {
+        return false;
+    }
+    if ((work.kind == WorkKind::ResolvePrompt || work.kind == WorkKind::DoseConfirmation) &&
         (work.shotId.isEmpty() || work.promptRevision == 0)) {
         return false;
     }
@@ -1652,7 +1691,8 @@ bool LocalAutoTuningStorePlugin::processOneWorkItem() {
             StoredShotNotice notice;
             notice.shotId = work.shotId;
             notice.doseConfirmationRequired = work.queuedShot->disposition.doseConfirmationRequired;
-            notice.doseTargetG = work.queuedShot->completion.doseTargetG;
+            notice.recipe = RecipePrompt::fromShot(work.queuedShot->shot,
+                                                   work.queuedShot->completion.doseTargetG);
             notice.promptRevision = notice.doseConfirmationRequired ? 1 : 0;
             std::lock_guard<std::mutex> guard(workMutex);
             storedShotNotices.push_back(std::move(notice));
@@ -1675,6 +1715,11 @@ bool LocalAutoTuningStorePlugin::processOneWorkItem() {
         break;
     case WorkKind::CommunitySweep:
         dispatchPendingCommunityUploads();
+        break;
+    case WorkKind::DoseConfirmation:
+        if (work.recipeConfirmation) {
+            processDoseConfirmation(work.shotId, work.promptRevision, *work.recipeConfirmation);
+        }
         break;
     case WorkKind::DoseConfirmationRecovery:
         recoverPendingDoseConfirmation();
@@ -2071,7 +2116,6 @@ void LocalAutoTuningStorePlugin::recoverPendingDoseConfirmation() {
         return;
     }
     String newestShotId;
-    float newestDoseTargetG = 0.0f;
     std::uint32_t newestPromptRevision = 0;
     EpochSeconds newestTimestamp = std::numeric_limits<EpochSeconds>::min();
     for (const String &path : paths) {
@@ -2082,25 +2126,20 @@ void LocalAutoTuningStorePlugin::recoverPendingDoseConfirmation() {
             if (deliveryState(replay).status == AutoTuning::DeliveryStatus::AwaitingDoseConfirmation &&
                 updatedAt >= newestTimestamp) {
                 newestShotId = replay["shot_id"].as<String>();
-                newestDoseTargetG = replay["dose_target_g"] | 0.0f;
                 newestPromptRevision = promptState(replay).revision;
-                if (newestDoseTargetG <= 0.0f) {
-                    AutoTuning::CompletedShotArtifact artifact;
-                    if (loadCommittedShot(newestShotId, artifact)) {
-                        newestDoseTargetG = artifact.completion.doseTargetG;
-                    }
-                }
                 newestTimestamp = updatedAt;
             }
         }
     }
-    if (newestShotId.isEmpty() || newestDoseTargetG <= 0.0f) {
+    if (newestShotId.isEmpty()) {
         return;
     }
     StoredShotNotice notice;
     notice.shotId = newestShotId;
     notice.doseConfirmationRequired = true;
-    notice.doseTargetG = newestDoseTargetG;
+    auto artifact = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    if (!loadCommittedShot(newestShotId, *artifact)) return;
+    notice.recipe = RecipePrompt::fromShot(artifact->record, artifact->completion.doseTargetG);
     notice.promptRevision = newestPromptRevision;
     std::lock_guard<std::mutex> guard(workMutex);
     storedShotNotices.push_back(std::move(notice));

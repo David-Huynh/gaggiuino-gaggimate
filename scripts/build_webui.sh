@@ -14,15 +14,5 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Seed profiles still go into the filesystem image used for fresh USB installs.
 mkdir -p "$ROOT/data/p"
 
-# Build the web application.
-cd "$ROOT/web"
-npm ci
-npm run build
-
-# Gzip the compressible assets in place (served with Content-Encoding: gzip).
-gzip -f dist/assets/*.js
-gzip -f dist/assets/*.css
-gzip -f dist/*.html
-
-# Pack the built bundle into firmware-embeddable flash artifacts.
-python "$ROOT/scripts/embed_webui.py" --src "$ROOT/web/dist" --out "$ROOT/src/display/webassets"
+# Build, compress and record source/output hashes for the firmware pre-build check.
+python "$ROOT/scripts/build_webui.py" --install

@@ -17,6 +17,7 @@
 #include <display/plugins/autotuning/local/LocalAutoTuningContextStore.h>
 #include <display/plugins/autotuning/local/CompletedShotArtifactStore.h>
 #include <display/plugins/autotuning/local/LocalAutoTuningSummaryStore.h>
+#include <display/plugins/autotuning/local/RecipePrompt.h>
 
 class LocalAutoTuningStorePlugin : public Plugin,
                                    public AutoTuning::LocalOptimizationStorePort,
@@ -40,6 +41,10 @@ class LocalAutoTuningStorePlugin : public Plugin,
   private:
     void handleShotDispatch(Event const &event);
     void handleDoseConfirmation(Event const &event);
+    void processDoseConfirmation(const String &shotId, std::uint32_t promptRevision,
+                                 AutoTuning::RecipeConfirmation const &answer);
+    void queuePromptEvent(Event event);
+    void drainPromptEvents();
     void handleShotReprocess(Event &event);
     void handleShotDeliveryAck(Event const &event);
     void processShotDeliveryAck(const String &shotId, const String &outcome, const String &reason,
@@ -76,7 +81,7 @@ class LocalAutoTuningStorePlugin : public Plugin,
     struct StoredShotNotice {
         String shotId;
         bool doseConfirmationRequired = false;
-        float doseTargetG = 0.0f;
+        RecipePrompt recipe;
         std::uint32_t promptRevision = 0;
     };
     enum class WorkKind : std::uint8_t {
@@ -87,6 +92,7 @@ class LocalAutoTuningStorePlugin : public Plugin,
         DeliverySweep,
         CommunitySweep,
         DoseConfirmationRecovery,
+        DoseConfirmation,
         StatusRefresh,
         MarkCompletionEmitted,
         RecoverCommittedArtifacts,
@@ -104,6 +110,7 @@ class LocalAutoTuningStorePlugin : public Plugin,
         std::int64_t timestamp = 0;
         std::uint32_t recordRevision = 0;
         std::uint32_t promptRevision = 0;
+        std::optional<AutoTuning::RecipeConfirmation> recipeConfirmation;
         std::optional<AutoTuning::PreferenceRequest> preferenceRequest;
         bool reprocess = false;
         bool automaticRetry = false;
@@ -159,6 +166,7 @@ class LocalAutoTuningStorePlugin : public Plugin,
     std::mutex workMutex;
     std::deque<WorkItem> workItems;
     std::deque<StoredShotNotice> storedShotNotices;
+    std::deque<Event> promptEvents;
     std::deque<CompletionNotice> completionNotices;
     std::vector<String> queuedCompletionShotIds;
     std::vector<ClaimablePrompt> claimablePrompts;

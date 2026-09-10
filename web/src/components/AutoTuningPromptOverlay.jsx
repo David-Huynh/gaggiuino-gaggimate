@@ -1,5 +1,5 @@
 import { createPortal } from 'preact/compat';
-import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { ApiServiceContext } from '../services/ApiService.js';
 import { formatGrinderSettingTransition } from '../utils/grinderRecommendation.js';
 import {
@@ -48,6 +48,7 @@ export function AutoTuningPromptOverlay() {
   const [dock, setDock] = useState(null);
   useEffect(() => setDock(document.getElementById('shot-prompt-dock')), []);
   const [pendingDose, setPendingDose] = useState(null);
+  const [shotProgress, setShotProgress] = useState(null);
   const [pendingPreference, setPendingPreference] = useState(null);
   const [preferenceSending, setPreferenceSending] = useState(false);
   const [preferenceError, setPreferenceError] = useState('');
@@ -57,6 +58,8 @@ export function AutoTuningPromptOverlay() {
   const [recipeGrind, setRecipeGrind] = useState('');
   const [recipeDose, setRecipeDose] = useState('');
   const [pendingRecommendation, setPendingRecommendation] = useState(null);
+  const recommendationRef = useRef(null);
+  recommendationRef.current = pendingRecommendation;
   const [view, setView] = useState(null);
   const seenRef = useRef(loadSeen());
   const pendingDoseId = useRef(null);
@@ -74,7 +77,9 @@ export function AutoTuningPromptOverlay() {
     }
   }, []);
 
-  useEffect(() => {
+  // Subscribe before paint: the machine can replay pending prompts as soon as
+  // the socket connects, before deferred effects would otherwise run.
+  useLayoutEffect(() => {
     if (!apiService) {
       return undefined;
     }
@@ -88,16 +93,23 @@ export function AutoTuningPromptOverlay() {
         return;
       }
       const prompt = { ...message };
+      recommendationRef.current = prompt;
       setPendingRecommendation(prompt);
+      setShotProgress(null);
       const key = `recommendation:${message.recommendation_id}`;
       const firstSeen = !seenRef.current.has(key);
       markSeen(key);
-      if (firstSeen) {
-        setView(current => current || 'recommendation');
-      }
+      setView(current =>
+        current === 'progress'
+          ? 'recommendation'
+          : firstSeen
+            ? current || 'recommendation'
+            : current,
+      );
     });
 
     const recommendationClearListener = apiService.on('evt:rl:recommendation-clear', () => {
+      recommendationRef.current = null;
       setPendingRecommendation(null);
       setView(current => (current === 'recommendation' ? null : current));
     });
@@ -136,12 +148,23 @@ export function AutoTuningPromptOverlay() {
         Number(message.prompt_revision) === Number(pendingDoseId.current?.prompt_revision)
       ) {
         setRecipeSending(false);
-        setView(current => (current === 'dose' ? null : current));
+        const nextRecipeReady = !!recommendationRef.current;
+        setShotProgress(
+          nextRecipeReady
+            ? null
+            : { shot_id: message.shot_id, followed: message.followed, accepted: false },
+        );
+        setView(current =>
+          current === 'dose' ? (nextRecipeReady ? 'recommendation' : 'progress') : current,
+        );
       }
     });
 
     const shotCompleteListener = apiService.on('evt:rl:shot-complete', message => {
       if (!message.preference_feedback_required) {
+        setShotProgress(current =>
+          current?.shot_id === message.shot_id ? { ...current, accepted: true } : current,
+        );
         return;
       }
       const revision = Number(message.prompt_revision);
@@ -158,6 +181,7 @@ export function AutoTuningPromptOverlay() {
       ) {
         return;
       }
+      setShotProgress(null);
       const prompt = { ...message, prompt_revision: revision };
       setPendingPreference(current => {
         if (current?.shot_id === message.shot_id && Number(current.prompt_revision) >= revision) {
@@ -168,9 +192,7 @@ export function AutoTuningPromptOverlay() {
       const key = `preference:${message.optimization_run_id}:${message.shot_id}:${revision}`;
       const firstSeen = !seenRef.current.has(key);
       markSeen(key);
-      if (firstSeen) {
-        setView('preference');
-      }
+      setView(current => (firstSeen || current === 'progress' ? 'preference' : current));
     });
 
     const preferenceResolvedListener = apiService.on('evt:rl:preference-resolved', message => {
@@ -197,14 +219,18 @@ export function AutoTuningPromptOverlay() {
     const clearListener = apiService.on('evt:rl:prompts-clear', message => {
       if (!message.shot_id) {
         setPendingDose(null);
+        setShotProgress(null);
         setPendingPreference(null);
         setPendingRecommendation(null);
         setView(null);
         return;
       }
+      setShotProgress(current => (current?.shot_id === message.shot_id ? null : current));
       setPendingDose(current => (current?.shot_id === message.shot_id ? null : current));
       setPendingPreference(current => (current?.shot_id === message.shot_id ? null : current));
-      setView(current => (current === 'dose' || current === 'preference' ? null : current));
+      setView(current =>
+        current === 'dose' || current === 'preference' || current === 'progress' ? null : current,
+      );
     });
 
     return () => {
@@ -355,11 +381,13 @@ export function AutoTuningPromptOverlay() {
   }, [apiService, pendingRecommendation]);
 
   if (!view) {
-    if (!pendingDose && !pendingPreference && !pendingRecommendation) {
+    if (!pendingDose && !pendingPreference && !pendingRecommendation && !shotProgress) {
       return null;
     }
     if (!dock) return null;
-    const count = [pendingDose, pendingPreference, pendingRecommendation].filter(Boolean).length;
+    const count = [pendingDose, pendingPreference, pendingRecommendation, shotProgress].filter(
+      Boolean,
+    ).length;
     return createPortal(
       <div className='flex items-center gap-3' aria-label='Pending shot prompts'>
         <button
@@ -367,7 +395,15 @@ export function AutoTuningPromptOverlay() {
           className='btn btn-circle btn-secondary relative min-h-12 min-w-12 shrink-0'
           aria-label={`Open shot prompts (${count} pending)`}
           onClick={() =>
-            setView(pendingDose ? 'dose' : pendingPreference ? 'preference' : 'recommendation')
+            setView(
+              pendingDose
+                ? 'dose'
+                : pendingPreference
+                  ? 'preference'
+                  : pendingRecommendation
+                    ? 'recommendation'
+                    : 'progress',
+            )
           }
         >
           <svg
@@ -385,7 +421,13 @@ export function AutoTuningPromptOverlay() {
           <span className='badge badge-sm absolute -top-1 -right-1'>{count}</span>
         </button>
         <span className='truncate text-sm'>
-          {pendingDose ? 'Confirm recipe' : pendingPreference ? 'Compare shot' : 'Next recipe'}
+          {pendingDose
+            ? 'Confirm recipe'
+            : pendingPreference
+              ? 'Compare shot'
+              : pendingRecommendation
+                ? 'Next recipe'
+                : 'Shot status'}
         </span>
       </div>,
       dock,
@@ -408,6 +450,32 @@ export function AutoTuningPromptOverlay() {
         >
           Minimize
         </button>
+
+        {view === 'progress' && shotProgress && (
+          <div className='space-y-4' role='status'>
+            <h2 className='text-xl font-bold'>
+              {shotProgress.accepted ? 'Shot received by EspressoRL' : 'Recipe saved'}
+            </h2>
+            <p>
+              {shotProgress.accepted
+                ? 'EspressoRL acknowledged this shot. No taste comparison was requested.'
+                : 'Waiting for EspressoRL to acknowledge this shot. A comparison or next recipe will open here when available.'}
+            </p>
+            {shotProgress.followed === false && (
+              <p>
+                Your recipe was marked uncertain, so it will not be used as a known recipe for
+                optimization.
+              </p>
+            )}
+            <p className='text-base-content/60 text-sm'>
+              You can minimize this message. If no next step appears, check delivery and optimizer
+              status in Auto-Tuning.
+            </p>
+            <a className='btn btn-outline w-full' href='/autotuning' onClick={() => setView(null)}>
+              View Auto-Tuning status
+            </a>
+          </div>
+        )}
 
         {view === 'dose' && pendingDose && (
           <div className='space-y-4'>

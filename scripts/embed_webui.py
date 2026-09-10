@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import gzip as gzip_codec
 import hashlib
 import os
 import sys
@@ -149,13 +150,16 @@ gWebUiBlobEnd:
         f.write("\n".join(lines))
 
 
-def pack(src_dir, out_dir):
+def pack(src_dir, out_dir, compress=False):
     assets = collect_assets(src_dir)
     blob = bytearray()
     entries = []
     for url_path, gzip, abs_file in assets:
         with open(abs_file, "rb") as f:
             data = f.read()
+        if compress and not gzip and os.path.splitext(url_path)[1] in (".js", ".css", ".html"):
+            data = gzip_codec.compress(data, mtime=0)
+            gzip = True
         entries.append(
             {
                 "path": url_path,
