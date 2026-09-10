@@ -29,7 +29,7 @@ function SunriseColorField({ id, label, value, fallback, onChange }) {
             id={id}
             name={id}
             type='color'
-            className='input input-bordered invisible w-full'
+            className='input cursor-pointer opacity-0'
             value={value || fallback}
             onChange={onChange}
           />
@@ -71,45 +71,7 @@ export function MachineTab({ formData, onChange, setField }) {
   const [steamPumpDraft, setSteamPumpDraft] = useState(null);
 
   return (
-    <div className='space-y-4 sm:space-y-6'>
-      {/* Temperature Settings */}
-      <Section title='Temperature Settings'>
-        <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
-          <InputGroupField
-            label='Default Steam Temperature'
-            htmlFor='targetSteamTemp'
-            unit='°C'
-            unitAriaLabel='celsius'
-            noMargin
-          >
-            <input
-              id='targetSteamTemp'
-              name='targetSteamTemp'
-              type='number'
-              placeholder='135'
-              value={formData.targetSteamTemp}
-              onChange={onChange('targetSteamTemp')}
-            />
-          </InputGroupField>
-          <InputGroupField
-            label='Default Water Temperature'
-            htmlFor='targetWaterTemp'
-            unit='°C'
-            unitAriaLabel='celsius'
-            noMargin
-          >
-            <input
-              id='targetWaterTemp'
-              name='targetWaterTemp'
-              type='number'
-              placeholder='80'
-              value={formData.targetWaterTemp}
-              onChange={onChange('targetWaterTemp')}
-            />
-          </InputGroupField>
-        </div>
-      </Section>
-
+    <div className='space-y-4 sm:space-y-6 lg:grid lg:grid-cols-2 lg:gap-4'>
       <Section title='Weight Sources'>
         <SettingsFormField label='Brew weight source' htmlFor='scaleSource' noMargin>
           <input
@@ -145,7 +107,7 @@ export function MachineTab({ formData, onChange, setField }) {
       </Section>
 
       {/* Machine Hardware Settings */}
-      <Section title='Machine Settings'>
+      <Section title='Machine Settings' className='h-full'>
         <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
           <InputGroupField
             label='PID Values'
@@ -223,6 +185,26 @@ export function MachineTab({ formData, onChange, setField }) {
               onChange={onChange('temperatureOffset')}
             />
           </InputGroupField>
+          {pressureAvailable.value && (
+            <InputGroupField
+              label='Pressure Offset'
+              htmlFor='pressureOffset'
+              unit='bar'
+              helpText='Cracking pressure of a grouphead mushroom valve (e.g. 4.0 on Delonghi machines). Subtracted from readings and added to targets only while a brew is running. Leave at 0.0 for a 3-way solenoid.'
+              noMargin
+            >
+              <input
+                id='pressureOffset'
+                name='pressureOffset'
+                type='number'
+                step='any'
+                className='grow'
+                placeholder='0.0'
+                value={formData.pressureOffset}
+                onChange={onChange('pressureOffset')}
+              />
+            </InputGroupField>
+          )}
           {pressureAvailable.value && (
             <InputGroupField
               label='Pressure Sensor Rating'
@@ -313,11 +295,63 @@ export function MachineTab({ formData, onChange, setField }) {
           </SettingsFormField>
         </div>
       </Section>
-
+      {/* Temperature Settings */}
+      <Section title='Temperature Settings' className='h-full md:order-3'>
+        <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
+          <InputGroupField
+            label='Default Steam Temperature'
+            htmlFor='targetSteamTemp'
+            unit='°C'
+            unitAriaLabel='celsius'
+            noMargin
+          >
+            <input
+              id='targetSteamTemp'
+              name='targetSteamTemp'
+              type='number'
+              placeholder='135'
+              value={formData.targetSteamTemp}
+              onChange={onChange('targetSteamTemp')}
+            />
+          </InputGroupField>
+          <InputGroupField
+            label='Default Water Temperature'
+            htmlFor='targetWaterTemp'
+            unit='°C'
+            unitAriaLabel='celsius'
+            noMargin
+          >
+            <input
+              id='targetWaterTemp'
+              name='targetWaterTemp'
+              type='number'
+              placeholder='80'
+              value={formData.targetWaterTemp}
+              onChange={onChange('targetWaterTemp')}
+            />
+          </InputGroupField>
+        </div>
+      </Section>
       {/* Alba Settings */}
       {ledControl.value && (
-        <Section title='Alba Settings'>
+        <Section title='Alba Settings' className='h-full'>
           <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
+            <TankDistanceField
+              id='emptyTankDistance'
+              label='Distance from sensor to bottom of the tank'
+              value={formData.emptyTankDistance}
+              onChange={onChange('emptyTankDistance')}
+              onUseCurrent={() => setField('emptyTankDistance', tofDistance.value)}
+            />
+            <TankDistanceField
+              id='fullTankDistance'
+              label='Distance from sensor to the fill line'
+              value={formData.fullTankDistance}
+              onChange={onChange('fullTankDistance')}
+              onUseCurrent={() => setField('fullTankDistance', tofDistance.value)}
+            />
+          </div>
+          <div className='border-base-content/5 mt-6 grid grid-cols-1 gap-4 border-t pt-6 md:grid-cols-4'>
             <SunriseColorField
               id='sunriseIdle'
               label='Idle Color'
@@ -365,22 +399,6 @@ export function MachineTab({ formData, onChange, setField }) {
               onChange={onChange('sunriseExtBrightness')}
             />
           </SettingsFormField>
-          <div className='border-base-content/5 mt-6 grid grid-cols-1 gap-4 border-t pt-6 md:grid-cols-2'>
-            <TankDistanceField
-              id='emptyTankDistance'
-              label='Distance from sensor to bottom of the tank'
-              value={formData.emptyTankDistance}
-              onChange={onChange('emptyTankDistance')}
-              onUseCurrent={() => setField('emptyTankDistance', tofDistance.value)}
-            />
-            <TankDistanceField
-              id='fullTankDistance'
-              label='Distance from sensor to the fill line'
-              value={formData.fullTankDistance}
-              onChange={onChange('fullTankDistance')}
-              onUseCurrent={() => setField('fullTankDistance', tofDistance.value)}
-            />
-          </div>
         </Section>
       )}
     </div>

@@ -32,13 +32,15 @@
  *     non-idempotent ops) and ACKed; payloads are dispatched by oneof tag to
  *     typed handlers -- no run-time type erasure.
  *
- * Threading: decode + ACK/dedup run on the transport's callback/pump thread, and
- * the send pump may also be driven by a dedicated transport task. Registered
- * handlers run on a separate dispatch task (fed by an inbound payload queue), so
- * slow application callbacks never block transport receive. If the inbound
- * queue is full the frame is left un-ACKed, which back-pressures the sender into
- * retransmitting. Queue + in-flight state are guarded by a mutex; handlers run
- * with the mutex released, so a handler may call send() re-entrantly.
+ * Threading: decode + ACK/dedup + the send pump run on the transport's callback
+ * thread, but registered handlers and connection callbacks are invoked on a
+ * dedicated dispatch task (fed by an inbound event queue) so slow application
+ * callbacks never block the BLE host task. Serializing both event types also
+ * prevents payload handlers from crossing a connection-session boundary. If
+ * the inbound queue is full the frame is left un-ACKed, which
+ * back-pressures the sender into retransmitting. Queue + in-flight state are
+ * guarded by a mutex; handlers run with the mutex released, so a handler may
+ * call send() re-entrantly.
  */
 class Endpoint {
   public:

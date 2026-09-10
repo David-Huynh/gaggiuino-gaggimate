@@ -587,6 +587,19 @@ static bool rlParticipationEnabled(Controller *controller) {
 
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
+static void addWarnings(JsonArray warn, const WarningManager &wm, bool onlyShown) {
+    for (int i = 0; i < WARNING_TYPE_COUNT; i++) {
+        const auto type = static_cast<WarningType>(i);
+        if (onlyShown && !wm.isWarn(type) && !wm.isError(type))
+            continue;
+        JsonObject w = warn.add<JsonObject>();
+        w["k"] = WarningManager::key(type);
+        w["l"] = wm.getLevel(type);
+        if (!onlyShown)
+            w["a"] = wm.isActive(type);
+    }
+}
+
 void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) {
     // Redirect mbedTLS allocations to PSRAM before any TLS (OTA) handshake runs, so the
     // ~32 KB handshake buffers don't exhaust the scarce internal-DRAM pool. See mbedtlsPsramCalloc.
@@ -605,6 +618,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             updateOTAProgress(phase, progress);
         },
         otaDisplayFirmwareName(), "display-filesystem.bin", "board-firmware.bin");
+    ota->init();
     pluginManager->on("controller:wifi:connect", [this](Event const &event) {
         apMode = event.getInt("AP");
         start();
@@ -618,9 +632,6 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
     pluginManager->on("controller:ready", [this](Event const &) {
         ota->setControllerVersion(controller->getSystemInfo().version);
-#ifndef GAGGIMATE_UART_COMMS
-        ota->init(controller->getClientController()->getClient());
-#endif
     });
     pluginManager->on("controller:autotune:result", [this](Event const &event) { sendAutotuneResult(); });
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
@@ -1159,6 +1170,20 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     });
 #endif
 
+    // A brew start blocked by an error-level warning asks every dashboard for confirmation.
+    pluginManager->on("controller:brew:confirm", [this](Event const &) {
+        JsonDocument doc(&psramAllocator);
+        doc["tp"] = "evt:brew:confirm";
+        addWarnings(doc["warn"].to<JsonArray>(), controller->getWarnings(), true);
+        broadcastJson(doc);
+    });
+
+    pluginManager->on("controller:brew:confirm:cancel", [this](Event const &) {
+        JsonDocument doc(&psramAllocator);
+        doc["tp"] = "evt:brew:confirm:cancel";
+        broadcastJson(doc);
+    });
+
     setupServer();
 }
 
@@ -1172,7 +1197,11 @@ void WebUIPlugin::loop() {
         // firmware over BLE (wants a low-latency link), a display update is over
         // Wi-Fi (wants BLE to stay out of the radio's way). "" = both.
         pluginManager->trigger("ota:update:start", "component", updateComponent);
-        ota->update(CONTROLLER_OTA_ENABLED && updateComponent != "display", updateComponent != "controller");
+        NimBLEClient *otaClient = nullptr;
+#ifndef GAGGIMATE_UART_COMMS
+        otaClient = controller->getClientController()->getClient();
+#endif
+        ota->update(CONTROLLER_OTA_ENABLED && updateComponent != "display", updateComponent != "controller", otaClient);
         pluginManager->trigger("ota:update:end");
         updating = false;
     }
@@ -1188,6 +1217,7 @@ void WebUIPlugin::loop() {
     }
     if (now > lastStatus + STATUS_PERIOD && !ws.getClients().empty()) {
         lastStatus = now;
+        publishState(now);
         statusDoc.clear();
         statusDoc["tp"] = "evt:status";
         statusDoc["ct"] = controller->getCurrentTemp();
@@ -1195,26 +1225,6 @@ void WebUIPlugin::loop() {
         statusDoc["pr"] = controller->getCurrentPressure();
         statusDoc["fl"] = controller->getCurrentPumpFlow();
         statusDoc["pt"] = controller->getTargetPressure();
-        statusDoc["m"] = controller->getMode();
-        statusDoc["bsp"] = controller->isBrewStartPending() ? 1 : 0;
-        statusDoc["bse"] = controller->getBrewStartError();
-        statusDoc["p"] = controller->getProfileManager()->getSelectedProfile().label;
-        statusDoc["puid"] = controller->getProfileManager()->getSelectedProfile().id;
-        statusDoc["cp"] = controller->getSystemInfo().capabilities.pressure;
-        statusDoc["cd"] = controller->getSystemInfo().capabilities.dimming;
-        statusDoc["ctof"] = controller->getSystemInfo().capabilities.tof;
-        statusDoc["gp"] = controller->getSystemInfo().capabilities.hasAddon(7);
-        statusDoc["tw"] = profileManager->getSelectedProfile().getTotalVolume(); // total target weight for the process
-        statusDoc["bta"] = controller->isVolumetricAvailable() ? 1 : 0;
-        statusDoc["bt"] =
-            controller->isVolumetricAvailable() && controller->getProfileManager()->getSelectedProfile().isVolumetric() ? 1 : 0;
-        statusDoc["btd"] = profileManager->getSelectedProfile().getTotalDuration();
-        statusDoc["led"] = controller->getSystemInfo().capabilities.ledControl;
-        statusDoc["gtd"] = controller->getTargetGrindDuration();
-        statusDoc["gtv"] = controller->getSettings().getTargetGrindVolume();
-        statusDoc["gta"] = controller->isGrindVolumetricAvailable() ? 1 : 0;
-        statusDoc["gt"] = controller->isGrindVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
-        statusDoc["gact"] = controller->isGrindActive() ? 1 : 0;
         statusDoc["wl"] = controller->getWaterLevel();
         statusDoc["tof"] = controller->getTofDistance();
         statusDoc["rssi"] = 0;
@@ -1387,6 +1397,7 @@ void WebUIPlugin::loop() {
         }
         if (process != nullptr) {
             auto pObj = statusDoc["process"].to<JsonObject>();
+            pObj["u"] = process->isUtility() ? 1 : 0;
             pObj["a"] = controller->isActive() ? 1 : 0;
             statusDoc["pkr"] = controller->getCurrentPuckResistance();
             statusDoc["pf"] = controller->getCurrentPuckFlow();
@@ -1433,7 +1444,7 @@ void WebUIPlugin::loop() {
         statusDoc["hf"] = ESP.getFreeHeap();
         statusDoc["hl"] = ESP.getMaxAllocHeap();
         statusDoc["hm"] = ESP.getMinFreeHeap();
-        statusDoc["up"] = millis() / 1000;
+        statusDoc["uptime"] = millis() / 1000;
 
         broadcastJson(statusDoc);
     }
@@ -1462,6 +1473,60 @@ void WebUIPlugin::loop() {
         lastDns = now;
         dnsServer->processNextRequest();
     }
+}
+
+void WebUIPlugin::publishState(unsigned long now) {
+    JsonDocument doc(&psramAllocator);
+    doc["tp"] = "evt:status";
+    doc["bsp"] = controller->isBrewStartPending() ? 1 : 0;
+    doc["bse"] = controller->getBrewStartError();
+    doc["gta"] = controller->isGrindVolumetricAvailable() ? 1 : 0;
+    doc["ctof"] = controller->getSystemInfo().capabilities.tof;
+    doc["m"] = controller->getMode();
+    const Profile &profile = controller->getProfileManager()->getSelectedProfile();
+    doc["p"] = profile.label;
+    doc["puid"] = profile.id;
+    const auto &caps = controller->getSystemInfo().capabilities;
+    doc["cp"] = caps.pressure;
+    doc["cd"] = caps.dimming;
+    doc["gp"] = caps.hasAddon(7);
+    doc["led"] = caps.ledControl;
+    doc["tw"] = profile.getTotalVolume(); // total target weight for the process
+    doc["bta"] = controller->isVolumetricAvailable() ? 1 : 0;
+    doc["bt"] = controller->isVolumetricAvailable() && profile.isVolumetric() ? 1 : 0;
+    doc["btd"] = profile.getTotalDuration();
+    doc["gtd"] = controller->getTargetGrindDuration();
+    doc["gtv"] = controller->getSettings().getTargetGrindVolume();
+    doc["gt"] = controller->isGrindVolumetricAvailable() && controller->getSettings().isVolumetricTarget() ? 1 : 0;
+    doc["gact"] = controller->isGrindActive() ? 1 : 0;
+    if (!otaUpdateCheckInProgress.load(std::memory_order_acquire))
+        cachedUpdateAvailable = OTA_ENABLED && (ota->isUpdateAvailable() ||
+                                                (CONTROLLER_OTA_ENABLED && ota->isUpdateAvailable(true)));
+    doc["up"] = cachedUpdateAvailable;
+    // Same text as the display's standby label, so headless users see starting/waiting/error states too.
+    JsonObject sys = doc["sys"].to<JsonObject>();
+    sys["s"] = systemStateKey(controller->getSystemState());
+    sys["m"] = controller->getSystemStateMessage();
+    sys["c"] = controller->getError();
+    const bool bleConnected = BLEScales.isConnected();
+    doc["bc"] = bleConnected;
+    // Scale battery: null when disconnected or the driver reports the UNKNOWN sentinel, so merging clients clear it.
+    if (bleConnected && BLEScales.hasBatteryLevel() && BLEScales.getBatteryLevel() != REMOTE_SCALES_BATTERY_UNKNOWN) {
+        doc["sbat"] = BLEScales.getBatteryLevel();
+    } else {
+        doc["sbat"] = nullptr;
+    }
+    addWarnings(doc["warn"].to<JsonArray>(), controller->getWarnings(), false);
+
+    auto buffer = toWsBuffer(doc);
+    const auto previous = std::atomic_load(&lastStateBuffer);
+    const bool unchanged = previous && previous->size() == buffer->size() &&
+                           memcmp(previous->data(), buffer->data(), buffer->size()) == 0;
+    if (unchanged && now - lastStateSent < STATE_RESEND_PERIOD)
+        return;
+    std::atomic_store(&lastStateBuffer, buffer);
+    lastStateSent = now;
+    ws.textAll(buffer);
 }
 
 void WebUIPlugin::startOTAUpdateCheck(const unsigned long now) {
@@ -1657,6 +1722,7 @@ void WebUIPlugin::setupServer() {
     ws.onEvent(
         [this](AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
             if (type == WS_EVT_CONNECT) {
+                if (auto state = std::atomic_load(&lastStateBuffer)) client->text(state);
                 // Close (and let the browser reconnect) a client whose send
                 // queue backs up, instead of keeping it open. With it kept open
                 // (false), a client that stalls under load â€” e.g. while the UI
@@ -2089,7 +2155,11 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                         }
                     }
                 } else if (msgType == "req:process:activate") {
-                    controller->postCommand(CtrlCmd::ACTIVATE);
+                    controller->postCommand(CtrlCmd::ACTIVATE, doc["ignoreWarnings"].as<bool>() ? 1 : 0);
+                } else if (msgType == "req:brew:confirm:cancel") {
+                    controller->postCommand(CtrlCmd::CANCEL_BREW_CONFIRM);
+                } else if (msgType == "req:flush:stop") {
+                    controller->postCommand(CtrlCmd::STOP_FLUSH);
                 } else if (msgType == "req:process:deactivate") {
                     controller->postCommand(CtrlCmd::DEACTIVATE_CLEAR);
                 } else if (msgType == "req:process:clear") {
@@ -2797,6 +2867,22 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
                 settings->setHomeAssistantTopic(request->arg("haTopic"));
             settings->setMomentaryButtons(request->hasArg("momentaryButtons"));
             settings->setDelayAdjust(request->hasArg("delayAdjust"));
+            if (request->hasArg("pressureOffset"))
+                settings->setPressureOffset(request->arg("pressureOffset").toFloat());
+            if (request->hasArg("flushDuration"))
+                settings->setFlushDuration(request->arg("flushDuration").toInt());
+            if (request->hasArg("warnWaterLevel"))
+                settings->setWarnWaterLevel(request->arg("warnWaterLevel").toInt());
+            if (request->hasArg("warnFlush"))
+                settings->setWarnFlush(request->arg("warnFlush").toInt());
+            if (request->hasArg("warnSteamSwitch"))
+                settings->setWarnSteamSwitch(request->arg("warnSteamSwitch").toInt());
+            if (request->hasArg("warnScaleConnected"))
+                settings->setWarnScaleConnected(request->arg("warnScaleConnected").toInt());
+            if (request->hasArg("warnScaleBattery"))
+                settings->setWarnScaleBattery(request->arg("warnScaleBattery").toInt());
+            if (request->hasArg("warnTemperature"))
+                settings->setWarnTemperature(request->arg("warnTemperature").toInt());
             if (request->hasArg("brewDelay"))
                 settings->setBrewDelay(request->arg("brewDelay").toDouble());
             if (request->hasArg("hardwareBrewDelay"))
@@ -3066,6 +3152,14 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["smartGrindIp"] = settings.getSmartGrindIp();
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["momentaryButtons"] = settings.isMomentaryButtons();
+    doc["pressureOffset"] = String(settings.getPressureOffset());
+    doc["flushDuration"] = settings.getFlushDuration();
+    doc["warnWaterLevel"] = settings.getWarnWaterLevel();
+    doc["warnFlush"] = settings.getWarnFlush();
+    doc["warnSteamSwitch"] = settings.getWarnSteamSwitch();
+    doc["warnScaleConnected"] = settings.getWarnScaleConnected();
+    doc["warnScaleBattery"] = settings.getWarnScaleBattery();
+    doc["warnTemperature"] = settings.getWarnTemperature();
     doc["brewDelay"] = settings.getBrewDelay();
     doc["hardwareBrewDelay"] = settings.getHardwareBrewDelay();
     doc["grindDelay"] = settings.getGrindDelay();

@@ -19,6 +19,7 @@
 constexpr size_t UPDATE_CHECK_INTERVAL = 30 * 60 * 1000;
 constexpr size_t CLEANUP_PERIOD = 1000;
 constexpr size_t STATUS_PERIOD = 500;
+constexpr size_t STATE_RESEND_PERIOD = 10000;
 constexpr size_t DNS_PERIOD = 50;
 
 const String LOCAL_URL = "http://4.4.4.1/";
@@ -71,6 +72,10 @@ class WebUIPlugin : public Plugin {
     void sendAutotuneResult();
     void sendAutotuneFailed();
 
+    void publishState(unsigned long now);
+    unsigned long lastStateSent = 0;
+    bool cachedUpdateAvailable = false;
+    AsyncWebSocketSharedBuffer lastStateBuffer;
     void broadcastJson(JsonDocument &doc);
 
     // Core dump download

@@ -23,14 +23,14 @@ def method(source, signature):
 
 def main():
     BUILD.mkdir(parents=True, exist_ok=True)
-    source = (ROOT / "src/display/core/Controller.cpp").read_text()
+    source = (ROOT / "src/display/core/Controller.cpp").read_text(encoding="utf-8")
     signatures = [
         "bool Controller::armHardwareScaleBrewTare()",
         "void Controller::cancelHardwareScaleBrewTare(",
         "void Controller::pollHardwareScaleBrewTare()",
         "bool Controller::deactivateLocked(",
         "void Controller::loopLogic()",
-        "void Controller::activate()",
+        "void Controller::activate(bool",
         "void Controller::deactivate()",
         "void Controller::startProcess(",
         "bool Controller::startProcessLocked(",
@@ -39,7 +39,7 @@ def main():
         "void Controller::handleBrewButton(",
         "void Controller::deactivateStandby()",
     ]
-    (BUILD / "controller_methods.inc").write_text("\n\n".join(method(source, s) for s in signatures))
+    (BUILD / "controller_methods.inc").write_text("\n\n".join(method(source, s) for s in signatures), encoding="utf-8")
     cxx = os.environ.get("CXX") or shutil.which("g++") or shutil.which("clang++")
     if cxx:
         command = [cxx]

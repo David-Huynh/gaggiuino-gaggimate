@@ -14,7 +14,9 @@
 #include "StorageCoordinator.h"
 #include "SystemInfo.h"
 #include <WiFi.h>
+#include <display/core/ButtonHandler.h>
 #include <display/core/ProfileManager.h>
+#include <display/core/WarningManager.h>
 #include <display/core/process/Process.h>
 #include <mutex>
 #include <optional>
@@ -47,12 +49,26 @@ enum class CtrlCmd : uint8_t {
     SET_MODE,
     CHANGE_MODE,
     START_FLUSH,
+    STOP_FLUSH,
+    CANCEL_BREW_CONFIRM,
     BUTTON_STATE,
     RAISE_TEMP,
     LOWER_TEMP,
     RAISE_GRIND_TARGET,
     LOWER_GRIND_TARGET,
 };
+
+// What the display's standby label reports; shared with the web UI so headless users see the same thing.
+enum SystemState {
+    SYSTEM_STARTING,
+    SYSTEM_WAITING_CONTROLLER,
+    SYSTEM_READY,
+    SYSTEM_UPDATING,
+    SYSTEM_AUTOTUNING,
+    SYSTEM_PROTOCOL_MISMATCH,
+    SYSTEM_ERROR
+};
+const char *systemStateKey(SystemState state);
 
 class Controller {
   public:
@@ -89,6 +105,7 @@ class Controller {
         return false;
 #endif
     }
+    bool isBrewActive() const;
     bool isUpdating() const;
     bool isAutotuning() const;
     bool isReady() const;
@@ -116,6 +133,7 @@ class Controller {
     virtual float getCurrentHeaterPower() const { return currentHeaterPower; }
     virtual float getCurrentPuckResistance() const { return currentPuckResistance; }
     virtual float getCurrentCoffeeVolume() const { return currentCoffeeVolume; }
+    virtual float getCurrentWaterPumped() const { return currentWaterPumped; }
 
     bool isTaskHealthy() const { return is_task_healthy(eTaskGetState(logicTaskHandle)); }
 
@@ -146,6 +164,8 @@ class Controller {
 #endif
     bool isErrorState() const { return error > 0; }
     int getError() const { return error; }
+    SystemState getSystemState() const;
+    String getSystemStateMessage() const;
 
     // Event callback methods
     void updateLastAction();
@@ -155,7 +175,8 @@ class Controller {
     void lowerBrewTarget();
     void raiseGrindTarget();
     void lowerGrindTarget();
-    void activate();
+    void activate(bool ignoreWarnings = false);
+    void cancelBrewConfirm();
     void deactivate();
     void clear();
     void activateGrind();
@@ -202,6 +223,7 @@ class Controller {
     bool isBluetoothScaleHealthy(ScaleRole role) const;
     void noteBluetoothScaleMeasurement(ScaleRole role);
     void onFlush();
+    void onFlushRelease(); // ends a hold-to-flush; no-op otherwise
     int getWaterLevel() const {
         int emptyDist = settings.getEmptyTankDistance();
         int fullDist  = settings.getFullTankDistance();
@@ -216,6 +238,10 @@ class Controller {
 
     void onVolumetricDelete();
     bool isLowWaterLevel() const { return getWaterLevel() < 20; };
+    bool isSteamSwitchOn() const { return steamSwitchOn; }
+    bool isFlushPending() const { return flushPending; }
+    WarningManager &getWarnings() { return warnings; }
+    const WarningManager &getWarnings() const { return warnings; }
 
     SystemInfo getSystemInfo() const { return systemInfo; }
     UartDiagnostics getUartDiagnostics() const;
@@ -267,12 +293,19 @@ class Controller {
 
     // Event handlers
     void onTempRead(float temperature);
+    void onPressureRead(float pressure);
 
-    void handleBrewButton(int brewButtonStatus);
+    // Physical buttons (GM-200): raw edges -> ButtonHandler -> behavior handlers. `pressed`
+    // false only reaches the handlers for latching switches; momentary presses toggle.
+    ButtonHandler::Config buttonConfig() const;
+    void onButtonEvent(uint8_t index, ButtonHandler::Event event);
+    void runButtonBehavior(const String &behavior, bool pressed);
+    void handleBrewButton(bool pressed);
+    void handleSteamButton(bool pressed);
+    void handleWaterButton(bool pressed);
+    void handleFlushButton(bool pressed);
+    void handleProfileButton(bool pressed, const String &id);
     void handleControllerButton(uint8_t index, bool pressed);
-    void handleSteamButton(int steamButtonStatus);
-    void handleWaterButton(int buttonStatus);
-    void handleProfileButton(int buttonStatus, String id);
     void handleProfileUpdate();
 
     // Private Attributes
@@ -281,6 +314,7 @@ class Controller {
     Driver *driver = nullptr;
 #endif
     GaggiMateClient comms;
+    ButtonHandler buttons;
     hw_timer_t *timer = nullptr;
     Settings settings;
     PluginManager *pluginManager{};
@@ -290,6 +324,7 @@ class Controller {
     AutoTuning::CompletedShotProjectionPort *completedShotProjection{};
     std::optional<StorageCoordinator::ProcessLease> processStorageLease;
     std::optional<StorageCoordinator::ProcessLease> pendingProcessStorageLease;
+    WarningManager warnings;
 
     int mode = MODE_BREW;
     // Sensor scalars written from the UART poll callback (Arduino loop task) and
@@ -304,6 +339,7 @@ class Controller {
     float currentHeaterPower = 0.0f;
     float currentPuckResistance = 0.0f;
     float currentCoffeeVolume = 0.0f;
+    std::atomic<float> currentWaterPumped{0.0f};
     float targetFlow = 0.0f;
     int tofDistance = 0;
 
@@ -380,6 +416,8 @@ class Controller {
     std::atomic<const char *> brewStartError{""};
     bool processCompleted = false;
     bool steamReady = false;
+    bool steamSwitchOn = false;
+    bool flushPending = false; // no flush since entering brew mode, waking up, or the last shot
     bool sdcard = false;
     int error = 0;
 

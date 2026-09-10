@@ -243,6 +243,7 @@ void AutoTuningCapturePlugin::recordShotSample() {
     sample.pumpTargetMode = pumpTargetMode;
     sample.valveOpen = valveOpen;
     sample.systemInfo = captureHistorySystemInfo();
+    sample.waterPumped = controller->getCurrentWaterPumped();
     sample.elapsedMs = elapsedMs;
     captureHistoryPhaseTransition();
     shotSamples.push_back(sample);

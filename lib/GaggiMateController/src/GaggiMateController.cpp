@@ -37,9 +37,20 @@ GaggiMateController::GaggiMateController(String version) : _version(std::move(ve
 char albaSwTxBuffer[128];
 char albaSwRxBuffer[128];
 
+bool GaggiMateController::isSteamSwitchOn() const {
+    pinMode(_config.steamButtonPin, INPUT_PULLUP);
+    for (int i = 0; i < 5; i++) { // active low; require a steady reading so a bouncing contact never opens the window
+        if (digitalRead(_config.steamButtonPin) != LOW)
+            return false;
+        delay(10);
+    }
+    return true;
+}
+
 void GaggiMateController::setup() {
     detectBoard();
     detectAddon();
+    const bool pairingWindow = isSteamSwitchOn();
 
     this->thermocouple = new Max31855Thermocouple(
         _config.maxCsPin, _config.maxMisoPin, _config.maxSckPin, [this](float temperature) { /* noop */ },
@@ -330,7 +341,7 @@ void GaggiMateController::setup() {
         capabilities.addons[0] = gaggimate_Addon_init_zero;
         capabilities.addons[0].type = 7;
     }
-    _comms.init("GPBLS", _config.name.c_str(), _version, capabilities);
+    _comms.init("GPBLS", _config.name.c_str(), _version, capabilities, pairingWindow);
 
     ESP_LOGI(LOG_TAG, "Initialization done");
 #ifdef ARDUINO_ARCH_STM32
@@ -523,6 +534,7 @@ void GaggiMateController::sendSensorData() {
         float puckFlow = 0.0f;
         float pumpFlow = 0.0f;
         float puckResistance = 0.0f;
+        float waterPumped = 0.0f;
         // Sensor + (optional) volumetric ride in one frame.
         gm::Payload batch[2];
         size_t n = 0;
@@ -531,12 +543,13 @@ void GaggiMateController::sendSensorData() {
             puckFlow = dimmedPump->getPuckFlow();
             pumpFlow = dimmedPump->getPumpFlow();
             puckResistance = dimmedPump->getPuckResistance();
+            waterPumped = dimmedPump->getPumpedWater();
             if (this->valve->getState()) {
                 batch[n++] = _comms.buildVolumetricMeasurement(dimmedPump->getCoffeeVolume());
             }
         }
         batch[n++] = _comms.buildSensorData(this->thermocouple->read(), this->pressureSensor->getPressure(), puckFlow, pumpFlow,
-                                            puckResistance, pumpPower, heaterPower);
+                                            puckResistance, pumpPower, heaterPower, waterPumped);
         _comms.sendUnreliableBatch(batch, n); // telemetry: fire-and-forget
     } else {
         _comms.sendSensorData(this->thermocouple->read(), 0.0f, 0.0f, 0.0f, 0.0f, pumpPower, heaterPower);

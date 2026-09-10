@@ -10,22 +10,27 @@ import {
   createPhaseDelayTracker,
 } from './delayTracking';
 import { getMetricStats } from './metricStats';
+import { getBluetoothScaleConnectionState } from './scaleConnection';
 import {
+  PREDICTION_INTERVAL_MS,
   buildTargetCalcValues,
   findManualTargetMatch,
   findTargetMatch,
   findTargetMatchWithDirection,
   formatStopReason,
-  predictTargetValuesAtStep,
+  predictTargetValuesAtDelay,
 } from './targetMatching';
 import {
   getLastNonExtendedIndex,
+  getFinalWeightSample,
+  getFinalWeightSamples,
   getPhaseEndSample,
   getPhaseWeightRate,
   getSampleInstantWeightRate,
   isPositiveFiniteRate,
   isWeightTelemetryAvailable,
 } from './weightRate';
+import { calculatePumpedWater } from './waterIntegration';
 import {
   getBrewModeLabel,
   getPhaseExitReasonMeta,
@@ -78,16 +83,7 @@ function getNextPhaseSamples({ phaseNum, phases, sortedPhaseKeys }) {
   return nextPhaseKey ? phases[nextPhaseKey] || [] : [];
 }
 
-function getPumpedWaterUntilIndex(samples, endIndex) {
-  let pumped = 0;
-  for (let i = 1; i <= endIndex; i++) {
-    const dt = (samples[i].t - samples[i - 1].t) / 1000;
-    pumped += samples[i].fl * dt;
-  }
-  return pumped;
-}
-
-function getRecordedStopValue(exitType, samples, phaseStartTime) {
+function getRecordedStopValue(exitType, samples, phaseStartTime, closingSample, pumpedWaterSource) {
   const stopIndex = getLastNonExtendedIndex(samples);
   const stopSample = stopIndex >= 0 ? samples[stopIndex] : getPhaseEndSample(samples);
   if (!stopSample) return null;
@@ -95,19 +91,25 @@ function getRecordedStopValue(exitType, samples, phaseStartTime) {
   if (exitType === 'weight' || exitType === 'volumetric') return stopSample.v;
   if (exitType === 'pressure') return stopSample.cp;
   if (exitType === 'flow') return stopSample.fl;
-  if (exitType === 'pumped') return getPumpedWaterUntilIndex(samples, stopIndex);
-  if (exitType === 'duration') return (stopSample.t - phaseStartTime) / 1000;
+  if (exitType === 'pumped') {
+    const stopClosingSample = stopIndex === samples.length - 1 ? closingSample : null;
+    return calculatePumpedWater(samples, stopIndex, stopClosingSample, pumpedWaterSource);
+  }
+  if (exitType === 'duration') {
+    const stopTime =
+      stopIndex === samples.length - 1 && closingSample ? closingSample.t : stopSample.t;
+    return (stopTime - phaseStartTime) / 1000;
+  }
   return null;
 }
 
 function buildPhaseTargetContext({
   isBrewByWeight,
   isLastPhase,
+  pumpedWaterSource,
   samples,
   scaleConnectionBrokenPermanently,
-  shotData,
 }) {
-  const sampleInterval = shotData.sampleInterval || 250;
   const lastNonExtendedIndex = getLastNonExtendedIndex(samples);
   const lastNonExtendedSample =
     lastNonExtendedIndex >= 0 ? samples[lastNonExtendedIndex] : getPhaseEndSample(samples);
@@ -119,14 +121,14 @@ function buildPhaseTargetContext({
 
   return {
     anchor,
-    anchorPumped: getPumpedWaterUntilIndex(samples, anchorIdx),
+    anchorPumped: calculatePumpedWater(samples, anchorIdx, null, pumpedWaterSource),
     flowSlope: anchorDt > 0 ? (anchor.fl - prevAnchor.fl) / anchorDt : 0,
     isBrewByWeight,
     isLastPhase,
     lastNonExtendedSample,
     pressureSlope: anchorDt > 0 ? (anchor.cp - prevAnchor.cp) / anchorDt : 0,
-    sampleInterval,
-    sampleIntervalSec: sampleInterval / 1000,
+    phaseSamples: samples,
+    pumpedWaterSource,
     scaleConnectionBrokenPermanently,
     weightRate: getPhaseWeightRate(samples, isLastPhase),
   };
@@ -147,22 +149,28 @@ function findAutoAdjustedTargetMatch(targets, targetContext, nextPhaseSamples) {
   );
   if (match) return match;
 
-  if (nextPhaseSamples.length > 0) {
-    match = findTargetMatchWithDirection(targets, nextPhaseSamples[0], 1, targetContext);
+  let lastObservedDelayMs = 0;
+  for (const nextSample of nextPhaseSamples.slice(0, 2)) {
+    const observedDelayMs = Number(nextSample?.t) - Number(anchor.t);
+    if (Number.isFinite(observedDelayMs)) {
+      lastObservedDelayMs = Math.max(lastObservedDelayMs, observedDelayMs);
+    }
+    match = findTargetMatchWithDirection(targets, nextSample, targetContext);
+    if (match) return match;
   }
-  if (match) return match;
 
-  if (nextPhaseSamples.length > 1) {
-    match = findTargetMatchWithDirection(targets, nextPhaseSamples[1], 2, targetContext);
-  }
-  if (match) return match;
-
-  const maxSteps = Math.ceil(LAST_PHASE_ESTIMATED_DELAY_MAX_MS / targetContext.sampleInterval);
-  for (let step = 3; step <= maxSteps; step++) {
+  const firstPredictionDelayMs =
+    Math.floor(lastObservedDelayMs / PREDICTION_INTERVAL_MS) * PREDICTION_INTERVAL_MS +
+    PREDICTION_INTERVAL_MS;
+  for (
+    let predictionDelayMs = firstPredictionDelayMs;
+    predictionDelayMs <= LAST_PHASE_ESTIMATED_DELAY_MAX_MS;
+    predictionDelayMs += PREDICTION_INTERVAL_MS
+  ) {
     match = findTargetMatch(
       targets,
-      predictTargetValuesAtStep(step, targetContext),
-      step * targetContext.sampleInterval,
+      predictTargetValuesAtDelay(predictionDelayMs, targetContext),
+      predictionDelayMs,
       targetContext,
     );
     if (match) return match;
@@ -225,7 +233,6 @@ function applyTargetMatchResult({
   exitState,
   isAutoAdjusted,
   match,
-  nextPhaseSamples,
   phaseNum,
   profilePhase,
   shotData,
@@ -236,7 +243,7 @@ function applyTargetMatchResult({
   exitState.finalPredictedWeight = match.predictedWeight;
   delayTracker.setEstimatedScaleDelay(match.delayMs);
 
-  if (isAutoAdjusted && match.delayMs >= targetContext.sampleInterval * 2) {
+  if (isAutoAdjusted && match.delayMs >= PREDICTION_INTERVAL_MS * 2) {
     delayTracker.setPhaseDelayReviewHint(match.delayMs, 'auto-delay');
   }
 
@@ -254,11 +261,7 @@ function applyTargetMatchResult({
   }
 
   if (match.delayMs > 0) {
-    exitState.targetCalcValues = buildTargetCalcValues(profilePhase.targets, match, {
-      ...targetContext,
-      isAutoAdjusted,
-      nextPhaseSamples,
-    });
+    exitState.targetCalcValues = buildTargetCalcValues(profilePhase.targets, match, targetContext);
   }
 }
 
@@ -459,6 +462,7 @@ function analyzePhaseTargets({
   phaseNum,
   phaseWeightRate,
   phases,
+  pumpedWaterSource,
   profilePhase,
   samples,
   scaleConnectionBrokenPermanently,
@@ -476,9 +480,9 @@ function analyzePhaseTargets({
   const targetContext = buildPhaseTargetContext({
     isBrewByWeight,
     isLastPhase,
+    pumpedWaterSource,
     samples,
     scaleConnectionBrokenPermanently,
-    shotData,
   });
   const match = findPhaseTargetMatch({
     isAutoAdjusted,
@@ -497,7 +501,6 @@ function analyzePhaseTargets({
       exitState,
       isAutoAdjusted,
       match,
-      nextPhaseSamples,
       phaseNum,
       profilePhase,
       shotData,
@@ -535,7 +538,7 @@ function analyzePhaseTargets({
   }
 }
 
-function getPhaseStats(samples, sysInfo, sysAnomalies, analyzerSystemInfo) {
+function getPhaseStats(samples, weightSamples, sysInfo, sysAnomalies, analyzerSystemInfo) {
   return {
     p: getMetricStats(samples, 'cp'),
     tp: getMetricStats(samples, 'tp'),
@@ -544,7 +547,7 @@ function getPhaseStats(samples, sysInfo, sysAnomalies, analyzerSystemInfo) {
     tf: getMetricStats(samples, 'tf'),
     t: getMetricStats(samples, 'ct'),
     tt: getMetricStats(samples, 'tt'),
-    w: getMetricStats(samples, 'v'),
+    w: getMetricStats(weightSamples, 'v'),
     wf: getMetricStats(samples, 'vf'),
     sys_raw: sysInfo.raw,
     sys_shot_vol: sysInfo.shotStartedVolumetric,
@@ -570,7 +573,9 @@ export function analyzeExecutedPhase({
   phaseNum,
   phases,
   profileData,
+  pumpedWaterSource,
   recordedExitReasonCode,
+  bluetoothScaleWasConnected,
   scaleConnectionBrokenPermanently,
   settings,
   shotData,
@@ -578,14 +583,25 @@ export function analyzeExecutedPhase({
 }) {
   const samples = phases[phaseNum];
   const pStart = (samples[0].t - globalStartTime) / 1000;
-  const pEnd = (getPhaseEndSample(samples).t - globalStartTime) / 1000;
-  const duration = pEnd - pStart;
   const isLastPhase = phaseNum === lastPhaseKey;
+  const nextPhaseSamples = getNextPhaseSamples({ phaseNum, phases, sortedPhaseKeys });
+  const closingSample = isLastPhase ? null : nextPhaseSamples[0] || null;
+  // The first sample of the next phase closes this phase, but remains sample 0
+  // of the next phase. The exact transition time inside this interval is unknown.
+  const phaseEndSample = closingSample || getPhaseEndSample(samples);
+  const pEnd = (phaseEndSample.t - globalStartTime) / 1000;
+  const duration = pEnd - pStart;
   const phaseWeightRate = getPhaseWeightRate(samples, isLastPhase);
+  const weightSamples = getFinalWeightSamples(samples);
+  const weightEndSample = getFinalWeightSample(samples) || getPhaseEndSample(samples);
   const rawName = phaseNameMap[phaseNum];
   const displayName = rawName || `Phase ${phaseNum}`;
   const sysInfo = getPhaseEndSample(samples).systemInfo || {};
   const sysAnomalies = getPhaseSysAnomalies(samples, sysInfo);
+  const bluetoothScaleConnection = getBluetoothScaleConnectionState(
+    samples,
+    bluetoothScaleWasConnected,
+  );
   const scaleLostInThisPhase =
     isBrewByWeight && samples.some(sample => !isWeightTelemetryAvailable(sample));
   const nextScaleConnectionBroken = scaleConnectionBrokenPermanently || scaleLostInThisPhase;
@@ -598,7 +614,13 @@ export function analyzeExecutedPhase({
     normalizedRecordedExitReasonCode,
   );
   const recordedStopValue = hasRecordedExitReason
-    ? getRecordedStopValue(exitState.exitType, samples, samples[0].t)
+    ? getRecordedStopValue(
+        exitState.exitType,
+        samples,
+        samples[0].t,
+        closingSample,
+        pumpedWaterSource,
+      )
     : null;
 
   if (profilePhase && !hasRecordedExitReason) {
@@ -615,6 +637,7 @@ export function analyzeExecutedPhase({
       phaseNum,
       phaseWeightRate,
       phases,
+      pumpedWaterSource,
       profilePhase,
       samples,
       scaleConnectionBrokenPermanently: nextScaleConnectionBroken,
@@ -632,9 +655,9 @@ export function analyzeExecutedPhase({
       start: pStart,
       end: pEnd,
       duration,
-      water: getPumpedWaterUntilIndex(samples, samples.length - 1),
-      weight: getPhaseEndSample(samples).v,
-      stats: getPhaseStats(samples, sysInfo, sysAnomalies, {
+      water: calculatePumpedWater(samples, samples.length - 1, closingSample, pumpedWaterSource),
+      weight: weightEndSample.v,
+      stats: getPhaseStats(samples, weightSamples, sysInfo, sysAnomalies, {
         brewModeLabel: getBrewModeLabel(isBrewByWeight),
         configuredScaleDelayMs: Math.max(0, Number(shotData.brewDelay) || 0),
         recordedStopReason: getPhaseExitReasonMeta(normalizedRecordedExitReasonCode).label,
@@ -660,6 +683,7 @@ export function analyzeExecutedPhase({
       targetCalcValues: exitState.targetCalcValues,
       isFinalExecuted: isLastPhase,
     },
+    bluetoothScaleWasConnected: bluetoothScaleConnection.bluetoothScaleWasConnected,
     scaleConnectionBrokenPermanently: nextScaleConnectionBroken,
   };
 }

@@ -47,6 +47,7 @@ class GaggiMateController {
 #if defined(GAGGIMATE_UART_DIAGNOSTICS)
     ControllerDiagnostics buildControllerDiagnostics(void);
 #endif
+    bool isSteamSwitchOn() const;
 
     ControllerConfig _config = ControllerConfig{};
     GaggiMateServer _comms;

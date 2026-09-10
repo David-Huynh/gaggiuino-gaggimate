@@ -97,7 +97,7 @@ void Controller::drainCommandQueue() {
     while (xQueueReceive(cmdQueue, &msg, 0) == pdTRUE) {
         switch (msg.type) {
         case CtrlCmd::ACTIVATE:
-            activate();
+            activate(msg.arg != 0);
             break;
         case CtrlCmd::DEACTIVATE:
             deactivate();
@@ -128,6 +128,12 @@ void Controller::drainCommandQueue() {
             deactivate();
             clear();
             setMode(static_cast<int>(msg.arg));
+            break;
+        case CtrlCmd::CANCEL_BREW_CONFIRM:
+            cancelBrewConfirm();
+            break;
+        case CtrlCmd::STOP_FLUSH:
+            onFlushRelease();
             break;
         case CtrlCmd::START_FLUSH:
             onFlush();
@@ -173,6 +179,7 @@ void Controller::setup() {
 #endif
 
     pluginManager = new PluginManager();
+    warnings.setup(this);
 #ifndef GAGGIMATE_HEADLESS
     ui = new DefaultUI(this, driver, pluginManager);
     if (driver->supportsSDCard() && driver->installSDCard()) {
@@ -248,6 +255,7 @@ void Controller::setup() {
     settings.setOnScaleSourceChange([this](int) {
         postCommand(CtrlCmd::DEACTIVATE_CLEAR);
     });
+    buttons.setCallback([this](uint8_t index, ButtonHandler::Event event) { onButtonEvent(index, event); });
 
 #ifndef GAGGIMATE_HEADLESS
     ui->init();
@@ -384,8 +392,6 @@ void Controller::setupBluetooth() {
         // starts with no state and updateControl() otherwise only sends deltas.
         controlStateSent = false;
         if (connected) {
-            // Re-assert the connection interval for the fresh link (e.g. tight
-            // again if we reconnected mid-shot).
             applyConnectionPriority(true);
         } else if (initialized) {
             pluginManager->trigger("controller:bluetooth:disconnect");
@@ -398,35 +404,28 @@ void Controller::setupBluetooth() {
         onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof, scale, addons);
     });
     comms.onIncompatibleController([this](const String &info) { onIncompatibleController(info); });
-    // A controller OTA streams the firmware over this BLE link; the relaxed idle
-    // interval makes that crawl. Force a low-latency interval for the duration of
-    // a controller flash, then restore. (A display OTA is Wi-Fi-bound, so leave
-    // BLE relaxed to keep radio airtime for the download.)
     pluginManager->on("ota:update:start", [this](Event const &event) {
         if (event.getString("component") != "display") {
             connLowLatency = true;
             comms.setLowLatency(true);
-            // Streaming firmware over BLE -> BLE must win the shared radio, same
-            // as during a shot. Without this it would run against the new
-            // idle WiFi-preference and crawl. Restored by applyConnectionPriority
-            // on ota:update:end. [GM-90]
             esp_coex_preference_set(ESP_COEX_PREFER_BT);
         }
     });
     pluginManager->on("ota:update:end", [this](Event const &) { applyConnectionPriority(true); });
     comms.onSensorData([this](float temp, float pressure, float puckFlow, float pumpFlow, float puckResistance, float pumpPower,
-                              float heaterPower) {
+                              float heaterPower, float waterPumped) {
         onTempRead(temp);
-        this->pressure.store(pressure, std::memory_order_relaxed);
+        onPressureRead(pressure);
         this->currentPuckFlow = puckFlow;
         this->currentPumpFlow.store(pumpFlow, std::memory_order_relaxed);
         this->currentPumpPower = pumpPower;
         this->currentHeaterPower = heaterPower;
         this->currentPuckResistance = puckResistance;
-        pluginManager->trigger("boiler:pressure:change", "value", pressure);
+        this->currentWaterPumped = waterPumped;
         pluginManager->trigger("pump:puck-flow:change", "value", puckFlow);
         pluginManager->trigger("pump:flow:change", "value", pumpFlow);
         pluginManager->trigger("pump:puck-resistance:change", "value", puckResistance);
+        pluginManager->trigger("pump:volume:change", "value", waterPumped);
     });
     comms.onButtonState([this](uint8_t index, bool pressed) {
         const int32_t packed = (static_cast<int32_t>(index) << 1) | (pressed ? 1 : 0);
@@ -772,6 +771,9 @@ void Controller::loop() {
         pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
     }
 
+    warnings.loop();
+    buttons.loop(millis());
+
     if (screenReady && !initialized) {
         connect();
     }
@@ -838,6 +840,7 @@ void Controller::loopLogic() {
                 auto brewProcess = static_cast<BrewProcess *>(currentProcess);
                 brewProcess->updatePressure(pressure.load(std::memory_order_relaxed));
                 brewProcess->updateFlow(currentPumpFlow.load(std::memory_order_relaxed));
+                brewProcess->updateWaterPumped(currentWaterPumped.load(std::memory_order_relaxed));
             }
             currentProcess->progress();
             if (!isActiveLocked()) {
@@ -933,6 +936,45 @@ ScaleAvailability Controller::scaleAvailability() const {
     a.hardwareCapable = systemInfo.capabilities.scale;
 #endif
     return a;
+}
+
+const char *systemStateKey(SystemState state) {
+    static const char *const KEYS[] = {"starting", "waiting", "ready", "updating", "autotuning", "mismatch", "error"};
+    return KEYS[state];
+}
+
+SystemState Controller::getSystemState() const {
+    if (isUpdating())
+        return SYSTEM_UPDATING;
+    if (isAutotuning())
+        return SYSTEM_AUTOTUNING;
+    if (systemInfo.protocolMismatch)
+        return SYSTEM_PROTOCOL_MISMATCH;
+    if (isErrorState())
+        return SYSTEM_ERROR;
+    if (!comms.isConnected())
+        return loaded || waitingForController ? SYSTEM_WAITING_CONTROLLER : SYSTEM_STARTING; // lost vs never had it
+    return SYSTEM_READY;
+}
+
+String Controller::getSystemStateMessage() const {
+    switch (getSystemState()) {
+    case SYSTEM_UPDATING:
+        return "Updating...";
+    case SYSTEM_AUTOTUNING:
+        return "Autotuning...";
+    case SYSTEM_PROTOCOL_MISMATCH:
+        return systemInfo.protocolVersion > gm_proto::PROTOCOL_VERSION ? "Version mismatch, update display"
+                                                                       : "Version mismatch, update controller";
+    case SYSTEM_ERROR:
+        return error == ERROR_CODE_RUNAWAY ? "Temperature error, restart..." : "Unknown error";
+    case SYSTEM_WAITING_CONTROLLER:
+        return "Waiting for controller...";
+    case SYSTEM_STARTING:
+        return "Starting...";
+    default:
+        return "";
+    }
 }
 
 bool Controller::isVolumetricAvailable() const {
@@ -1335,6 +1377,7 @@ void Controller::updateControl(bool urgent) {
     bool pressureTarget = false;
     float pumpSetpoint = 0.0f;
     float advancedPressure = 0.0f;
+    float pressureOffset = 0.0f;
     float advancedFlow = 0.0f;
     float targetTemp = 0.0f;
 
@@ -1369,6 +1412,7 @@ void Controller::updateControl(bool urgent) {
                     outputValve = brewProcess->isRelayActive();
                     pressureTarget = brewProcess->getPumpTarget() == PumpTarget::PUMP_TARGET_PRESSURE;
                     advancedPressure = brewProcess->getPumpPressure();
+                    pressureOffset = settings.getPressureOffset();
                     advancedFlow = brewProcess->getPumpFlow();
                 }
             }
@@ -1398,7 +1442,7 @@ void Controller::updateControl(bool urgent) {
         targetPressure = advancedPressure;
         targetFlow = advancedFlow;
         pump.mode = pressureTarget ? PumpControlMode::Pressure : PumpControlMode::Flow;
-        pump.pressure = advancedPressure;
+        pump.pressure = advancedPressure + pressureOffset;
         pump.flow = advancedFlow;
     } else {
         targetPressure = 0.0f;
@@ -1437,10 +1481,14 @@ void Controller::updateControl(bool urgent) {
     controlStateSent = true;
 }
 
-void Controller::activate() {
+void Controller::activate(bool ignoreWarnings) {
     brewStartError.store("");
     if (!isReady()) {
         brewStartError.store("controller_not_ready");
+        return;
+    }
+    if (mode == MODE_BREW && !ignoreWarnings && warnings.hasError()) {
+        pluginManager->trigger("controller:brew:confirm");
         return;
     }
     const bool wasActive = isActive();
@@ -1483,6 +1531,7 @@ void Controller::activate() {
     // is a separate scale command path. Always reset pump control at brew start
     // so hardware-scale brews do not inherit stale pressure-controller state.
     comms.tare();
+    currentWaterPumped.store(0.0f, std::memory_order_relaxed);
     currentVolumetricSource = resolved;
     ESP_LOGI(LOG_TAG, "activate: mode=%d brewSrcSetting=%d resolvedSource=%d", mode, brewSrcSetting, static_cast<int>(resolved));
 
@@ -1517,6 +1566,9 @@ void Controller::activate() {
         }
     }
 }
+
+// A UI declined the brew confirmation; every UI showing it dismisses.
+void Controller::cancelBrewConfirm() { pluginManager->trigger("controller:brew:confirm:cancel"); }
 
 void Controller::deactivate() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
@@ -1563,6 +1615,8 @@ bool Controller::deactivateLocked(DeferredProcessEvents &events) {
     const bool brewWasUtility = lastProcess->isUtility();
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
     if (swappedType == MODE_BREW) {
+        if (!brewWasUtility)
+            flushPending = true;
         events.push_back({"controller:brew:end", brewWasUtility ? 1 : 0});
     } else if (swappedType == MODE_GRIND) {
         events.push_back({"controller:grind:end"});
@@ -1654,11 +1708,19 @@ bool Controller::isGrindActive() const {
     return currentProcess != nullptr && currentProcess->isActive() && currentProcess->getType() == MODE_GRIND;
 }
 
+bool Controller::isBrewActive() const {
+    std::lock_guard<std::recursive_mutex> guard(processMutex);
+    return currentProcess != nullptr && currentProcess->isActive() && currentProcess->getType() == MODE_BREW;
+}
+
 int Controller::getMode() const { return mode; }
 
 void Controller::setMode(int newMode) {
     Event modeEvent = pluginManager->trigger("controller:mode:change", "value", newMode);
+    const int previousMode = mode;
     mode = modeEvent.getInt("value");
+    if (mode == MODE_BREW && previousMode != MODE_BREW)
+        flushPending = true; // entering brew mode, including wake-up from standby
     steamReady = false;
 
     updateLastAction();
@@ -1670,6 +1732,15 @@ void Controller::onTempRead(float temperature) {
     float temp = temperature - static_cast<float>(settings.getTemperatureOffset());
     Event event = pluginManager->trigger("boiler:currentTemperature:change", "value", temp);
     currentTemp.store(event.getFloat("value"), std::memory_order_relaxed);
+}
+
+void Controller::onPressureRead(float pressure) {
+    float p = pressure;
+    // Only a running brew opens the grouphead valve, so only then does the mushroom valve eat its cracking pressure
+    if (isBrewActive())
+        p = std::max(0.0f, p - settings.getPressureOffset());
+    Event event = pluginManager->trigger("boiler:pressure:change", "value", p);
+    this->pressure = event.getFloat("value");
 }
 
 void Controller::updateLastAction() { lastAction = millis(); }
@@ -1801,7 +1872,11 @@ void Controller::onFlush() {
         return;
     }
     // Allocate outside the lock; reachable from the UI, AsyncTCP and BLE tasks (GM-147).
-    auto *flush = new BrewProcess(FLUSH_PROFILE, ProcessTarget::TIME, settings.getBrewDelay());
+    const int duration = settings.getFlushDuration();
+    Profile profile = FLUSH_PROFILE;
+    profile.phases[0].duration = duration > 0 ? duration : FLUSH_HOLD_MAX_DURATION_S; // 0 = hold, capped
+    auto *flush = new BrewProcess(profile, ProcessTarget::TIME, settings.getBrewDelay());
+    flush->holdPhase = duration == 0; // pump phase ends on onFlushRelease(), the drain phase still runs
     DeferredProcessEvents events;
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
@@ -1811,11 +1886,20 @@ void Controller::onFlush() {
         }
         clearLocked(events);
         if (startProcessLocked(flush, events)) {
+            flushPending = false;
             processStorageLease.emplace(std::move(lease));
             events.push_back({"controller:brew:start", 1});
         }
     }
     dispatchEvents(events);
+}
+
+// Every hold-to-flush source (physical button, touch, web) funnels its release through here.
+void Controller::onFlushRelease() {
+    std::lock_guard<std::recursive_mutex> guard(processMutex);
+    if (currentProcess != nullptr && currentProcess->getType() == MODE_BREW) {
+        static_cast<BrewProcess *>(currentProcess)->release();
+    }
 }
 
 void Controller::onVolumetricDelete() {
@@ -1824,143 +1908,182 @@ void Controller::onVolumetricDelete() {
     }
 }
 
-void Controller::handleBrewButton(int brewButtonStatus) {
-    ESP_LOGI(LOG_TAG, "handleBrewButton: mode=%d status=%d isActive=%d src=%d", getMode(), brewButtonStatus, isActive(),
-             settings.getScaleSource());
-    if (brewButtonStatus) {
-        switch (getMode()) {
-        case MODE_STANDBY:
-            deactivateStandby();
-            break;
-        case MODE_BREW:
-#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-            if (brewTare.pending()) {
-                ESP_LOGI(LOG_TAG, "Ignoring duplicate physical brew start while scale tare is pending");
-                break;
-            }
-#endif
-            if (!isActive()) {
-                deactivateStandby();
-                clear();
-                activate();
-            } else if (settings.isMomentaryButtons()) {
-                deactivate();
-                clear();
-            }
-            break;
-        case MODE_WATER:
-            activate();
-            break;
-        case MODE_STEAM:
-            deactivate();
-            setMode(MODE_BREW);
-        default:
-            break;
-        }
-    } else if (!settings.isMomentaryButtons()) {
+// A long press on a momentary button that starts a shot (brew or a profile) flushes instead.
+static bool longPressFlushes(const String &behavior) {
+    return behavior != "" && behavior != "none" && behavior != "steam" && behavior != "water" && behavior != "flush";
+}
+
+ButtonHandler::Config Controller::buttonConfig() const {
+    ButtonHandler::Config cfg;
+    cfg.momentary = settings.isMomentaryButtons();
+    const bool holdFlush = settings.getFlushDuration() == 0;
+    for (uint8_t i = 0; i < ButtonHandler::BUTTON_COUNT; i++) {
+        const String behavior = settings.getButtonBehavior(i);
+        cfg.longPress[i] = cfg.momentary && longPressFlushes(behavior);
+        cfg.clickOnPress[i] = holdFlush && behavior == "flush"; // a hold-to-flush has to start on press
+    }
+    // Only pay the combo window when the virtual third button does something
+    const String third = settings.getButtonBehavior(ButtonHandler::COMBO_BUTTON);
+    cfg.combo = third != "" && third != "none";
+    return cfg;
+}
+
+void Controller::onButtonEvent(uint8_t index, ButtonHandler::Event event) {
+    using Event = ButtonHandler::Event;
+    const String behavior = settings.getButtonBehavior(index);
+    ESP_LOGV(LOG_TAG, "Button %d event %d, behavior: %s", index, static_cast<int>(event), behavior.c_str());
+    switch (event) {
+    case Event::PRESS:
+    case Event::CLICK:
+        runButtonBehavior(behavior, true);
+        break;
+    case Event::RELEASE:
+        runButtonBehavior(behavior, false);
+        break;
+    case Event::LONG_PRESS:
+        handleFlushButton(true);
+        break;
+    case Event::LONG_PRESS_END:
+        handleFlushButton(false);
+        break;
+    case Event::CLICK_END: // momentary release only matters for a hold-to-flush
+        if (behavior == "flush")
+            onFlushRelease();
+        break;
+    }
+}
+
+void Controller::runButtonBehavior(const String &behavior, bool pressed) {
+    if (behavior == "" || behavior == "none") {
+        return;
+    }
+    if (behavior == "brew") {
+        handleBrewButton(pressed);
+    } else if (behavior == "steam") {
+        handleSteamButton(pressed);
+    } else if (behavior == "water") {
+        handleWaterButton(pressed);
+    } else if (behavior == "flush") {
+        handleFlushButton(pressed);
+    } else {
+        handleProfileButton(pressed, behavior); // anything else is a profile id
+    }
+}
+
+void Controller::handleBrewButton(bool pressed) {
+    if (!pressed) { // latching switch flipped off
         if (getMode() == MODE_BREW) {
-            if (isActive()) {
-                deactivate();
-                clear();
-            } else {
-                clear();
-            }
+            deactivate();
+            clear();
         } else if (getMode() == MODE_WATER) {
             deactivate();
         }
+        return;
+    }
+    switch (getMode()) {
+    case MODE_STANDBY:
+        deactivateStandby();
+        break;
+    case MODE_BREW:
+        if (!isActive()) {
+            activate();
+        } else if (settings.isMomentaryButtons()) { // second press stops the shot
+            deactivate();
+            clear();
+        }
+        break;
+    case MODE_WATER:
+        activate();
+        break;
+    case MODE_STEAM:
+        deactivate();
+        setMode(MODE_BREW);
+        break;
+    default:
+        break;
     }
 }
 
 void Controller::handleControllerButton(uint8_t index, bool pressed) {
-    const int status = pressed ? 1 : 0;
-    String behavior = settings.getButtonBehavior(index);
-    ESP_LOGV("Controller", "Button %d changed to %d, behavior: %s", index, status, behavior.c_str());
-    if (behavior.isEmpty() || behavior == "none")
-        return;
-    if (behavior == "brew") {
-        handleBrewButton(status);
-        return;
-    }
-    if (behavior == "steam") {
-        handleSteamButton(status);
-        return;
-    }
-    if (behavior == "water") {
-        handleWaterButton(status);
-        return;
-    }
-    if (behavior == "flush") {
-        if (status) {
-            if (getMode() == MODE_STANDBY)
-                deactivateStandby();
-            if (getMode() != MODE_BREW && !isActive())
-                setMode(MODE_BREW);
-            onFlush();
-        }
-        return;
-    }
-    handleProfileButton(status, behavior);
+    buttons.setConfig(buttonConfig());
+    buttons.onRawState(index, pressed, millis());
 }
 
-void Controller::handleSteamButton(int steamButtonStatus) {
+void Controller::handleSteamButton(bool pressed) {
     {
         std::lock_guard<std::recursive_mutex> guard(processMutex);
         Process *proc = currentProcess;
         if (proc != nullptr && proc->isActive() && proc->getType() == MODE_BREW) {
-            ESP_LOGW(LOG_TAG, "Ignoring steam button state %d while brew process is active", steamButtonStatus);
+            ESP_LOGW(LOG_TAG, "Ignoring steam button state %d while brew process is active", pressed);
             return;
         }
     }
-    if (steamButtonStatus) {
+    if (pressed) {
         if (getMode() != MODE_STEAM) {
             setMode(MODE_STEAM);
+        } else if (settings.isMomentaryButtons()) { // second press leaves steam mode
+            deactivate();
+            setMode(MODE_BREW);
         }
-    } else if (!settings.isMomentaryButtons() && getMode() == MODE_STEAM) {
+    } else if (getMode() == MODE_STEAM) {
         deactivate();
         setMode(MODE_BREW);
     }
+    if (!settings.isMomentaryButtons()) {
+        steamSwitchOn = pressed; // the "steam switch left on" warning only makes sense for a latching switch
+    }
 }
 
-void Controller::handleWaterButton(int buttonStatus) {
-    if (buttonStatus) {
-        switch (getMode()) {
-        case MODE_WATER:
-            if (!isActive()) {
-                activate();
-            }
-            break;
-        default:
+void Controller::handleWaterButton(bool pressed) {
+    if (pressed) {
+        if (getMode() != MODE_WATER) {
             setMode(MODE_WATER);
-            break;
+        } else if (!isActive()) {
+            activate();
+        } else if (settings.isMomentaryButtons()) { // second press stops the water
+            deactivate();
         }
-    } else if (!settings.isMomentaryButtons() && getMode() == MODE_WATER && isActive()) {
+    } else if (getMode() == MODE_WATER && isActive()) {
         deactivate();
     }
 }
 
-void Controller::handleProfileButton(int buttonStatus, String id) {
-    if (buttonStatus && getMode() == MODE_STANDBY) {
+void Controller::handleFlushButton(bool pressed) {
+    if (!pressed) {
+        onFlushRelease(); // ends a hold-to-flush, otherwise nothing: a release must not cut a flush short
+        return;
+    }
+    if (getMode() == MODE_STANDBY) {
+        deactivateStandby();
+    }
+    if (getMode() != MODE_BREW && !isActive()) {
+        setMode(MODE_BREW); // land in brew mode so the flush UI renders, never mid-process
+    }
+    onFlush(); // no-op while a process runs, so repeated presses don't queue
+}
+
+void Controller::handleProfileButton(bool pressed, const String &id) {
+    if (!pressed) { // latching switch flipped off
+        deactivate();
+        clear();
+        return;
+    }
+    if (getMode() == MODE_STANDBY) {
         deactivateStandby();
         return;
     }
-    if (!buttonStatus && !settings.isMomentaryButtons()) {
+    if (getMode() != MODE_BREW) {
+        setMode(MODE_BREW);
+    }
+    if (isActive()) { // pressing again stops the running shot
         deactivate();
         clear();
+        return;
     }
-    if (buttonStatus) {
-        if (getMode() != MODE_BREW) {
-            setMode(MODE_BREW);
-        }
-        if (isActive()) {
-            deactivate();
-            clear();
-            return;
-        }
-        std::vector<String> profileIds = profileManager->listProfiles();
-        if (std::find(profileIds.begin(), profileIds.end(), id) != profileIds.end()) {
-            profileManager->selectProfile(id);
-            activate();
-        }
+    std::vector<String> profileIds = profileManager->listProfiles();
+    if (std::find(profileIds.begin(), profileIds.end(), id) != profileIds.end()) {
+        profileManager->selectProfile(id);
+        activate();
     }
 }
 

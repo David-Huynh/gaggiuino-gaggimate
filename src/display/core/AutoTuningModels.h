@@ -86,6 +86,7 @@ struct ShotSample {
     float measuredFlow = 0.0f;
     float puckFlow = 0.0f;
     float puckResistance = 0.0f;
+    std::optional<float> waterPumped; // absent in artifacts recorded before cumulative telemetry
     PumpTargetMode pumpTargetMode = PumpTargetMode::Simple;
     bool valveOpen = false;
     std::uint16_t systemInfo = 0;

@@ -13,6 +13,7 @@ enum class PumpTarget {
 };
 enum class PhaseType { PHASE_TYPE_PREINFUSION, PHASE_TYPE_BREW };
 enum class TransitionType { INSTANT, LINEAR, EASE_IN, EASE_OUT, EASE_IN_OUT };
+enum class TransitionTarget { TIME, VOLUMETRIC, PUMPED };
 
 // Why a phase ended; persisted as uint8_t in the .slog phase transitions, so values must stay stable.
 // NONE (0) doubles as "still running" and as the legacy/unknown value in old shot files.
@@ -25,6 +26,7 @@ enum class PhaseExitReason : uint8_t {
     DURATION = 5,          // phase duration elapsed
     SAFETY = 6,            // brew safety timeout (set by BrewProcess, not Phase::isFinished)
     ABORTED = 7,           // shot manually stopped before the process finished
+    HOLD_RELEASED = 8,     // held phase ended because the button was released (hold-to-flush)
 };
 
 struct Target {
@@ -48,6 +50,7 @@ struct PumpAdvanced {
 
 struct Transition {
     TransitionType type;
+    TransitionTarget target;
     float duration;
     bool adaptive;
 };
@@ -82,6 +85,24 @@ struct Phase {
         return Target{};
     }
 
+    bool hasPumpedTarget() const {
+        for (const auto &target : targets) {
+            if (target.type == TargetType::TARGET_TYPE_PUMPED && target.value > 0.0f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Target getPumpedTarget() const {
+        for (auto &target : targets) {
+            if (target.type == TargetType::TARGET_TYPE_PUMPED) {
+                return target;
+            }
+        }
+        return Target{};
+    }
+
     void adjustDuration(float amount) { duration = std::max(0.5f, duration + amount); }
 
     void adjustVolumetricTarget(float factor) {
@@ -99,6 +120,9 @@ struct Phase {
         for (const auto &target : targets) {
             switch (target.type) {
             case TargetType::TARGET_TYPE_VOLUMETRIC:
+                if (target.value <= 0.0f) {
+                    break;
+                }
                 volumetricTested = enableVolumetric;
                 if (enableVolumetric && target.isReached(volume)) {
                     return PhaseExitReason::TARGET_VOLUMETRIC;
@@ -313,11 +337,20 @@ inline bool parseProfile(const JsonObject &obj, Profile &profile) {
             } else {
                 phase.transition.type = TransitionType::INSTANT;
             }
+            String target = transition["target"].as<String>();
+            if (target == "volumetric") {
+                phase.transition.target = TransitionTarget::VOLUMETRIC;
+            } else if (target == "pumped") {
+                phase.transition.target = TransitionTarget::PUMPED;
+            } else {
+                phase.transition.target = TransitionTarget::TIME;
+            }
             phase.transition.duration = transition["duration"].as<float>();
             phase.transition.adaptive = transition["adaptive"].as<bool>();
         } else {
             phase.transition = Transition{
                 .type = TransitionType::INSTANT,
+                .target = TransitionTarget::TIME,
                 .duration = 0,
                 .adaptive = false,
             };
@@ -397,6 +430,13 @@ inline void writeProfile(JsonObject &obj, const Profile &profile) {
         default:
             transition["type"] = "instant";
             break;
+        }
+        if (phase.transition.target == TransitionTarget::VOLUMETRIC) {
+            transition["target"] = "volumetric";
+        } else if (phase.transition.target == TransitionTarget::PUMPED) {
+            transition["target"] = "pumped";
+        } else {
+            transition["target"] = "time";
         }
         transition["duration"] = phase.transition.duration;
         transition["adaptive"] = phase.transition.adaptive;

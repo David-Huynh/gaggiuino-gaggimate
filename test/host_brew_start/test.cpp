@@ -58,7 +58,7 @@ struct Process {
 };
 struct BrewProcess : Process {
     ProcessTarget target = ProcessTarget::TIME;
-    void updatePressure(float) {} void updateFlow(float) {}
+    void updatePressure(float) {} void updateFlow(float) {} void updateWaterPumped(float) {}
     double getNewDelayTime() const { return -1; }
 };
 struct GrindProcess : Process {
@@ -87,13 +87,15 @@ struct Controller {
     Plugins plugins;
     Plugins *pluginManager = &plugins;
     Settings settings;
+    struct Warnings { bool error = false; bool hasError() const { return error; } } warnings;
+    bool flushPending = false;
     Process *currentProcess = nullptr, *lastProcess = nullptr;
     bool ready = true, started = false, steamReady = false, processCompleted = false;
     bool hardwareScalePresent = true;
     int mode = MODE_BREW;
     unsigned urgentStops = 0, endEvents = 0;
     unsigned long grindActiveUntil = 0, lastAction = 0;
-    std::atomic<float> currentTemp{0}, pressure{0}, currentPumpFlow{0};
+    std::atomic<float> currentTemp{0}, pressure{0}, currentPumpFlow{0}, currentWaterPumped{0};
     bool isReady() const { return ready; }
     bool isErrorState() const { return false; }
     bool isActiveLocked() const { return currentProcess && currentProcess->active; }
@@ -136,13 +138,13 @@ struct Controller {
     void pollHardwareScaleBrewTare();
     bool deactivateLocked(DeferredProcessEvents &events);
     void loopLogic();
-    void activate();
+    void activate(bool ignoreWarnings = false);
     void deactivate();
     void startProcess(Process *process);
     bool startProcessLocked(Process *process, DeferredProcessEvents &events);
     void clear();
     void clearLocked(DeferredProcessEvents &events);
-    void handleBrewButton(int brewButtonStatus);
+    void handleBrewButton(bool pressed);
     void deactivateStandby();
     ~Controller() { delete currentProcess; delete lastProcess; }
 };
@@ -317,7 +319,15 @@ static void testController() {
         assert(flash);
     }
     assert(c.urgentStops == 100 && c.endEvents == 100);
+    c.warnings.error = true;
     c.activate();
+    assert(!c.brewTare.pending() && !storage.processActive());
+    c.ready = false;
+    c.activate(true); // warning override cannot bypass controller readiness
+    assert(!c.brewTare.pending() && !storage.processActive());
+    c.ready = true;
+    c.activate(true);
+    assert(c.brewTare.pending() && storage.processActive());
     c.handleBrewButton(0); // physical release cancels a pending tare
     assert(!c.brewTare.pending() && !storage.processActive());
     puts("PASS actual Controller methods: cancellation/recovery; 100 web/button starts with automatic/manual stops");

@@ -30,7 +30,7 @@ class GaggiMateClient {
                            bool ledControl, bool tof, bool scale, std::vector<uint32_t> addons)>;
     using SensorCallback =
         std::function<void(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance,
-                           float pumpPower, float heaterPower)>;
+                           float pumpPower, float heaterPower, float waterPumped)>;
     using ButtonCallback = std::function<void(uint8_t index, bool pressed)>;
     using AutotuneResultCallback = std::function<void(float kp, float ki, float kd, float kf)>;
     using VolumetricCallback = std::function<void(float volume)>;
@@ -70,9 +70,14 @@ class GaggiMateClient {
     void disconnect() { _transport.disconnect(); }
 #endif
 
-    // BLE round-trip latency (ms) measured by the reliability layer (send -> ACK).
-    // EWMA-smoothed; refreshed at least every ~2s by the keep-alive ping plus on
-    // every control update. hasLatency() is false until the first ACK of a link.
+    // Forget the paired controller so the display can pair to a different one.
+    void clearBonds() {
+#ifndef GAGGIMATE_UART_COMMS
+        _transport.clearBonds();
+#endif
+    }
+
+    // EWMA-smoothed send->ACK round-trip (ms); hasLatency() is false until the first ACK of a link.
     uint32_t getLatencyMs() const { return _endpoint.latencyMs(); }
     uint32_t getLastLatencyMs() const { return _endpoint.lastLatencyMs(); }
     bool hasLatency() const { return _endpoint.hasLatency(); }
@@ -145,14 +150,12 @@ class GaggiMateClient {
     // the outbound queue would coalesce down to a single channel).
     void sendLedControl(const LedChannelCommand *channels, size_t count);
 
-    // Send a pre-built payload / batch of payloads (one frame). Compose batches
-    // from build*() helpers -- e.g. the display's delta-based control update.
+    // Send a pre-built payload / batch of payloads (one frame), composed from the build*() helpers.
     void send(const gm::Payload &payload) { _endpoint.send(payload); }
     void sendBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendBatch(payloads, count); }
     void sendUrgentBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendUrgentBatch(payloads, count); }
 
-    // Fired when the connected controller is missing the framed-comms
-    // characteristics (old / incompatible firmware); link is kept for OTA.
+    // Fired when the controller lacks the framed-comms characteristics (old firmware); link is kept for OTA.
     void onIncompatibleController(IncompatibleCallback cb) { _incompatibleCb = std::move(cb); }
 
     // Response registrations (controller -> display)

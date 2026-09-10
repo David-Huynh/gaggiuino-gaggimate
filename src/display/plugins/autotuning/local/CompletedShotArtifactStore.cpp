@@ -1,3 +1,4 @@
+#include <cmath>
 #include "CompletedShotArtifactStore.h"
 
 #include "../AutoTuningJsonCodec.h"
@@ -128,6 +129,7 @@ bool writeHistorySamples(AutoTuning::ShotRecord const &record, JsonObject output
     JsonArray measuredFlow = output["measured_flow"].to<JsonArray>();
     JsonArray puckFlow = output["puck_flow"].to<JsonArray>();
     JsonArray puckResistance = output["puck_resistance"].to<JsonArray>();
+    JsonArray waterPumped = output["water_pumped"].to<JsonArray>();
     JsonArray systemInfo = output["system_info"].to<JsonArray>();
     for (AutoTuning::ShotSample const &sample : record.samples) {
         measuredWeight.add(sample.measuredWeight);
@@ -135,6 +137,12 @@ bool writeHistorySamples(AutoTuning::ShotRecord const &record, JsonObject output
         measuredFlow.add(sample.measuredFlow);
         puckFlow.add(sample.puckFlow);
         puckResistance.add(sample.puckResistance);
+        if (sample.waterPumped && (!std::isfinite(*sample.waterPumped) || *sample.waterPumped < 0.0f))
+            return false;
+        if (sample.waterPumped)
+            waterPumped.add(*sample.waterPumped);
+        else
+            waterPumped.add(nullptr);
         systemInfo.add(sample.systemInfo);
     }
     return true;
@@ -302,6 +310,12 @@ bool decodeArtifact(const ByteBuffer &encoded, AutoTuning::CompletedShotArtifact
             return false;
         }
     }
+    const bool hasWater = !historySamples["water_pumped"].isNull();
+    if (hasWater && (!historySamples["water_pumped"].is<JsonArrayConst>() ||
+                     historySamples["water_pumped"].size() != sampleCount)) {
+        error = "Completed shot pumped-water channel is invalid";
+        return false;
+    }
     for (size_t index = 0; index < sampleCount; ++index) {
         AutoTuning::ShotSample &sample = decoded.samples[index];
         JsonVariantConst measuredWeight = historySamples["measured_weight"][index];
@@ -322,6 +336,14 @@ bool decodeArtifact(const ByteBuffer &encoded, AutoTuning::CompletedShotArtifact
         sample.puckFlow = puckFlow.as<float>();
         sample.puckResistance = puckResistance.as<float>();
         sample.systemInfo = systemInfo;
+        JsonVariantConst water = historySamples["water_pumped"][index];
+        if (hasWater && !water.isNull()) {
+            if (!water.is<float>() || !std::isfinite(water.as<float>()) || water.as<float>() < 0.0f) {
+                error = "Completed shot pumped-water sample is invalid";
+                return false;
+            }
+            sample.waterPumped = water.as<float>();
+        }
     }
 
     // Every field is replaced below. Avoid constructing a multi-kilobyte reset

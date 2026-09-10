@@ -1,11 +1,13 @@
 import PropTypes from 'prop-types';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faTint } from '@fortawesome/free-solid-svg-icons/faTint';
 import { getPrimaryIcon, getPrimaryLabel } from '../utils.js';
+import { WarningIcon } from '../../../components/WarningIcon.jsx';
+import { activeWarnings, WARNING_LEVEL } from '../../../utils/warnings.js';
 import { useEffect, useState } from 'preact/hooks';
 import TargetToggle from '../TargetToggle.jsx';
 import Adjuster from '../Adjuster.jsx';
 import { OptimizationStrip } from '../OptimizationStrip.jsx';
+import { FlushButton } from '../FlushButton.jsx';
 
 export function ActionCard({
   mode,
@@ -20,6 +22,7 @@ export function ActionCard({
   deactivate,
   clear,
   startFlush,
+  stopFlush,
   inCard = false,
   currentTemperature,
   targetTemperature,
@@ -36,13 +39,15 @@ export function ActionCard({
   hasBeanContext,
   toggleLocalOptimization,
   brewStartError,
+  warnings = [],
+  systemMessage = '',
 }) {
   const [preheated, setPreheated] = useState(false);
   const showPrimary = mode === 1 || mode === 3 || mode === 4;
   const showStandby = mode === 0;
   const showSteam = mode === 2;
 
-  const showFlush = isBrewing && !isActive && !isStarting && !isFinished;
+  const showFlush = isBrewing && (isFlushing || (!isActive && !isStarting && !isFinished)); // stays mounted while held
   const grindValue =
     grindTarget === 1 && volumetricAvailable
       ? `${grindTargetVolume}g`
@@ -56,6 +61,7 @@ export function ActionCard({
 
   const primaryActive = isActive || isStarting;
   const primaryLabel = isStarting ? 'Cancel brew start' : getPrimaryLabel(isActive, isFinished);
+  const shownWarnings = showStandby ? [] : activeWarnings(warnings);
 
   useEffect(() => {
     setPreheated(false);
@@ -96,7 +102,18 @@ export function ActionCard({
           />
         </div>
       )}
-      <div className='flex justify-start'></div>
+      {!showStandby && (
+        <div className='flex items-center justify-start gap-2' aria-label='Active warnings'>
+          {shownWarnings.map(w => (
+            <WarningIcon
+              key={w.key}
+              icon={w.icon}
+              title={w.label}
+              className={`text-xl ${w.level === WARNING_LEVEL.ERROR ? 'text-error' : 'text-warning'}`}
+            />
+          ))}
+        </div>
+      )}
       {showPrimary && (
         <button
           type='button'
@@ -109,26 +126,27 @@ export function ActionCard({
         </button>
       )}
       {showStandby && (
-        <span className='text-base-content/70 py-2 text-sm'>Machine is ready, wake up to use</span>
+        <span className='text-base-content/70 col-span-full py-2 text-center text-sm'>
+          {systemMessage || 'Machine is ready, wake up to use'}
+        </span>
       )}
       {showSteam && (
         <span className='text-base-content/70 py-2 text-sm'>
           {!preheated ? 'Preheating...' : 'Ready to steam, open wand'}
         </span>
       )}
-      <div className='flex justify-end'>
-        {showFlush && (
-          <button
-            className='btn btn-ghost btn-sm text-base-content/60 hover:text-base-content rounded-full text-sm'
-            onClick={startFlush}
-            disabled={isFlushing}
-            aria-label='Flush water'
-          >
-            <FontAwesomeIcon icon={faTint} />
-            Flush
-          </button>
-        )}
-      </div>
+      {!showStandby && (
+        <div className='flex justify-end'>
+          {showFlush && (
+            <FlushButton
+              className='btn btn-ghost btn-sm text-base-content/60 hover:text-base-content rounded-full text-sm'
+              isFlushing={isFlushing}
+              startFlush={startFlush}
+              stopFlush={stopFlush}
+            />
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -146,6 +164,7 @@ ActionCard.propTypes = {
   deactivate: PropTypes.func.isRequired,
   clear: PropTypes.func.isRequired,
   startFlush: PropTypes.func.isRequired,
+  stopFlush: PropTypes.func.isRequired,
   inCard: PropTypes.bool,
   autoTuningEnabled: PropTypes.bool.isRequired,
   localOptimizationEnabled: PropTypes.bool.isRequired,
@@ -153,4 +172,6 @@ ActionCard.propTypes = {
   hasBeanContext: PropTypes.bool.isRequired,
   toggleLocalOptimization: PropTypes.func.isRequired,
   brewStartError: PropTypes.string,
+  warnings: PropTypes.array,
+  systemMessage: PropTypes.string,
 };

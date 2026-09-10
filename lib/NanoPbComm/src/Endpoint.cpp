@@ -350,6 +350,10 @@ void Endpoint::handleConnection(bool connected) {
     unlock();
 
     if (_rxQueue) {
+        // Drop queued payloads from the previous session, then serialize the
+        // application connection callback with payload dispatch. A payload
+        // already executing finishes before this event, so it cannot mutate
+        // per-session application state after the callback resets it.
         xQueueReset(_rxQueue);
         DispatchEvent event;
         event.isConnection = true;

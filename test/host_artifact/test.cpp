@@ -211,7 +211,12 @@ int main(int argc, char **argv) {
     // write quanta, including rebuilding a partial projection after a restart.
     auto historyArtifact = fixture();
     historyArtifact.record.shotId = historyArtifact.completion.shotId = "history-recovery";
+    historyArtifact.samples[1].elapsedMs = 380; // actual late capture, not a fixed interval
+    historyArtifact.samples[1].waterPumped = 1.25f;
     historyArtifact.bindSamples();
+    historyArtifact.samples[0].waterPumped = -1.0f;
+    assert(!store.write(historyArtifact));
+    historyArtifact.samples[0].waterPumped.reset();
     assert(store.write(historyArtifact));
     AutoTuning::CompletedShotArtifact restoredHistory;
     assert(store.load("history-recovery", restoredHistory));
@@ -227,7 +232,8 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 240; ++i) {
         ShotLogSample sample{};
         assert(historyFile.read(reinterpret_cast<uint8_t *>(&sample), sizeof(sample)) == sizeof(sample));
-        assert(sample.t == i && sample.ct == 930 && sample.cp == 90);
+        assert(sample.t == (i == 1 ? 380 : i * 250) && sample.ct == 930 && sample.cp == 90);
+        assert(sample.wp == (i == 1 ? 13 : SHOT_LOG_WATER_PUMPED_UNKNOWN));
     }
     assert(history.index.size() == 1 && history.index.at(42).avgTemp == 930);
     assert(history.savedNotes.indexOf("history-recovery") >= 0);

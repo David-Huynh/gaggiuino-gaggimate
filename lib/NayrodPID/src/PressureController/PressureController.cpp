@@ -131,6 +131,7 @@ float PressureController::getSlip() const {
 float PressureController::getGeometricFlow() const { return getAvailableFlow() + getSlip(); }
 
 float PressureController::getPumpDutyCycleForFlowRate() const {
+    if (*_rawFlowSetpoint <= 0.0f) return 0.0f;
     const float geometricFlow = getGeometricFlow();
     if (geometricFlow <= 0.0f) {
         return 0.0f;
@@ -192,6 +193,10 @@ void PressureController::tare() {
     _puckCounter = 0;
     _pumpFlowRate = 0.0f;
     exportPumpFlowRate = 0.0f;
+    _filteredPressureDerivative = 0.0f;
+    _waterThroughPuckFlowRate = 0.0f;
+    _lastPuckConductance = 0.0f;
+    _puckConductance = 0.0f;
     _puckConductanceDerivative = 0.0f;
     _coffeeFlowRate = 0.0f;
     _puckResistance = INFINITY;

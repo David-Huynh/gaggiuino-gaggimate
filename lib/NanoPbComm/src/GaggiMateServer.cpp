@@ -25,10 +25,11 @@ GaggiMateServer::GaggiMateServer()
 #endif
 
 void GaggiMateServer::init(const String &deviceName, const String &hardware, const String &version,
-                           const gm::DeviceCapabilities &capabilities) {
+                           const gm::DeviceCapabilities &capabilities, bool pairingWindow) {
     setSystemInfo(hardware, version, capabilities);
     registerHandlers();
     _endpoint.onConnection([this](bool connected) {
+        _sentSystemInfoAfterHandshake = false;
         if (connected) {
             _systemInfoAcknowledged = false;
             pushSystemInfo();
@@ -41,7 +42,7 @@ void GaggiMateServer::init(const String &deviceName, const String &hardware, con
     (void)deviceName;
     _transport.begin();
 #else
-    _transport.init(deviceName);
+    _transport.init(deviceName, pairingWindow);
 #endif
 
 #if defined(ARDUINO_ARCH_STM32)
@@ -112,18 +113,18 @@ void GaggiMateServer::pushSystemInfo() {
 void GaggiMateServer::acknowledgeSystemInfo() { _systemInfoAcknowledged = true; }
 
 gm::Payload GaggiMateServer::buildSensorData(float temperature, float pressure, float puckFlow, float pumpFlow,
-                                             float puckResistance, float pumpPower, float heaterPower) {
+                                             float puckResistance, float pumpPower, float heaterPower, float waterPumped) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_sensor_tag;
     p.content.sensor.boilers_count = 1; // boiler 0; schema allows more
     p.content.sensor.boilers[0].index = 0;
     p.content.sensor.boilers[0].temperature = temperature;
     p.content.sensor.boilers[0].pressure = pressure;
+    p.content.sensor.boilers[0].power = heaterPower;
     p.content.sensor.puck_flow = puckFlow;
     p.content.sensor.pump_flow = pumpFlow;
     p.content.sensor.puck_resistance = puckResistance;
     p.content.sensor.pump_power = pumpPower;
-    p.content.sensor.heater_power = heaterPower;
 #if defined(GAGGIMATE_UART_DIAGNOSTICS)
     p.content.sensor.has_diagnostics = true;
     p.content.sensor.diagnostics.error_code = _controllerDiagnostics.errorCode;
@@ -151,6 +152,7 @@ gm::Payload GaggiMateServer::buildSensorData(float temperature, float pressure, 
     p.content.sensor.diagnostics.uart_parsed_payloads = _controllerDiagnostics.uartParsedPayloads;
     p.content.sensor.diagnostics.free_heap = _controllerDiagnostics.freeHeap;
 #endif
+    p.content.sensor.water_pumped = waterPumped;
     return p;
 }
 
@@ -240,8 +242,8 @@ gm::Payload GaggiMateServer::buildScaleCalibrationResult(uint8_t channel, float 
 // one. This avoids the constant ACK chatter on the high-rate path. Button /
 // autotune-result / error / system-info stay reliable.
 void GaggiMateServer::sendSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance,
-                                     float pumpPower, float heaterPower) {
-    _endpoint.sendUnreliable(buildSensorData(temperature, pressure, puckFlow, pumpFlow, puckResistance, pumpPower, heaterPower));
+                                     float pumpPower, float heaterPower, float waterPumped) {
+    _endpoint.sendUnreliable(buildSensorData(temperature, pressure, puckFlow, pumpFlow, puckResistance, pumpPower, heaterPower, waterPumped));
 }
 
 void GaggiMateServer::sendButtonState(uint8_t index, bool pressed) { _endpoint.send(buildButtonState(index, pressed)); }
@@ -268,6 +270,14 @@ void GaggiMateServer::sendScaleCalibrationResult(uint8_t channel, float calibrat
 
 void GaggiMateServer::registerHandlers() {
     _endpoint.on(gaggimate_Payload_ping_tag, [this](const gm::Payload &) {
+        // A SystemInfo notification sent synchronously from the BLE subscribe
+        // callback can beat the client's notification handler. Once a ping has
+        // crossed the framed protocol, the link is fully established; resend
+        // SystemInfo once so reliable delivery starts from a usable session.
+        if (!_sentSystemInfoAfterHandshake) {
+            _sentSystemInfoAfterHandshake = true;
+            pushSystemInfo();
+        }
         if (_pingCb)
             _pingCb();
     });
