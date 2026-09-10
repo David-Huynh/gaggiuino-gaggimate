@@ -1,7 +1,7 @@
 """Check Xtensa stack frames after a PlatformIO display build.
 
-This catches the large automatic artifact/decoder frames behind the recipe
-prompt stack-canary crash. It measures individual frames, not total runtime
+This catches large automatic artifact/decoder and history-buffer frames behind
+the recipe prompt and startup recovery crashes. It measures frames, not total runtime
 stack usage; recovery and confirmation must also be exercised on hardware.
 """
 import argparse
@@ -11,6 +11,17 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def frame_size(output, name):
+    frames = []
+    for symbol, size in re.findall(r"^\w+ <([^\n]+)>:\n\s*[^\n]*entry\s+a1,\s*(\S+)", output, re.MULTILINE):
+        if symbol.startswith(name + "(") and "::{lambda" not in symbol:
+            frames.append(int(size, 0))
+    if not frames:
+        raise ValueError(f"Missing Xtensa stack frame for {name}")
+    # Count the largest compiler clone, never a small nested lambda's frame.
+    return max(frames)
 
 
 def main():
@@ -24,21 +35,35 @@ def main():
         objdump = next(folder.glob("xtensa-esp32s3-elf-objdump*"), None)
     if not objdump:
         parser.error("Pass --objdump with the Xtensa toolchain executable")
-    artifact = ROOT / f".pio/build/{args.environment}/src/display/plugins/LocalAutoTuningStorePlugin.cpp.o"
-    output = subprocess.check_output([str(objdump), "-d", "-C", str(artifact)], text=True)
-    budgets = {"drainStoredShots": 256, "drainPromptEvents": 256,
-               "handleDoseConfirmation": 1024, "loadCommittedShot": 512,
-               "recoverPendingDoseConfirmation": 512}
-    for method, budget in budgets.items():
-        pattern = (r"^\w+ <LocalAutoTuningStorePlugin::" + method +
-                   r"\([^\n]*\)(?: const)?>:\n\s*[^\n]*entry\s+a1,\s*(\S+)")
-        match = re.search(pattern, output, re.MULTILINE)
-        if not match:
-            raise SystemExit(f"Missing Xtensa stack frame for {method}")
-        size = int(match.group(1), 0)
-        if size > budget:
-            raise SystemExit(f"{method}: {size} bytes exceeds {budget}-byte frame budget")
-        print(f"PASS {method}: {size} bytes (budget {budget})")
+    budgets = {
+        "LocalAutoTuningStorePlugin": {
+            "drainStoredShots": 256, "drainPromptEvents": 256,
+            "handleDoseConfirmation": 1024, "loadCommittedShot": 512,
+            "recoverPendingDoseConfirmation": 512, "recoverCommittedArtifacts": 512,
+            "persistShot": 512, "correctShot": 1024, "dispatchStoredShot": 1024,
+            "prepareShotReprocess": 1280, "prepareShotComplete": 1280,
+            "processShotDeliveryAck": 1024, "dispatchPendingCommunityUploads": 512,
+        },
+        "ShotHistoryPlugin": {"ensureProjection": 1024},
+    }
+    frames = {}
+    for plugin, methods in budgets.items():
+        artifact = ROOT / f".pio/build/{args.environment}/src/display/plugins/{plugin}.cpp.o"
+        output = subprocess.check_output([str(objdump), "-d", "-C", str(artifact)], text=True)
+        for method, budget in methods.items():
+            name = f"{plugin}::{method}"
+            size = frame_size(output, name)
+            frames[name] = size
+            if size > budget:
+                raise SystemExit(f"{name}: {size} bytes exceeds {budget}-byte frame budget")
+            print(f"PASS {name}: {size} bytes (budget {budget})")
+    # These two frames overlap during boot and normal recovery. Leave room for
+    # setup/worker frames, filesystem internals and codec calls on the 8 KB task.
+    recovery_frames = (frames["LocalAutoTuningStorePlugin::recoverCommittedArtifacts"] +
+                       frames["ShotHistoryPlugin::ensureProjection"])
+    if recovery_frames > 1536:
+        raise SystemExit(f"Combined recovery/projection frames exceed 1536 bytes: {recovery_frames}")
+    print(f"PASS combined recovery/projection frames: {recovery_frames} bytes (budget 1536)")
 
 
 if __name__ == "__main__":

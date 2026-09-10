@@ -55,6 +55,15 @@ headless environment) after building to check the Xtensa prompt/loader frame
 budgets. These checks do not replace a hardware test of pending-shot recovery,
 recipe confirmation, and delivery through to a comparison or recommendation.
 
+Startup recovery also invokes the history projection port before the main loop
+runs. Its shot artifact and the history writer's 4 KB sample buffer must use
+scoped PSRAM allocations, with the existing internal-heap fallback. The same
+rule applies to artifacts loaded for normal writes, corrections, delivery,
+acknowledgements and reprocessing. The flash quantum and startup ordering stay
+unchanged. Stack checks cover these callers and the overlapping recovery and
+projection frames; host recovery tests compile the production projection method
+with an in-memory filesystem and fake index/notes collaborators.
+
 ## Flash Coordination
 
 Every runtime LittleFS read, write, scan, rename, verification, and prune passes

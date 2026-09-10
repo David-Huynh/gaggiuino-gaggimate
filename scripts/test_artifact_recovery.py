@@ -30,9 +30,15 @@ def main():
     generated = build / "taste.cpp"
     generated.write_text('#include <display/plugins/autotuning/AutoTuningTasteGoalJson.h>\nnamespace AutoTuning {\n' +
                          "\n".join(methods) + "\n}\n")
+    history = (ROOT / "src/display/plugins/ShotHistoryPlugin.cpp").read_text(encoding="utf-8")
+    helpers = history[history.index("namespace {"):history.index("bool readOptionalCorrectionFloat(")]
+    start = history.index("bool ShotHistoryPlugin::ensureProjection(")
+    projection = build / "projection.cpp"
+    projection.write_text('#include "ProjectionHarness.h"\n#include <cmath>\n' + helpers + "\n}\n" +
+                          history[start:history.index("\n}\n", start) + 3], encoding="utf-8")
     command = compiler + ["-x", "c++", "-std=c++17", "-pthread", "-DGAGGIMATE_SIM", "-DARDUINO=10819"]
     for folder in (ROOT / "test/host_artifact/stubs", ROOT / "sim/platform", ROOT / "sim/platform/arduino",
-                   ROOT / "src", json_header.parent):
+                   ROOT / "src", ROOT / "test/host_artifact", json_header.parent):
         command += ["-I", str(folder)]
     sources = ["test/host_artifact/test.cpp", "sim/platform/arduino/WString.cpp",
                "sim/platform/arduino/Print.cpp", "sim/platform/arduino/Stream.cpp",
@@ -41,7 +47,7 @@ def main():
                "src/display/plugins/autotuning/local/CompletedShotArtifactStore.cpp",
                "src/display/util/AtomicFile.cpp", "src/display/util/LittleFSUtil.cpp"]
     binary = build / ("test.exe" if os.name == "nt" else "test")
-    command += [str(ROOT / source) for source in sources] + [str(generated), "-o", str(binary)]
+    command += [str(ROOT / source) for source in sources] + [str(generated), str(projection), "-o", str(binary)]
     subprocess.run(command, check=True, cwd=ROOT)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=ROOT)
 

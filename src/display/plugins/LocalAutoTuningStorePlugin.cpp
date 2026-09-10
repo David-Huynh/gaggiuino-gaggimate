@@ -284,7 +284,8 @@ bool LocalAutoTuningStorePlugin::persistShot(AutoTuning::ShotRecord const &shot,
         return false;
     }
 
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    auto &artifact = *artifactStorage;
     artifact.record = shot;
     artifact.completion = completion;
     artifact.disposition = disposition;
@@ -371,7 +372,8 @@ bool LocalAutoTuningStorePlugin::correctShot(AutoTuning::ShotCorrection const &c
         return true;
     }
 
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    auto &artifact = *artifactStorage;
     if (!loadCommittedShot(shotId, artifact)) {
         reason = "Stored shot artifact is unavailable";
         return false;
@@ -893,7 +895,8 @@ bool LocalAutoTuningStorePlugin::prepareShotReprocess(const String &shotId) {
         storedShotNotices.push_back(std::move(notice));
         return true;
     }
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    auto &artifact = *artifactStorage;
     if (!loadCommittedShot(shotId, artifact)) {
         return false;
     }
@@ -1040,7 +1043,8 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
         return false;
     }
 
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    auto &artifact = *artifactStorage;
     AutoTuning::ShotDeliveryAttempt attempt;
     bool localDeliveryRequired = false;
     JsonDocument envelope(&psramAllocator);
@@ -1227,7 +1231,8 @@ bool LocalAutoTuningStorePlugin::recoverCommittedArtifacts() {
     }
     bool recovered = true;
     for (const String &shotId : shotIds) {
-        AutoTuning::CompletedShotArtifact artifact;
+        auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+        auto &artifact = *artifactStorage;
         if (!artifactStore.load(shotId, artifact)) {
             recovered = false;
             continue;
@@ -1282,7 +1287,8 @@ void LocalAutoTuningStorePlugin::dispatchPendingCommunityUploads() {
     }
     for (const String &path : paths) {
         String shotId;
-        AutoTuning::CompletedShotArtifact artifact;
+        auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+        auto &artifact = *artifactStorage;
         bool due = false;
         JsonDocument envelope(&psramAllocator);
         {
@@ -1342,7 +1348,8 @@ void LocalAutoTuningStorePlugin::processShotDeliveryAck(const String &shotId, co
             return;
         }
         if (preferenceRequest.has_value()) {
-            AutoTuning::CompletedShotArtifact artifact;
+            auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+            auto &artifact = *artifactStorage;
             if (!loadCommittedShot(shotId, artifact)) {
                 ESP_LOGW(LOG_TAG, "Cannot attach comparison request to unavailable shot %s",
                          shotId.c_str());
@@ -1442,7 +1449,8 @@ bool LocalAutoTuningStorePlugin::prepareShotComplete(const String &shotId, JsonD
             return false;
         }
     }
-    AutoTuning::CompletedShotArtifact artifact;
+    auto artifactStorage = makePsramUnique<AutoTuning::CompletedShotArtifact>();
+    auto &artifact = *artifactStorage;
     if (!loadCommittedShot(shotId, artifact)) {
         root["completion_emitted"] = true;
         root["updated_at"] = nowEpoch();

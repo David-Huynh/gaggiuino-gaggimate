@@ -236,7 +236,10 @@ bool ShotHistoryPlugin::ensureProjection(AutoTuning::CompletedShotArtifact const
 
         constexpr size_t SAMPLES_PER_CHUNK =
             StorageCoordinator::MAX_FLASH_QUANTUM_BYTES / sizeof(ShotLogSample);
-        std::array<ShotLogSample, SAMPLES_PER_CHUNK> encoded{};
+        // This 4 KB flash quantum must not live on a task's 8 KB stack.
+        // Allocate only when rebuilding; release it after this projection.
+        auto encodedStorage = makePsramUnique<std::array<ShotLogSample, SAMPLES_PER_CHUNK>>();
+        auto &encoded = *encodedStorage;
         for (size_t offset = 0; offset < artifact.record.samples.size();
              offset += SAMPLES_PER_CHUNK) {
             const size_t count =

@@ -1,4 +1,5 @@
 #include <display/core/RecipeConfirmation.h>
+#include "ProjectionHarness.h"
 #include <display/plugins/autotuning/local/RecipePrompt.h>
 #include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <Arduino.h>
@@ -206,6 +207,41 @@ int main(int argc, char **argv) {
     }
     CompletedShotArtifactStore store;
     assert(store.begin());
+    // Reproduce boot recovery with a persisted shot spanning multiple 4 KB
+    // write quanta, including rebuilding a partial projection after a restart.
+    auto historyArtifact = fixture();
+    historyArtifact.record.shotId = historyArtifact.completion.shotId = "history-recovery";
+    historyArtifact.bindSamples();
+    assert(store.write(historyArtifact));
+    AutoTuning::CompletedShotArtifact restoredHistory;
+    assert(store.load("history-recovery", restoredHistory));
+    ShotHistoryPlugin history;
+    assert(history.ensureProjection(restoredHistory));
+    auto historyFile = LittleFS.open("/h/000042.slog", FILE_READ);
+    assert(historyFile.size() == sizeof(ShotLogHeader) + 240 * sizeof(ShotLogSample));
+    const auto expectedHistory = historyFile.node->bytes;
+    ShotLogHeader historyHeader{};
+    assert(historyFile.read(reinterpret_cast<uint8_t *>(&historyHeader), sizeof(historyHeader)) == sizeof(historyHeader));
+    assert(historyHeader.sampleCount == 240 && historyHeader.durationMs == 59750);
+    assert(historyHeader.phaseTransitionCount == 1 && historyHeader.phaseTransitions[0].transitionReason == 7);
+    for (unsigned i = 0; i < 240; ++i) {
+        ShotLogSample sample{};
+        assert(historyFile.read(reinterpret_cast<uint8_t *>(&sample), sizeof(sample)) == sizeof(sample));
+        assert(sample.t == i && sample.ct == 930 && sample.cp == 90);
+    }
+    assert(history.index.size() == 1 && history.index.at(42).avgTemp == 930);
+    assert(history.savedNotes.indexOf("history-recovery") >= 0);
+    assert(history.ensureProjection(restoredHistory));
+    assert(history.index.size() == 1 && historyFile.node->bytes == expectedHistory);
+    historyFile.node->bytes.resize(100); // interrupted/partial old history file
+    assert(history.ensureProjection(restoredHistory));
+    assert(LittleFS.open("/h/000042.slog").node->bytes == expectedHistory);
+    assert(!LittleFS.exists("/h/000042.slog.tmp"));
+    restoredHistory.record.history.phaseTransitionCount = restoredHistory.record.history.phaseTransitions.size() + 1;
+    assert(!history.ensureProjection(restoredHistory));
+    assert(LittleFS.open("/h/000042.slog").node->bytes == expectedHistory);
+    assert(store.remove("history-recovery"));
+    puts("PASS history projection: persisted-shot recovery, chunk boundary, repeat recovery and invalid metadata");
     recipeArtifact.record = edited;
     recipeArtifact.record.shotId = "confirmed-recipe";
     recipeArtifact.completion.shotId = "confirmed-recipe";
