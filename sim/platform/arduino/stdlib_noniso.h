@@ -21,15 +21,13 @@
 #ifndef STDLIB_NONISO_H
 #define STDLIB_NONISO_H
 
+// Standard conversions come from the host libc, including its C++ exception
+// specifications (e.g. glibc's noexcept). Only declare Arduino extensions here.
+#include <stdlib.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-int atoi(const char *s);
-
-long atol(const char *s);
-
-double atof(const char *s);
 
 char *itoa(int val, char *s, int radix);
 
