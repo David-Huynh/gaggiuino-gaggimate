@@ -50,6 +50,8 @@ export function ChartComponent({ data, className, chartClassName, style }) {
     if (!chart) return;
 
     // Generic "get or create" helper for nested option objects.
+    let orientationTimeout;
+    let disposed = false;
     const ensure = (obj, key, def) => {
       if (!obj[key]) obj[key] = def;
       return obj[key];
@@ -64,6 +66,7 @@ export function ChartComponent({ data, className, chartClassName, style }) {
     };
 
     const handleResize = () => {
+      if (disposed) return;
       const isSmallScreen = window.innerWidth < 640;
 
       // Update legend font size
@@ -94,7 +97,8 @@ export function ChartComponent({ data, className, chartClassName, style }) {
     // iOS PWA specific: orientationchange event
     const handleOrientationChange = () => {
       // Use a small delay to ensure the orientation change is complete
-      setTimeout(handleResize, 100);
+      clearTimeout(orientationTimeout);
+      orientationTimeout = setTimeout(handleResize, 100);
     };
     window.addEventListener('orientationchange', handleOrientationChange);
 
@@ -108,6 +112,8 @@ export function ChartComponent({ data, className, chartClassName, style }) {
 
     // Cleanup
     return () => {
+      disposed = true;
+      clearTimeout(orientationTimeout);
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('orientationchange', handleOrientationChange);
       if (window.visualViewport) {

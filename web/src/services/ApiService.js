@@ -13,6 +13,7 @@ function randomId() {
 export default class ApiService {
   socket = null;
   listeners = {};
+  pendingRequests = new Set();
   reconnectAttempts = 0;
   maxReconnectDelay = 30000; // Maximum delay of 30 seconds
   baseReconnectDelay = 1000; // Start with 1 second delay
@@ -64,6 +65,9 @@ export default class ApiService {
       ...machine.value,
       connected: false,
     };
+    for (const reject of [...this.pendingRequests]) {
+      reject(new Error('WebSocket disconnected'));
+    }
     this._scheduleReconnect();
   }
 
@@ -117,7 +121,8 @@ export default class ApiService {
     }
   }
 
-  async request(data = {}) {
+  async request(data = {}, { signal } = {}) {
+    if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
@@ -127,25 +132,38 @@ export default class ApiService {
     const message = { ...data, rid };
     return new Promise((resolve, reject) => {
       let timeoutId;
+      let listenerId;
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        this.off(returnType, listenerId);
+        signal?.removeEventListener('abort', onAbort);
+        this.pendingRequests.delete(fail);
+      };
+      const fail = error => {
+        cleanup();
+        reject(error);
+      };
+      const onAbort = () => fail(new DOMException('Request cancelled', 'AbortError'));
 
       // Create a listener for the response with matching rid
-      const listenerId = this.on(returnType, response => {
+      listenerId = this.on(returnType, response => {
         if (response.rid === rid) {
           // Clean up the listener and cancel the timeout to free the closure.
-          clearTimeout(timeoutId);
-          this.off(returnType, listenerId);
+          cleanup();
           resolve(response);
         }
       });
 
-      // Send the request
-      this.send(message);
-
       // Timeout: reject if no matching response arrives within 30 seconds
-      timeoutId = setTimeout(() => {
-        this.off(returnType, listenerId);
-        reject(new Error(`Request ${data.tp} timed out`));
-      }, 30000); // 30 second timeout
+      timeoutId = setTimeout(() => fail(new Error(`Request ${data.tp} timed out`)), 30000);
+      this.pendingRequests.add(fail);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      // A send can fail even after the readyState check. Release its listener too.
+      try {
+        this.send(message);
+      } catch (error) {
+        fail(error);
+      }
     });
   }
 
@@ -159,7 +177,10 @@ export default class ApiService {
   }
 
   off(type, id) {
-    delete this.listeners[type][id];
+    const listeners = this.listeners[type];
+    if (!listeners) return;
+    delete listeners[id];
+    if (Object.keys(listeners).length === 0) delete this.listeners[type];
   }
 
   // evt:status frames are partial: fast telemetry every tick, slow state only when it changes

@@ -805,15 +805,24 @@ export function ProfileList() {
     };
   }, [loading, searchTerm, onDragStart, onDragChange, onDragEnd]);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const isConnected = connected.value;
   useEffect(() => {
-    const loadData = async () => {
-      if (connected.value) {
-        await loadProfiles();
-      }
+    if (!isConnected || !apiService) return;
+    const abort = new AbortController();
+    setLoading(true);
+    apiService.request({ tp: 'req:profiles:list' }, { signal: abort.signal })
+      .then(response => {
+        if (abort.signal.aborted) return;
+        setProfiles(response.profiles ?? []);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (!abort.signal.aborted) setLoading(false);
+      });
+    return () => {
+      abort.abort();
     };
-    loadData();
-  }, [connected.value]);
+  }, [apiService, isConnected]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const onDelete = useCallback(

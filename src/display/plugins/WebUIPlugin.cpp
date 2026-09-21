@@ -25,6 +25,7 @@
 #include <display/util/LittleFSUtil.h>
 #include <display/util/PsramStlAllocator.h>
 #include <display/util/PsramWsBuffer.h>
+#include <display/util/WebSocketRequestBuffer.h>
 #include <display/webassets/web_ui_manifest.h>
 #include <esp32-hal-psram.h>
 #include <esp_core_dump.h>
@@ -35,7 +36,6 @@
 #include <mbedtls/platform.h>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 #include <version.h>
 
@@ -44,8 +44,7 @@
 // transient buffers don't spike the scarce internal SRAM. The map nodes
 // themselves stay on the default heap (tiny: an id + a string handle).
 using PsramString = std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>>;
-static std::unordered_map<uint32_t, PsramString> rxBuffers;
-static std::unordered_map<uint32_t, unsigned long> rxBufferLastActivity;
+static WebSocketRequestBuffer<PsramString> rxBuffers(DEFAULT_MAX_WS_CLIENTS);
 static constexpr unsigned long RXBUFFER_IDLE_EVICT_MS = 5UL * 60UL * 1000UL;
 
 namespace {
@@ -1454,17 +1453,7 @@ void WebUIPlugin::loop() {
         // Evict rxBuffers from clients that dropped TCP without a clean WS close
         // (mobile screen-lock, OS killing background tab). Otherwise these leak
         // until reboot.
-        const unsigned long nowMs = millis();
-        size_t evicted = 0;
-        for (auto it = rxBufferLastActivity.begin(); it != rxBufferLastActivity.end();) {
-            if (nowMs - it->second > RXBUFFER_IDLE_EVICT_MS) {
-                rxBuffers.erase(it->first);
-                it = rxBufferLastActivity.erase(it);
-                ++evicted;
-            } else {
-                ++it;
-            }
-        }
+        const size_t evicted = rxBuffers.expire(millis(), RXBUFFER_IDLE_EVICT_MS);
         if (evicted > 0) {
             ESP_LOGI("WebUIPlugin", "Evicted %u idle rxBuffers", static_cast<unsigned>(evicted));
         }
@@ -1753,7 +1742,7 @@ void WebUIPlugin::setupServer() {
                 }
             } else if (type == WS_EVT_DISCONNECT) {
                 ESP_LOGI("WebUIPlugin", "WebSocket client disconnected (%d open connections)", server->getClients().size());
-                rxBuffers.erase(client->id());
+                rxBuffers.disconnect(client->id());
             } else if (type == WS_EVT_DATA) {
                 handleWebSocketData(server, client, type, arg, data, len);
             }
@@ -1944,289 +1933,277 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
     auto *info = static_cast<AwsFrameInfo *>(arg);
     const uint32_t cid = client->id();
 
-    rxBufferLastActivity[cid] = millis();
-
-    if (info->index == 0) {
-        auto &buf = rxBuffers[cid];
-        buf.clear();
-        if (info->len <= 64 * 1024) {
-            buf.reserve(info->len);
-        }
+    PsramString buf;
+    const auto result = rxBuffers.append(cid, *info, data, len, millis(), buf);
+    if (result == WebSocketRequestBuffer<PsramString>::Result::Rejected) {
+        client->close(1009, "Invalid or oversized request");
+        return;
     }
+    if (result != WebSocketRequestBuffer<PsramString>::Result::Complete) return;
 
-    auto &buf = rxBuffers[cid];
-    buf.append(reinterpret_cast<const char *>(data), len);
-    const bool isFinal = info->final && (info->index + len) == info->len;
-
-    // If this is the final frame of the message, process and clear
-    if (isFinal) {
-        if (info->opcode == WS_TEXT) {
-            ESP_LOGV("WebUIPlugin", "Received request: %.*s", (int)buf.size(), buf.c_str());
-            JsonDocument doc(&psramAllocator);
-            DeserializationError err = deserializeJson(doc, buf.c_str());
-            if (!err) {
-                String msgType = doc["tp"].as<String>();
-                if (msgType.startsWith("req:profiles:")) {
-                    handleProfileRequest(client->id(), doc);
-                } else if (msgType == "req:ota-settings") {
-                    handleOTASettings(client->id(), doc);
-                } else if (msgType == "req:ota-start") {
-                    handleOTAStart(client->id(), doc);
-                } else if (msgType == "req:autotune-start") {
-                    handleAutotuneStart(client->id(), doc);
-                } else if (msgType == "req:rl:status:refresh" || msgType == "req:rl:context:list" ||
-                           msgType == "req:rl:context:switch" || msgType == "req:rl:context:start-bean" ||
-                           msgType == "req:rl:context:start-bag" || msgType == "req:rl:context:update" ||
-                           msgType == "req:rl:context:retire" || msgType == "req:rl:context:delete" ||
-                           msgType.startsWith("req:rl:grinder-context:") || msgType == "req:rl:local-optimization" ||
-                           msgType == "req:rl:optimization:pause" || msgType == "req:rl:optimization:resume" ||
-                           msgType == "req:rl:taste-goal:set" || msgType == "req:rl:dose-target:set" ||
-                           msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:cpbo-config:set" ||
-                           msgType == "req:rl:local-reset") {
-                    handleRLRequest(client->id(), doc);
-                } else if (msgType == "req:rl:recommendation:use") {
-                    if (rlParticipationEnabled(controller)) {
-                        String recommendationId = doc["recommendation_id"].as<String>();
-                        if (!recommendationId.isEmpty()) {
-                            Event event;
-                            event.id = "rl:recommendation:apply";
-                            event.setString("recommendation_id", recommendationId);
-                            pluginManager->trigger(event);
-                            if (event.getInt("decision_persisted") == 1) {
-                                _pendRecJson = ""; // Resolved; drop the reopen affordance.
-                            }
-                        }
+    // buf owns the completed message. Cleanup on another task cannot free it,
+    // and no receive-buffer lock is held while handlers access flash or reply.
+    ESP_LOGV("WebUIPlugin", "Received request: %.*s", (int)buf.size(), buf.c_str());
+    JsonDocument doc(&psramAllocator);
+    DeserializationError err = deserializeJson(doc, buf.c_str());
+    if (!err) {
+        String msgType = doc["tp"].as<String>();
+        if (msgType.startsWith("req:profiles:")) {
+            handleProfileRequest(client->id(), doc);
+        } else if (msgType == "req:ota-settings") {
+            handleOTASettings(client->id(), doc);
+        } else if (msgType == "req:ota-start") {
+            handleOTAStart(client->id(), doc);
+        } else if (msgType == "req:autotune-start") {
+            handleAutotuneStart(client->id(), doc);
+        } else if (msgType == "req:rl:status:refresh" || msgType == "req:rl:context:list" ||
+                   msgType == "req:rl:context:switch" || msgType == "req:rl:context:start-bean" ||
+                   msgType == "req:rl:context:start-bag" || msgType == "req:rl:context:update" ||
+                   msgType == "req:rl:context:retire" || msgType == "req:rl:context:delete" ||
+                   msgType.startsWith("req:rl:grinder-context:") || msgType == "req:rl:local-optimization" ||
+                   msgType == "req:rl:optimization:pause" || msgType == "req:rl:optimization:resume" ||
+                   msgType == "req:rl:taste-goal:set" || msgType == "req:rl:dose-target:set" ||
+                   msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:cpbo-config:set" ||
+                   msgType == "req:rl:local-reset") {
+            handleRLRequest(client->id(), doc);
+        } else if (msgType == "req:rl:recommendation:use") {
+            if (rlParticipationEnabled(controller)) {
+                String recommendationId = doc["recommendation_id"].as<String>();
+                if (!recommendationId.isEmpty()) {
+                    Event event;
+                    event.id = "rl:recommendation:apply";
+                    event.setString("recommendation_id", recommendationId);
+                    pluginManager->trigger(event);
+                    if (event.getInt("decision_persisted") == 1) {
+                        _pendRecJson = ""; // Resolved; drop the reopen affordance.
                     }
-                } else if (msgType == "req:rl:recommendation:ignore") {
-                    if (rlParticipationEnabled(controller)) {
-                        String recommendationId = doc["recommendation_id"].as<String>();
-                        if (!recommendationId.isEmpty()) {
-                            Event event;
-                            event.id = "rl:recommendation:ignore";
-                            event.setString("recommendation_id", recommendationId);
-                            pluginManager->trigger(event);
-                            if (event.getInt("decision_persisted") == 1) {
-                                _pendRecJson = ""; // Resolved; drop the reopen affordance.
-                            }
-                        }
-                    }
-                } else if (msgType == "req:rl:shot:correction") {
-                    JsonDocument resp;
-                    resp["tp"] = "res:rl:shot:correction";
-                    resp["rid"] = doc["rid"];
-                    if (!rlParticipationEnabled(controller)) {
-                        resp["error"] = F("Auto Tuning is disabled");
-                    } else {
-                        String shotId = doc["shot_id"].as<String>();
-                        if (shotId.isEmpty()) {
-                            shotId = rlLastShotId;
-                        }
-                        if (shotId.isEmpty()) {
-                            resp["error"] = F("No shot available to correct");
-                        } else {
-                            AutoTuning::ShotCorrection correction;
-                            correction.shotId = shotId.c_str();
-                            correction.source = "gaggimate_webui";
-                            if (doc["exclude_from_local_optimization"].is<bool>()) {
-                                correction.excludeFromLocalOptimization = doc["exclude_from_local_optimization"].as<bool>();
-                            }
-                            if (doc["shot_type"].is<String>()) {
-                                correction.shotType = doc["shot_type"].as<String>().c_str();
-                            }
-                            if (doc["grind_followed"].is<bool>()) {
-                                correction.grindFollowed = doc["grind_followed"].as<bool>();
-                            }
-                            if (doc["dose_followed"].is<bool>()) {
-                                correction.doseFollowed = doc["dose_followed"].as<bool>();
-                            }
-                            if (doc["yield_followed"].is<bool>()) {
-                                correction.yieldFollowed = doc["yield_followed"].as<bool>();
-                            }
-                            if (doc["correction_tags"].is<JsonArray>()) {
-                                for (JsonVariant tag : doc["correction_tags"].as<JsonArray>()) {
-                                    String value = tag.as<String>();
-                                    value.trim();
-                                    if (!value.isEmpty() && value.length() <= 64 && correction.tags.size() < 16) {
-                                        correction.tags.emplace_back(value.c_str());
-                                    }
-                                }
-                            }
-                            Event event;
-                            event.id = "rl:shot:correction";
-                            event.setString("shot_id", shotId);
-                            event.setPayload(correction);
-                            pluginManager->trigger(event);
-                            resp["success"] = event.getInt("optimizer_persisted") == 1;
-                            if (event.getInt("optimizer_persisted") != 1) {
-                                resp["error"] = "Unable to persist optimizer correction";
-                            }
-                            resp["shot_id"] = shotId;
-                        }
-                    }
-                    String msg;
-                    serializeJson(resp, msg);
-                    client->text(msg);
-                } else if (msgType == "req:rl:dose-confirmation") {
-                    const String shotId = doc["shot_id"].as<String>();
-                    const std::uint32_t promptRevision =
-                        doc["prompt_revision"] | 0U;
-                    if (rlParticipationEnabled(controller) && !_pendingDoseShotId.isEmpty() && shotId == _pendingDoseShotId &&
-                        promptRevision == _pendingDosePromptRevision &&
-                        promptRevision > 0 && (doc["action"] == "confirm" || doc["action"] == "change" || doc["action"] == "unknown")) {
-                        Event claim;
-                        claim.id = "rl:prompt:claim";
-                        claim.setString("shot_id", shotId);
-                        claim.setInt64("prompt_revision", promptRevision);
-                        pluginManager->trigger(claim);
-                        if (claim.getInt("claimed") != 1) {
-                            return;
-                        }
-                        Event event;
-                        event.id = "rl:dose-confirmation";
-                        event.setString("shot_id", shotId);
-                        event.setInt64("prompt_revision", promptRevision);
-                        event.setInt("prompt_claimed", 1);
-                        AutoTuning::RecipeConfirmation answer;
-                        answer.answer = doc["action"] == "confirm" ? AutoTuning::RecipeAnswer::Confirm
-                            : doc["action"] == "change" ? AutoTuning::RecipeAnswer::Change : AutoTuning::RecipeAnswer::Unknown;
-                        if (doc["grind_setting"].is<float>()) answer.grindSetting = doc["grind_setting"].as<float>();
-                        if (doc["dose_g"].is<float>()) answer.doseG = doc["dose_g"].as<float>();
-                        event.setPayload(answer);
-                        pluginManager->trigger(event);
-                    }
-                } else if (msgType == "req:rl:preference") {
-                    if (rlParticipationEnabled(controller) && !_pendingPreferenceShotId.isEmpty()) {
-                        const String installId = doc["install_id"].as<String>();
-                        const String runId = doc["optimization_run_id"].as<String>();
-                        const String newShotId = doc["new_shot_id"].as<String>();
-                        const String anchorShotId = doc["anchor_shot_id"].as<String>();
-                        const String comparisonMode = doc["comparison_mode"].as<String>();
-                        const String label = doc["label"].as<String>();
-                        const std::uint32_t promptRevision =
-                            doc["prompt_revision"] | 0U;
-                        const bool matchesPending = installId == _pendPreferenceInstallId && runId == _pendPreferenceRunId &&
-                                                    newShotId == _pendingPreferenceShotId &&
-                                                    anchorShotId == _pendPreferenceAnchorShotId &&
-                                                    comparisonMode == _pendPreferenceComparisonMode &&
-                                                    promptRevision == _pendingPreferencePromptRevision &&
-                                                    promptRevision > 0;
-                        if (matchesPending && newShotId != anchorShotId) {
-                            const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
-                            const auto parsedMode = AutoTuning::comparisonModeFromKey(comparisonMode.c_str());
-                            if (!parsedLabel || !parsedMode) {
-                                return;
-                            }
-                            Event claim;
-                            claim.id = "rl:prompt:claim";
-                            claim.setString("shot_id", newShotId);
-                            claim.setInt64("prompt_revision", promptRevision);
-                            pluginManager->trigger(claim);
-                            if (claim.getInt("claimed") != 1) {
-                                return;
-                            }
-                            AutoTuning::PreferenceFeedback feedback(*parsedLabel);
-                            feedback.installId = installId.c_str();
-                            feedback.optimizationRunId = runId.c_str();
-                            feedback.newShotId = newShotId.c_str();
-                            feedback.anchorShotId = anchorShotId.c_str();
-                            feedback.comparisonMode = *parsedMode;
-                            feedback.tasteGoal = _pendPreferenceTasteGoal;
-                            feedback.recommendationId = _pendingPreferenceRecommendationId.c_str();
-                            Event event;
-                            event.id = "rl:preference";
-                            event.setString("install_id", installId);
-                            event.setString("optimization_run_id", runId);
-                            event.setString("new_shot_id", newShotId);
-                            event.setString("anchor_shot_id", anchorShotId);
-                            event.setString("label", label);
-                            event.setString("comparison_mode", comparisonMode);
-                            event.setString("recommendation_id", _pendingPreferenceRecommendationId);
-                            event.setInt64("prompt_revision", promptRevision);
-                            event.setInt("prompt_claimed", 1);
-                            event.setPayload(feedback);
-                            pluginManager->trigger(event);
-                            if (event.getInt("decision_persisted") != 1) {
-                                Event release;
-                                release.id = "rl:prompt:release";
-                                release.setString("shot_id", newShotId);
-                                release.setInt64("prompt_revision", promptRevision);
-                                pluginManager->trigger(release);
-                            }
-                        }
-                    }
-                } else if (msgType == "req:process:activate") {
-                    controller->postCommand(CtrlCmd::ACTIVATE, doc["ignoreWarnings"].as<bool>() ? 1 : 0);
-                } else if (msgType == "req:brew:confirm:cancel") {
-                    controller->postCommand(CtrlCmd::CANCEL_BREW_CONFIRM);
-                } else if (msgType == "req:flush:stop") {
-                    controller->postCommand(CtrlCmd::STOP_FLUSH);
-                } else if (msgType == "req:process:deactivate") {
-                    controller->postCommand(CtrlCmd::DEACTIVATE_CLEAR);
-                } else if (msgType == "req:process:clear") {
-                    controller->postCommand(CtrlCmd::CLEAR);
-                } else if (msgType == "req:grind:activate") {
-                    controller->postCommand(CtrlCmd::ACTIVATE_GRIND);
-                } else if (msgType == "req:grind:deactivate") {
-                    controller->postCommand(CtrlCmd::DEACTIVATE_GRIND);
-                } else if (msgType == "req:change-grind-target") {
-                    if (doc["target"].is<uint8_t>()) {
-                        auto target = doc["target"].as<uint8_t>();
-                        controller->getSettings().setVolumetricTarget(target);
-                    }
-                } else if (msgType == "req:raise-temp") {
-                    controller->postCommand(CtrlCmd::RAISE_TEMP);
-                } else if (msgType == "req:lower-temp") {
-                    controller->postCommand(CtrlCmd::LOWER_TEMP);
-                } else if (msgType == "req:raise-grind-target") {
-                    controller->postCommand(CtrlCmd::RAISE_GRIND_TARGET);
-                } else if (msgType == "req:lower-grind-target") {
-                    controller->postCommand(CtrlCmd::LOWER_GRIND_TARGET);
-                } else if (msgType == "req:raise-brew-target") {
-                    controller->raiseBrewTarget();
-                } else if (msgType == "req:lower-brew-target") {
-                    controller->lowerBrewTarget();
-                } else if (msgType == "req:change-mode") {
-                    if (doc["mode"].is<uint8_t>()) {
-                        auto mode = doc["mode"].as<uint8_t>();
-                        controller->postCommand(CtrlCmd::CHANGE_MODE, mode);
-                    }
-                } else if (msgType == "req:change-brew-target") {
-                    if (doc["target"].is<uint8_t>()) {
-                        auto target = doc["target"].as<uint8_t>();
-                        controller->getSettings().setVolumetricTarget(target);
-                    }
-                } else if (msgType == "req:history:rebuild") {
-                    // Handle rebuild asynchronously - send immediate ack, progress comes via events
-                    JsonDocument resp(&psramAllocator);
-                    resp["tp"] = "res:history:rebuild";
-                    if (doc["rid"].is<const char *>()) {
-                        resp["rid"] = doc["rid"];
-                    }
-                    resp["msg"] = "Rebuild started";
-                    client->text(toWsBuffer(resp));
-                    ShotHistory.startAsyncRebuild();
-                } else if (msgType.startsWith("req:history")) {
-                    JsonDocument resp(&psramAllocator);
-                    ShotHistory.handleRequest(doc, resp);
-                    client->text(toWsBuffer(resp));
-                } else if (msgType == "req:flush:start") {
-                    handleFlushStart(client->id(), doc);
-#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
-                } else if (msgType == "req:scale:tare") {
-                    controller->scaleTare();
-                } else if (msgType == "req:scale:cal:start") {
-                    uint8_t channel = doc["channel"] | 0;
-                    float refWeight = doc["refWeight"] | 0.0f;
-                    if ((channel == 1 || channel == 2) && refWeight > 0.0f) {
-                        controller->getClientController()->startScaleCalibration(channel, refWeight);
-                    }
-#endif
                 }
             }
+        } else if (msgType == "req:rl:recommendation:ignore") {
+            if (rlParticipationEnabled(controller)) {
+                String recommendationId = doc["recommendation_id"].as<String>();
+                if (!recommendationId.isEmpty()) {
+                    Event event;
+                    event.id = "rl:recommendation:ignore";
+                    event.setString("recommendation_id", recommendationId);
+                    pluginManager->trigger(event);
+                    if (event.getInt("decision_persisted") == 1) {
+                        _pendRecJson = ""; // Resolved; drop the reopen affordance.
+                    }
+                }
+            }
+        } else if (msgType == "req:rl:shot:correction") {
+            JsonDocument resp;
+            resp["tp"] = "res:rl:shot:correction";
+            resp["rid"] = doc["rid"];
+            if (!rlParticipationEnabled(controller)) {
+                resp["error"] = F("Auto Tuning is disabled");
+            } else {
+                String shotId = doc["shot_id"].as<String>();
+                if (shotId.isEmpty()) {
+                    shotId = rlLastShotId;
+                }
+                if (shotId.isEmpty()) {
+                    resp["error"] = F("No shot available to correct");
+                } else {
+                    AutoTuning::ShotCorrection correction;
+                    correction.shotId = shotId.c_str();
+                    correction.source = "gaggimate_webui";
+                    if (doc["exclude_from_local_optimization"].is<bool>()) {
+                        correction.excludeFromLocalOptimization = doc["exclude_from_local_optimization"].as<bool>();
+                    }
+                    if (doc["shot_type"].is<String>()) {
+                        correction.shotType = doc["shot_type"].as<String>().c_str();
+                    }
+                    if (doc["grind_followed"].is<bool>()) {
+                        correction.grindFollowed = doc["grind_followed"].as<bool>();
+                    }
+                    if (doc["dose_followed"].is<bool>()) {
+                        correction.doseFollowed = doc["dose_followed"].as<bool>();
+                    }
+                    if (doc["yield_followed"].is<bool>()) {
+                        correction.yieldFollowed = doc["yield_followed"].as<bool>();
+                    }
+                    if (doc["correction_tags"].is<JsonArray>()) {
+                        for (JsonVariant tag : doc["correction_tags"].as<JsonArray>()) {
+                            String value = tag.as<String>();
+                            value.trim();
+                            if (!value.isEmpty() && value.length() <= 64 && correction.tags.size() < 16) {
+                                correction.tags.emplace_back(value.c_str());
+                            }
+                        }
+                    }
+                    Event event;
+                    event.id = "rl:shot:correction";
+                    event.setString("shot_id", shotId);
+                    event.setPayload(correction);
+                    pluginManager->trigger(event);
+                    resp["success"] = event.getInt("optimizer_persisted") == 1;
+                    if (event.getInt("optimizer_persisted") != 1) {
+                        resp["error"] = "Unable to persist optimizer correction";
+                    }
+                    resp["shot_id"] = shotId;
+                }
+            }
+            String msg;
+            serializeJson(resp, msg);
+            client->text(msg);
+        } else if (msgType == "req:rl:dose-confirmation") {
+            const String shotId = doc["shot_id"].as<String>();
+            const std::uint32_t promptRevision =
+                doc["prompt_revision"] | 0U;
+            if (rlParticipationEnabled(controller) && !_pendingDoseShotId.isEmpty() && shotId == _pendingDoseShotId &&
+                promptRevision == _pendingDosePromptRevision &&
+                promptRevision > 0 && (doc["action"] == "confirm" || doc["action"] == "change" || doc["action"] == "unknown")) {
+                Event claim;
+                claim.id = "rl:prompt:claim";
+                claim.setString("shot_id", shotId);
+                claim.setInt64("prompt_revision", promptRevision);
+                pluginManager->trigger(claim);
+                if (claim.getInt("claimed") != 1) {
+                    return;
+                }
+                Event event;
+                event.id = "rl:dose-confirmation";
+                event.setString("shot_id", shotId);
+                event.setInt64("prompt_revision", promptRevision);
+                event.setInt("prompt_claimed", 1);
+                AutoTuning::RecipeConfirmation answer;
+                answer.answer = doc["action"] == "confirm" ? AutoTuning::RecipeAnswer::Confirm
+                    : doc["action"] == "change" ? AutoTuning::RecipeAnswer::Change : AutoTuning::RecipeAnswer::Unknown;
+                if (doc["grind_setting"].is<float>()) answer.grindSetting = doc["grind_setting"].as<float>();
+                if (doc["dose_g"].is<float>()) answer.doseG = doc["dose_g"].as<float>();
+                event.setPayload(answer);
+                pluginManager->trigger(event);
+            }
+        } else if (msgType == "req:rl:preference") {
+            if (rlParticipationEnabled(controller) && !_pendingPreferenceShotId.isEmpty()) {
+                const String installId = doc["install_id"].as<String>();
+                const String runId = doc["optimization_run_id"].as<String>();
+                const String newShotId = doc["new_shot_id"].as<String>();
+                const String anchorShotId = doc["anchor_shot_id"].as<String>();
+                const String comparisonMode = doc["comparison_mode"].as<String>();
+                const String label = doc["label"].as<String>();
+                const std::uint32_t promptRevision =
+                    doc["prompt_revision"] | 0U;
+                const bool matchesPending = installId == _pendPreferenceInstallId && runId == _pendPreferenceRunId &&
+                                            newShotId == _pendingPreferenceShotId &&
+                                            anchorShotId == _pendPreferenceAnchorShotId &&
+                                            comparisonMode == _pendPreferenceComparisonMode &&
+                                            promptRevision == _pendingPreferencePromptRevision &&
+                                            promptRevision > 0;
+                if (matchesPending && newShotId != anchorShotId) {
+                    const auto parsedLabel = AutoTuning::preferenceLabelFromKey(label.c_str());
+                    const auto parsedMode = AutoTuning::comparisonModeFromKey(comparisonMode.c_str());
+                    if (!parsedLabel || !parsedMode) {
+                        return;
+                    }
+                    Event claim;
+                    claim.id = "rl:prompt:claim";
+                    claim.setString("shot_id", newShotId);
+                    claim.setInt64("prompt_revision", promptRevision);
+                    pluginManager->trigger(claim);
+                    if (claim.getInt("claimed") != 1) {
+                        return;
+                    }
+                    AutoTuning::PreferenceFeedback feedback(*parsedLabel);
+                    feedback.installId = installId.c_str();
+                    feedback.optimizationRunId = runId.c_str();
+                    feedback.newShotId = newShotId.c_str();
+                    feedback.anchorShotId = anchorShotId.c_str();
+                    feedback.comparisonMode = *parsedMode;
+                    feedback.tasteGoal = _pendPreferenceTasteGoal;
+                    feedback.recommendationId = _pendingPreferenceRecommendationId.c_str();
+                    Event event;
+                    event.id = "rl:preference";
+                    event.setString("install_id", installId);
+                    event.setString("optimization_run_id", runId);
+                    event.setString("new_shot_id", newShotId);
+                    event.setString("anchor_shot_id", anchorShotId);
+                    event.setString("label", label);
+                    event.setString("comparison_mode", comparisonMode);
+                    event.setString("recommendation_id", _pendingPreferenceRecommendationId);
+                    event.setInt64("prompt_revision", promptRevision);
+                    event.setInt("prompt_claimed", 1);
+                    event.setPayload(feedback);
+                    pluginManager->trigger(event);
+                    if (event.getInt("decision_persisted") != 1) {
+                        Event release;
+                        release.id = "rl:prompt:release";
+                        release.setString("shot_id", newShotId);
+                        release.setInt64("prompt_revision", promptRevision);
+                        pluginManager->trigger(release);
+                    }
+                }
+            }
+        } else if (msgType == "req:process:activate") {
+            controller->postCommand(CtrlCmd::ACTIVATE, doc["ignoreWarnings"].as<bool>() ? 1 : 0);
+        } else if (msgType == "req:brew:confirm:cancel") {
+            controller->postCommand(CtrlCmd::CANCEL_BREW_CONFIRM);
+        } else if (msgType == "req:flush:stop") {
+            controller->postCommand(CtrlCmd::STOP_FLUSH);
+        } else if (msgType == "req:process:deactivate") {
+            controller->postCommand(CtrlCmd::DEACTIVATE_CLEAR);
+        } else if (msgType == "req:process:clear") {
+            controller->postCommand(CtrlCmd::CLEAR);
+        } else if (msgType == "req:grind:activate") {
+            controller->postCommand(CtrlCmd::ACTIVATE_GRIND);
+        } else if (msgType == "req:grind:deactivate") {
+            controller->postCommand(CtrlCmd::DEACTIVATE_GRIND);
+        } else if (msgType == "req:change-grind-target") {
+            if (doc["target"].is<uint8_t>()) {
+                auto target = doc["target"].as<uint8_t>();
+                controller->getSettings().setVolumetricTarget(target);
+            }
+        } else if (msgType == "req:raise-temp") {
+            controller->postCommand(CtrlCmd::RAISE_TEMP);
+        } else if (msgType == "req:lower-temp") {
+            controller->postCommand(CtrlCmd::LOWER_TEMP);
+        } else if (msgType == "req:raise-grind-target") {
+            controller->postCommand(CtrlCmd::RAISE_GRIND_TARGET);
+        } else if (msgType == "req:lower-grind-target") {
+            controller->postCommand(CtrlCmd::LOWER_GRIND_TARGET);
+        } else if (msgType == "req:raise-brew-target") {
+            controller->raiseBrewTarget();
+        } else if (msgType == "req:lower-brew-target") {
+            controller->lowerBrewTarget();
+        } else if (msgType == "req:change-mode") {
+            if (doc["mode"].is<uint8_t>()) {
+                auto mode = doc["mode"].as<uint8_t>();
+                controller->postCommand(CtrlCmd::CHANGE_MODE, mode);
+            }
+        } else if (msgType == "req:change-brew-target") {
+            if (doc["target"].is<uint8_t>()) {
+                auto target = doc["target"].as<uint8_t>();
+                controller->getSettings().setVolumetricTarget(target);
+            }
+        } else if (msgType == "req:history:rebuild") {
+            // Handle rebuild asynchronously - send immediate ack, progress comes via events
+            JsonDocument resp(&psramAllocator);
+            resp["tp"] = "res:history:rebuild";
+            if (doc["rid"].is<const char *>()) {
+                resp["rid"] = doc["rid"];
+            }
+            resp["msg"] = "Rebuild started";
+            client->text(toWsBuffer(resp));
+            ShotHistory.startAsyncRebuild();
+        } else if (msgType.startsWith("req:history")) {
+            JsonDocument resp(&psramAllocator);
+            ShotHistory.handleRequest(doc, resp);
+            client->text(toWsBuffer(resp));
+        } else if (msgType == "req:flush:start") {
+            handleFlushStart(client->id(), doc);
+#ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
+        } else if (msgType == "req:scale:tare") {
+            controller->scaleTare();
+        } else if (msgType == "req:scale:cal:start") {
+            uint8_t channel = doc["channel"] | 0;
+            float refWeight = doc["refWeight"] | 0.0f;
+            if ((channel == 1 || channel == 2) && refWeight > 0.0f) {
+                controller->getClientController()->startScaleCalibration(channel, refWeight);
+            }
+#endif
         }
-        // Done with this message
-        rxBuffers.erase(cid);
-        rxBufferLastActivity.erase(cid);
     }
 }
 

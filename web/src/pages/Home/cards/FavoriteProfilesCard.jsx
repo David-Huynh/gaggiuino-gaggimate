@@ -68,9 +68,10 @@ export function FavoriteProfilesCard({ selectedProfileId, inCard = false, compac
       return;
     }
     let cancelled = false;
+    const abort = new AbortController();
     setLoading(true);
     apiService
-      .request({ tp: 'req:profiles:list' })
+      .request({ tp: 'req:profiles:list' }, { signal: abort.signal })
       .then(res => {
         if (cancelled) return;
         setFavorites((res.profiles ?? []).filter(p => p.favorite).slice(0, 3));
@@ -81,6 +82,7 @@ export function FavoriteProfilesCard({ selectedProfileId, inCard = false, compac
       });
     return () => {
       cancelled = true;
+      abort.abort();
     };
   });
 

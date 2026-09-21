@@ -1,4 +1,5 @@
 import { useContext, useEffect, useState } from 'preact/hooks';
+import { computed } from '@preact/signals';
 import { ApiServiceContext, machine } from '../../../services/ApiService.js';
 import PropTypes from 'prop-types';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
@@ -9,6 +10,8 @@ import { profileChartHeightSignal } from '../../../utils/dashboardManager.js';
 import { SkeletonBlock } from '../../../components/SkeletonBlock.jsx';
 import { fmtElapsed, fmtPhaseTarget, getPhaseLabel } from '../utils.js';
 import { parseBinaryIndex, indexToShotList } from '../../ShotHistory/parseBinaryIndex.js';
+
+const connected = computed(() => machine.value.connected);
 
 function ProgressCard({ processInfo, isBrewing, isGrinding, selectedProfile }) {
   const p = processInfo;
@@ -116,6 +119,7 @@ export function ProfileCard({
   compact = false,
 }) {
   const apiService = useContext(ApiServiceContext);
+  const isConnected = connected.value;
   const [profileData, setProfileData] = useState(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [finishedStats, setFinishedStats] = useState(null);
@@ -162,28 +166,31 @@ export function ProfileCard({
   }, [isFinished, isBrewing, finishedStats]);
 
   useEffect(() => {
-    if (!selectedProfileId || !apiService) {
+    if (!selectedProfileId || !apiService || !isConnected) {
       setProfileData(null);
+      setProfileLoading(false);
       return;
     }
     let cancelled = false;
+    const abort = new AbortController();
     setProfileLoading(true);
     apiService
-      .request({ tp: 'req:profiles:load', id: selectedProfileId })
+      .request({ tp: 'req:profiles:load', id: selectedProfileId }, { signal: abort.signal })
       .then(res => {
         if (cancelled) return;
         setProfileData(res.profile);
         setProfileLoading(false);
       })
-      .catch(e => {
+      .catch(() => {
         if (cancelled) return;
         setProfileData(null);
         setProfileLoading(false);
       });
     return () => {
       cancelled = true;
+      abort.abort();
     };
-  }, [selectedProfileId, apiService]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedProfileId, apiService, isConnected]);
 
   const showProgress = (isBrewing || isGrinding) && (isActive || isFinished);
 
