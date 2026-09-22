@@ -143,6 +143,8 @@ class WebUIPlugin : public Plugin {
     String rlCPBOEffectiveComparisonMode = "";
     String rlCPBOOptimizationRunId = "";
     bool rlCPBOLocallyConverged = false;
+    bool rlCPBOStoppedByUser = false;
+    String rlCPBOBestShotId;
     float rlCPBOTrustRegionLength = 0.0f;
     int rlCPBOTrustRegionSuccessCount = 0;
     int rlCPBOTrustRegionFailureCount = 0;

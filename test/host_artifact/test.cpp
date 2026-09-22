@@ -148,6 +148,18 @@ int main(int argc, char **argv) {
     assert(!AutoTuning::recommendationContextMatches(recommendation, "other", "bean", "grinder", "A", goal));
     assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "other", "grinder", "A", goal));
     assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "other", "A", goal));
+    recommendation.recommendationId = "restore-1";
+    recommendation.mode = AutoTuning::RecommendationMode::RestoreBest;
+    recommendation.preferenceFeedbackRequired = false;
+    assert(AutoTuning::restoreBestRequestMatches(recommendation, "restore-1"));
+    assert(!AutoTuning::restoreBestRequestMatches(recommendation, ""));
+    assert(!AutoTuning::restoreBestRequestMatches(recommendation, "stale-request"));
+    recommendation.preferenceFeedbackRequired = true;
+    assert(!AutoTuning::restoreBestRequestMatches(recommendation, "restore-1"));
+    recommendation.preferenceFeedbackRequired = false;
+    recommendation.mode = AutoTuning::RecommendationMode::CpboBestIncumbent;
+    assert(!AutoTuning::restoreBestRequestMatches(recommendation, "restore-1"));
+    assert(AutoTuning::recommendationModeFromKey("restore_best") == AutoTuning::RecommendationMode::RestoreBest);
     recommendation.profileId.clear();
     assert(!AutoTuning::recommendationContextMatches(recommendation, "machine", "bean", "grinder", "A", goal));
     static_assert(!std::is_default_constructible<AutoTuning::PreferenceFeedback>::value,

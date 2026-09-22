@@ -457,6 +457,7 @@ void DefaultUI::loop() {
     }
 
     if (rerender) {
+        updateAutoTuningSettingsModal();
         rerender = false;
         lastRender = now;
         applyTheme();
@@ -703,13 +704,110 @@ void DefaultUI::showAutoTuningSettings() {
     lv_obj_set_style_text_color(advancedLabel, themeColor(1), 0);
     lv_obj_center(advancedLabel);
 
-    autoTuningStatusLabel = createAutoTuningLabel(body, "", 4, 370, bodyWidth - 12, &lv_font_montserrat_16, themeColor(0));
-    autoTuningSummaryLabel = createAutoTuningLabel(body, "", 4, 438, bodyWidth - 12, &lv_font_montserrat_14, themeColor(3));
+    autoTuningStopButton = lv_btn_create(body);
+    lv_obj_set_pos(autoTuningStopButton, 4, 360);
+    lv_obj_set_size(autoTuningStopButton, bodyWidth - 12, 52);
+    lv_obj_set_style_bg_color(autoTuningStopButton, themeColor(0), 0);
+    lv_obj_add_event_cb(autoTuningStopButton, [](lv_event_t *event) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(event))->confirmStopOptimization();
+    }, LV_EVENT_CLICKED, this);
+    lv_obj_t *stopLabel = lv_label_create(autoTuningStopButton);
+    lv_label_set_text(stopLabel, "Stop & use best shot");
+    lv_obj_set_style_text_color(stopLabel, themeColor(1), 0);
+    lv_obj_center(stopLabel);
+    autoTuningResumeButton = lv_btn_create(body);
+    lv_obj_set_pos(autoTuningResumeButton, 4, 424);
+    lv_obj_set_size(autoTuningResumeButton, bodyWidth - 12, 48);
+    lv_obj_set_style_bg_color(autoTuningResumeButton, themeColor(0), 0);
+    lv_obj_add_event_cb(autoTuningResumeButton, [](lv_event_t *event) {
+        static_cast<DefaultUI *>(lv_event_get_user_data(event))->resumeOptimization();
+    }, LV_EVENT_CLICKED, this);
+    lv_obj_t *resumeLabel = lv_label_create(autoTuningResumeButton);
+    lv_label_set_text(resumeLabel, "Resume exploration");
+    lv_obj_set_style_text_color(resumeLabel, themeColor(1), 0);
+    lv_obj_center(resumeLabel);
+
+    autoTuningStatusLabel = createAutoTuningLabel(body, "", 4, 486, bodyWidth - 12, &lv_font_montserrat_16, themeColor(0));
+    autoTuningSummaryLabel = createAutoTuningLabel(body, "", 4, 574, bodyWidth - 12, &lv_font_montserrat_14, themeColor(3));
 
     updateAutoTuningSettingsModal();
 }
 
+void DefaultUI::confirmStopOptimization() {
+    if (autoTuningStopConfirmation) return;
+    autoTuningControlError = "";
+    autoTuningStopConfirmation = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(autoTuningStopConfirmation, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(autoTuningStopConfirmation, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(autoTuningStopConfirmation, LV_OPA_60, 0);
+    lv_obj_clear_flag(autoTuningStopConfirmation, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *card = lv_obj_create(autoTuningStopConfirmation);
+    const lv_coord_t width = autoTuningCardWidth();
+    const lv_coord_t height = autoTuningCardHeight();
+    lv_obj_set_size(card, width, height);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, themeColor(1), 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    createAutoTuningLabel(card, "Keep your best recipe?", 8, 8, width - 48, &lv_font_montserrat_20, themeColor(0));
+    lv_obj_t *body = lv_obj_create(card);
+    lv_obj_set_pos(body, 0, 48);
+    lv_obj_set_size(body, width - 32, height - 210);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    String description = String("Bean: ") + controller->getSettings().getRLBeanContextName() +
+        "\nProfile: " + controller->getProfileManager()->getSelectedProfile().label +
+        "\nGoal: " + AutoTuning::activeTasteGoalSummary(controller->getSettings()) +
+        "\n\nStop exploring and restore the best recorded shot for this profile. "
+        "An unanswered comparison will be discarded. Move the grinder manually to the restored setting.";
+    lv_obj_t *label = createAutoTuningLabel(body, description.c_str(), 0, 0, width - 70, &lv_font_montserrat_16, themeColor(0));
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    for (int choice = 0; choice < 2; ++choice) {
+        lv_obj_t *button = lv_btn_create(card);
+        lv_obj_set_pos(button, 4, height - 152 + choice * 60);
+        lv_obj_set_size(button, width - 48, 52);
+        lv_obj_set_style_bg_color(button, themeColor(0), 0);
+        lv_obj_add_event_cb(button, choice == 0 ? +[](lv_event_t *event) {
+            static_cast<DefaultUI *>(lv_event_get_user_data(event))->finishStopConfirmation(true);
+        } : +[](lv_event_t *event) {
+            static_cast<DefaultUI *>(lv_event_get_user_data(event))->finishStopConfirmation(false);
+        }, LV_EVENT_CLICKED, this);
+        lv_obj_t *buttonLabel = lv_label_create(button);
+        lv_label_set_text(buttonLabel, choice == 0 ? "Stop & restore best" : "Keep optimizing");
+        lv_obj_set_style_text_color(buttonLabel, themeColor(1), 0);
+        lv_obj_center(buttonLabel);
+    }
+}
+
+void DefaultUI::finishStopConfirmation(bool confirmed) {
+    if (!autoTuningStopConfirmation) return;
+    if (confirmed) {
+        Event event;
+        event.id = "rl:optimization:stop-best";
+        pluginManager->trigger(event);
+        if (event.getInt("control_persisted") <= 0) autoTuningControlError = event.getString("error");
+    }
+    lv_obj_del(autoTuningStopConfirmation);
+    autoTuningStopConfirmation = nullptr;
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
+void DefaultUI::resumeOptimization() {
+    Event event;
+    event.id = "rl:optimization:resume-exploration";
+    pluginManager->trigger(event);
+    autoTuningControlError = event.getInt("control_persisted") > 0 ? "" : event.getString("error");
+    updateAutoTuningSettingsModal();
+    markDirty();
+}
+
 void DefaultUI::closeAutoTuningSettings() {
+    if (autoTuningStopConfirmation) lv_obj_del(autoTuningStopConfirmation);
+    autoTuningStopConfirmation = nullptr;
+    autoTuningStopButton = nullptr;
+    autoTuningResumeButton = nullptr;
+    autoTuningControlError = "";
     closeTasteGoalSettings();
     closeRecipeDomainSettings();
     if (autoTuningModal != nullptr) {
@@ -1186,7 +1284,33 @@ void DefaultUI::updateAutoTuningSettingsModal() {
     }
     lv_label_set_text(autoTuningStatusLabel, status.c_str());
 
+    const String restoreStatus = settings.getRLRestoreBestStatus();
+    const bool controlsReady = providerEnabled && mode == AutoTuning::PROVIDER_OFF_BOARD &&
+        !controller->isActive() && restoreStatus != "pending";
+    for (auto *button : {autoTuningStopButton, autoTuningResumeButton}) {
+        if (controlsReady) lv_obj_clear_state(button, LV_STATE_DISABLED);
+        else lv_obj_add_state(button, LV_STATE_DISABLED);
+    }
     String summary = router.providerSummary();
+    if (restoreStatus == "pending") summary = "Request queued. Waiting for EspressoRL. Keep the machine idle.";
+    else if (restoreStatus == "restored") {
+        summary = "Optimization stopped. Best dose and yield restored.";
+        JsonDocument grinders;
+        if (!deserializeJson(grinders, settings.getRLGrinderContextsJson())) {
+            for (JsonObjectConst grinder : grinders.as<JsonArrayConst>()) {
+                if (grinder["id"].as<String>() != settings.getRLGrinderContextId()) continue;
+                const bool absolute = grinder["current_absolute_step"].is<float>();
+                const float position = absolute ? grinder["current_absolute_step"].as<float>() : grinder["current_relative_step"].as<float>();
+                summary += String("\nMove grinder manually to ") + String(position, 1) + (absolute ? "" : " steps from reference");
+                break;
+            }
+        }
+        summary += String("\nDose: ") + String(settings.getTargetGrindVolume(), 1) + " g";
+    }
+    else if (restoreStatus == "failed") summary = "Best recipe not restored. Check connection, profile and recipe limits, then retry.";
+    if (!autoTuningControlError.isEmpty()) summary = autoTuningControlError;
+    lv_obj_update_layout(autoTuningStatusLabel);
+    lv_obj_set_y(autoTuningSummaryLabel, lv_obj_get_y(autoTuningStatusLabel) + lv_obj_get_height(autoTuningStatusLabel) + 16);
     if (mode == AutoTuning::PROVIDER_OFF_BOARD && !settings.isHomeAssistant()) {
         summary += "\nEnable MQTT Broker for off-board mode";
     }

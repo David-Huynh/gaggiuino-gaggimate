@@ -49,6 +49,9 @@ class DefaultUI {
     void onVolumetricDelete();
     void showAutoTuningSettings();
     void closeAutoTuningSettings();
+    void confirmStopOptimization();
+    void finishStopConfirmation(bool confirmed);
+    void resumeOptimization();
     void setAutoTuningEnabled(bool enabled);
     void setAutoTuningProviderFromIndex(uint16_t index);
     void setAutoTuningLocalOptimization(bool enabled);
@@ -182,6 +185,10 @@ class DefaultUI {
     lv_obj_t *autoTuningTasteGoalButton = nullptr;
     lv_obj_t *autoTuningTasteGoalButtonLabel = nullptr;
     lv_obj_t *autoTuningAdvancedButton = nullptr;
+    lv_obj_t *autoTuningStopButton = nullptr;
+    lv_obj_t *autoTuningResumeButton = nullptr;
+    lv_obj_t *autoTuningStopConfirmation = nullptr;
+    String autoTuningControlError;
     lv_obj_t *autoTuningStatusLabel = nullptr;
     lv_obj_t *autoTuningSummaryLabel = nullptr;
     lv_obj_t *recipeDomainModal = nullptr;

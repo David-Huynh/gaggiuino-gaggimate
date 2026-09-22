@@ -110,6 +110,10 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     void addUartDiagnostics(JsonDocument &doc) const;
     bool isAutoTuningEnabled() const;
     bool isAutoTuningParticipating() const;
+    bool restoreBestAuthorized(const AutoTuning::Recommendation &recommendation) const;
+    void requestRestoreBest(Event &event);
+    void resumeOptimization(Event &event);
+    void failRestoreBest();
     bool canApplyGrindByWeightTarget() const;
     String machineTopicId() const;
     String machineId() const;
@@ -162,6 +166,7 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     std::atomic<PendingMachineState> pendingMachineState{PendingMachineState::None};
 
     String awaitingLifecycleDigest;
+    String awaitingRestoreRequestId;
     std::optional<std::pair<String, bool>> lifecycleReceipt;
     bool hasRecommendation = false;
     AutoTuning::Recommendation latestRecommendation;
@@ -188,6 +193,8 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     String latestStatusCPBOComparisonMode;
     String latestStatusCPBOOptimizationRunId;
     bool latestStatusCPBOLocallyConverged = false;
+    bool latestStatusCPBOStoppedByUser = false;
+    String latestStatusCPBOBestShotId;
     float latestStatusCPBOTrustRegionLength = 0.0f;
     int latestStatusCPBOTrustRegionSuccessCount = 0;
     int latestStatusCPBOTrustRegionFailureCount = 0;

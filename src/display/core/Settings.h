@@ -188,6 +188,12 @@ class Settings {
     bool isRLAutoTuningEnabled() const { return rlAutoTuningEnabled.get(); }
     bool isRLLocalOptimizationEnabled() const { return rlLocalOptimizationEnabled.get(); }
     bool isRLOptimizationPaused() const { return rlOptimizationPaused.get(); }
+    String getRLRestoreBestRequestId() const { return rlRestoreBestRequestId.get(); }
+    String getRLRestoreBestRunId() const { return rlRestoreBestRunId.get(); }
+    void setRLRestoreBestRunId(const String &id) { rlRestoreBestRunId.set(id); }
+    String getRLRestoreBestStatus() const { return rlRestoreBestStatus.get(); }
+    void setRLRestoreBestRequestId(const String &id) { rlRestoreBestRequestId.set(id); }
+    void setRLRestoreBestStatus(const String &status) { rlRestoreBestStatus.set(status); }
     bool isRLCommunityUploadEnabled() const { return rlCommunityUploadEnabled.get(); }
     bool isRLCommunityUploadPrompted() const { return rlCommunityUploadPrompted.get(); }
     String getRLUploadBaseUrl() const { return rlUploadBaseUrl.get(); }
@@ -420,6 +426,9 @@ class Settings {
     Property<bool> rlAutoTuningEnabled{registry, "rl_enabled", false};
     Property<bool> rlLocalOptimizationEnabled{registry, "rl_local", true};
     Property<bool> rlOptimizationPaused{registry, "rl_pause", false};
+    Property<String> rlRestoreBestRequestId{registry, "rl_restore_id", ""};
+    Property<String> rlRestoreBestRunId{registry, "rl_restore_run", ""};
+    Property<String> rlRestoreBestStatus{registry, "rl_restore_st", ""};
     Property<bool> rlCommunityUploadEnabled{registry, "rl_cu", false};
     Property<bool> rlCommunityUploadPrompted{registry, "rl_cu_ask", false};
     Property<String> rlUploadBaseUrl{registry, "rl_up_base", ""};

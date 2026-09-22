@@ -299,3 +299,26 @@ radius around the current incumbent, clipped to the configured search space,
 while retaining shots, comparisons, incumbent history, checkpoints, and the
 transition audit. Global-previous mode remains available and searches the full
 configured domain.
+
+## Stop and restore the best shot
+
+The Auto Tuning page and screen offer **Stop & use best shot**, separately from
+comparison feedback. Confirmation queues `stop_and_restore_best` on the existing
+durable optimizer-control channel. EspressoRL validates ownership, current
+context and recipe bounds, persists the stopped state, supersedes pending
+suggestions and discards the unfinished comparison without creating a label.
+It returns a `restore_best` recommendation whose ID matches the control request.
+
+Firmware persists that request ID before sending. A restore requires this
+matching intent, a matching bean/grinder/profile/taste goal, valid bounds and an
+idle machine. The device reports queued, restored or failed; receipt from the
+broker alone never means the recipe was restored. Replayed retained messages do
+not apply again after restoration. Dose and profile yield are restored; the
+grinder setting is an instruction for the user, not proof of physical movement.
+**Resume exploration** retains the shot/comparison history and resumes the run.
+Both the container and firmware must support this protocol addition.
+
+The page merges live status/recommendations over any settings snapshot already
+in flight and refreshes on reconnect. `scripts/test_autotuning_browser.py`
+exercises those races and the controls at mobile, landscape and desktop sizes
+against a fake machine; it requires a current web build and Playwright/Chrome.

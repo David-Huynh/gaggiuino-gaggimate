@@ -636,13 +636,10 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
     pluginManager->on("controller:autotune:failed", [this](Event const &) { sendAutotuneFailed(); });
 
     pluginManager->on("rl:recommendation:received", [this](Event const &event) {
-        if (!rlParticipationEnabled(controller)) {
-            _pendRecJson = "";
-            return;
-        }
-
         AutoTuning::Recommendation const *recommendation = event.getPayload<AutoTuning::Recommendation>();
-        if (!recommendation) {
+        if (!recommendation) return;
+        if (!rlParticipationEnabled(controller) && recommendation->mode != AutoTuning::RecommendationMode::RestoreBest) {
+            _pendRecJson = "";
             return;
         }
 
@@ -692,9 +689,18 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         const String payload = doc.as<String>();
         // Cache as the reopen source of truth only while still promptable; a
         // resolved status (applied/ignored/etc) clears any pending prompt.
-        const bool promptable = status.isEmpty() || status == "pending" || status == "shown";
+        const bool promptable = recommendation->mode != AutoTuning::RecommendationMode::RestoreBest &&
+            (status.isEmpty() || status == "pending" || status == "shown");
         _pendRecJson = promptable ? payload : String("");
         ws.textAll(payload);
+    });
+
+    pluginManager->on("rl:restore:state", [this](Event const &) {
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:status";
+        doc["rlRestoreBestStatus"] = controller->getSettings().getRLRestoreBestStatus();
+        doc["rlOptimizationPaused"] = controller->getSettings().isRLOptimizationPaused();
+        broadcastJson(doc);
     });
 
     pluginManager->on("rl:recommendation:cleared", [this](Event const &) {
@@ -908,6 +914,8 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlCPBOEffectiveComparisonMode = event.getString("cpbo_comparison_mode");
         rlCPBOOptimizationRunId = event.getString("cpbo_optimization_run_id");
         rlCPBOLocallyConverged = event.getInt("cpbo_locally_converged") > 0;
+        rlCPBOStoppedByUser = event.getInt("cpbo_stopped_by_user") > 0;
+        rlCPBOBestShotId = event.getString("cpbo_best_shot_id");
         rlCPBOTrustRegionLength = event.getString("cpbo_trust_region_length").toFloat();
         rlCPBOTrustRegionSuccessCount = event.getInt("cpbo_trust_region_success_count");
         rlCPBOTrustRegionFailureCount = event.getInt("cpbo_trust_region_failure_count");
@@ -993,6 +1001,9 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlCPBOEffectiveComparisonMode"] = rlCPBOEffectiveComparisonMode;
         doc["rlCPBOOptimizationRunId"] = rlCPBOOptimizationRunId;
         doc["rlCPBOLocallyConverged"] = rlCPBOLocallyConverged;
+        doc["rlCPBOStoppedByUser"] = rlCPBOStoppedByUser;
+        doc["rlCPBOBestShotId"] = rlCPBOBestShotId;
+        doc["rlRestoreBestStatus"] = settings.getRLRestoreBestStatus();
         doc["rlCPBOTrustRegionLength"] = rlCPBOTrustRegionLength;
         doc["rlCPBOTrustRegionSuccessCount"] = rlCPBOTrustRegionSuccessCount;
         doc["rlCPBOTrustRegionFailureCount"] = rlCPBOTrustRegionFailureCount;
@@ -1961,24 +1972,24 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                    msgType == "req:rl:context:start-bag" || msgType == "req:rl:context:update" ||
                    msgType == "req:rl:context:retire" || msgType == "req:rl:context:delete" ||
                    msgType.startsWith("req:rl:grinder-context:") || msgType == "req:rl:local-optimization" ||
-                   msgType == "req:rl:optimization:pause" || msgType == "req:rl:optimization:resume" ||
+                   msgType.startsWith("req:rl:optimization:") ||
                    msgType == "req:rl:taste-goal:set" || msgType == "req:rl:dose-target:set" ||
                    msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:cpbo-config:set" ||
                    msgType == "req:rl:local-reset") {
             handleRLRequest(client->id(), doc);
         } else if (msgType == "req:rl:recommendation:use") {
-            if (rlParticipationEnabled(controller)) {
-                String recommendationId = doc["recommendation_id"].as<String>();
-                if (!recommendationId.isEmpty()) {
-                    Event event;
-                    event.id = "rl:recommendation:apply";
-                    event.setString("recommendation_id", recommendationId);
-                    pluginManager->trigger(event);
-                    if (event.getInt("decision_persisted") == 1) {
-                        _pendRecJson = ""; // Resolved; drop the reopen affordance.
-                    }
-                }
-            }
+            JsonDocument response;
+            response["tp"] = "res:rl:recommendation:use";
+            response["rid"] = doc["rid"];
+            Event event;
+            event.id = "rl:recommendation:apply";
+            event.setString("recommendation_id", doc["recommendation_id"].as<String>());
+            if (rlParticipationEnabled(controller)) pluginManager->trigger(event);
+            if (event.getInt("decision_persisted") == 1) _pendRecJson = "";
+            else response["error"] = "Recommendation could not be applied. Refresh and check the current context.";
+            String payload;
+            serializeJson(response, payload);
+            client->text(payload);
         } else if (msgType == "req:rl:recommendation:ignore") {
             if (rlParticipationEnabled(controller)) {
                 String recommendationId = doc["recommendation_id"].as<String>();
@@ -2667,33 +2678,34 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
                 settings.save(true);
                 changed = true;
             }
+        } else if (type == "req:rl:optimization:stop-best") {
+            Event event;
+            event.id = "rl:optimization:stop-best";
+            pluginManager->trigger(event);
+            if (event.getInt("control_persisted") <= 0) {
+                response["error"] = event.getString("error");
+            } else {
+                response["restore_status"] = "pending";
+            }
         } else if (type == "req:rl:optimization:pause") {
             settings.setRLOptimizationPaused(true);
             settings.save(true);
             changed = true;
-        } else if (type == "req:rl:optimization:resume") {
+        } else if (type == "req:rl:optimization:resume" && settings.getRLRestoreBestRequestId().isEmpty() && !rlCPBOStoppedByUser) {
             settings.setRLOptimizationPaused(false);
             settings.setRLLocalOptimizationEnabled(true);
             settings.save(true);
             changed = true;
-        } else if (type == "req:rl:optimization:resume-exploration") {
-            if (rlCPBOOptimizationRunId.isEmpty()) {
-                response["error"] = F("No converged CPBO run is available");
-            } else {
-                Event event;
-                event.id = "rl:optimization:control";
-                event.setString("action", "resume_local_exploration");
-                event.setString("optimization_run_id", rlCPBOOptimizationRunId);
-                event.setString(
-                    "request_id",
-                    String("resume_") + String(static_cast<long long>(EpochTime::now())) + "_" +
-                        String(static_cast<unsigned long>(millis())));
-                pluginManager->trigger(event);
-                if (event.getInt("control_persisted") <= 0) {
-                    response["error"] = F("Unable to queue the resume command");
-                }
-            }
+        } else if (type == "req:rl:optimization:resume-exploration" || type == "req:rl:optimization:resume") {
+            Event event;
+            event.id = "rl:optimization:resume-exploration";
+            pluginManager->trigger(event);
+            if (event.getInt("control_persisted") <= 0) response["error"] = event.getString("error");
+            else changed = true;
         } else if (type == "req:rl:local-reset") {
+            settings.setRLRestoreBestRequestId("");
+            settings.setRLRestoreBestRunId("");
+            settings.setRLRestoreBestStatus("");
             settings.setRLBeanContextId("");
             settings.setRLBeanContextName("");
             settings.setRLBeanContextsJson("[]");
@@ -3070,6 +3082,9 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlCPBOEffectiveComparisonMode"] = rlCPBOEffectiveComparisonMode;
     doc["rlCPBOOptimizationRunId"] = rlCPBOOptimizationRunId;
     doc["rlCPBOLocallyConverged"] = rlCPBOLocallyConverged;
+    doc["rlCPBOStoppedByUser"] = rlCPBOStoppedByUser;
+    doc["rlCPBOBestShotId"] = rlCPBOBestShotId;
+    doc["rlRestoreBestStatus"] = settings.getRLRestoreBestStatus();
     doc["rlCPBOTrustRegionLength"] = rlCPBOTrustRegionLength;
     doc["rlCPBOTrustRegionSuccessCount"] = rlCPBOTrustRegionSuccessCount;
     doc["rlCPBOTrustRegionFailureCount"] = rlCPBOTrustRegionFailureCount;

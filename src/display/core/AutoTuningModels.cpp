@@ -21,7 +21,7 @@ constexpr std::array<const char *, TASTE_GOAL_ATTRIBUTE_COUNT> TASTE_ATTRIBUTE_K
 
 constexpr std::array<const char *, 4> TASTE_LEVEL_KEYS = {"", "low", "medium", "high"};
 constexpr std::array<const char *, 3> COMPARISON_MODE_KEYS = {"", "global_previous", "best_incumbent"};
-constexpr std::array<const char *, 3> RECOMMENDATION_MODE_KEYS = {"", "cpbo_global_previous", "cpbo_best_incumbent"};
+constexpr std::array<const char *, 4> RECOMMENDATION_MODE_KEYS = {"", "cpbo_global_previous", "cpbo_best_incumbent", "restore_best"};
 constexpr std::array<const char *, 10> RECOMMENDATION_STATUS_KEYS = {
     "", "pending", "shown", "accepted", "edited", "ignored", "used", "superseded", "expired", "failed"};
 constexpr std::array<const char *, 7> DELIVERY_STATUS_KEYS = {

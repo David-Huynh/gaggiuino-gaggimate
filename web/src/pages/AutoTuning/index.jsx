@@ -1,4 +1,11 @@
-import { useCallback, useContext, useEffect, useState } from 'preact/hooks';
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'preact/hooks';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faGear } from '@fortawesome/free-solid-svg-icons/faGear';
 import { faPause } from '@fortawesome/free-solid-svg-icons/faPause';
@@ -7,7 +14,8 @@ import { faPlus } from '@fortawesome/free-solid-svg-icons/faPlus';
 import { faSave } from '@fortawesome/free-solid-svg-icons/faSave';
 import { faTrashCan } from '@fortawesome/free-solid-svg-icons/faTrashCan';
 import { Spinner } from '../../components/Spinner.jsx';
-import { ApiServiceContext } from '../../services/ApiService.js';
+import { computed } from '@preact/signals';
+import { ApiServiceContext, machine } from '../../services/ApiService.js';
 import { formatGrinderSettingTransition } from '../../utils/grinderRecommendation.js';
 import {
   TASTE_LEVEL_LABELS,
@@ -15,6 +23,8 @@ import {
   TASTE_TAG_GROUPS,
   TASTE_TAG_LABELS,
 } from '../../utils/tasteTags.js';
+
+const connected = computed(() => machine.value.connected);
 
 const PROMPTABLE_RECOMMENDATION_STATUSES = new Set(['', 'pending', 'shown']);
 const PROVIDER_LABELS = {
@@ -435,7 +445,11 @@ function currentRecommendation(settings, activeGrinder) {
         : undefined);
   return {
     id: recommendationId,
-    status: settings.rlRecommendationStatus || settings.rlRecommendationApplyStatus || '',
+    status:
+      settings.rlRecommendationMode === 'restore_best' &&
+      settings.rlRestoreBestStatus === 'restored'
+        ? 'restored'
+        : settings.rlRecommendationStatus || settings.rlRecommendationApplyStatus || '',
     grindDeltaStepsFromCurrent,
     projectedRelativeStepFromReference: projectedRelative,
     currentAbsoluteStep: currentAbsolute,
@@ -451,6 +465,7 @@ function recommendationStatus(recommendation) {
     return 'Waiting for a valid shot';
   }
   const labels = {
+    restored: 'Restored',
     accepted: 'Accepted',
     edited: 'Edited',
     used: 'Accepted',
@@ -649,6 +664,8 @@ function GrinderFields({ form, setField, suggestions = [], searching = false, ap
 
 export function AutoTuning() {
   const apiService = useContext(ApiServiceContext);
+  const isConnected = connected.value;
+  const snapshotRef = useRef(null);
   const [settings, setSettings] = useState(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -666,15 +683,29 @@ export function AutoTuning() {
   const [cpboComparisonDraft, setCpboComparisonDraft] = useState('best_incumbent');
   const [doseTargetDraft, setDoseTargetDraft] = useState('18');
 
+  const mergeLiveSettings = useCallback(update => {
+    if (snapshotRef.current) Object.assign(snapshotRef.current.patch, update);
+    setSettings(current => ({ ...(current || {}), ...update }));
+  }, []);
+
   const loadSettings = useCallback(async () => {
-    const response = await fetch('/api/settings');
-    if (!response.ok) {
-      throw new Error('Unable to load Auto Tuning settings.');
+    snapshotRef.current?.controller.abort();
+    const snapshot = { patch: {}, controller: new AbortController() };
+    snapshotRef.current = snapshot;
+    try {
+      const response = await fetch('/api/settings', { signal: snapshot.controller.signal });
+      if (!response.ok) throw new Error('Unable to load Auto Tuning settings.');
+      const loaded = await response.json();
+      if (snapshotRef.current !== snapshot) return;
+      const merged = { ...loaded, ...snapshot.patch };
+      setSettings(merged);
+      setDoseTargetDraft(String(optionalNumber(merged.rlDoseTargetG) ?? 18));
+      setLoading(false);
+    } catch (caught) {
+      if (caught.name !== 'AbortError') throw caught;
+    } finally {
+      if (snapshotRef.current === snapshot) snapshotRef.current = null;
     }
-    const loaded = await response.json();
-    setSettings(loaded);
-    setDoseTargetDraft(String(optionalNumber(loaded.rlDoseTargetG) ?? 18));
-    setLoading(false);
   }, []);
 
   useEffect(() => {
@@ -682,21 +713,23 @@ export function AutoTuning() {
       setError(caught.message);
       setLoading(false);
     });
-  }, [loadSettings]);
+    if (isConnected) apiService?.request({ tp: 'req:rl:status:refresh' }).catch(() => {});
+    return () => {
+      snapshotRef.current?.controller.abort();
+      snapshotRef.current = null;
+    };
+  }, [apiService, isConnected, loadSettings]);
 
-  useEffect(() => {
-    if (!apiService) {
-      return undefined;
-    }
+  useLayoutEffect(() => {
+    if (!apiService) return undefined;
     const statusListener = apiService.on('evt:rl:status', message => {
-      setSettings(current => ({ ...(current || {}), ...message }));
+      mergeLiveSettings(message);
       if (optionalNumber(message.rlDoseTargetG) !== undefined) {
         setDoseTargetDraft(String(message.rlDoseTargetG));
       }
     });
     const recommendationListener = apiService.on('evt:rl:recommendation', message => {
-      setSettings(current => ({
-        ...(current || {}),
+      mergeLiveSettings({
         rlLastRecommendationId: message.recommendation_id,
         rlRecommendationStatus: message.status,
         rlRecommendationMode: message.mode,
@@ -710,23 +743,21 @@ export function AutoTuning() {
         rlRecommendationNextDoseG: message.next_dose_g,
         rlRecommendationTargetYieldG: message.target_yield_g,
         rlRecommendationTargetRatio: message.target_ratio,
-      }));
+      });
     });
     const recommendationClearListener = apiService.on('evt:rl:recommendation-clear', () => {
-      setSettings(current => ({
-        ...(current || {}),
+      mergeLiveSettings({
         rlLastRecommendationId: '',
         rlRecommendationStatus: '',
         rlRecommendationApplyStatus: '',
-      }));
+      });
     });
-    apiService.request({ tp: 'req:rl:status:refresh' }).catch(() => {});
     return () => {
       apiService.off('evt:rl:status', statusListener);
       apiService.off('evt:rl:recommendation', recommendationListener);
       apiService.off('evt:rl:recommendation-clear', recommendationClearListener);
     };
-  }, [apiService]);
+  }, [apiService, mergeLiveSettings]);
 
   const run = useCallback(
     async (tp, payload = {}) => {
@@ -818,7 +849,9 @@ export function AutoTuning() {
   const activeTasteGoalSummary = tasteGoalSummary(activeTasteGoal);
   const recommendation = currentRecommendation(settings, activeGrinder);
   const recommendationPromptable =
-    !!recommendation && PROMPTABLE_RECOMMENDATION_STATUSES.has(recommendation.status || '');
+    !!recommendation &&
+    settings.rlRecommendationMode !== 'restore_best' &&
+    PROMPTABLE_RECOMMENDATION_STATUSES.has(recommendation.status || '');
   const paused = !!settings.rlOptimizationPaused;
   const localOn = !!settings.rlLocalOptimizationEnabled;
   const recipeDomain = settings.rlRecipeDomain || DEFAULT_RECIPE_DOMAIN;
@@ -865,13 +898,15 @@ export function AutoTuning() {
                       : 'neutral'
               }
             >
-              {settings.rlCPBOLocallyConverged
-                ? 'Local optimum found'
-                : paused
-                  ? 'Paused'
-                  : localOn
-                    ? 'Optimizing'
-                    : 'Observation only'}
+              {settings.rlCPBOStoppedByUser
+                ? 'Optimization stopped'
+                : settings.rlCPBOLocallyConverged
+                  ? 'Local optimum found'
+                  : paused
+                    ? 'Paused'
+                    : localOn
+                      ? 'Optimizing'
+                      : 'Observation only'}
             </StatusPill>
           </div>
         </div>
@@ -885,7 +920,7 @@ export function AutoTuning() {
             <FontAwesomeIcon icon={faGear} />
             Advanced
           </button>
-          {settings.rlCPBOLocallyConverged ? (
+          {settings.rlCPBOLocallyConverged || settings.rlCPBOStoppedByUser ? (
             <button
               type='button'
               className='btn btn-primary btn-sm'
@@ -929,6 +964,93 @@ export function AutoTuning() {
       </div>
 
       {error && <div className='alert alert-error text-sm'>{error}</div>}
+
+      <Panel title='Keep your best recipe'>
+        <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+          <p className='max-w-xl text-sm'>
+            Satisfied with your results? Stop exploring and restore the best recorded shot for this
+            session.
+          </p>
+          <button
+            type='button'
+            className='btn btn-outline h-auto min-h-12 w-full py-3 whitespace-normal sm:w-auto sm:shrink-0'
+            disabled={
+              busy ||
+              !isConnected ||
+              !settings.rlCPBOBestShotId ||
+              settings.rlRestoreBestStatus === 'pending'
+            }
+            onClick={() => setDialog('stop-best')}
+          >
+            {settings.rlRestoreBestStatus === 'failed'
+              ? 'Retry restoring best shot'
+              : 'Stop optimization and use best shot'}
+          </button>
+        </div>
+        {!settings.rlCPBOBestShotId && (
+          <p className='mt-2 text-sm opacity-70'>
+            Available once EspressoRL has a valid shot in this session.
+          </p>
+        )}
+        <div role='status' aria-live='polite' className='mt-3 text-sm'>
+          {settings.rlRestoreBestStatus === 'pending' &&
+            'Request queued. Waiting for EspressoRL to confirm and restore the recipe. Keep the machine idle.'}
+          {settings.rlRestoreBestStatus === 'restored' &&
+            'Optimization stopped. Best dose and yield restored. Move your grinder manually to the setting shown below.'}
+          {settings.rlRestoreBestStatus === 'failed' &&
+            'The best recipe could not be restored. Check your connection, selected profile and recipe limits, then retry. The recipe has not been confirmed restored.'}
+        </div>
+        {settings.rlRestoreBestStatus === 'restored' &&
+          recommendation &&
+          settings.rlRecommendationMode === 'restore_best' && (
+            <p className='bg-base-200 mt-3 rounded-md p-3 text-sm'>
+              <strong>Move grinder: {recommendationGrind(recommendation)}</strong>
+              <br />
+              Dose {formatNumber(recommendation.nextDoseG, 1, 'g')} ? Yield{' '}
+              {formatNumber(recommendation.targetYieldG, 1, 'g')}
+            </p>
+          )}
+      </Panel>
+      {dialog === 'stop-best' && (
+        <Modal title='Stop optimization and use best shot?' onClose={() => setDialog(null)}>
+          <div className='space-y-4'>
+            {error && (
+              <div role='alert' className='alert alert-error text-sm'>
+                {error}
+              </div>
+            )}
+            <p>
+              Restore the best recorded recipe for {activeBean?.name || 'this bean'}, using the
+              taste goal: {activeTasteGoalSummary}.
+            </p>
+            <p className='text-sm'>
+              Any unanswered comparison will be discarded without rating it. Your newest shot will
+              not automatically become the best. Dose and yield will be restored within your current
+              limits; you must move the grinder yourself.
+            </p>
+            <div className='flex flex-col-reverse gap-2 sm:flex-row sm:justify-end'>
+              <button
+                type='button'
+                className='btn min-h-12'
+                disabled={busy}
+                onClick={() => setDialog(null)}
+              >
+                Keep optimizing
+              </button>
+              <button
+                type='button'
+                className='btn btn-primary h-auto min-h-12 py-3 whitespace-normal'
+                disabled={busy || !isConnected}
+                onClick={async () => {
+                  if (await run('req:rl:optimization:stop-best')) setDialog(null);
+                }}
+              >
+                Stop and restore best
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
 
       <Panel title='Active Session'>
         <div className='grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4'>
@@ -1076,7 +1198,9 @@ export function AutoTuning() {
         <div className='mt-5'>
           <div className='mb-3 flex items-center justify-between gap-3'>
             <h3 className='text-sm font-semibold tracking-wide uppercase'>
-              Current Recommendation
+              {settings.rlRecommendationMode === 'restore_best'
+                ? 'Best recorded recipe'
+                : 'Current Recommendation'}
             </h3>
             <span className='text-base-content/60 text-sm'>
               {recommendationStatus(recommendation)}

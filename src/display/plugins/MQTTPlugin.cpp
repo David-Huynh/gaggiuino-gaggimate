@@ -744,6 +744,12 @@ bool MQTTPlugin::flushDurablePublishes() {
         }
     }
     const String digest = lifecycleDigest(topic, message);
+    String restoreId;
+    if (topic.endsWith("/rl/control")) {
+        JsonDocument control;
+        if (!deserializeJson(control, message) && control["action"] == "stop_and_restore_best")
+            restoreId = control["request_id"].as<String>();
+    }
     std::optional<bool> accepted;
     {
         std::lock_guard<std::mutex> guard(queueMutex);
@@ -770,6 +776,7 @@ bool MQTTPlugin::flushDurablePublishes() {
     {
         std::lock_guard<std::mutex> guard(queueMutex);
         awaitingLifecycleDigest = digest;
+        awaitingRestoreRequestId = restoreId;
     }
     if (!publishNow(topic, message, retained, qos)) {
         nextDurablePublishAttemptMs = millis() + 1000;
@@ -1075,21 +1082,25 @@ void MQTTPlugin::drainInbound() {
             handleShotDeliveryAck(message.payload);
         } else if (message.topic.endsWith("/rl/lifecycle/ack")) {
             JsonDocument receipt;
+            String rejectedRestore;
             if (!deserializeJson(receipt, message.payload)) {
                 std::lock_guard<std::mutex> guard(queueMutex);
                 auto accepted = AutoTuning::acceptedLifecycleReceipt(receipt.as<JsonObjectConst>(),
                     machineId().c_str(), awaitingLifecycleDigest.c_str());
                 if (accepted.has_value()) {
                     lifecycleReceipt = std::make_pair(awaitingLifecycleDigest, *accepted);
+                    if (!*accepted) rejectedRestore = awaitingRestoreRequestId;
                     if (connectionTaskHandle) xTaskNotifyGive(connectionTaskHandle);
                 }
             }
+            if (!rejectedRestore.isEmpty() && controller &&
+                rejectedRestore == controller->getSettings().getRLRestoreBestRequestId()) failRestoreBest();
         }
     }
 }
 
 void MQTTPlugin::handleRecommendation(const String &payload) {
-    if (!pluginManager || !isAutoTuningParticipating()) {
+    if (!pluginManager || !isAutoTuningEnabled()) {
         clearLatestRecommendation();
         return;
     }
@@ -1120,7 +1131,10 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
                                   recommendation.status == AutoTuning::RecommendationStatus::Shown;
     const bool attributionStatus = recommendation.status == AutoTuning::RecommendationStatus::Accepted ||
                                    recommendation.status == AutoTuning::RecommendationStatus::Edited;
-    const bool matchingMode = (recommendation.mode == AutoTuning::RecommendationMode::CpboGlobalPrevious &&
+    const bool restoreBest = restoreBestAuthorized(recommendation);
+    if ((!isAutoTuningParticipating() && !restoreBest) ||
+        (recommendation.mode == AutoTuning::RecommendationMode::RestoreBest && !restoreBest)) return;
+    const bool matchingMode = restoreBest || (recommendation.mode == AutoTuning::RecommendationMode::CpboGlobalPrevious &&
                                recommendation.comparisonMode == AutoTuning::ComparisonMode::GlobalPrevious) ||
                               (recommendation.mode == AutoTuning::RecommendationMode::CpboBestIncumbent &&
                                recommendation.comparisonMode == AutoTuning::ComparisonMode::BestIncumbent);
@@ -1132,6 +1146,7 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     if (recommendation.machineId != machineId().c_str() || (!actionableStatus && !attributionStatus) || !matchingMode ||
         !timestampsPlausible ||
         (recommendation.preferenceFeedbackRequired && recommendation.sourceShotId != recommendation.comparisonAnchorShotId)) {
+        if (restoreBest) failRestoreBest();
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1139,6 +1154,7 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     AutoTuning::TasteGoal activeTasteGoal;
     String tasteGoalError;
     if (!AutoTuning::activeTasteGoal(controller->getSettings(), activeTasteGoal, &tasteGoalError)) {
+        if (restoreBest) failRestoreBest();
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1147,6 +1163,7 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     if (!profiles || !AutoTuning::recommendationContextMatches(recommendation, machineId().c_str(),
             settings.getRLBeanContextId().c_str(), settings.getRLGrinderContextId().c_str(),
             profiles->getSelectedProfile().id.c_str(), activeTasteGoal)) {
+        if (restoreBest) failRestoreBest();
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1157,6 +1174,7 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
                          : validateAppliedRecommendationGrindProjection(recommendation, settings, grindProjectionReason);
     if (!grindProjectionValid) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid recommendation: %s", grindProjectionReason.c_str());
+        if (restoreBest) failRestoreBest();
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1165,6 +1183,7 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     std::string validationReason;
     if (!AutoTuning::validateRecommendationTargets(targets, settings.getRLRecipeDomain(), validationReason)) {
         ESP_LOGW(LOG_TAG.c_str(), "Rejected invalid recommendation: %s", validationReason.c_str());
+        if (restoreBest) failRestoreBest();
         clearLatestRecommendationAndNotify();
         return;
     }
@@ -1188,7 +1207,25 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
     if (store) {
         store->storeRecommendation(recommendation);
     }
-
+    if (restoreBest && actionableStatus && controller->getSettings().getRLRestoreBestStatus() == "pending") {
+        const bool restored = !controller->isActive() && applyLatestRecommendation();
+        auto &settings = controller->getSettings();
+        settings.setRLOptimizationPaused(true);
+        settings.setRLRestoreBestStatus(restored ? "restored" : "failed");
+        settings.save(true);
+        pluginManager->trigger("rl:restore:state");
+        // Drop unfinished prompts without asserting a taste comparison.
+        Event clear;
+        clear.id = "rl:prompts:invalidated";
+        pluginManager->trigger(clear);
+        publishOptimizerSettings();
+        publishMachineState("idle", true);
+    } else if (restoreBest && attributionStatus && controller->getSettings().getRLRestoreBestStatus() == "pending") {
+        // A reboot may occur between applying the recipe and persisting the
+        // completion marker. An accepted broker record alone cannot prove the
+        // local recipe is restored; allow an explicit retry instead of waiting.
+        failRestoreBest();
+    }
 }
 
 void MQTTPlugin::handleShotDeliveryAck(const String &payload) {
@@ -1255,6 +1292,8 @@ void MQTTPlugin::handleStatus(const String &payload) {
     latestStatusCPBOComparisonMode = mqttJsonString(doc["cpbo_comparison_mode"]);
     latestStatusCPBOOptimizationRunId = mqttJsonString(doc["cpbo_optimization_run_id"]);
     latestStatusCPBOLocallyConverged = doc["cpbo_locally_converged"] | false;
+    latestStatusCPBOStoppedByUser = doc["cpbo_stopped_by_user"] | false;
+    latestStatusCPBOBestShotId = mqttJsonString(doc["cpbo_best_shot_id"]);
     latestStatusCPBOTrustRegionLength = doc["cpbo_trust_region_length"] | 0.0f;
     latestStatusCPBOTrustRegionSuccessCount = doc["cpbo_trust_region_success_count"] | 0;
     latestStatusCPBOTrustRegionFailureCount = doc["cpbo_trust_region_failure_count"] | 0;
@@ -1347,6 +1386,8 @@ void MQTTPlugin::handleStatus(const String &payload) {
     event.setString("cpbo_comparison_mode", latestStatusCPBOComparisonMode);
     event.setString("cpbo_optimization_run_id", latestStatusCPBOOptimizationRunId);
     event.setInt("cpbo_locally_converged", latestStatusCPBOLocallyConverged ? 1 : 0);
+    event.setInt("cpbo_stopped_by_user", latestStatusCPBOStoppedByUser ? 1 : 0);
+    event.setString("cpbo_best_shot_id", latestStatusCPBOBestShotId);
     event.setString("cpbo_trust_region_length", String(latestStatusCPBOTrustRegionLength, 8));
     event.setInt("cpbo_trust_region_success_count", latestStatusCPBOTrustRegionSuccessCount);
     event.setInt("cpbo_trust_region_failure_count", latestStatusCPBOTrustRegionFailureCount);
@@ -1425,7 +1466,7 @@ bool MQTTPlugin::showIntendedGrinderPosition() {
 }
 
 bool MQTTPlugin::applyLatestRecommendation() {
-    if (!hasRecommendation || !controller || !isAutoTuningParticipating())
+    if (!hasRecommendation || !controller || (!isAutoTuningParticipating() && !restoreBestAuthorized(latestRecommendation)))
         return false;
 
     String reason;
@@ -1479,7 +1520,7 @@ bool MQTTPlugin::applyLatestRecommendation() {
     accepted.setPayload(latestRecommendation);
     pluginManager->trigger(accepted);
     publishMachineState("idle");
-    return true;
+    return !yieldFailed;
 }
 
 bool MQTTPlugin::ignoreLatestRecommendation() {
@@ -1500,6 +1541,11 @@ bool MQTTPlugin::validateLatestRecommendation(String &reason) {
         return false;
     }
     Settings const &settings = controller->getSettings();
+    if (latestRecommendation.mode == AutoTuning::RecommendationMode::RestoreBest &&
+        (!restoreBestAuthorized(latestRecommendation) || controller->isActive())) {
+        reason = "best-shot restore is no longer authorized or machine is busy";
+        return false;
+    }
     AutoTuning::TasteGoal goal;
     auto *profiles = controller->getProfileManager();
     if (!profiles || !AutoTuning::activeTasteGoal(settings, goal) ||
@@ -1547,7 +1593,7 @@ void MQTTPlugin::clearLatestRecommendation() {
 }
 
 bool MQTTPlugin::publishRecommendationDecision(const char *decision, bool includeEditedFields) {
-    if (!isAutoTuningParticipating() || latestRecommendation.recommendationId.empty())
+    if ((!isAutoTuningParticipating() && !restoreBestAuthorized(latestRecommendation)) || latestRecommendation.recommendationId.empty())
         return false;
 
     JsonDocument doc;
@@ -1570,7 +1616,7 @@ bool MQTTPlugin::publishRecommendationDecision(const char *decision, bool includ
 }
 
 void MQTTPlugin::publishRecommendationApply(bool doseApplied, bool yieldApplied, bool yieldFailed) {
-    if (!isAutoTuningParticipating() || latestRecommendation.recommendationId.empty())
+    if ((!isAutoTuningParticipating() && !restoreBestAuthorized(latestRecommendation)) || latestRecommendation.recommendationId.empty())
         return;
 
     const bool grindManual = fabsf(latestRecommendation.grindDeltaStepsFromCurrent) >= 0.001f;
@@ -1737,6 +1783,82 @@ bool MQTTPlugin::isAutoTuningEnabled() const {
         return false;
     Settings const &settings = controller->getSettings();
     return AutoTuning::Router(settings.getRLOptimizerConfiguration(), this).routeOffBoardTransport();
+}
+
+bool MQTTPlugin::restoreBestAuthorized(const AutoTuning::Recommendation &recommendation) const {
+    return controller && isAutoTuningEnabled() && AutoTuning::restoreBestRequestMatches(
+        recommendation, controller->getSettings().getRLRestoreBestRequestId().c_str()) &&
+        recommendation.optimizationRunId == controller->getSettings().getRLRestoreBestRunId().c_str();
+}
+
+void MQTTPlugin::failRestoreBest() {
+    auto &settings = controller->getSettings();
+    if (settings.getRLRestoreBestStatus() != "pending") return;
+    settings.setRLRestoreBestStatus("failed");
+    settings.save(true);
+    pluginManager->trigger("rl:restore:state");
+}
+
+void MQTTPlugin::resumeOptimization(Event &event) {
+    event.setInt("control_persisted", 0);
+    if (latestStatusCPBOOptimizationRunId.isEmpty() || !isAutoTuningEnabled() || controller->isActive()) {
+        event.setString("error", "No optimization run is available, or the machine is busy");
+        return;
+    }
+    event.setString("action", "resume_local_exploration");
+    event.setString("optimization_run_id", latestStatusCPBOOptimizationRunId);
+    event.setString("request_id", String("resume_") + String(esp_random(), HEX) + "_" + String(esp_random(), HEX));
+    if (!publishOptimizerControl(event)) {
+        event.setString("error", "Unable to queue the resume command");
+        return;
+    }
+    auto &settings = controller->getSettings();
+    settings.setRLRestoreBestRequestId("");
+    settings.setRLRestoreBestRunId("");
+    settings.setRLRestoreBestStatus("");
+    settings.setRLOptimizationPaused(false);
+    settings.setRLLocalOptimizationEnabled(true);
+    settings.save(true);
+    event.setInt("control_persisted", 1);
+    pluginManager->trigger("rl:settings:changed");
+    pluginManager->trigger("rl:restore:state");
+}
+
+void MQTTPlugin::requestRestoreBest(Event &event) {
+    event.setInt("control_persisted", 0);
+    if (!controller || !isAutoTuningEnabled() || controller->isActive() ||
+        latestStatusCPBOOptimizationRunId.isEmpty() || latestStatusCPBOBestShotId.isEmpty()) {
+        event.setString("error", "No best shot is available, or the machine is busy");
+        return;
+    }
+    auto &settings = controller->getSettings();
+    const String previousId = settings.getRLRestoreBestRequestId();
+    const String previousStatus = settings.getRLRestoreBestStatus();
+    const String previousRun = settings.getRLRestoreBestRunId();
+    String requestId = previousId;
+    if (requestId.isEmpty() || previousRun != latestStatusCPBOOptimizationRunId) {
+        requestId = String("restore_") + String(esp_random(), HEX) + "_" + String(esp_random(), HEX);
+    }
+    // Persist explicit authorization before queueing the durable command. A
+    // retained restore can never change values without this matching intent.
+    settings.setRLRestoreBestRequestId(requestId);
+    settings.setRLRestoreBestRunId(latestStatusCPBOOptimizationRunId);
+    settings.setRLRestoreBestStatus("pending");
+    settings.save(true);
+    event.setString("action", "stop_and_restore_best");
+    event.setString("optimization_run_id", latestStatusCPBOOptimizationRunId);
+    event.setString("request_id", requestId);
+    if (!publishOptimizerControl(event)) {
+        settings.setRLRestoreBestRequestId(previousId);
+        settings.setRLRestoreBestRunId(previousRun);
+        settings.setRLRestoreBestStatus(previousStatus);
+        settings.save(true);
+        event.setString("error", "Unable to save the stop request; please retry");
+        return;
+    }
+    event.setInt("control_persisted", 1);
+    clearLatestRecommendationAndNotify();
+    pluginManager->trigger("rl:restore:state");
 }
 
 bool MQTTPlugin::isAutoTuningParticipating() const {
@@ -1983,6 +2105,10 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
         publishOptimizerSettings();
         publishMachineState("idle", true);
     });
+
+    pm->on("rl:optimization:resume-exploration", [this](Event &event) { resumeOptimization(event); });
+
+    pm->on("rl:optimization:stop-best", [this](Event &event) { requestRestoreBest(event); });
 
     pm->on("rl:optimization:control", [this](Event &event) {
         event.setInt("control_persisted", publishOptimizerControl(event) ? 1 : 0);

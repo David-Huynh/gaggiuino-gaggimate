@@ -326,7 +326,7 @@ void AutoTuningPreferencePlugin::showNextPendingOverlay() {
 
 void AutoTuningPreferencePlugin::storeRecommendation(Event const &event) {
     AutoTuning::Recommendation const *recommendation = event.getPayload<AutoTuning::Recommendation>();
-    if (!recommendation) {
+    if (!recommendation || recommendation->mode == AutoTuning::RecommendationMode::RestoreBest) {
         return;
     }
     pendingRecommendationId = recommendation->recommendationId.c_str();

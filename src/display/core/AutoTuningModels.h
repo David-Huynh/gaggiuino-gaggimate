@@ -176,7 +176,7 @@ struct ProfileSnapshot {
 };
 
 enum class ComparisonMode : std::uint8_t { None, GlobalPrevious, BestIncumbent };
-enum class RecommendationMode : std::uint8_t { Unknown, CpboGlobalPrevious, CpboBestIncumbent };
+enum class RecommendationMode : std::uint8_t { Unknown, CpboGlobalPrevious, CpboBestIncumbent, RestoreBest };
 enum class RecommendationStatus : std::uint8_t {
     Unknown,
     Pending,

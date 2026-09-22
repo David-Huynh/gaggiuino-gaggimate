@@ -1,5 +1,12 @@
 import { createPortal } from 'preact/compat';
-import { useCallback, useContext, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'preact/hooks';
 import { ApiServiceContext } from '../services/ApiService.js';
 import { formatGrinderSettingTransition } from '../utils/grinderRecommendation.js';
 import {
@@ -85,6 +92,7 @@ export function AutoTuningPromptOverlay() {
     }
 
     const recommendationListener = apiService.on('evt:rl:recommendation', message => {
+      if (message.mode === 'restore_best') return;
       const status = message.status || '';
       if (!message.recommendation_id || !RECOMMENDATION_STATUSES.has(status)) {
         setPendingRecommendation(current =>
