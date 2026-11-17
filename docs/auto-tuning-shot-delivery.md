@@ -345,3 +345,14 @@ snapshot. After a restart, its target grind, dose, yield and date remain visible
 for the same context. Applying requires a live validated recommendation;
 restoring this view cannot apply a recipe or treat an old retained command as
 new authorization. Repeated delivery bookkeeping does not cause snapshot writes.
+
+## Wired scale recovery
+
+On the STM32, a detected HX711 pair with no successful reads for one second is
+reset through the shared clock/power-down line. Calibration and zero offsets
+remain intact. In-flight tare collection restarts with fresh readings and keeps
+its original six-second deadline; only the correlated successful tare result
+can authorize a brew. An unplugged or persistently faulty scale still fails
+safely. Use matching ESP32/STM32 firmware when updating. Host tests in
+`scripts/test_brew_start.py` cover stalled-ADC recovery and correlated tare, but
+electrical/power-up behavior still needs a physical machine test.

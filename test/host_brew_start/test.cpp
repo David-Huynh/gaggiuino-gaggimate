@@ -16,8 +16,10 @@ bool driverReady = true, driverSaturated = false;
 bool driverReadValid = true;
 long driverRaw1 = 1000, driverRaw2 = 2000;
 void HX711Dual::begin(uint8_t, uint8_t, uint8_t, uint8_t, uint32_t) {}
-void HX711Dual::power_up() {}
-void HX711Dual::power_down() {}
+unsigned driverResetCount = 0;
+bool driverRecoversOnReset = false;
+void HX711Dual::power_up() { if (driverRecoversOnReset) driverReady = true; }
+void HX711Dual::power_down() { ++driverResetCount; }
 void HX711Dual::set_gain(uint8_t) {}
 bool HX711Dual::is_ready() const { return driverReady; }
 bool HX711Dual::wait_ready_timeout(unsigned long timeout, unsigned long) {
@@ -260,6 +262,15 @@ static void testDriver() {
     assert(results.size() == beforeSettling); // Invalid conversions were not counted.
     clockMs += 100; scale.loop();
     assert(results.back().requestId == 16 && results.back().validSuccess());
+    const auto resets = driverResetCount;
+    driverReady = false;
+    driverRecoversOnReset = true;
+    scale.requestTare(17);
+    for (int i = 0; i < 7; ++i) scale.loop(); // one second without a conversion
+    assert(driverResetCount > resets && driverReady);
+    for (int i = 0; i < 10; ++i) { clockMs += 100; scale.loop(); }
+    assert(results.back().requestId == 17 && results.back().validSuccess());
+    driverRecoversOnReset = false;
     puts("PASS actual HX711 driver: ten-pair mean, one-second tare, six-second timeout, delayed reads and recovery");
 }
 

@@ -107,6 +107,8 @@ bool HX711Scale::initializeDriver() {
     }
 
     _present = true;
+    _lastOkRead = millis();
+    _lastReadRecoveryMs = _lastOkRead;
     ESP_LOGI(LOG_TAG, "HX711 detected: both channels ready (DOUT1=%d, DOUT2=%d, SCK=%d)", _dout1_pin, _dout2_pin, _sck_pin);
 
     _nativeHz = _drv->detect_rate();
@@ -230,6 +232,7 @@ void HX711Scale::loop() {
             _healthBits |= SCALE_HEALTH_STALE;
         }
         advanceTareSm(raw, valid, sat);
+        recoverStalledRead(now);
         publishSnapshot();
         return;
     }
@@ -241,6 +244,7 @@ void HX711Scale::loop() {
             _healthBits |= SCALE_HEALTH_STALE;
         }
         advanceTareSm(raw, valid, sat);
+        recoverStalledRead(now);
         publishSnapshot();
         return;
     }
@@ -276,6 +280,22 @@ void HX711Scale::loop() {
     advanceCalSm(raw, valid, sat);
 
     processOneRawSample(raw, valid, sat);
+}
+
+// A missed clock/power-up can leave the shared ADC pair out of sync forever.
+// Reset both converters after a second without a read, rather than requiring
+// mains power cycling. Calibration/offsets survive; a tare still needs ten new
+// pairs and keeps its original deadline, so recovery cannot authorize a shot.
+void HX711Scale::recoverStalledRead(uint32_t now) {
+    constexpr uint32_t RECOVERY_INTERVAL_MS = 1000;
+    if (now - _lastOkRead < RECOVERY_INTERVAL_MS || now - _lastReadRecoveryMs < RECOVERY_INTERVAL_MS) return;
+    _lastReadRecoveryMs = now;
+    _healthBits |= SCALE_HEALTH_STALE;
+    _drv->power_down();
+    _drv->power_up();
+    _filter.reset();
+    _tareCollected = 0;
+    ESP_LOGW(LOG_TAG, "No HX711 readings; resetting both converters");
 }
 
 void HX711Scale::processOneRawSample(long raw[2], bool valid[2], bool sat[2]) {

@@ -107,6 +107,8 @@ class HX711Scale {
     uint16_t _nativeHz = 10; // detected at setup; 10 or 80
     uint16_t _samplePeriodMs = SCALE_READ_INTERVAL_MS;
     uint32_t _lastInitAttemptMs = 0;
+    uint32_t _lastReadRecoveryMs = 0;
+    void recoverStalledRead(uint32_t now);
 
     // ----- calibration / offsets (set externally, read in scale loop) -----
     float _scale1 = 0.0f;
