@@ -112,6 +112,8 @@ class MQTTPlugin : public Plugin, public AutoTuning::OptimizerTransportPort {
     bool isAutoTuningParticipating() const;
     bool restoreBestAuthorized(const AutoTuning::Recommendation &recommendation) const;
     void requestRestoreBest(Event &event);
+    void rememberConfirmedRecipe(Event &event);
+    void persistRecommendationView();
     void resumeOptimization(Event &event);
     void failRestoreBest();
     bool canApplyGrindByWeightTarget() const;

@@ -1,3 +1,4 @@
+#include <display/core/RecipeConfirmation.h>
 #include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <display/core/RecommendationContext.h>
 #include "MQTTPlugin.h"
@@ -1197,6 +1198,7 @@ void MQTTPlugin::handleRecommendation(const String &payload) {
 
     hasRecommendation = true;
     latestRecommendation = recommendation;
+    persistRecommendationView();
 
     Event event;
     event.id = "rl:recommendation:received";
@@ -1465,6 +1467,70 @@ bool MQTTPlugin::showIntendedGrinderPosition() {
     return true;
 }
 
+void MQTTPlugin::persistRecommendationView() {
+    if (!controller || !hasRecommendation) return;
+    JsonDocument view(&psramAllocator);
+    if (!AutoTuningJsonCodec::writeRecommendation(latestRecommendation, view)) return;
+    // Delivery bookkeeping changes on every replay. Persist recipe/status
+    // changes only, not a fresh flash write for each shown-count or receipt.
+    view["updated_at"] = latestRecommendation.createdAt;
+    view["shown_count"] = 0;
+    for (const char *key : {"accepted_at", "ignored_at", "edited_at", "used_at", "superseded_at",
+                            "apply_acknowledged_at", "apply_status", "apply_error", "reason"}) view.remove(key);
+    String json;
+    serializeJson(view, json);
+    if (json.length() > 4096) return;
+    auto &settings = controller->getSettings();
+    if (json != settings.getRLSavedRecommendationJson()) {
+        settings.setRLSavedRecommendationJson(json);
+        settings.save(true);
+    }
+}
+
+void MQTTPlugin::rememberConfirmedRecipe(Event &event) {
+    auto const *confirmed = event.getPayload<AutoTuning::ConfirmedRecipe>();
+    if (!confirmed || !controller || controller->isActive()) return;
+    auto &settings = controller->getSettings();
+    auto *profiles = controller->getProfileManager();
+    AutoTuning::TasteGoal goal;
+    if (!profiles || !AutoTuning::activeTasteGoal(settings, goal) ||
+        !AutoTuning::canRememberRecipe(*confirmed, machineId().c_str(), settings.getRLBeanContextId().c_str(),
+            settings.getRLGrinderContextId().c_str(), profiles->getSelectedProfile().id.c_str(), goal,
+            settings.getRLRecipeChangedAt())) return;
+    JsonDocument contexts(&psramAllocator);
+    if (deserializeJson(contexts, settings.getRLGrinderContextsJson()) || !contexts.is<JsonArray>()) return;
+    for (JsonObject context : contexts.as<JsonArray>()) {
+        if (context["id"].as<String>() != settings.getRLGrinderContextId()) continue;
+        auto const &position = confirmed->recipe.grinder;
+        const std::optional<float> reference = mqttJsonNumber(context["absolute_reference_step"])
+            ? std::optional<float>(context["absolute_reference_step"].as<float>()) : std::nullopt;
+        const std::optional<float> calibration = mqttJsonNumber(context["microns_per_step"])
+            ? std::optional<float>(context["microns_per_step"].as<float>()) : std::nullopt;
+        const bool sameCalibration = calibration.has_value() == position.micronsPerStep.has_value() &&
+            (!calibration || std::fabs(*calibration - *position.micronsPerStep) < 0.0001f);
+        if (reference != position.absoluteReferenceStep || !sameCalibration ||
+            (context["step_direction"] | "higher_is_finer") != position.stepDirection) return;
+        context["current_relative_step"] = *position.relativeStepsFromReference;
+        if (position.currentAbsoluteStep) context["current_absolute_step"] = *position.currentAbsoluteStep;
+        else context.remove("current_absolute_step");
+        String json;
+        serializeJson(contexts, json);
+        settings.setRLGrinderContextsJson(json);
+        // This is the reported last recipe, even when it is outside the search
+        // range. It does not widen that range or mark a proposal as followed.
+        controller->setTargetGrindVolume(*confirmed->recipe.doseTargetG);
+        settings.setRLRecipeChangedAt(confirmed->timestamp);
+        settings.save(true);
+        pluginManager->trigger("rl:recipe:changed");
+        if (!settings.isRLRecipeStatePersisted()) {
+            event.setInt("recipe_state_retry", 1);
+            return;
+        }
+        publishMachineState("idle", true);
+        return;
+    }
+}
+
 bool MQTTPlugin::applyLatestRecommendation() {
     if (!hasRecommendation || !controller || (!isAutoTuningParticipating() && !restoreBestAuthorized(latestRecommendation)))
         return false;
@@ -1513,8 +1579,13 @@ bool MQTTPlugin::applyLatestRecommendation() {
         yieldFailed = true;
     }
 
+    auto &settings = controller->getSettings();
+    settings.setRLRecipeChangedAt(EpochTime::now());
+    settings.save(true);
+    pluginManager->trigger("rl:recipe:changed");
     publishRecommendationApply(doseApplied, yieldApplied, yieldFailed);
     latestRecommendation.status = AutoTuning::RecommendationStatus::Accepted;
+    persistRecommendationView();
     Event accepted;
     accepted.id = "rl:recommendation:received";
     accepted.setPayload(latestRecommendation);
@@ -2107,6 +2178,8 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     });
 
     pm->on("rl:optimization:resume-exploration", [this](Event &event) { resumeOptimization(event); });
+
+    pm->on("rl:recipe:confirmed", [this](Event &event) { rememberConfirmedRecipe(event); });
 
     pm->on("rl:optimization:stop-best", [this](Event &event) { requestRestoreBest(event); });
 

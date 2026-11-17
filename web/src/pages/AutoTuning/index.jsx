@@ -419,7 +419,21 @@ function applyGrinderSuggestion(form, suggestion) {
 function currentRecommendation(settings, activeGrinder) {
   const recommendationId = optionalText(settings?.rlLastRecommendationId);
   if (!recommendationId) {
-    return null;
+    const saved = settings?.rlSavedRecommendation;
+    if (!saved?.recommendation_id) return null;
+    return {
+      id: saved.recommendation_id,
+      status: saved.status,
+      saved: true,
+      createdAt: saved.created_at,
+      projectedRelativeStepFromReference: optionalNumber(
+        saved.projected_relative_step_from_reference,
+      ),
+      projectedAbsoluteStep: optionalNumber(saved.projected_absolute_step),
+      nextDoseG: optionalNumber(saved.next_dose_g),
+      targetYieldG: optionalNumber(saved.target_yield_g),
+      targetRatio: optionalNumber(saved.target_ratio),
+    };
   }
   const grindDeltaStepsFromCurrent = optionalNumber(
     settings.rlRecommendationGrindDeltaStepsFromCurrent,
@@ -464,6 +478,10 @@ function recommendationStatus(recommendation) {
   if (!recommendation) {
     return 'Waiting for a valid shot';
   }
+  if (recommendation.saved) {
+    const date = optionalNumber(recommendation.createdAt);
+    return date > 0 ? `Saved ? ${new Date(date * 1000).toLocaleString()}` : 'Saved on device';
+  }
   const labels = {
     restored: 'Restored',
     accepted: 'Accepted',
@@ -479,6 +497,13 @@ function recommendationStatus(recommendation) {
 function recommendationGrind(recommendation) {
   if (!recommendation) {
     return '-';
+  }
+  if (recommendation.saved) {
+    return recommendation.projectedAbsoluteStep !== undefined
+      ? formatNumber(recommendation.projectedAbsoluteStep, 1)
+      : recommendation.projectedRelativeStepFromReference !== undefined
+        ? `${signedNumber(recommendation.projectedRelativeStepFromReference)} from reference`
+        : '-';
   }
   return formatGrinderSettingTransition({
     currentAbsoluteStep: recommendation.currentAbsoluteStep,
@@ -708,7 +733,7 @@ export function AutoTuning() {
     }
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     loadSettings().catch(caught => {
       setError(caught.message);
       setLoading(false);
@@ -728,9 +753,15 @@ export function AutoTuning() {
         setDoseTargetDraft(String(message.rlDoseTargetG));
       }
     });
+    const recipeListener = apiService.on('evt:rl:recipe', message => {
+      mergeLiveSettings(message);
+      if (optionalNumber(message.rlDoseTargetG) !== undefined)
+        setDoseTargetDraft(String(message.rlDoseTargetG));
+    });
     const recommendationListener = apiService.on('evt:rl:recommendation', message => {
       mergeLiveSettings({
         rlLastRecommendationId: message.recommendation_id,
+        rlSavedRecommendation: message,
         rlRecommendationStatus: message.status,
         rlRecommendationMode: message.mode,
         rlRecommendationGrindDeltaStepsFromCurrent: message.grind_delta_steps_from_current,
@@ -754,6 +785,7 @@ export function AutoTuning() {
     });
     return () => {
       apiService.off('evt:rl:status', statusListener);
+      apiService.off('evt:rl:recipe', recipeListener);
       apiService.off('evt:rl:recommendation', recommendationListener);
       apiService.off('evt:rl:recommendation-clear', recommendationClearListener);
     };
@@ -843,13 +875,16 @@ export function AutoTuning() {
     ? settings.rlGrinderContexts
     : [];
   const activeBean = beanContexts.find(context => context.id === settings.rlBeanContextId) || null;
-  const activeGrinder =
-    grinderContexts.find(context => context.id === settings.rlGrinderContextId) || null;
+  const selectedGrinder = grinderContexts.find(
+    context => context.id === settings.rlGrinderContextId,
+  );
+  const activeGrinder = selectedGrinder ? { ...selectedGrinder, ...settings.rlCurrentGrind } : null;
   const activeTasteGoal = normalizeTasteGoal(settings.rlTasteGoal);
   const activeTasteGoalSummary = tasteGoalSummary(activeTasteGoal);
   const recommendation = currentRecommendation(settings, activeGrinder);
   const recommendationPromptable =
     !!recommendation &&
+    !recommendation.saved &&
     settings.rlRecommendationMode !== 'restore_best' &&
     PROMPTABLE_RECOMMENDATION_STATUSES.has(recommendation.status || '');
   const paused = !!settings.rlOptimizationPaused;
@@ -1193,14 +1228,41 @@ export function AutoTuning() {
           </div>
         </div>
 
+        <div className='my-5 space-y-3' aria-label='Current recipe'>
+          <h3 className='text-sm font-semibold tracking-wide uppercase'>Current recipe</h3>
+          <div className='grid grid-cols-1 gap-3 sm:grid-cols-3'>
+            <StatCard
+              label='Grinder setting'
+              value={
+                optionalNumber(activeGrinder?.current_absolute_step) !== undefined
+                  ? formatNumber(activeGrinder.current_absolute_step, 1)
+                  : optionalNumber(activeGrinder?.current_relative_step) !== undefined
+                    ? `${signedNumber(activeGrinder.current_relative_step)} from reference`
+                    : '-'
+              }
+            />
+            <StatCard label='Current dose' value={formatNumber(settings.rlDoseTargetG, 1, 'g')} />
+            <StatCard
+              label='Current yield'
+              value={formatNumber(settings.rlCurrentYieldG, 1, 'g')}
+            />
+          </div>
+          <p className='text-sm opacity-70'>
+            Saved on the device after applying a recipe or confirming shot values. Move your grinder
+            manually to the displayed setting.
+          </p>
+        </div>
+
         <RuntimeDetails settings={settings} />
 
-        <div className='mt-5'>
+        <div className='mt-5' aria-label='Recommendation recipe'>
           <div className='mb-3 flex items-center justify-between gap-3'>
             <h3 className='text-sm font-semibold tracking-wide uppercase'>
-              {settings.rlRecommendationMode === 'restore_best'
-                ? 'Best recorded recipe'
-                : 'Current Recommendation'}
+              {recommendation?.saved
+                ? 'Last recommendation'
+                : settings.rlRecommendationMode === 'restore_best'
+                  ? 'Best recorded recipe'
+                  : 'Current Recommendation'}
             </h3>
             <span className='text-base-content/60 text-sm'>
               {recommendationStatus(recommendation)}
@@ -1228,7 +1290,7 @@ export function AutoTuning() {
                   }
                 >
                   <FontAwesomeIcon icon={faPlay} />
-                  Apply
+                  {recommendation.saved ? 'Waiting for EspressoRL' : 'Apply'}
                 </button>
               </div>
             </div>

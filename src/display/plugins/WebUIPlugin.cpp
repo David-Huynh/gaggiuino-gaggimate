@@ -1,3 +1,4 @@
+#include <display/core/RecommendationContext.h>
 #include <display/core/RecipeConfirmation.h>
 #include "WebUIPlugin.h"
 #include "autotuning/AutoTuningJsonCodec.h"
@@ -584,6 +585,54 @@ static bool rlParticipationEnabled(Controller *controller) {
                .acceptActionableRecommendations();
 }
 
+// Read-only view of persisted state. It never authorizes applying a cached
+// recommendation; actionable recommendations still come through the transport.
+static void addRLRecipeState(JsonDocument &doc, Controller *controller) {
+    auto const &settings = controller->getSettings();
+    doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
+    auto *profiles = controller->getProfileManager();
+    doc["rlCurrentGrind"] = nullptr;
+    doc["rlCurrentYieldG"] = nullptr;
+    doc["rlSavedRecommendation"] = nullptr;
+    if (!profiles) return;
+    auto const &profile = profiles->getSelectedProfile();
+    const float yieldG = profile.getTotalVolume();
+    if (yieldG > 0) doc["rlCurrentYieldG"] = yieldG;
+    else doc["rlCurrentYieldG"] = nullptr;
+    doc["rlCurrentProfileId"] = profile.id;
+    JsonDocument contexts(&psramAllocator);
+    if (!deserializeJson(contexts, settings.getRLGrinderContextsJson())) {
+        for (JsonObject context : contexts.as<JsonArray>()) {
+            if (context["id"].as<String>() == settings.getRLGrinderContextId()) {
+                copyRLGrinderCalibration(doc["rlCurrentGrind"].to<JsonObject>(), context);
+                break;
+            }
+        }
+    }
+    auto recommendation = std::make_unique<AutoTuning::Recommendation>();
+    String error;
+    AutoTuning::TasteGoal goal;
+    const String saved = settings.getRLSavedRecommendationJson();
+    String topicId = WiFi.macAddress();
+    topicId.replace(":", "_");
+    const String machine = "gaggimate:" + topicId;
+    if (!saved.isEmpty() && saved.length() <= 4096 &&
+        AutoTuningJsonCodec::deserializeRecommendation(saved, *recommendation, error) &&
+        AutoTuning::activeTasteGoal(settings, goal) &&
+        AutoTuning::recommendationContextMatches(*recommendation, machine.c_str(), settings.getRLBeanContextId().c_str(),
+            settings.getRLGrinderContextId().c_str(), profile.id.c_str(), goal)) {
+        JsonObject view = doc["rlSavedRecommendation"].to<JsonObject>();
+        view["recommendation_id"] = recommendation->recommendationId.c_str();
+        view["status"] = AutoTuning::recommendationStatusKey(recommendation->status);
+        view["created_at"] = recommendation->createdAt;
+        view["next_dose_g"] = recommendation->nextDoseG;
+        view["target_yield_g"] = recommendation->targetYieldG;
+        view["target_ratio"] = recommendation->targetRatio;
+        view["projected_relative_step_from_reference"] = recommendation->projectedRelativeStepFromReference;
+        if (recommendation->projectedAbsoluteStep) view["projected_absolute_step"] = *recommendation->projectedAbsoluteStep;
+    }
+}
+
 WebUIPlugin::WebUIPlugin() : server(80), ws("/ws") { g_webUIPlugin = this; }
 
 static void addWarnings(JsonArray warn, const WarningManager &wm, bool onlyShown) {
@@ -693,6 +742,13 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             (status.isEmpty() || status == "pending" || status == "shown");
         _pendRecJson = promptable ? payload : String("");
         ws.textAll(payload);
+    });
+
+    pluginManager->on("rl:recipe:changed", [this](Event const &) {
+        JsonDocument doc(&psramAllocator);
+        doc["tp"] = "evt:rl:recipe";
+        addRLRecipeState(doc, controller);
+        broadcastJson(doc);
     });
 
     pluginManager->on("rl:restore:state", [this](Event const &) {
@@ -1008,7 +1064,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlCPBOTrustRegionSuccessCount"] = rlCPBOTrustRegionSuccessCount;
         doc["rlCPBOTrustRegionFailureCount"] = rlCPBOTrustRegionFailureCount;
         doc["rlCPBOLastTransitionAction"] = rlCPBOLastTransitionAction;
-        doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
+        addRLRecipeState(doc, controller);
         addRLRecipeDomain(doc.as<JsonObject>(), settings);
         doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
         doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
@@ -2525,6 +2581,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             } else {
                 applyRLGrinderCalibration(context, request);
                 persistRLGrinderContexts(settings, grinderContextsDoc);
+                if (id == settings.getRLGrinderContextId()) settings.setRLRecipeChangedAt(EpochTime::now());
                 settings.save(true);
                 changed = true;
             }
@@ -2675,6 +2732,7 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
                 response["error"] = F("Dose target is outside the configured recipe domain");
             } else {
                 controller->setTargetGrindVolume(value.as<float>());
+                settings.setRLRecipeChangedAt(EpochTime::now());
                 settings.save(true);
                 changed = true;
             }
@@ -2703,6 +2761,8 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             if (event.getInt("control_persisted") <= 0) response["error"] = event.getString("error");
             else changed = true;
         } else if (type == "req:rl:local-reset") {
+            settings.setRLSavedRecommendationJson("");
+            settings.setRLRecipeChangedAt(0);
             settings.setRLRestoreBestRequestId("");
             settings.setRLRestoreBestRunId("");
             settings.setRLRestoreBestStatus("");
@@ -3089,7 +3149,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlCPBOTrustRegionSuccessCount"] = rlCPBOTrustRegionSuccessCount;
     doc["rlCPBOTrustRegionFailureCount"] = rlCPBOTrustRegionFailureCount;
     doc["rlCPBOLastTransitionAction"] = rlCPBOLastTransitionAction;
-    doc["rlDoseTargetG"] = settings.getTargetGrindVolume();
+    addRLRecipeState(doc, controller);
     addRLRecipeDomain(doc.as<JsonObject>(), settings);
     doc["rlOptimizerConfiguredMode"] = rlOptimizerConfiguredMode;
     doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;

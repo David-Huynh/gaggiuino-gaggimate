@@ -895,6 +895,7 @@ void DefaultUI::setAutoTuningDoseTarget(const float doseG) {
         return;
     }
     controller->setTargetGrindVolume(doseG);
+    settings.setRLRecipeChangedAt(static_cast<long>(time(nullptr)));
     settings.save(true);
     if (pluginManager) {
         pluginManager->trigger("settings:changed");
@@ -1260,6 +1261,17 @@ void DefaultUI::updateAutoTuningSettingsModal() {
         } else {
             lv_obj_add_state(autoTuningProviderDropdown, LV_STATE_DISABLED);
         }
+    }
+
+    if (autoTuningDoseTarget && !lv_obj_has_state(autoTuningDoseTarget, LV_STATE_FOCUSED)) {
+        const auto domain = settings.getRLRecipeDomain();
+        const float dose = settings.getTargetGrindVolume();
+        // A reported actual dose may exceed the search range. Keep it visible
+        // without clamping the remembered recipe or widening optimizer limits.
+        lv_spinbox_set_range(autoTuningDoseTarget, std::lround(std::min(domain.doseMinG, dose) * 10),
+                             std::lround(std::max(domain.doseMaxG, dose) * 10));
+        const int32_t value = std::lround(dose * 10);
+        if (lv_spinbox_get_value(autoTuningDoseTarget) != value) lv_spinbox_set_value(autoTuningDoseTarget, value);
     }
 
     setAutoTuningSwitchState(autoTuningLocalSwitch, settings.isRLLocalOptimizationEnabled(), providerEnabled);

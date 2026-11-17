@@ -36,6 +36,15 @@ def main():
     projection = build / "projection.cpp"
     projection.write_text('#include "ProjectionHarness.h"\n#include <cmath>\n' + helpers + "\n}\n" +
                           history[start:history.index("\n}\n", start) + 3], encoding="utf-8")
+    mqtt = (ROOT / "src/display/plugins/MQTTPlugin.cpp").read_text(encoding="utf-8")
+    recipe_methods = []
+    for signature in ("void MQTTPlugin::rememberConfirmedRecipe(", "void MQTTPlugin::persistRecommendationView("):
+        start = mqtt.index(signature)
+        recipe_methods.append(mqtt[start:mqtt.index("\n}", start) + 2])
+    recipe_source = build / "recipe_state.cpp"
+    recipe_source.write_text('#include "RecipeStateHarness.h"\n'
+        'static bool mqttJsonNumber(JsonVariantConst value) { return value.is<float>() || value.is<long>(); }\n' +
+        "\n".join(recipe_methods), encoding="utf-8")
     command = compiler + ["-x", "c++", "-std=c++17", "-pthread", "-DGAGGIMATE_SIM", "-DARDUINO=10819"]
     for folder in (ROOT / "test/host_artifact/stubs", ROOT / "sim/platform", ROOT / "sim/platform/arduino",
                    ROOT / "src", ROOT / "test/host_artifact", json_header.parent):
@@ -47,7 +56,7 @@ def main():
                "src/display/plugins/autotuning/local/CompletedShotArtifactStore.cpp",
                "src/display/util/AtomicFile.cpp", "src/display/util/LittleFSUtil.cpp"]
     binary = build / ("test.exe" if os.name == "nt" else "test")
-    command += [str(ROOT / source) for source in sources] + [str(generated), str(projection), "-o", str(binary)]
+    command += [str(ROOT / source) for source in sources] + [str(generated), str(projection), str(recipe_source), "-o", str(binary)]
     subprocess.run(command, check=True, cwd=ROOT)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=ROOT)
 

@@ -1,3 +1,4 @@
+#include "RecipeStateHarness.h"
 #include <display/core/RecipeConfirmation.h>
 #include "ProjectionHarness.h"
 #include <display/plugins/autotuning/local/RecipePrompt.h>
@@ -50,7 +51,78 @@ static AutoTuning::CompletedShotArtifact fixture() {
     return artifact;
 }
 
+void testRememberedRecipe() {
+    RecipeStateController controller;
+    MQTTPlugin mqtt{&controller};
+    auto &r = mqtt.latestRecommendation;
+    r.recommendationId = "saved-rec"; r.sourceShotId = "shot";
+    r.machineId = "machine"; r.installId = "install";
+    r.beanContextId = "bean"; r.grinderContextId = "grinder"; r.profileId = "profile";
+    r.optimizationRunId = "run"; r.comparisonAnchorShotId = "shot";
+    r.comparisonMode = AutoTuning::ComparisonMode::BestIncumbent;
+    r.mode = AutoTuning::RecommendationMode::CpboBestIncumbent;
+    r.status = AutoTuning::RecommendationStatus::Pending;
+    r.nextDoseG = 20; r.targetYieldG = 40; r.targetRatio = 2;
+    r.projectedRelativeStepFromReference = 2; r.createdAt = r.updatedAt = 1720000000;
+    mqtt.persistRecommendationView();
+    const auto saves = controller.settings.saves;
+    assert(!controller.settings.savedRecommendation.isEmpty());
+    r.shownCount = 20; r.updatedAt += 100;
+    mqtt.persistRecommendationView();
+    assert(controller.settings.saves == saves); // Retained duplicates do not wear flash.
+    AutoTuning::Recommendation rebooted;
+    String error;
+    assert(AutoTuningJsonCodec::deserializeRecommendation(controller.settings.savedRecommendation, rebooted, error));
+    assert(rebooted.nextDoseG == 20 && rebooted.recommendationId == "saved-rec");
+
+    AutoTuning::ConfirmedRecipe actual;
+    actual.shotId = "shot"; actual.machineId = "machine"; actual.profileId = "profile";
+    actual.timestamp = 1720000030;
+    actual.recipe.beanContextId = "bean"; actual.recipe.grinder.contextId = "grinder";
+    actual.recipe.grinder.absoluteReferenceStep = 10;
+    actual.recipe.grinder.currentAbsoluteStep = 14;
+    actual.recipe.grinder.relativeStepsFromReference = 4;
+    actual.recipe.grinder.observed = true; actual.recipe.doseTargetG = 24;
+    actual.recipe.targetYieldG = 36;
+    Event event; event.setPayload(actual);
+    mqtt.rememberConfirmedRecipe(event);
+    assert(controller.settings.dose == 24 && controller.settings.persistedDose == 24);
+    assert(mqtt.publishedDose == 24 && mqtt.plugins.changes == 1);
+    JsonDocument contexts;
+    assert(!deserializeJson(contexts, controller.settings.contexts));
+    assert(contexts[0]["current_absolute_step"].as<float>() == 14);
+    assert(contexts[0]["current_relative_step"].as<float>() == 4);
+    controller.settings.dose = 22; controller.settings.changedAt = actual.timestamp + 1;
+    mqtt.rememberConfirmedRecipe(event);
+    assert(controller.settings.dose == 22); // An older prompt cannot undo a newer Apply.
+    controller.settings.changedAt = 0;
+    controller.profiles.selected.id = "other";
+    mqtt.rememberConfirmedRecipe(event);
+    assert(controller.settings.dose == 22);
+    controller.profiles.selected.id = "profile";
+    controller.active = true;
+    mqtt.rememberConfirmedRecipe(event);
+    assert(controller.settings.dose == 22);
+    controller.active = false;
+    auto recalibrated = actual;
+    recalibrated.recipe.grinder.micronsPerStep = 20;
+    Event calibrationChange; calibrationChange.setPayload(recalibrated);
+    mqtt.rememberConfirmedRecipe(calibrationChange);
+    assert(controller.settings.dose == 22);
+    controller.settings.failSave = true;
+    Event retry; retry.setPayload(actual);
+    mqtt.publishedDose = 0;
+    mqtt.rememberConfirmedRecipe(retry);
+    assert(retry.getInt("recipe_state_retry") == 1 && mqtt.publishedDose == 0);
+    controller.settings.failSave = false;
+    Event recovered; recovered.setPayload(actual);
+    mqtt.rememberConfirmedRecipe(recovered);
+    assert(recovered.getInt("recipe_state_retry") == 0 && mqtt.publishedDose == 24);
+    puts("PASS recipe state: saved recommendation roundtrip, deduplicated writes, 24 g actual inputs before publish, stale/context/active guards");
+}
+
 int main(int argc, char **argv) {
+    if (argc == 1) testRememberedRecipe();
     auto recipeArtifact = fixture();
     recipeArtifact.bindSamples();
     auto recipe = recipeArtifact.record;
@@ -75,6 +147,32 @@ int main(int argc, char **argv) {
     assert(edited.recipe.grinder.currentAbsoluteStep == 14.0f);
     assert(edited.recipe.doseTargetG == 19.0f && edited.doseTargetConfirmed);
     assert(edited.grindFollowed == false && edited.doseFollowed == false);
+    auto actual = recipe;
+    actual.recipe.beanContextId = "bean";
+    actual.recipe.grinder.contextId = "grinder";
+    actual.profile.id = "profile";
+    assert(AutoTuning::confirmRecipe(actual, {AutoTuning::RecipeAnswer::Change, 14.0f, 24.0f}));
+    auto remembered = AutoTuning::confirmedRecipe(actual);
+    auto matches = [&](std::string const &profile, AutoTuning::Timestamp changedAt) {
+        return AutoTuning::canRememberRecipe(remembered, "fixture-machine", "bean", "grinder", profile,
+                                             AutoTuning::TasteGoal::balanced(), changedAt);
+    };
+    assert(matches("profile", 0)); // 24 g is actual evidence, not an optimizer bound.
+    assert(!matches("other-profile", 0));
+    assert(!matches("profile", remembered.timestamp + 1)); // Do not overwrite a newer Apply.
+    remembered.recipe.doseTargetG = std::numeric_limits<float>::quiet_NaN();
+    assert(!matches("profile", 0));
+    remembered.recipe.doseTargetG = 24;
+    remembered.recipe.grinder.observed = false;
+    assert(!matches("profile", 0));
+    recipe.beverageOutG = 47.3f; // Measurement is not a new target.
+    auto measuredActual = recipe;
+    measuredActual.doseObserved = true;
+    measuredActual.measuredDoseG = 24;
+    assert(AutoTuning::confirmRecipe(measuredActual, {AutoTuning::RecipeAnswer::Confirm}));
+    assert(measuredActual.recipe.doseTargetG == 24 && measuredActual.doseObserved);
+    assert(measuredActual.doseFollowed == false);
+    assert(measuredActual.recipe.targetYieldG == 36.0f && measuredActual.beverageOutG == 47.3f);
     JsonDocument savedRecipe;
     assert(AutoTuningJsonCodec::writeShotRecord(edited, savedRecipe));
     AutoTuningJsonCodec::DecodedShotRecord decodedRecipe;

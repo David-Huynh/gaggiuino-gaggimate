@@ -815,6 +815,7 @@ void LocalAutoTuningStorePlugin::processDoseConfirmation(
     }
     const EpochSeconds now = nowEpoch();
     root["dose_confirmation_status"] = followed ? "confirmed" : "unknown";
+    root["recipe_state_pending"] = followed;
     root["dispatch_state"] = "ready";
     root["local_delivery_state"] = "pending";
     root["local_next_retry_at"] = 0;
@@ -1087,6 +1088,16 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
             }
         }
 
+        // Confirmed inputs reach Settings/UI on the controller thread before
+        // the canonical shot is sent. The marker survives a power loss here.
+        if (root["recipe_state_pending"] | false) {
+            Event remember;
+            remember.id = "rl:recipe:confirmed";
+            remember.setString("shot_id", shotId);
+            remember.setPayload(AutoTuning::confirmedRecipe(artifact.record));
+            queuePromptEvent(std::move(remember));
+            return false;
+        }
         const int previousAttempts =
             jsonNumber(root["local_attempt_count"])
                 ? root["local_attempt_count"].as<int>()
@@ -1495,6 +1506,12 @@ void LocalAutoTuningStorePlugin::drainPromptEvents() {
             promptEvents.pop_front();
         }
         pluginManager->trigger(event);
+        if (event.id == "rl:recipe:confirmed" && event.getInt("recipe_state_retry") == 0) {
+            WorkItem work;
+            work.kind = WorkKind::RecipeStateRemembered;
+            work.shotId = event.getString("shot_id");
+            enqueueWork(std::move(work));
+        }
     }
 }
 
@@ -1682,6 +1699,17 @@ bool LocalAutoTuningStorePlugin::processOneWorkItem() {
         workItems.pop_front();
     }
     switch (work.kind) {
+    case WorkKind::RecipeStateRemembered: {
+        {
+            LocalStoreLock lock(storeMutex);
+            JsonDocument envelope(&psramAllocator);
+            if (!loadReplaySnapshot(work.shotId, envelope)) break;
+            envelope["recipe_state_pending"] = false;
+            if (!LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(REPLAY_DIR, work.shotId), envelope)) break;
+        }
+        dispatchStoredShot(work.shotId, false, false);
+        break;
+    }
     case WorkKind::StoreShot:
         if (!work.queuedShot) {
             break;

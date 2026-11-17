@@ -188,6 +188,13 @@ class Settings {
     bool isRLAutoTuningEnabled() const { return rlAutoTuningEnabled.get(); }
     bool isRLLocalOptimizationEnabled() const { return rlLocalOptimizationEnabled.get(); }
     bool isRLOptimizationPaused() const { return rlOptimizationPaused.get(); }
+    String getRLSavedRecommendationJson() const { return rlSavedRecommendationJson.get(); }
+    void setRLSavedRecommendationJson(const String &json) { rlSavedRecommendationJson.set(json); }
+    bool isRLRecipeStatePersisted() const {
+        return !targetGrindVolume.isDirty() && !rlGrinderContextsJson.isDirty() && !rlRecipeChangedAt.isDirty();
+    }
+    long getRLRecipeChangedAt() const { return rlRecipeChangedAt.get(); }
+    void setRLRecipeChangedAt(long value) { rlRecipeChangedAt.set(value); }
     String getRLRestoreBestRequestId() const { return rlRestoreBestRequestId.get(); }
     String getRLRestoreBestRunId() const { return rlRestoreBestRunId.get(); }
     void setRLRestoreBestRunId(const String &id) { rlRestoreBestRunId.set(id); }
@@ -426,6 +433,8 @@ class Settings {
     Property<bool> rlAutoTuningEnabled{registry, "rl_enabled", false};
     Property<bool> rlLocalOptimizationEnabled{registry, "rl_local", true};
     Property<bool> rlOptimizationPaused{registry, "rl_pause", false};
+    Property<String> rlSavedRecommendationJson{registry, "rl_rec_view", ""};
+    Property<long> rlRecipeChangedAt{registry, "rl_recipe_at", 0};
     Property<String> rlRestoreBestRequestId{registry, "rl_restore_id", ""};
     Property<String> rlRestoreBestRunId{registry, "rl_restore_run", ""};
     Property<String> rlRestoreBestStatus{registry, "rl_restore_st", ""};

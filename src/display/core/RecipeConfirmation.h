@@ -10,6 +10,29 @@ struct RecipeConfirmation {
     std::optional<float> doseG;
 };
 
+// Compact event value; never carries shot samples into UI/controller work.
+struct ConfirmedRecipe {
+    std::string shotId;
+    std::string machineId;
+    std::string profileId;
+    Timestamp timestamp = 0;
+    RecipeSnapshot recipe;
+};
+inline ConfirmedRecipe confirmedRecipe(ShotRecord const &shot) {
+    return {shot.shotId, shot.machineId, shot.profile.id, shot.timestamp, shot.recipe};
+}
+inline bool canRememberRecipe(ConfirmedRecipe const &value, std::string const &machine,
+                              std::string const &bean, std::string const &grinder,
+                              std::string const &profile, TasteGoal const &goal, Timestamp lastChange) {
+    auto const &recipe = value.recipe;
+    auto const &position = recipe.grinder.relativeStepsFromReference;
+    return !value.shotId.empty() && !bean.empty() && !grinder.empty() && !profile.empty() &&
+        value.machineId == machine && recipe.beanContextId == bean && recipe.grinder.contextId == grinder &&
+        value.profileId == profile && recipe.tasteGoal == goal && value.timestamp >= lastChange &&
+        recipe.grinder.observed && position && std::isfinite(*position) && std::fabs(*position) <= 10000 &&
+        recipe.doseTargetG && std::isfinite(*recipe.doseTargetG) && *recipe.doseTargetG >= 0.1f && *recipe.doseTargetG <= 100;
+}
+
 inline bool usesAbsoluteGrind(ShotRecord const &shot) {
     return shot.recipe.grinder.absoluteReferenceStep.has_value() &&
            shot.recipe.grinder.currentAbsoluteStep.has_value();
@@ -46,8 +69,8 @@ inline bool confirmRecipe(ShotRecord &shot, RecipeConfirmation const &answer) {
             (snapshot.stepDirection == "higher_is_coarser" ? -1 : 1);
     }
     snapshot.observed = true;
+    shot.recipe.doseTargetG = *dose;
     if (!shot.doseObserved || !shot.measuredDoseG || std::fabs(*dose - *shot.measuredDoseG) > 0.0001f) {
-        shot.recipe.doseTargetG = *dose;
         shot.measuredDoseG = *dose;
         shot.doseObserved = false;
         shot.doseTargetConfirmed = true;

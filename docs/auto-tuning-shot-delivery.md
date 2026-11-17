@@ -322,3 +322,26 @@ The page merges live status/recommendations over any settings snapshot already
 in flight and refreshes on reconnect. `scripts/test_autotuning_browser.py`
 exercises those races and the controls at mobile, landscape and desktop sizes
 against a fake machine; it requires a current web build and Playwright/Chrome.
+
+## Current recipe and saved recommendation
+
+The Auto Tuning page shows the **Current recipe** separately from the next
+recommendation. Applying a recommendation persists the dose after changing it,
+keeps the selected profile's saved yield and updates the displayed grinder
+position. A recipe event updates all three fields in open browsers, including
+when Apply was pressed in the prompt or on the machine screen.
+
+Confirmed or edited shot inputs update the remembered dose/grinder position
+before uploading that shot. The replay record retains a `recipe_state_pending`
+marker until that step has run on the controller thread and its settings have
+been saved; an interrupted update is retried after reboot. A delayed answer for
+another bean, grinder, profile, taste goal, calibration or an older recipe must
+not overwrite the current controls. A reported 24 g dose remains 24 g even when
+the optimizer's search maximum is 22 g. Reporting actual values never widens the
+search limits or claims that an unfollowed recommendation succeeded.
+
+The most recent validated recommendation also has a bounded, read-only device
+snapshot. After a restart, its target grind, dose, yield and date remain visible
+for the same context. Applying requires a live validated recommendation;
+restoring this view cannot apply a recipe or treat an old retained command as
+new authorization. Repeated delivery bookkeeping does not cause snapshot writes.
