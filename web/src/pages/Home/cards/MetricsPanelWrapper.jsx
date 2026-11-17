@@ -20,6 +20,7 @@ export function MetricsPanelWrapper({ ds, inCard = false, compact = false }) {
       label: m.label,
       current: m.getValue(ds),
       target: m.getTarget ? m.getTarget(ds) : null,
+      targetMismatch: m.targetMismatch ? m.targetMismatch(ds) : false,
       unit: m.unit,
       adjustable: m.adjustable(ds),
       disabled: m.disabled ? m.disabled(ds) : false,

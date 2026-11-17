@@ -26,6 +26,21 @@ assert.equal(machine.value.status.brewStartPending, false);
 assert.equal(machine.value.history.length, count + 1);
 console.log('PASS sparse status: preserves hardware scales, profile, updates and pending brew state');
 
+api._onStatus({ tp: 'evt:status', tt: 85, cht: 145, chc: true });
+assert.equal(machine.value.status.targetTemperature, 85);
+assert.equal(machine.value.status.controllerTargetTemperature, 145);
+api._onStatus({ tp: 'evt:status', up: true });
+assert.equal(machine.value.status.controllerTargetTemperature, 145);
+api._onStatus({ tp: 'evt:status', cht: null, chc: false });
+assert.equal(machine.value.status.controllerTargetTemperature, null);
+api._onStatus({ tp: 'evt:status', cht: 145 });
+api.pendingRequests = new Set();
+api._scheduleReconnect = () => {};
+api._onClose();
+assert.equal(machine.value.status.controllerTargetTemperature, undefined);
+assert.equal(machine.value.status.targetTemperature, 85);
+console.log('PASS heater readback: sparse status, explicit clearing and disconnect preserve the requested target');
+
 function fixture(version, water = [0, 25, 50]) {
   const stride = version >= 7 ? 30 : version >= 6 ? 28 : 26;
   const data = new ArrayBuffer(512 + 3 * stride);

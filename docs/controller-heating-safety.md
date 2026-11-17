@@ -40,6 +40,24 @@ remain enforced. Ordinary at-target cutoff holds the learned PID state; a target
 change, invalid configuration or lost authorization clears it. These are
 software output checks, not a physical power cutoff.
 
+## Web target display
+
+Controller telemetry includes its accepted target and configuration state, adding
+up to seven boiler payload bytes to the existing sensor stream. The display
+removes the configured temperature offset before comparing it with the profile
+target, just as it does for the displayed temperature.
+
+The existing dashboard target number shows the controller target in amber when
+it differs by more than 0.5 C. Otherwise it shows the requested target in its
+normal colour. Missing readback falls back to the requested target; disconnects
+clear stale readback. There is no additional visible label or diagnostic panel.
+Readback only affects presentation: controls, profiles and optimizer context
+retain the requested target.
+
+Shot confirmation remembers actual dose and grind. Measured beverage output
+never replaces target yield. An applied recommendation or an explicit manual
+target edit may change target yield.
+
 ## Verification
 
 `scripts/test_heater_safety.py` builds the real endpoint, heater/PID and
@@ -52,6 +70,9 @@ heater across partial board restarts.
 
 `scripts/test_brew_start.py` checks initial negotiation, control refresh,
 protocol mismatch, correlated tare handling and stalled HX711 recovery.
+`scripts/test_artifact_recovery.py` checks that measured beverage output is
+preserved without changing target yield. Web unit tests and
+`scripts/test_navigation_browser.py` check target fallback/colour and navigation.
 The safety host tests run in CI after building the UART controller.
 
 Physical validation remains necessary: cold starts, warm power cycles,

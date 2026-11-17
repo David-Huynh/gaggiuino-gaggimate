@@ -26,6 +26,7 @@ function MetricCell({
   label,
   current,
   target,
+  targetMismatch = false,
   unit,
   onDecrease,
   onIncrease,
@@ -51,7 +52,12 @@ function MetricCell({
           {target != null && (
             <>
               <span className='text-base-content/30 mx-0.5 text-xs'>/</span>
-              <span className='text-success text-xs font-semibold'>
+              <span
+                className={`text-xs font-semibold ${targetMismatch ? 'text-warning' : 'text-success'}`}
+                aria-label={
+                  targetMismatch ? 'Temperature target differs from selected target' : undefined
+                }
+              >
                 {target}
                 {unit}
               </span>
@@ -72,6 +78,7 @@ function MetricCellItem({ m, inCard, compact }) {
       label={m.label}
       current={m.current}
       target={m.target}
+      targetMismatch={m.targetMismatch}
       unit={m.unit}
       adjustable={m.adjustable}
       disabled={m.disabled}

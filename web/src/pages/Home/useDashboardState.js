@@ -1,3 +1,4 @@
+import { displayedTemperatureTarget } from '../../utils/temperatureTarget.js';
 import { computed } from '@preact/signals';
 import { useContext, useEffect, useState } from 'preact/hooks';
 import { useQuery } from 'preact-fetching';
@@ -134,6 +135,11 @@ export function useDashboardState() {
     apiService.send({ tp: 'req:rl:local-optimization', enabled });
   };
 
+  const displayedTarget = displayedTemperatureTarget(
+    s.targetTemperature,
+    s.controllerTargetTemperature,
+  );
+
   return {
     brewStartError: sendError || brewStartErrorMessage(s.brewStartError),
     // raw status
@@ -142,6 +148,8 @@ export function useDashboardState() {
     systemMessage,
     currentTemperature: s.currentTemperature,
     targetTemperature: s.targetTemperature,
+    displayedTargetTemperature: displayedTarget.value,
+    controllerTargetMismatch: displayedTarget.mismatch,
     currentPressure: s.currentPressure,
     targetPressure: s.targetPressure,
     currentFlow: s.currentFlow,

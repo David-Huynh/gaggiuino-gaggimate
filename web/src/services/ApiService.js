@@ -64,6 +64,11 @@ export default class ApiService {
     machine.value = {
       ...machine.value,
       connected: false,
+      status: {
+        ...machine.value.status,
+        controllerTargetTemperature: undefined,
+        controllerHeatingConfigured: undefined,
+      },
     };
     for (const reject of [...this.pendingRequests]) {
       reject(new Error('WebSocket disconnected'));
@@ -193,6 +198,8 @@ export default class ApiService {
     };
     map('ct', 'currentTemperature');
     map('tt', 'targetTemperature');
+    map('cht', 'controllerTargetTemperature');
+    map('chc', 'controllerHeatingConfigured');
     map('pr', 'currentPressure');
     map('pt', 'targetPressure');
     map('tw', 'targetWeight', v => v || 0);

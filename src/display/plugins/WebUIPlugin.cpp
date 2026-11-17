@@ -1288,6 +1288,13 @@ void WebUIPlugin::loop() {
         statusDoc["tp"] = "evt:status";
         statusDoc["ct"] = controller->getCurrentTemp();
         statusDoc["tt"] = controller->getTargetTemp();
+        if (controller->hasControllerHeaterStatus()) {
+            statusDoc["cht"] = controller->getControllerTargetTemp();
+            statusDoc["chc"] = controller->isControllerHeatingConfigured();
+        } else {
+            statusDoc["cht"] = nullptr;
+            statusDoc["chc"] = false;
+        }
         statusDoc["pr"] = controller->getCurrentPressure();
         statusDoc["fl"] = controller->getCurrentPumpFlow();
         statusDoc["pt"] = controller->getTargetPressure();
@@ -1678,6 +1685,11 @@ void WebUIPlugin::setupServer() {
         doc["mode"] = controller->getMode();
         doc["tt"] = controller->getTargetTemp();
         doc["ct"] = controller->getCurrentTemp();
+        if (controller->hasControllerHeaterStatus()) {
+            doc["controller_target_temperature"] = controller->getControllerTargetTemp();
+            doc["controller_heating_configured"] = controller->isControllerHeatingConfigured();
+        }
+        doc["heater_power_percent"] = controller->getCurrentHeaterPower();
         // Read-only hang/tare diagnostics. No filesystem access or process lock:
         // this remains useful while another task is waiting for shot storage.
         doc["uptime_ms"] = millis();

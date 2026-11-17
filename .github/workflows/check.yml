@@ -16,7 +16,7 @@ jobs:
       - name: Test boot and native-task storage ownership
         run: python scripts/test_storage_ownership.py
       - name: Test web startup error reporting
-        run: node --test web/src/utils/brewStartError.test.js
+        run: node --test web/src/utils/brewStartError.test.js web/src/utils/temperatureTarget.test.js
 
   test:
     runs-on: ubuntu-latest

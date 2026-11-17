@@ -82,6 +82,18 @@ def main():
                 page.evaluate("window.__reply(window.__sent.filter(m => m.tp === 'req:profiles:load').at(-1))")
                 page.wait_for_function("document.querySelectorAll('canvas').length >= 2")
 
+                # The target number uses controller readback only on mismatch;
+                # no diagnostic panel/label changes the dashboard layout.
+                page.evaluate("window.__emit({tp:'evt:status',tt:85,cht:145,chc:true,ct:86,m:1})")
+                target = page.get_by_label('Temperature target differs from selected target')
+                target.wait_for()
+                assert '145' in target.inner_text() and 'text-warning' in target.get_attribute('class')
+                assert page.get_by_text('Heating details', exact=True).count() == 0
+                page.evaluate("window.__emit({tp:'evt:status',tt:85,cht:85,chc:true})")
+                target.wait_for(state='hidden')
+                page.evaluate("window.__emit({tp:'evt:status',tt:85,cht:null,chc:false})")
+                assert page.get_by_label('Temperature target differs from selected target').count() == 0
+
                 # An orientation timer queued just before leaving must not use a
                 # destroyed Chart.js instance 100 ms later.
                 page.evaluate("window.dispatchEvent(new Event('orientationchange')); window.__navigate('/not-found')")
