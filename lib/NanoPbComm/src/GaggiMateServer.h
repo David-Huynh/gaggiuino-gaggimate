@@ -36,6 +36,7 @@ class GaggiMateServer {
     void init(const String &deviceName, const String &hardware, const String &version, const gm::DeviceCapabilities &capabilities,
               bool pairingWindow = false);
     void loop();
+    void onConnectionChanged(std::function<void(bool)> callback) { _connectionCb = std::move(callback); }
     bool isConnected() const { return _endpoint.isConnected(); }
     bool isUpdating() const { return _transport.isUpdating(); }
 
@@ -57,7 +58,7 @@ class GaggiMateServer {
 
     // Build a payload without sending; sendSensorData reports boiler 0 (the wire format supports several).
     gm::Payload buildSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance,
-                                float pumpPower = 0.0f, float heaterPower = 0.0f, float waterPumped = 0.0f);
+                                float pumpPower = 0.0f, float heaterPower = 0.0f, float waterPumped = 0.0f, float controllerTarget = 0.0f, bool heatingConfigured = false);
     gm::Payload buildButtonState(uint8_t index, bool pressed);
     gm::Payload buildAutotuneResult(float kp, float ki, float kd, float kf);
     gm::Payload buildVolumetricMeasurement(float volume);
@@ -70,7 +71,7 @@ class GaggiMateServer {
 
     // Responses (controller -> display)
     void sendSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance,
-                        float pumpPower = 0.0f, float heaterPower = 0.0f, float waterPumped = 0.0f);
+                        float pumpPower = 0.0f, float heaterPower = 0.0f, float waterPumped = 0.0f, float controllerTarget = 0.0f, bool heatingConfigured = false);
     void sendButtonState(uint8_t index, bool pressed);
     void sendAutotuneResult(float kp, float ki, float kd, float kf);
     void sendVolumetricMeasurement(float volume);
@@ -121,6 +122,7 @@ class GaggiMateServer {
     BleServerTransport _transport;
 #endif
     Endpoint _endpoint;
+    std::function<void(bool)> _connectionCb;
     gm::SystemInfo _systemInfo = gaggimate_SystemInfo_init_zero;
 #if defined(GAGGIMATE_UART_DIAGNOSTICS)
     ControllerDiagnostics _controllerDiagnostics{};

@@ -26,6 +26,10 @@ message Frame {
     // One or more messages delivered together (see Frame.payloads in the
     // .options file for the cap).
     repeated Payload payloads = 3;
+    // Session nonce and intended peer nonce. Empty id=ack=0 frames negotiate
+    // them before any payload is accepted. ACKs are bound to both nonces too.
+    fixed32 session_id = 4;
+    fixed32 peer_session_id = 5;
 }
 
 // Tagged union of every protocol message. The oneof tag drives dispatch on the
@@ -208,6 +212,8 @@ message BoilerReading {
     float temperature = 2;
     float pressure = 3;
     float power = 4; // heater power 0..100 %
+    float target_temperature = 5; // controller-side target; 0 while inhibited
+    bool heating_configured = 6; // validated PID installed for this session
 }
 
 message SensorData {

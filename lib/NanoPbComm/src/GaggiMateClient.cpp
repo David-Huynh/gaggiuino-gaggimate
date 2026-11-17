@@ -305,7 +305,9 @@ void GaggiMateClient::registerHandlers() {
         }
 #endif
         _sensorCb(temperature, pressure, p.content.sensor.puck_flow, p.content.sensor.pump_flow,
-                  p.content.sensor.puck_resistance, p.content.sensor.pump_power, heater_power, p.content.sensor.water_pumped);
+                  p.content.sensor.puck_resistance, p.content.sensor.pump_power, heater_power, p.content.sensor.water_pumped,
+                  p.content.sensor.boilers_count > 0 ? p.content.sensor.boilers[0].target_temperature : 0,
+                  p.content.sensor.boilers_count > 0 && p.content.sensor.boilers[0].heating_configured);
     });
     _endpoint.on(gaggimate_Payload_button_tag, [this](const gm::Payload &p) {
         if (_buttonCb)

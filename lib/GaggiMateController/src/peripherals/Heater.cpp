@@ -16,12 +16,15 @@ Heater::Heater(TemperatureSensor *sensor, uint8_t heaterPin, const heater_error_
     : sensor(sensor), heaterPin(heaterPin), taskHandle(nullptr), error_callback(error_callback), pid_callback(pid_callback),
       autotune_fail_callback(autotune_fail_callback) {
 
+    configurationMutex = xSemaphoreCreateMutex();
     simplePid = new SimplePID(&output, &temperature, &setpoint);
     autotuner = new Autotune();
 }
 
 void Heater::setup() {
+    digitalWrite(heaterPin, LOW);
     pinMode(heaterPin, OUTPUT);
+    digitalWrite(heaterPin, LOW);
     setupPid();
     xTaskCreate(loopTask, "Heater::loop", configMINIMAL_STACK_SIZE * 8, this, 1, &taskHandle);
 }
@@ -31,9 +34,8 @@ void Heater::setupPid() {
     simplePid->setCtrlOutputLimits(0.0f, TUNER_OUTPUT_SPAN);
     simplePid->activateSetPointFilter(false);
     simplePid->activateFeedForward(false);
-    // Initialize with default gains so heater works even before CMD,PID arrives.
-    // The ESP32 will override these with user-configured values once connected.
-    simplePid->setControllerPIDGains(Kp, Ki, Kd, 0.0f);
+    // Heating is inhibited until a validated configuration arrives this session.
+    simplePid->setControllerPIDGains(0.0f, 0.0f, 0.0f, 0.0f);
     simplePid->reset();
 }
 
@@ -48,37 +50,128 @@ void Heater::setupAutotune(int testTimeSec, int windowSize, int heaterWattage) {
     autotuner->reset();
 }
 
+void Heater::driveRelayOff() {
+    relayStatus.store(false);
+    reportedOutput.store(0);
+    digitalWrite(heaterPin, LOW);
+}
+
+void Heater::stopOutput() {
+    output = 0;
+    simplePid->setMode(SimplePID::Control::manual);
+    simplePid->reset();
+    windowStartTime = millis();
+    driveRelayOff();
+}
+
+void Heater::invalidateConfiguration() {
+    controlEpoch.fetch_add(1);
+    configured.store(false);
+    requestedSetpoint.store(0);
+    autotuning.store(false);
+    driveRelayOff();
+    if (configurationMutex && xSemaphoreTake(configurationMutex, portMAX_DELAY) == pdTRUE) {
+        configurationPending = false;
+        xSemaphoreGive(configurationMutex);
+    }
+}
+
+bool Heater::configure(float kp, float ki, float kd, float kff) {
+    if (!std::isfinite(kp) || !std::isfinite(ki) || !std::isfinite(kd) || !std::isfinite(kff) ||
+        kp < 0 || ki < 0 || kd < 0 || kff < 0 || !std::isfinite(kp + ki + kd) || kp + ki + kd <= 0) {
+        invalidateConfiguration();
+        return false;
+    }
+    if (!configurationMutex || xSemaphoreTake(configurationMutex, portMAX_DELAY) != pdTRUE) return false;
+    if ((configurationPending || hasConfiguration()) && pendingConfiguration.epoch == controlEpoch.load() &&
+        pendingConfiguration.kp == kp && pendingConfiguration.ki == ki &&
+        pendingConfiguration.kd == kd && pendingConfiguration.kff == kff) {
+        xSemaphoreGive(configurationMutex);
+        return true;
+    }
+    configured.store(false);
+    requestedSetpoint.store(0);
+    pendingConfiguration = {kp, ki, kd, kff, controlEpoch.load()};
+    configurationPending = true;
+    driveRelayOff();
+    xSemaphoreGive(configurationMutex);
+    return true;
+}
+
+void Heater::applyConfiguration() {
+    if (!configurationMutex || xSemaphoreTake(configurationMutex, portMAX_DELAY) != pdTRUE) return;
+    if (configurationPending && pendingConfiguration.epoch == controlEpoch.load()) {
+        // Only the heater task touches PID state. A communication callback must
+        // not reset its integrator/deque concurrently with update().
+        stopOutput();
+        auto const &pid = pendingConfiguration;
+        simplePid->setControllerPIDGains(pid.kp, pid.ki, pid.kd, 0);
+        combinedKff = pid.kff;
+        installedEpoch.store(pid.epoch);
+        configured.store(true);
+    }
+    configurationPending = false;
+    xSemaphoreGive(configurationMutex);
+}
+
 void Heater::loop() {
-    if (!sensor->isErrorState() && autotuning) {
+    applyConfiguration();
+    temperature = sensor->read();
+    if (!hasConfiguration() || !sensor->hasUsableReading() || !std::isfinite(temperature) || temperature <= 0) {
+        autotuning.store(false);
+        stopOutput();
+        return;
+    }
+    const float safetyTemperature = sensor->readForSafety();
+    if (!std::isfinite(safetyTemperature) || safetyTemperature > MAX_SAFE_TEMP) {
+        autotuning.store(false);
+        stopOutput();
+        if (error_callback) error_callback();
+        return;
+    }
+    if (autotuning.load()) {
         loopAutotune();
         return;
     }
-
-    if (sensor->isErrorState() || setpoint <= 0.0f) {
-        simplePid->setMode(SimplePID::Control::manual);
-        digitalWrite(heaterPin, LOW);
-        relayStatus = false;
-        temperature = sensor->read();
+    const float target = requestedSetpoint.load();
+    if (static_cast<uint32_t>(millis()) - lastTargetAt.load() > TARGET_LEASE_MS) {
+        requestedSetpoint.store(0);
+        stopOutput();
+        return;
+    }
+    if (!std::isfinite(target) || target <= 0) {
+        stopOutput();
+        return;
+    }
+    if (setpoint != target) {
+        stopOutput(); // A previous steam target must not leave its PID state behind.
+        setpoint = target;
+    }
+    if (temperature >= target || safetyTemperature >= target) {
+        // Hold PID state during ordinary regulation. Resetting the integral on
+        // every at-target sample loses the learned steady-state heat demand.
+        output = 0;
+        windowStartTime = millis();
+        driveRelayOff();
         return;
     }
     simplePid->setMode(SimplePID::Control::automatic);
-
     loopPid();
+    softPwm(TUNER_OUTPUT_SPAN);
 }
 
-void Heater::setSetpoint(float setpoint) {
-    if (this->setpoint != setpoint) {
-        this->setpoint = setpoint;
-        ESP_LOGV(LOG_TAG, "Set setpoint %f°C", setpoint);
+void Heater::setSetpoint(float target) {
+    if (!std::isfinite(target) || target < 0 || target >= MAX_SAFE_TEMP) {
+        requestedSetpoint.store(0);
+        driveRelayOff();
+        return;
     }
-}
-
-void Heater::setTunings(float Kp, float Ki, float Kd) {
-    if (simplePid->getKp() != Kp || simplePid->getKi() != Ki || simplePid->getKd() != Kd) {
-        simplePid->setControllerPIDGains(Kp, Ki, Kd, 0.0f);
-        simplePid->reset();
-        ESP_LOGV(LOG_TAG, "Set tunings to Kp: %f, Ki: %f, Kd: %f", Kp, Ki, Kd);
-    }
+    // Positive targets received before PID installation are discarded. A fresh
+    // target after configuration is required, including after a partial reboot.
+    if (target > 0 && !hasConfiguration()) return;
+    lastTargetAt.store(millis());
+    requestedSetpoint.store(target);
+    if (target == 0) driveRelayOff();
 }
 
 void Heater::setThermalFeedforward(float *pumpFlowPtr, float incomingWaterTemp, int *valveStatusPtr) {
@@ -92,19 +185,13 @@ void Heater::setThermalFeedforward(float *pumpFlowPtr, float incomingWaterTemp, 
              combinedKff);
 }
 
-void Heater::setFeedforwardScale(float combinedKff) {
-    this->combinedKff = combinedKff;
-    ESP_LOGI(LOG_TAG, "Combined feedforward gain (Kff) set to: %.3f output units per watt", combinedKff);
-}
-
 void Heater::autotune(int testTimeSec, int windowSize, int heaterWattage) {
+    if (!hasConfiguration() || !sensor->hasUsableReading() || autotuning.load()) return;
     setupAutotune(testTimeSec, windowSize, heaterWattage);
     autotuning = true;
 }
 
 void Heater::loopPid() {
-    softPwm(TUNER_OUTPUT_SPAN);
-    temperature = sensor->read();
 
     // Calculate and set disturbance feedforward BEFORE PID update
     // Only apply thermal feedforward when Kf>0, valve is open, and water is flowing
@@ -143,13 +230,13 @@ void Heater::loopAutotune() {
     autotuner->reset();
     long microseconds;
     long loopInterval = (static_cast<long>(TUNER_OUTPUT_SPAN) - 1L) * 1000L;
-    while (!autotuner->isFinished()) {
+    while (autotuning.load() && hasConfiguration() && !autotuner->isFinished()) {
         microseconds = micros();
         // Re-check sensor every iteration. Heater::loop entry gate sampled
         // once — mid-test fault would leave relay stuck at full power for
         // rest of window. Max31855Thermocouple::read() returns 0 on fault;
         // neither overtemp guard nor autotuner state machine detects it.
-        if (sensor->isErrorState()) {
+        if (!sensor->hasUsableReading()) {
             output = 0.0f;
             autotuning = false;
             softPwm(TUNER_OUTPUT_SPAN);
@@ -166,7 +253,8 @@ void Heater::loopAutotune() {
         }
         ESP_LOGI(LOG_TAG, "Autotuner Cycle: Temperature=%.2f", temperature);
         autotuner->update(temperature, millis() / 1000.0f);
-        while (micros() - microseconds < loopInterval) {
+        while (micros() - microseconds < loopInterval && autotuning.load() && hasConfiguration()) {
+            if (!sensor->hasUsableReading()) { output = 0; break; }
             softPwm(TUNER_OUTPUT_SPAN);
             vTaskDelay(1 / portTICK_PERIOD_MS);
         }
@@ -183,9 +271,11 @@ void Heater::loopAutotune() {
             return;
         }
     }
+    const bool cancelled = !autotuning.load() || !hasConfiguration();
     output = 0.0f;
     autotuning = false;
     softPwm(TUNER_OUTPUT_SPAN);
+    if (cancelled) return;
 
     if (autotuner->isTimedOut()) {
         // Reaction/inflection never detected in window. Keep NVS PID — never
@@ -211,8 +301,7 @@ void Heater::loopAutotune() {
 
     pid_callback(autotuner->getKp() * 1000.0f, autotuner->getKi() * 1000.0f, autotuner->getKd() * 1000.0f, kffFromWattage);
 
-    setTunings(autotuner->getKp() * 1000.0f, autotuner->getKi() * 1000.0f, autotuner->getKd() * 1000.0f);
-    setFeedforwardScale(kffFromWattage);
+    configure(autotuner->getKp() * 1000.0f, autotuner->getKi() * 1000.0f, autotuner->getKd() * 1000.0f, kffFromWattage);
 
     ESP_LOGI(LOG_TAG, "Autotuning finished: Kp=%.4f, Ki=%.4f, Kd=%.4f, Kff=%.4f", autotuner->getKp() * 1000.0f,
              autotuner->getKi() * 1000.0f, autotuner->getKd() * 1000.0f, kffFromWattage);
@@ -224,29 +313,27 @@ void Heater::loopAutotune() {
              autotuneHeaterWattage, autotuner->getKff() * 1000.0f);
 }
 
-float Heater::softPwm(uint32_t windowSize) {
-    // software PWM timer
-    unsigned long msNow = millis();
-    if (msNow - windowStartTime >= windowSize) {
-        windowStartTime = msNow;
-    }
-    float optimumOutput = output;
+bool Heater::canEnergize(uint32_t now) const {
+    if (!hasConfiguration() || !sensor->hasUsableReading()) return false;
+    const float raw = sensor->readForSafety();
+    if (!std::isfinite(raw) || raw <= 0 || raw >= MAX_SAFE_TEMP) return false;
+    if (autotuning.load()) return raw < MAX_AUTOTUNE_TEMP;
+    const float target = requestedSetpoint.load();
+    return target > 0 && raw < target && sensor->read() < target && now - lastTargetAt.load() <= TARGET_LEASE_MS;
+}
 
-    // PWM relay output
-    if (!relayStatus && static_cast<unsigned long>(optimumOutput) > (msNow - windowStartTime)) {
-        if (msNow > nextSwitchTime) {
-            nextSwitchTime = msNow;
-            relayStatus = true;
-            digitalWrite(heaterPin, HIGH);
-        }
-    } else if (relayStatus && static_cast<unsigned long>(optimumOutput) < (msNow - windowStartTime)) {
-        if (msNow > nextSwitchTime) {
-            nextSwitchTime = msNow;
-            relayStatus = false;
-            digitalWrite(heaterPin, LOW);
-        }
-    }
-    return optimumOutput;
+float Heater::softPwm(uint32_t windowSize) {
+    const uint32_t now = millis();
+    if (now - static_cast<uint32_t>(windowStartTime) >= windowSize) windowStartTime = now;
+    const bool enabled = canEnergize(now);
+    const float duty = enabled && std::isfinite(output) ? std::clamp(output, 0.0f, float(windowSize)) : 0;
+    reportedOutput.store(duty);
+    const bool on = duty > 0 && duty > now - static_cast<uint32_t>(windowStartTime);
+    digitalWrite(heaterPin, on ? HIGH : LOW);
+    relayStatus.store(on);
+    // A stop/target change can arrive while this task is writing the pin.
+    if (!canEnergize(millis())) driveRelayOff();
+    return duty;
 }
 
 void Heater::plot(float optimumOutput, float outputScale, uint8_t everyNth) {

@@ -5,7 +5,9 @@
 #else
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 #endif
+#include <atomic>
 #include "Autotune/Autotune.h"
 #include "Max31855Thermocouple.h"
 #include "TemperatureSensor.h"
@@ -29,19 +31,34 @@ class Heater {
     void loop();
 
     void setSetpoint(float setpoint);
-    float getSetpoint() { return setpoint; };
-    float getDutyCycle() const { return output / TUNER_OUTPUT_SPAN * 100.0f; }
-    float getOutput() const { return output; }
+    float getSetpoint() const { return hasConfiguration() ? requestedSetpoint.load() : 0.0f; }
+    float getDutyCycle() const { return hasConfiguration() ? reportedOutput.load() / TUNER_OUTPUT_SPAN * 100.0f : 0.0f; }
+    float getOutput() const { return reportedOutput.load(); }
     bool isRelayOn() const { return relayStatus; }
-    void setTunings(float Kp, float Ki, float Kd);
+    bool configure(float Kp, float Ki, float Kd, float Kff);
+    void invalidateConfiguration();
+    bool hasConfiguration() const { return configured.load() && installedEpoch.load() == controlEpoch.load(); }
+    static constexpr uint32_t TARGET_LEASE_MS = 3000;
     void autotune(int testTimeSec, int windowSize, int heaterWattage);
 
     // Thermal feedforward control
     void setThermalFeedforward(float *pumpFlowPtr = nullptr, float incomingWaterTemp = 23.0f, int *valveStatusPtr = nullptr);
-    void setFeedforwardScale(float combinedKff); // Set combined Kff value (output units per watt)
+
 
   private:
     void setupPid();
+    void applyConfiguration();
+    void stopOutput();
+    void driveRelayOff();
+    bool canEnergize(uint32_t now) const;
+    struct PidConfiguration { float kp = 0, ki = 0, kd = 0, kff = 0; uint32_t epoch = 0; };
+    PidConfiguration pendingConfiguration;
+    SemaphoreHandle_t configurationMutex = nullptr;
+    bool configurationPending = false;
+    std::atomic<bool> configured{false};
+    std::atomic<uint32_t> controlEpoch{1}, installedEpoch{0};
+    std::atomic<float> requestedSetpoint{0};
+    std::atomic<uint32_t> lastTargetAt{0};
     void setupAutotune(int testTimeSec, int windowSize, int heaterWattage);
     void loopPid();
     void loopAutotune();
@@ -60,20 +77,18 @@ class Heater {
     heater_autotune_fail_callback_t autotune_fail_callback;
 
     float temperature = 0.0f;
-    float output = 0.0f;
+    float output = 0.0f; // PID storage: accessed only by the heater task
+    std::atomic<float> reportedOutput{0};
     float setpoint = 0.0f;
-    float Kp = 2.4;
-    float Ki = 40;
-    float Kd = 10;
     int plotCount = 0;
 
-    bool relayStatus = false;
+    std::atomic<bool> relayStatus{false};
     unsigned long windowStartTime = 0;
-    unsigned long nextSwitchTime = 0;
+
 
     // Autotune variables
     bool startup = true;
-    bool autotuning = false;
+    std::atomic<bool> autotuning{false};
     // Stashed at autotune-start (BLE field 3) so loopAutotune can derive
     // combinedKff = 1000 / wattage on completion. 0 ⇒ caller didn't supply
     // wattage (older display firmware) ⇒ skip combinedKff derivation.

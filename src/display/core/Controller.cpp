@@ -386,19 +386,7 @@ void Controller::setupBluetooth() {
 #ifndef GAGGIMATE_DISABLE_HARDWARE_SCALE
     brewTare.seed(esp_random());
 #endif
-    comms.onConnectionChanged([this](bool connected) {
-        infoApplied.store(false);
-        // Force a full control resend after any (re)connect -- the controller
-        // starts with no state and updateControl() otherwise only sends deltas.
-        controlStateSent = false;
-        if (connected) {
-            applyConnectionPriority(true);
-        } else if (initialized) {
-            pluginManager->trigger("controller:bluetooth:disconnect");
-            waitingForController = true;
-            postCommand(CtrlCmd::CHANGE_MODE, MODE_STANDBY);
-        }
-    });
+    comms.onConnectionChanged([this](bool connected) { onControllerConnection(connected); });
     comms.onSystemInfo([this](const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
                               bool ledControl, bool tof, bool scale, std::vector<uint32_t> addons) {
         onSystemInfo(hardware, version, protocolVersion, dimming, pressure, ledControl, tof, scale, addons);
@@ -413,7 +401,10 @@ void Controller::setupBluetooth() {
     });
     pluginManager->on("ota:update:end", [this](Event const &) { applyConnectionPriority(true); });
     comms.onSensorData([this](float temp, float pressure, float puckFlow, float pumpFlow, float puckResistance, float pumpPower,
-                              float heaterPower, float waterPumped) {
+                              float heaterPower, float waterPumped, float remoteTarget, bool heatingConfigured) {
+        controllerTargetTemp.store(remoteTarget);
+        controllerHeatingConfigured.store(heatingConfigured);
+        controllerHeaterStatusKnown.store(true);
         onTempRead(temp);
         onPressureRead(pressure);
         this->currentPuckFlow = puckFlow;
@@ -576,6 +567,21 @@ void Controller::setupBluetooth() {
 #endif
 }
 
+void Controller::onControllerConnection(bool connected) {
+    const bool wasReady = infoApplied.exchange(false);
+    controllerHeaterStatusKnown.store(false);
+    controlRevision.fetch_add(1);
+    if (connected) {
+        applyConnectionPriority(true);
+    } else if (initialized && wasReady) {
+        // Initial session negotiation is not the loss of an established
+        // controller. Do not queue a late standby that overrides startup mode.
+        pluginManager->trigger("controller:bluetooth:disconnect");
+        waitingForController = true;
+        postCommand(CtrlCmd::CHANGE_MODE, MODE_STANDBY);
+    }
+}
+
 void Controller::onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
                               bool ledControl, bool tof, bool scale, std::vector<uint32_t> addons) {
     const bool mismatch = protocolVersion != gm_proto::PROTOCOL_VERSION;
@@ -620,14 +626,17 @@ void Controller::onSystemInfo(const char *hardware, const char *version, uint32_
     systemInfo.capabilities.scale = false;
 #endif
 
-    infoApplied.store(!mismatch);
     if (!loaded) {
         loaded = true;
         if (!mismatch && settings.getStartupMode() == MODE_STANDBY)
             activateStandby();
-        pluginManager->trigger("controller:ready");
         setMode(settings.getStartupMode());
+        pluginManager->trigger("controller:ready");
     }
+    // Publish readiness only after mode/configuration are applied. INFO can
+    // arrive after a peer reset without a visible UART disconnect.
+    controlRevision.fetch_add(1);
+    infoApplied.store(!mismatch);
     pluginManager->trigger("controller:bluetooth:connect");
 }
 
@@ -1367,9 +1376,10 @@ LiveBrewTargetApplyStatus Controller::applyLiveBrewTargetUpdate(const LiveBrewTa
 void Controller::updateControl(bool urgent) {
     // Never drive a controller whose protocol version we don't match -- the
     // commands could be misinterpreted (OTA recovery still works; see onSystemInfo).
-    if (systemInfo.protocolMismatch) {
-        return;
-    }
+    if (!comms.isConnected() || !infoApplied.load() || systemInfo.protocolMismatch) return;
+    const uint32_t revision = controlRevision.load();
+    const unsigned long now = millis();
+    const bool refresh = urgent || sentControlRevision != revision || now - lastFullControlSend >= CONTROL_REFRESH_MS;
 
     bool altRelayActive = false;
     bool useAdvancedOutput = false;
@@ -1451,20 +1461,18 @@ void Controller::updateControl(bool urgent) {
         pump.power = pumpSetpoint;
     }
 
-    // Only send components that changed since the last update. The controller is
-    // stateful and every message is acknowledged, so re-sending unchanged values
-    // each cycle is unnecessary; a periodic ping (see loop()) keeps the watchdog
-    // fed when nothing changes. controlStateSent is reset on (re)connect to force
-    // a full resend.
+    // Send changes immediately and refresh the full desired state once per
+    // second. Link ACK retries are bounded; losing an initial command must not
+    // leave heating off indefinitely while the UI still shows brew mode.
     gm::Payload batch[4];
     size_t count = 0;
-    if (urgent || !controlStateSent || boiler != lastBoiler)
+    if (refresh || boiler != lastBoiler)
         batch[count++] = comms.buildBoilerControl(boiler.index, boiler.mode, boiler.setpoint);
-    if (urgent || !controlStateSent || pump != lastPump)
+    if (refresh || pump != lastPump)
         batch[count++] = comms.buildPumpControl(pump.index, pump.mode, pump.power, pump.pressure, pump.flow);
-    if (urgent || !controlStateSent || relay != lastRelay)
+    if (refresh || relay != lastRelay)
         batch[count++] = comms.buildRelayControl(relay.index, relay.open); // index 0 = brew valve
-    if (urgent || !controlStateSent || altRelayActive != lastAlt)
+    if (refresh || altRelayActive != lastAlt)
         batch[count++] = comms.buildRelayControl(1, altRelayActive); // index 1 = alt relay
 
     if (count > 0) {
@@ -1478,7 +1486,8 @@ void Controller::updateControl(bool urgent) {
     lastPump = pump;
     lastRelay = relay;
     lastAlt = altRelayActive;
-    controlStateSent = true;
+    sentControlRevision = revision;
+    if (refresh) lastFullControlSend = now;
 }
 
 void Controller::activate(bool ignoreWarnings) {

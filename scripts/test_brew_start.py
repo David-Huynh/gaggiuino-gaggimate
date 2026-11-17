@@ -59,6 +59,14 @@ def main():
     command += ["-o", str(binary)]
     subprocess.run(command, check=True, cwd=ROOT)
     subprocess.run([str(binary)], check=True, timeout=20, cwd=ROOT)
+    (BUILD / "controller_control.inc").write_text(method(source, "void Controller::updateControl(") + "\n" +
+        method(source, "void Controller::onControllerConnection("), encoding="utf-8")
+    control_binary = BUILD / ("control.exe" if os.name == "nt" else "control")
+    control_command = command[:command.index(str(ROOT / "test/host_brew_start/test.cpp"))]
+    control_command += [str(ROOT / "test/host_brew_start/control.cpp"), "-o", str(control_binary)]
+    subprocess.run(control_command, check=True, cwd=ROOT)
+    subprocess.run([str(control_binary)], check=True, timeout=20, cwd=ROOT)
+
 
 
 if __name__ == "__main__":

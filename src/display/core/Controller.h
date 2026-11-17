@@ -130,6 +130,12 @@ class Controller {
     virtual float getCurrentPuckFlow() const { return currentPuckFlow; }
     virtual float getCurrentPumpFlow() const { return currentPumpFlow.load(std::memory_order_relaxed); }
     virtual float getCurrentPumpPower() const { return currentPumpPower; }
+    bool hasControllerHeaterStatus() const { return controllerHeaterStatusKnown.load() && isReady(); }
+    bool isControllerHeatingConfigured() const { return controllerHeatingConfigured.load(); }
+    float getControllerTargetTemp() const {
+        const float raw = controllerTargetTemp.load();
+        return raw > 0 ? raw - settings.getTemperatureOffset() : 0;
+    }
     virtual float getCurrentHeaterPower() const { return currentHeaterPower; }
     virtual float getCurrentPuckResistance() const { return currentPuckResistance; }
     virtual float getCurrentCoffeeVolume() const { return currentCoffeeVolume; }
@@ -255,6 +261,7 @@ class Controller {
     void setupPanel();
 #endif
     void setupBluetooth();
+    void onControllerConnection(bool connected);
     void onSystemInfo(const char *hardware, const char *version, uint32_t protocolVersion, bool dimming, bool pressure,
                       bool ledControl, bool tof, bool scale, std::vector<uint32_t> addons);
     // Connected to a controller too old to speak the framed protocol: drive the
@@ -337,6 +344,8 @@ class Controller {
     std::atomic<float> currentPumpFlow{0.0f};
     float currentPumpPower = 0.0f;
     float currentHeaterPower = 0.0f;
+    std::atomic<float> controllerTargetTemp{0};
+    std::atomic<bool> controllerHeatingConfigured{false}, controllerHeaterStatusKnown{false};
     float currentPuckResistance = 0.0f;
     float currentCoffeeVolume = 0.0f;
     std::atomic<float> currentWaterPumped{0.0f};
@@ -346,13 +355,16 @@ class Controller {
     SystemInfo systemInfo{};
 
     // Last control values sent to the controller. updateControl() only
-    // transmits components that differ from these (the controller is stateful
-    // and delivery is acknowledged). Reset on (re)connect to force a full resend.
+    // transmits changes immediately and refreshes the full state once a second.
+    // Session revisions prevent a concurrent INFO/reset from being lost.
     BoilerCommand lastBoiler{};
     PumpCommand lastPump{};
     RelayCommand lastRelay{};
     bool lastAlt = false;
-    bool controlStateSent = false;
+    std::atomic<uint32_t> controlRevision{1};
+    uint32_t sentControlRevision = 0;
+    unsigned long lastFullControlSend = 0;
+    static constexpr unsigned long CONTROL_REFRESH_MS = 1000;
 
     // BLE connection-interval priority: tight while a process runs, relaxed when
     // idle (frees radio airtime for Wi-Fi). Tracks the last requested state.

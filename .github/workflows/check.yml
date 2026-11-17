@@ -77,3 +77,5 @@ jobs:
         run: python scripts/test_artifact_stack.py
       - name: Build UART STM32 controller
         run: platformio run -e stm32f4
+      - name: Test heater safety and independent controller restarts
+        run: python scripts/test_heater_safety.py

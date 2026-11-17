@@ -6,6 +6,7 @@
 #include "Max31855Thermocouple.h"
 #include "logging.h"
 #include <Arduino.h>
+#include <cmath>
 #include <SPI.h>
 #ifdef ARDUINO_ARCH_STM32
 // On STM32, xTaskDelayUntil is usually named vTaskDelayUntil
@@ -20,9 +21,15 @@ Max31855Thermocouple::Max31855Thermocouple(const int csPin, const int misoPin, c
     this->error_callback = error_callback;
 }
 
-float Max31855Thermocouple::read() { return isErrorState() ? 0.0f : temperature; }
+float Max31855Thermocouple::read() { return isErrorState() ? 0.0f : temperature.load(); }
 
 bool Max31855Thermocouple::isErrorState() { return temperature <= 0 || errorCount >= MAX31855_MAX_ERRORS; }
+
+bool Max31855Thermocouple::hasUsableReading() {
+    return hasValidReading && lastReadStatus == STATUS_OK && std::isfinite(lastRawTemperature) &&
+        lastRawTemperature > 0 && lastRawTemperature <= MAX_SAFE_TEMP &&
+        static_cast<uint32_t>(millis()) - lastValidReadAt <= 1000 && !isErrorState();
+}
 
 void Max31855Thermocouple::setup() {
     SPI.begin();
@@ -38,7 +45,7 @@ void Max31855Thermocouple::setup() {
 
 void Max31855Thermocouple::loop() {
     if (errorCount >= MAX31855_MAX_ERRORS || temperature > MAX_SAFE_TEMP) {
-        ESP_LOGE(LOG_TAG, "Thermocouple failure! Error Count: %d, Temperature: %.2f\n", errorCount, temperature);
+        ESP_LOGE(LOG_TAG, "Thermocouple failure! Error Count: %d, Temperature: %.2f\n", errorCount.load(), temperature.load());
         error_callback();
         return;
     }
@@ -65,15 +72,19 @@ void Max31855Thermocouple::loop() {
         ESP_LOGE(LOG_TAG, "Temperature reported below 0°C: %.2f\n", temp);
     }
 
-    resultBuffer[bufferIndex] = temp <= 0.0f ? 1 : 0;
+    resultBuffer[bufferIndex] = (!std::isfinite(temp) || temp <= 0.0f) ? 1 : 0;
     errorCount += resultBuffer[bufferIndex];
     bufferIndex = (bufferIndex + 1) % MAX31855_ERROR_WINDOW;
 
-    if (temp <= 0.0f)
-        return;
-    temperature = 0.2f * temp + 0.8f * temperature;
-    ESP_LOGV(LOG_TAG, "Updated temperature: %2f\n", temperature);
-    callback(temperature);
+    if (!std::isfinite(temp) || temp <= 0.0f) return;
+    if (temp > MAX_SAFE_TEMP) { error_callback(); return; }
+    // A warm restart must start from the actual reading, not an artificial 0 C
+    // history that asks the heater for power while the boiler is already hot.
+    temperature = hasValidReading.load() ? 0.2f * temp + 0.8f * temperature.load() : temp;
+    hasValidReading = true;
+    lastValidReadAt = millis();
+    ESP_LOGV(LOG_TAG, "Updated temperature: %2f\n", temperature.load());
+    callback(temperature.load());
 }
 
 [[noreturn]] void Max31855Thermocouple::monitorTask(void *arg) {

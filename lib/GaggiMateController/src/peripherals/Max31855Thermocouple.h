@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #endif
+#include <atomic>
 #include "TemperatureSensor.h"
 #include <MAX31855.h>
 
@@ -23,6 +24,8 @@ class Max31855Thermocouple : public TemperatureSensor {
                          const temperature_error_callback_t &error_callback);
     float read() override;
     bool isErrorState() override;
+    bool hasUsableReading() override;
+    float readForSafety() override { return lastRawTemperature; }
     float rawTemperature() const { return lastRawTemperature; }
     float filteredTemperature() const { return temperature; }
     uint8_t lastStatus() const { return lastReadStatus; }
@@ -37,15 +40,17 @@ class Max31855Thermocouple : public TemperatureSensor {
     MAX31855 *max31855;
     xTaskHandle taskHandle;
 
-    int errorCount = 0;
+    std::atomic<int> errorCount{0};
     std::array<int, MAX31855_ERROR_WINDOW> resultBuffer{};
     size_t resultCount = 0;
     size_t bufferIndex = 0;
 
-    float temperature = .0f;
-    float lastRawTemperature = .0f;
-    uint8_t lastReadStatus = STATUS_NOREAD;
-    uint32_t readCount = 0;
+    std::atomic<bool> hasValidReading{false};
+    std::atomic<uint32_t> lastValidReadAt{0};
+    std::atomic<float> temperature{0};
+    std::atomic<float> lastRawTemperature{0};
+    std::atomic<uint8_t> lastReadStatus{STATUS_NOREAD};
+    std::atomic<uint32_t> readCount{0};
 
     int csPin = 0;
     int misoPin = 0;

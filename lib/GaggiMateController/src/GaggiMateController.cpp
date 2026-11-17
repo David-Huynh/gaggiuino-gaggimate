@@ -180,7 +180,6 @@ void GaggiMateController::setup() {
         int *valveStatusPtr = dimmedPump->getValveStatusPtr();
 
         heater->setThermalFeedforward(pumpFlowPtr, 23.0f, valveStatusPtr);
-        heater->setFeedforwardScale(0.0f);
     }
     // Initialize last ping time
     lastPingTime = millis();
@@ -272,10 +271,8 @@ void GaggiMateController::setup() {
     });
     _comms.onPidSettings([this](float Kp, float Ki, float Kd, float Kf) {
         handlePing();
-        this->heater->setTunings(Kp, Ki, Kd);
-
-        // Apply thermal feedforward parameters if available
-        this->heater->setFeedforwardScale(Kf);
+        if (!this->heater->configure(Kp, Ki, Kd, Kf))
+            ESP_LOGE(LOG_TAG, "Rejected invalid heater configuration; heating inhibited");
     });
     _comms.onPumpSettings([this](gm::PumpSettings settings) {
         handlePing();
@@ -341,6 +338,14 @@ void GaggiMateController::setup() {
         capabilities.addons[0] = gaggimate_Addon_init_zero;
         capabilities.addons[0].type = 7;
     }
+    _comms.onConnectionChanged([this](bool) {
+        // This callback is also fired when the peer's session changes without
+        // a physical UART disconnect. Reconfiguration is required before heat.
+        this->heater->invalidateConfiguration();
+        this->pump->setPower(0);
+        this->valve->set(false);
+        if (this->alt) this->alt->set(false);
+    });
     _comms.init("GPBLS", _config.name.c_str(), _version, capabilities, pairingWindow);
 
     ESP_LOGI(LOG_TAG, "Initialization done");
@@ -549,10 +554,10 @@ void GaggiMateController::sendSensorData() {
             }
         }
         batch[n++] = _comms.buildSensorData(this->thermocouple->read(), this->pressureSensor->getPressure(), puckFlow, pumpFlow,
-                                            puckResistance, pumpPower, heaterPower, waterPumped);
+                                            puckResistance, pumpPower, heaterPower, waterPumped, heater->getSetpoint(), heater->hasConfiguration());
         _comms.sendUnreliableBatch(batch, n); // telemetry: fire-and-forget
     } else {
-        _comms.sendSensorData(this->thermocouple->read(), 0.0f, 0.0f, 0.0f, 0.0f, pumpPower, heaterPower);
+        _comms.sendSensorData(this->thermocouple->read(), 0.0f, 0.0f, 0.0f, 0.0f, pumpPower, heaterPower, 0.0f, heater->getSetpoint(), heater->hasConfiguration());
     }
 }
 

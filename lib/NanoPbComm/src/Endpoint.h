@@ -6,6 +6,7 @@
 #include "Protocol.h"
 #include "Transport.h"
 #include <array>
+#include <atomic>
 #if defined(ARDUINO_ARCH_STM32)
 #include <STM32FreeRTOS.h>
 #include <queue.h>
@@ -89,7 +90,7 @@ class Endpoint {
     // link state has been reset. Used to push connect-time messages.
     void onConnection(ConnectionHandler handler) { _connHandler = std::move(handler); }
 
-    bool isConnected() const { return _transport.isConnected(); }
+    bool isConnected() const { return _applicationConnected.load() && _transport.isConnected(); }
 
     // Reliable-delivery round-trip latency (ms): time from transmitting a frame
     // to receiving its ACK. Derived for free from the stop-and-wait reliability
@@ -138,6 +139,13 @@ class Endpoint {
     uint32_t _smoothedRttMs = 0;
     bool _rttValid = false;
 
+    uint32_t _localSession = 0;
+    uint32_t _peerSession = 0;
+    bool _sessionReady = false;
+    std::atomic<bool> _applicationConnected{false};
+    std::atomic<uint32_t> _dispatchGeneration{0};
+    unsigned long _lastHelloMs = 0;
+    static constexpr unsigned long HELLO_INTERVAL_MS = 250;
     uint32_t _nextId = 1; // next outbound frame id (0 is reserved for ACKs)
     uint32_t _lastRxId = 0;
 
@@ -148,6 +156,7 @@ class Endpoint {
     struct DispatchEvent {
         bool isConnection = false;
         bool connected = false;
+        uint32_t generation = 0;
         gm::Payload payload{};
     };
     // Inbound events are drained off the transport task.
@@ -157,10 +166,15 @@ class Endpoint {
     gm::Frame _rxFrame{}; // decode scratch (onData is single-threaded per link)
     gm::Frame _txFrame{}; // encode scratch (guarded by _mutex in pump())
 
+    void processDispatchEvent(DispatchEvent const &event);
     void handleData(const uint8_t *data, size_t length);
     void handleConnection(bool connected);
     void pump();
     void sendAck(uint32_t id);
+    void sendHello();
+    void resetSession(); // caller holds _mutex
+    void queueConnection(bool connected);
+    static uint32_t freshSessionId();
     void dispatch(const gm::Payload &payload);
     static void dispatchTaskFn(void *arg);
     static bool encodeFrame(const gm::Frame &frame, uint8_t *buf, size_t bufSize, size_t *outLen);

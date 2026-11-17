@@ -6,6 +6,9 @@
 #else
 #include <esp_log.h>
 #endif
+#if !defined(ARDUINO_ARCH_STM32)
+#include <esp_system.h>
+#endif
 #include <pb_decode.h>
 #include <pb_encode.h>
 
@@ -51,12 +54,7 @@ void Endpoint::dispatchTaskFn(void *arg) {
     for (;;) {
         if (xQueueReceive(self->_rxQueue, &event, portMAX_DELAY) != pdTRUE)
             continue;
-        if (event.isConnection) {
-            if (self->_connHandler)
-                self->_connHandler(event.connected);
-        } else {
-            self->dispatch(event.payload);
-        }
+        self->processDispatchEvent(event);
     }
 }
 
@@ -64,6 +62,14 @@ void Endpoint::dispatch(const gm::Payload &payload) {
     const pb_size_t which = payload.which_content;
     if (which < HANDLER_SLOTS && _handlers[which])
         _handlers[which](payload);
+}
+
+void Endpoint::processDispatchEvent(DispatchEvent const &event) {
+    if (event.generation != _dispatchGeneration.load()) return;
+    if (event.isConnection) {
+        _applicationConnected.store(event.connected);
+        if (_connHandler) _connHandler(event.connected);
+    } else dispatch(event.payload);
 }
 
 void Endpoint::loop() { pump(); }
@@ -124,7 +130,7 @@ void Endpoint::sendUrgentBatch(const gm::Payload *payloads, size_t count) {
     for (size_t i = 0; i < count; i++)
         _queue.invalidate(gm_proto::coalescingKey(payloads[i]));
 
-    if (!_transport.isConnected()) {
+    if (!_transport.isConnected() || !_sessionReady) {
         for (size_t i = 0; i < count; i++)
             _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::PRIO_HIGH, payloads[i]);
         unlock();
@@ -132,6 +138,8 @@ void Endpoint::sendUrgentBatch(const gm::Payload *payloads, size_t count) {
     }
 
     memset(&_txFrame, 0, sizeof(_txFrame));
+    _txFrame.session_id = _localSession;
+    _txFrame.peer_session_id = _peerSession;
     _txFrame.id = _nextId++;
     if (_nextId == 0)
         _nextId = 1;
@@ -160,7 +168,7 @@ void Endpoint::sendUrgentBatch(const gm::Payload *payloads, size_t count) {
 void Endpoint::sendUnreliable(const gm::Payload &payload) { sendUnreliable(&payload, 1); }
 
 void Endpoint::sendUnreliable(const gm::Payload *payloads, size_t count) {
-    if (payloads == nullptr || count == 0 || !_transport.isConnected())
+    if (payloads == nullptr || count == 0 || !_transport.isConnected() || !_applicationConnected.load())
         return;
     if (count > MAX_PAYLOADS_PER_FRAME)
         count = MAX_PAYLOADS_PER_FRAME;
@@ -171,6 +179,8 @@ void Endpoint::sendUnreliable(const gm::Payload *payloads, size_t count) {
     memset(&_txFrame, 0, sizeof(_txFrame));
     _txFrame.id = 0;
     _txFrame.ack = 0;
+    _txFrame.session_id = _localSession;
+    _txFrame.peer_session_id = _peerSession;
     _txFrame.payloads_count = static_cast<pb_size_t>(count);
     for (size_t i = 0; i < count; i++)
         _txFrame.payloads[i] = payloads[i];
@@ -190,10 +200,12 @@ bool Endpoint::encodeFrame(const gm::Frame &frame, uint8_t *buf, size_t bufSize,
 
 void Endpoint::sendAck(uint32_t id) {
     gm::Frame frame = gaggimate_Frame_init_zero;
+    frame.session_id = _localSession;
+    frame.peer_session_id = _peerSession;
     frame.id = 0; // ACKs are never themselves acknowledged
     frame.ack = id;
     frame.payloads_count = 0;
-    uint8_t buf[16];
+    uint8_t buf[32];
     size_t len = 0;
     if (encodeFrame(frame, buf, sizeof(buf), &len))
         _transport.send(buf, len);
@@ -205,6 +217,11 @@ void Endpoint::pump() {
 
     lock();
     const unsigned long now = millis();
+    if (!_sessionReady) {
+        if (now - _lastHelloMs >= HELLO_INTERVAL_MS) sendHello();
+        unlock();
+        return;
+    }
 
     if (_inFlight) {
         if (now - _sentAt < ACK_TIMEOUT_MS) {
@@ -241,20 +258,21 @@ void Endpoint::pump() {
     }
     _txFrame.payloads_count = count;
     _txFrame.ack = 0;
+    _txFrame.session_id = _localSession;
+    _txFrame.peer_session_id = _peerSession;
     _txFrame.id = _nextId++;
     if (_nextId == 0)
         _nextId = 1;
 
-    if (!encodeFrame(_txFrame, _txBuf, BUFFER_SIZE, &_txLen)) {
-        ESP_LOGE(ENDPOINT_TAG, "Failed to encode outbound frame (%u payloads); re-queuing", count);
-        // The payloads were already popped -- put them back (coalescing keeps the
-        // latest value if a newer one arrived) so nothing is silently lost. The
-        // reserved id is simply skipped; the receiver only needs monotonic ids.
-        for (pb_size_t i = 0; i < count; i++)
-            _queue.upsert(gm_proto::coalescingKey(_txFrame.payloads[i]),
-                          gm_proto::defaultPriority(_txFrame.payloads[i].which_content), _txFrame.payloads[i]);
-        unlock();
-        return;
+    while (!encodeFrame(_txFrame, _txBuf, BUFFER_SIZE, &_txLen)) {
+        if (count <= 1) {
+            ESP_LOGE(ENDPOINT_TAG, "Outbound payload exceeds datagram budget");
+            unlock();
+            return;
+        }
+        const auto &deferred = _txFrame.payloads[--count];
+        _queue.upsert(gm_proto::coalescingKey(deferred), gm_proto::defaultPriority(deferred.which_content), deferred);
+        _txFrame.payloads_count = count;
     }
 
     _transport.send(_txBuf, _txLen);
@@ -275,6 +293,53 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
         ESP_LOGW(ENDPOINT_TAG, "Failed to decode frame (%u bytes): %s", static_cast<unsigned>(length), PB_GET_ERROR(&is));
         return;
     }
+
+    // A physical UART link can stay alive while one board reboots. Sequence
+    // counters alone cannot identify that event or bind an old ACK to a boot.
+    const bool hello = _rxFrame.id == 0 && _rxFrame.ack == 0 && _rxFrame.payloads_count == 0;
+    lock();
+    const uint32_t source = _rxFrame.session_id;
+    const uint32_t destination = _rxFrame.peer_session_id;
+    if (source == 0) {
+        // Legacy INFO is read-only and still useful for an OTA mismatch screen.
+        if (_rxQueue) for (pb_size_t i = 0; i < _rxFrame.payloads_count; ++i) {
+            if (_rxFrame.payloads[i].which_content != gaggimate_Payload_system_info_tag) continue;
+            DispatchEvent event;
+            event.generation = _dispatchGeneration.load();
+            event.payload = _rxFrame.payloads[i];
+            xQueueSend(_rxQueue, &event, 0);
+        }
+        unlock();
+        return;
+    }
+    if ((destination != 0 && destination != _localSession) ||
+        (source != _peerSession && (!hello || (_sessionReady && destination != 0)))) {
+        sendHello();
+        unlock();
+        return;
+    }
+    bool reply = false;
+    if (hello && destination == 0) {
+        if (_sessionReady || (_peerSession != 0 && _peerSession != source)) {
+            _localSession = freshSessionId();
+            resetSession();
+            queueConnection(false);
+        }
+        _peerSession = source;
+        reply = true;
+    } else if (hello && source != _peerSession) {
+        _peerSession = source;
+        reply = true;
+    }
+    if (destination == _localSession && source == _peerSession && !_sessionReady) {
+        _sessionReady = true;
+        queueConnection(true);
+        reply = true;
+    }
+    if (reply) sendHello();
+    const bool ready = _sessionReady && source == _peerSession && destination == _localSession;
+    unlock();
+    if (!ready || hello) return;
 
     const uint32_t id = _rxFrame.id;
     const uint32_t ack = _rxFrame.ack;
@@ -315,6 +380,7 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
         } else {
             for (pb_size_t i = 0; i < n; i++) {
                 DispatchEvent event;
+                event.generation = _dispatchGeneration.load();
                 event.payload = _rxFrame.payloads[i];
                 xQueueSend(_rxQueue, &event, 0);
             }
@@ -334,8 +400,42 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
     pump();
 }
 
-void Endpoint::handleConnection(bool connected) {
-    lock();
+uint32_t Endpoint::freshSessionId() {
+#if defined(ARDUINO_ARCH_STM32)
+    // Session identity, not authentication. Hardware timing + device identity
+    // distinguish boots; a peer hello also rotates the still-running ESP's RNG
+    // nonce, invalidating frames addressed to the previous session.
+    static uint32_t sequence = 0;
+    uint32_t value = micros() ^ HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ (++sequence * 0x9e3779b9u);
+#else
+    uint32_t value = esp_random();
+#endif
+    return value == 0 ? 1 : value;
+}
+
+void Endpoint::sendHello() {
+    gm::Frame frame = gaggimate_Frame_init_zero;
+    frame.session_id = _localSession;
+    frame.peer_session_id = _peerSession;
+    uint8_t bytes[16];
+    size_t length = 0;
+    if (encodeFrame(frame, bytes, sizeof(bytes), &length)) _transport.send(bytes, length);
+    _lastHelloMs = millis();
+}
+
+void Endpoint::queueConnection(bool connected) {
+    if (!_rxQueue) return;
+    DispatchEvent event;
+    event.isConnection = true;
+    event.connected = connected;
+    event.generation = _dispatchGeneration.load();
+    xQueueSend(_rxQueue, &event, 0);
+}
+
+void Endpoint::resetSession() {
+    _sessionReady = false;
+    _applicationConnected.store(false);
+    _dispatchGeneration.fetch_add(1);
     _inFlight = false;
     _inFlightPayloadCount = 0;
     _retries = 0;
@@ -343,21 +443,18 @@ void Endpoint::handleConnection(bool connected) {
     _inFlightId = 0;
     _lastRxId = 0;
     _nextId = 1;
-    _rttValid = false; // latency is per-link; don't carry a stale estimate across reconnects
-    _smoothedRttMs = 0;
-    _lastRttMs = 0;
+    _rttValid = false;
+    _smoothedRttMs = _lastRttMs = 0;
     _queue.clear();
-    unlock();
+    if (_rxQueue) xQueueReset(_rxQueue);
+}
 
-    if (_rxQueue) {
-        // Drop queued payloads from the previous session, then serialize the
-        // application connection callback with payload dispatch. A payload
-        // already executing finishes before this event, so it cannot mutate
-        // per-session application state after the callback resets it.
-        xQueueReset(_rxQueue);
-        DispatchEvent event;
-        event.isConnection = true;
-        event.connected = connected;
-        xQueueSend(_rxQueue, &event, 0);
-    }
+void Endpoint::handleConnection(bool connected) {
+    lock();
+    _localSession = freshSessionId();
+    _peerSession = 0;
+    resetSession();
+    queueConnection(false);
+    if (connected) sendHello();
+    unlock();
 }

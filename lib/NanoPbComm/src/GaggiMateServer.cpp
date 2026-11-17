@@ -29,6 +29,7 @@ void GaggiMateServer::init(const String &deviceName, const String &hardware, con
     setSystemInfo(hardware, version, capabilities);
     registerHandlers();
     _endpoint.onConnection([this](bool connected) {
+        if (_connectionCb) _connectionCb(connected);
         _sentSystemInfoAfterHandshake = false;
         if (connected) {
             _systemInfoAcknowledged = false;
@@ -113,7 +114,7 @@ void GaggiMateServer::pushSystemInfo() {
 void GaggiMateServer::acknowledgeSystemInfo() { _systemInfoAcknowledged = true; }
 
 gm::Payload GaggiMateServer::buildSensorData(float temperature, float pressure, float puckFlow, float pumpFlow,
-                                             float puckResistance, float pumpPower, float heaterPower, float waterPumped) {
+                                             float puckResistance, float pumpPower, float heaterPower, float waterPumped, float controllerTarget, bool heatingConfigured) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_sensor_tag;
     p.content.sensor.boilers_count = 1; // boiler 0; schema allows more
@@ -121,6 +122,8 @@ gm::Payload GaggiMateServer::buildSensorData(float temperature, float pressure, 
     p.content.sensor.boilers[0].temperature = temperature;
     p.content.sensor.boilers[0].pressure = pressure;
     p.content.sensor.boilers[0].power = heaterPower;
+    p.content.sensor.boilers[0].target_temperature = controllerTarget;
+    p.content.sensor.boilers[0].heating_configured = heatingConfigured;
     p.content.sensor.puck_flow = puckFlow;
     p.content.sensor.pump_flow = pumpFlow;
     p.content.sensor.puck_resistance = puckResistance;
@@ -242,8 +245,8 @@ gm::Payload GaggiMateServer::buildScaleCalibrationResult(uint8_t channel, float 
 // one. This avoids the constant ACK chatter on the high-rate path. Button /
 // autotune-result / error / system-info stay reliable.
 void GaggiMateServer::sendSensorData(float temperature, float pressure, float puckFlow, float pumpFlow, float puckResistance,
-                                     float pumpPower, float heaterPower, float waterPumped) {
-    _endpoint.sendUnreliable(buildSensorData(temperature, pressure, puckFlow, pumpFlow, puckResistance, pumpPower, heaterPower, waterPumped));
+                                     float pumpPower, float heaterPower, float waterPumped, float controllerTarget, bool heatingConfigured) {
+    _endpoint.sendUnreliable(buildSensorData(temperature, pressure, puckFlow, pumpFlow, puckResistance, pumpPower, heaterPower, waterPumped, controllerTarget, heatingConfigured));
 }
 
 void GaggiMateServer::sendButtonState(uint8_t index, bool pressed) { _endpoint.send(buildButtonState(index, pressed)); }

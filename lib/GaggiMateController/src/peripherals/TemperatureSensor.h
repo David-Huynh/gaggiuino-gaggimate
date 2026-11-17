@@ -8,6 +8,8 @@ class TemperatureSensor {
     virtual ~TemperatureSensor() = default;
     virtual float read();
     virtual bool isErrorState();
+    virtual float readForSafety() { return read(); }
+    virtual bool hasUsableReading() { return !isErrorState(); }
     virtual void setup();
 };
 
