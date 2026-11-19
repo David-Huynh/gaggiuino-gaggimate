@@ -79,3 +79,10 @@ jobs:
         run: platformio run -e stm32f4
       - name: Test heater safety and independent controller restarts
         run: python scripts/test_heater_safety.py
+      - name: Build STM32 OTA development firmware
+        env:
+          # RFC 8032 fixture key for simulation builds only.
+          GAGGIMATE_STM32_OTA_PUBLIC_KEY: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+        run: platformio run -e stm32f4-bootloader -e stm32f4-ota-app
+      - name: Simulate STM32 OTA UART transfers and interrupted flash writes
+        run: python scripts/test_stm32_ota.py --image .pio/build/stm32f4-ota-app/firmware.bin

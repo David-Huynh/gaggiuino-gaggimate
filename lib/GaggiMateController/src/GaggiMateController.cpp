@@ -356,6 +356,13 @@ void GaggiMateController::setup() {
         handlePing();
         _comms.sendMachineHardwareStatus(machineHardwareHash(settings), true, false);
     });
+#if defined(GAGGIMATE_STM32_OTA_APP)
+    _comms.onUpdateStart([this]() {
+        heater->stop();
+        pump->setPower(0);
+        valve->set(false);
+    });
+#endif
     _comms.enableUart(UART_RX_PIN, UART_TX_PIN, UART_COMM, UART_COMM_BAUD);
     _comms.init("GPBLS", _config.name.c_str(), _version, capabilities, pairingWindow);
 

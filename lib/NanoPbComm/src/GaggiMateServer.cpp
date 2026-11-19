@@ -1,6 +1,11 @@
 #include "GaggiMateServer.h"
 #include <cstdio>
 #include <cstring>
+#if defined(GAGGIMATE_STM32_OTA_APP)
+#include <Stm32BootWire.h>
+#include <stm32_ota_key.h>
+#include <stm32_ota_reset.h>
+#endif
 #if defined(ARDUINO_ARCH_STM32)
 #define ESP_LOGE(tag, fmt, ...) ((void)0)
 #define ESP_LOGI(tag, fmt, ...) ((void)0)
@@ -67,13 +72,30 @@ void GaggiMateServer::init(const String &deviceName, const String &hardware, con
         _uartPort->setTxBufferSize(gm_uart::TX_BUFFER_SIZE);
         _uartPort->begin(_uartBaud, SERIAL_8N1, _uartRxPin, _uartTxPin);
 #endif
+#if defined(GAGGIMATE_STM32_OTA_APP)
+        _uart->onChannelData(UartTransport::CHANNEL_OTA, [this](const uint8_t *request, size_t length) {
+            if (!_endpoint.isConnected() || !_updateStartCb ||
+                !stm32_ota::authorizedBeginRequest(request, length, STM32_OTA_KEY))
+                return;
+            _updateStartCb();
+            // The loader replies to the sender's next BEGIN. It verifies the
+            // manifest again before erasing any staging sector.
+            stm32_ota::resetToLoader();
+        });
+#endif
         _uart->begin();
         ESP_LOGI("GaggiMateServer", "Display link on UART rx=%u tx=%u @ %u baud", _uartRxPin, _uartTxPin,
                  static_cast<unsigned>(_uartBaud));
     }
 
 #if defined(ARDUINO_ARCH_STM32)
-    if (xTaskCreate(pumpTask, "GaggiMateServer", 768, this, 1, &_taskHandle) != pdPASS) {
+#if defined(GAGGIMATE_STM32_OTA_APP)
+    // The signed BEGIN check runs here before a reset into the bootloader.
+    constexpr uint16_t stackWords = 2048;
+#else
+    constexpr uint16_t stackWords = 768;
+#endif
+    if (xTaskCreate(pumpTask, "GaggiMateServer", stackWords, this, 1, &_taskHandle) != pdPASS) {
 #else
     if (xTaskCreatePinnedToCore(pumpTask, "GaggiMateServer", 4096, this, 1, &_taskHandle, 0) != pdPASS) {
 #endif
