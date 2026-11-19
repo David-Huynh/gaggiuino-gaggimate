@@ -307,7 +307,7 @@ void Controller::connect() {
     // Keep the SDK's heap preference during radio startup. A cold WebUI load
     // then gets PSRAM for ordinary buffers and leaves internal RAM for Wi-Fi.
     if (psramFound()) {
-        constexpr size_t internalHeapPreferenceBytes = 512;
+        constexpr size_t internalHeapPreferenceBytes = 128;
         heap_caps_malloc_extmem_enable(internalHeapPreferenceBytes);
     }
 #endif
