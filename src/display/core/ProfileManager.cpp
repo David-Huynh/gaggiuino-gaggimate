@@ -1,7 +1,11 @@
 #include "ProfileManager.h"
 #include <ArduinoJson.h>
+#include <display/core/ProfileImage.h>
+#include <display/core/system_profiles.h>
+#include <display/util/FsUtil.h>
 #include <display/core/StorageCoordinator.h>
 #include <display/util/PsramAllocator.h>
+#include <esp32-hal-psram.h>
 
 #include <utility>
 
@@ -10,6 +14,9 @@ ProfileManager::ProfileManager(fs::FS *fs, String dir, Settings &settings, Plugi
 
 void ProfileManager::setup() {
     ensureDirectory();
+    // Created up front so listing it later never takes the noisy missing-path fallback in the Arduino VFS.
+    if (!_fs->exists(profile_image::DIR))
+        _fs->mkdir(profile_image::DIR);
     // Call listProfiles once; each call scans the filesystem and (historically)
     // burned a file handle. Reuse this snapshot for both the entry guard and
     // the migrate() call so we hit the FS as little as possible at boot.
@@ -25,6 +32,7 @@ void ProfileManager::setup() {
         selectedProfile = Profile{};
         loadSelectedProfile(selectedProfile);
     }
+    ensureSystemProfiles();
     _settings.setFavoritedProfiles(getFavoritedProfiles(true));
 
     String startupProfile = _settings.getStartupProfile();
@@ -46,6 +54,20 @@ bool ProfileManager::ensureDirectory() const {
         return _fs->mkdir(_dir);
     }
     return true;
+}
+
+bool ProfileManager::isSystemProfile(const String &uuid) { return uuid == BACKFLUSH_PROFILE_ID || uuid == DESCALING_PROFILE_ID; }
+
+void ProfileManager::ensureSystemProfiles() {
+    Profile seeds[] = {makeBackflushProfile(BACKFLUSH_PROFILE_ID), makeDescalingProfile(DESCALING_PROFILE_ID)};
+    for (Profile &seed : seeds) {
+        if (profileExists(seed.id))
+            continue;
+        if (saveProfile(seed))
+            ESP_LOGI("ProfileManager", "Created system profile %s", seed.id.c_str());
+        else
+            ESP_LOGE("ProfileManager", "Failed to create system profile %s", seed.id.c_str());
+    }
 }
 
 String ProfileManager::profilePath(const String &uuid) const { return _dir + "/" + uuid + ".json"; }
@@ -85,7 +107,7 @@ void ProfileManager::migrate(const std::vector<String> &existingProfiles) {
     Profile profile{};
     profile.id = generateShortID();
     profile.label = "Default";
-    profile.description = "Default profile";
+    profile.description = "Automatically created default profile - runs the machine as before";
     profile.temperature = 93;
     profile.type = "standard";
     Phase brewPhase{};
@@ -127,7 +149,7 @@ std::vector<String> ProfileManager::listProfiles() {
     File file = root.openNextFile();
     while (file) {
         String name = file.name();
-        if (name.endsWith(".json")) {
+        if (name.endsWith(".json") && !fs_util::isHiddenPath(name)) {
             int start = name.lastIndexOf('/') + 1;
             int end = name.lastIndexOf('.');
             uuids.push_back(name.substring(start, end));
@@ -189,6 +211,9 @@ bool ProfileManager::saveProfile(Profile &profile) {
         isNew = true;
     }
 
+    if (isSystemProfile(profile.id))
+        profile.utility = true;
+
     ESP_LOGI("ProfileManager", "Saving profile %s", profile.id.c_str());
 
     File file = _fs->open(profilePath(profile.id), "w");
@@ -214,10 +239,21 @@ bool ProfileManager::saveProfile(Profile &profile) {
 }
 
 bool ProfileManager::deleteProfile(const String &uuid) {
+    if (isSystemProfile(uuid)) {
+        ESP_LOGW("ProfileManager", "Refusing to delete system profile %s", uuid.c_str());
+        return false;
+    }
+    if (uuid == _settings.getSelectedProfile()) {
+        ESP_LOGW("ProfileManager", "Refusing to delete selected profile %s", uuid.c_str());
+        return false;
+    }
     auto flashLease = StorageCoordinator::instance().acquireFlash();
     removeFavoritedProfile(uuid);
     if (_settings.getStartupProfile() == uuid) {
         _settings.setStartupProfile("");
+    }
+    if (hasProfileImage(uuid)) {
+        _fs->remove(profile_image::path(uuid));
     }
     return _fs->remove(profilePath(uuid));
 }
@@ -227,12 +263,63 @@ bool ProfileManager::profileExists(const String &uuid) {
     return _fs->exists(profilePath(uuid));
 }
 
-void ProfileManager::selectProfile(const String &uuid) {
+bool ProfileManager::hasProfileImage(const String &uuid) {
+    return profile_image::isValidId(uuid) && _fs->exists(profile_image::path(uuid));
+}
+
+std::vector<String> ProfileManager::listProfileImages() {
+    std::vector<String> ids;
+    File root = _fs->open(profile_image::DIR);
+    if (!root || !root.isDirectory()) {
+        if (root)
+            root.close();
+        return ids;
+    }
+    // Names only: openNextFile() would fopen every entry against the 10-file SD_MMC limit.
+    bool isDir = false;
+    for (String name = root.getNextFileName(&isDir); !name.isEmpty(); name = root.getNextFileName(&isDir)) {
+        if (isDir || !name.endsWith(".bin") || fs_util::isHiddenPath(name))
+            continue;
+        ids.push_back(name.substring(name.lastIndexOf('/') + 1, name.lastIndexOf('.')));
+    }
+    root.close();
+    return ids;
+}
+
+uint8_t *ProfileManager::loadProfileImage(const String &uuid) {
+    if (!profile_image::isValidId(uuid))
+        return nullptr;
+    File file = _fs->open(profile_image::path(uuid), "r");
+    if (!file)
+        return nullptr;
+    uint32_t header = 0;
+    const size_t pixelBytes = profile_image::FILE_BYTES - profile_image::HEADER_BYTES;
+    if (file.size() != profile_image::FILE_BYTES ||
+        file.read(reinterpret_cast<uint8_t *>(&header), sizeof(header)) != sizeof(header) || header != profile_image::HEADER) {
+        file.close();
+        return nullptr;
+    }
+    auto *pixels = static_cast<uint8_t *>(ps_malloc(pixelBytes));
+    if (pixels != nullptr && file.read(pixels, pixelBytes) != pixelBytes) {
+        free(pixels);
+        pixels = nullptr;
+    }
+    file.close();
+    return pixels;
+}
+
+bool ProfileManager::selectProfile(const String &uuid) {
+    Profile profile{};
+    if (!loadProfile(uuid, profile)) {
+        ESP_LOGW("ProfileManager", "Refusing to select unreadable profile %s", uuid.c_str());
+        return false;
+    }
     ESP_LOGI("ProfileManager", "Selecting profile %s", uuid.c_str());
     _settings.setSelectedProfile(uuid);
-    selectedProfile = Profile{};
-    loadSelectedProfile(selectedProfile);
+    selectedProfile = std::move(profile);
+    selectedProfile.selected = true;
     _plugin_manager->trigger("profiles:profile:select", "id", uuid);
+    return true;
 }
 
 Profile &ProfileManager::getSelectedProfile() { return selectedProfile; }
@@ -263,6 +350,9 @@ std::vector<String> ProfileManager::getFavoritedProfiles(bool validate) {
         }
     }
 
+    // Older firmware never enforced the limit; cap here instead of rewriting the stored favorites.
+    if (result.size() > MAX_FAVORITED_PROFILES)
+        result.resize(MAX_FAVORITED_PROFILES);
     if (result.empty()) {
         String sel = _settings.getSelectedProfile();
         bool selValid = (!validate) || profileExists(sel);
@@ -278,7 +368,13 @@ void ProfileManager::removeFavoritedProfile(String id) {
     _plugin_manager->trigger("profiles:profile:unfavorite", "id", id);
 }
 
-void ProfileManager::addFavoritedProfile(String id) {
+bool ProfileManager::addFavoritedProfile(String id) {
+    const auto &favorites = _settings.getFavoritedProfiles();
+    if (std::find(favorites.begin(), favorites.end(), id) != favorites.end())
+        return true;
+    if (favorites.size() >= MAX_FAVORITED_PROFILES)
+        return false;
     _settings.addFavoritedProfile(id);
     _plugin_manager->trigger("profiles:profile:favorite", "id", id);
+    return true;
 }

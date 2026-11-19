@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'preact/hooks';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { Trans, useLingui } from '@lingui/react/macro';
+import { plural } from '@lingui/core/macro';
 import { faCompress } from '@fortawesome/free-solid-svg-icons/faCompress';
 import Card from '../../components/Card.jsx';
 import { Tooltip } from '../../components/Tooltip.jsx';
@@ -50,6 +52,7 @@ import { METRIC_DEFINITIONS } from '../../utils/metricDefinitions.js';
 import { PANEL_DEFINITIONS, SPACER_ID, SPACER_DEFINITION } from '../../utils/panelDefinitions.js';
 
 export function DashboardSettings() {
+  const { t } = useLingui();
   const [dashboardLayout, setDashboardLayoutState] = useState(() => getDashboardLayout());
   const [dashboardCardMode, setDashboardCardModeState] = useState(() => getDashboardCardMode());
   const [showRecentShots, setShowRecentShotsState] = useState(() => getShowRecentShots());
@@ -79,17 +82,19 @@ export function DashboardSettings() {
     }
   };
 
-  const hiddenMetrics = METRIC_DEFINITIONS.filter(
-    m => !m.required && !metricOrder.includes(m.id) && m.available(machine.value.status),
-  );
+  // Home passes its dashboard state to available(); mirror the fields those checks read from here.
+  const availability = {
+    ...machine.value.status,
+    ledControl: machine.value.capabilities.ledControl,
+  };
 
+  const availableMetrics = METRIC_DEFINITIONS.filter(m => m.available(availability));
+  const availablePanels = PANEL_DEFINITIONS.filter(def =>
+    (def.availableInSettings ?? def.available)(availability),
+  );
+  const hiddenMetrics = availableMetrics.filter(m => !m.required && !metricOrder.includes(m.id));
   const hiddenPanels = [
-    ...PANEL_DEFINITIONS.filter(def => {
-      if (def.required) return false;
-      if (panelOrder.includes(def.id)) return false;
-      const availFn = def.availableInSettings ?? def.available;
-      return availFn(machine.value.status);
-    }),
+    ...availablePanels.filter(def => !def.required && !panelOrder.includes(def.id)),
     ...(panelOrder.includes(SPACER_ID) ? [] : [SPACER_DEFINITION]),
   ];
 
@@ -101,7 +106,9 @@ export function DashboardSettings() {
   return (
     <>
       <div className='mb-4 flex flex-row items-center gap-2'>
-        <h2 className='flex-grow text-2xl font-bold sm:text-3xl'>Dashboard Settings</h2>
+        <h2 className='flex-grow text-2xl font-bold sm:text-3xl'>
+          <Trans>Dashboard Settings</Trans>
+        </h2>
       </div>
 
       <div
@@ -110,8 +117,8 @@ export function DashboardSettings() {
         onClickCapture={markCustomized}
       >
         {/* ── Card 1: General Settings ─────────────────────────────────── */}
-        <Card sm={10} lg={5} title='General Settings'>
-          <SettingsFormField label='Dashboard Layout' htmlFor='dashboardLayout'>
+        <Card sm={10} lg={5} title={t`General Settings`}>
+          <SettingsFormField label={t`Dashboard Layout`} htmlFor='dashboardLayout'>
             <select
               id='dashboardLayout'
               className='select select-bordered w-full'
@@ -121,14 +128,14 @@ export function DashboardSettings() {
                 setDashboardLayout(e.target.value);
               }}
             >
-              <option value={DASHBOARD_LAYOUTS.ORDER_FIRST}>Process Controls First</option>
-              <option value={DASHBOARD_LAYOUTS.ORDER_LAST}>Chart First</option>
+              <option value={DASHBOARD_LAYOUTS.ORDER_FIRST}>{t`Process Controls First`}</option>
+              <option value={DASHBOARD_LAYOUTS.ORDER_LAST}>{t`Chart First`}</option>
             </select>
           </SettingsFormField>
           <SettingsFormField
-            label='Control Column Style'
+            label={t`Control Column Style`}
             htmlFor='dashboardCardMode'
-            helpText='Show the control column panels as separate cards, or group them into a single unified card.'
+            helpText={t`Show the control column panels as separate cards, or group them into a single unified card.`}
             noMargin
           >
             <select
@@ -140,16 +147,16 @@ export function DashboardSettings() {
                 setDashboardCardMode(e.target.value);
               }}
             >
-              <option value={DASHBOARD_CARD_MODES.MULTI}>Multiple Cards</option>
-              <option value={DASHBOARD_CARD_MODES.SINGLE}>Single Card</option>
+              <option value={DASHBOARD_CARD_MODES.MULTI}>{t`Multiple Cards`}</option>
+              <option value={DASHBOARD_CARD_MODES.SINGLE}>{t`Single Card`}</option>
             </select>
           </SettingsFormField>
         </Card>
 
         {/* ── Card 2: Recent Shots ──────────────────────────────────────── */}
-        <Card sm={10} lg={5} title='Recent Shots'>
+        <Card sm={10} lg={5} title={t`Recent Shots`}>
           <ToggleField
-            label='Show Recent Shots'
+            label={t`Show Recent Shots`}
             htmlFor='showRecentShots'
             checked={showRecentShots}
             onChange={e => {
@@ -159,7 +166,7 @@ export function DashboardSettings() {
           />
           {showRecentShots && (
             <>
-              <SettingsFormField label='Max Recent Shots' htmlFor='recentShotCount'>
+              <SettingsFormField label={t`Max Recent Shots`} htmlFor='recentShotCount'>
                 <div className='flex items-center gap-3'>
                   <input
                     id='recentShotCount'
@@ -176,33 +183,36 @@ export function DashboardSettings() {
                     }}
                   />
                   <span className='w-20 text-sm'>
-                    {recentShotCount} {recentShotCount === 1 ? 'shot' : 'shots'}
+                    {plural(recentShotCount, { one: '# shot', other: '# shots' })}
                   </span>
                 </div>
               </SettingsFormField>
-              <SettingsFormField label='Shot Card Metrics' htmlFor='shotMetricSlot0' noMargin>
+              <SettingsFormField label={t`Shot Card Metrics`} htmlFor='shotMetricSlot0' noMargin>
                 <div className='flex gap-2'>
-                  {[0, 1, 2].map(i => (
-                    <div key={i} className='flex flex-1 flex-col gap-1'>
-                      <span className='text-base-content/60 text-xs'>Slot {i + 1}</span>
-                      <select
-                        className='select select-bordered select-sm w-full'
-                        value={shotMetricSlots[i]}
-                        onChange={e => {
-                          const next = [...shotMetricSlots];
-                          next[i] = e.target.value;
-                          setShotMetricSlotsState(next);
-                          setShotMetricSlots(next);
-                        }}
-                      >
-                        <option value='duration'>Duration</option>
-                        <option value='weight'>Weight</option>
-                        <option value='avgTemp'>Avg Temp</option>
-                        <option value='maxPressure'>Max Pressure</option>
-                        <option value='avgFlow'>Avg Flow</option>
-                      </select>
-                    </div>
-                  ))}
+                  {[0, 1, 2].map(i => {
+                    const slotNumber = i + 1;
+                    return (
+                      <div key={i} className='flex flex-1 flex-col gap-1'>
+                        <span className='text-base-content/60 text-xs'>{t`Slot ${slotNumber}`}</span>
+                        <select
+                          className='select select-bordered select-sm w-full'
+                          value={shotMetricSlots[i]}
+                          onChange={e => {
+                            const next = [...shotMetricSlots];
+                            next[i] = e.target.value;
+                            setShotMetricSlotsState(next);
+                            setShotMetricSlots(next);
+                          }}
+                        >
+                          <option value='duration'>{t`Duration`}</option>
+                          <option value='weight'>{t`Weight`}</option>
+                          <option value='avgTemp'>{t`Avg Temp`}</option>
+                          <option value='maxPressure'>{t`Max Pressure`}</option>
+                          <option value='avgFlow'>{t`Avg Flow`}</option>
+                        </select>
+                      </div>
+                    );
+                  })}
                 </div>
               </SettingsFormField>
             </>
@@ -210,9 +220,9 @@ export function DashboardSettings() {
         </Card>
 
         {/* ── Card 3: Panel Selection ───────────────────────────────────── */}
-        <Card sm={10} lg={5} title='Panel Selection'>
+        <Card sm={10} lg={5} title={t`Panel Selection`}>
           <ToggleField
-            label='Stick first panel to top'
+            label={t`Stick first panel to top`}
             htmlFor='stickyTop'
             checked={stickyTop}
             onChange={e => {
@@ -221,7 +231,7 @@ export function DashboardSettings() {
             }}
           />
           <ToggleField
-            label='Stick last panel to bottom'
+            label={t`Stick last panel to bottom`}
             htmlFor='stickyBottom'
             checked={stickyBottom}
             onChange={e => {
@@ -230,12 +240,12 @@ export function DashboardSettings() {
             }}
           />
           <SettingsFormField
-            label='Column Spacing'
+            label={t`Column Spacing`}
             htmlFor='columnSpacing'
             helpText={
               panelOrder.includes(SPACER_ID)
-                ? 'Ignored while a Flexible Space item is present in the panel list below.'
-                : 'Controls how panels are distributed vertically: pack them to the top, or space them evenly across the column.'
+                ? t`Ignored while a Flexible Space item is present in the panel list below.`
+                : t`Controls how panels are distributed vertically: pack them to the top, or space them evenly across the column.`
             }
           >
             <select
@@ -247,19 +257,19 @@ export function DashboardSettings() {
                 setColumnSpacing(e.target.value);
               }}
             >
-              <option value={COLUMN_SPACINGS.START}>Pack to top</option>
-              <option value={COLUMN_SPACINGS.BETWEEN}>Space evenly</option>
+              <option value={COLUMN_SPACINGS.START}>{t`Pack to top`}</option>
+              <option value={COLUMN_SPACINGS.BETWEEN}>{t`Space evenly`}</option>
             </select>
           </SettingsFormField>
           <SortableConfigurator
             order={panelOrder}
-            definitions={[...PANEL_DEFINITIONS, SPACER_DEFINITION]}
+            definitions={[...availablePanels, SPACER_DEFINITION]}
             hidden={hiddenPanels}
             onOrderChange={ids => {
               setPanelOrderState(ids);
               persistPanelOrder(ids);
             }}
-            emptyMessage='All available panels are visible.'
+            emptyMessage={t`All available panels are visible.`}
             extraControls={def => {
               if (!def.supportsCompact) return null;
               const isCompact = compactPanels.includes(def.id);
@@ -267,13 +277,13 @@ export function DashboardSettings() {
                 <Tooltip
                   content={
                     isCompact
-                      ? 'Compact mode is on — click to show the full panel'
-                      : 'Enables compact mode for this panel'
+                      ? t`Compact mode is on — click to show the full panel`
+                      : t`Enables compact mode for this panel`
                   }
                 >
                   <button
                     type='button'
-                    aria-label={isCompact ? 'Switch to full view' : 'Switch to compact view'}
+                    aria-label={isCompact ? t`Switch to full view` : t`Switch to compact view`}
                     onClick={() => handleToggleCompact(def.id)}
                     className={`btn btn-xs flex h-6 items-center justify-center gap-1 rounded-full px-2 ${
                       isCompact
@@ -282,7 +292,11 @@ export function DashboardSettings() {
                     }`}
                   >
                     <FontAwesomeIcon icon={faCompress} className='h-3 w-3' />
-                    <span className='hidden @md:inline'>{isCompact ? 'Compact' : 'Full'}</span>
+                    <span className='hidden @md:inline'>
+                      {isCompact
+                        ? t({ message: 'Compact', context: 'panel view' })
+                        : t({ message: 'Full', context: 'panel view' })}
+                    </span>
                   </button>
                 </Tooltip>
               );
@@ -290,9 +304,9 @@ export function DashboardSettings() {
           />
           {!compactPanels.includes('profile') && panelOrder.includes('profile') && (
             <SettingsFormField
-              label='Profile Chart Height'
+              label={t`Profile Chart Height`}
               htmlFor='profileChartHeight'
-              helpText='Sets the height of the profile chart preview shown in the Profile Selector panel.'
+              helpText={t`Sets the height of the profile chart preview shown in the Profile Selector panel.`}
             >
               <div className='flex items-center gap-3'>
                 <input
@@ -316,11 +330,11 @@ export function DashboardSettings() {
         </Card>
 
         {/* ── Card 4: Metric Selection ──────────────────────────────────── */}
-        <Card sm={10} lg={5} title='Metric Selection'>
+        <Card sm={10} lg={5} title={t`Metric Selection`}>
           <SettingsFormField
-            label='Metrics Columns'
+            label={t`Metrics Columns`}
             htmlFor='metricsColumns'
-            helpText='Sets the maximum number of columns. On smaller screens, fewer columns are used to keep metrics readable.'
+            helpText={t`Sets the maximum number of columns. On smaller screens, fewer columns are used to keep metrics readable.`}
           >
             <div className='flex items-center gap-3'>
               <input
@@ -338,14 +352,14 @@ export function DashboardSettings() {
                 }}
               />
               <span className='w-20 text-sm'>
-                {metricsColumns} {metricsColumns === 1 ? 'column' : 'columns'}
+                {plural(metricsColumns, { one: '# column', other: '# columns' })}
               </span>
             </div>
           </SettingsFormField>
           <SettingsFormField
-            label='Last Row Fill'
+            label={t`Last Row Fill`}
             htmlFor='metricsLastRowFill'
-            helpText='Controls how the last, incomplete row of metrics is laid out: stretch items evenly to fill the row, or keep them aligned to the column grid.'
+            helpText={t`Controls how the last, incomplete row of metrics is laid out: stretch items evenly to fill the row, or keep them aligned to the column grid.`}
           >
             <select
               id='metricsLastRowFill'
@@ -356,19 +370,19 @@ export function DashboardSettings() {
                 setMetricsLastRowFill(e.target.value);
               }}
             >
-              <option value={METRICS_LAST_ROW_FILLS.EVEN}>Even fill</option>
-              <option value={METRICS_LAST_ROW_FILLS.GRID}>Align to grid</option>
+              <option value={METRICS_LAST_ROW_FILLS.EVEN}>{t`Even fill`}</option>
+              <option value={METRICS_LAST_ROW_FILLS.GRID}>{t`Align to grid`}</option>
             </select>
           </SettingsFormField>
           <SortableConfigurator
             order={metricOrder}
-            definitions={METRIC_DEFINITIONS}
+            definitions={availableMetrics}
             hidden={hiddenMetrics}
             onOrderChange={ids => {
               setMetricOrderState(ids);
               persistMetricOrder(ids);
             }}
-            emptyMessage='All available metrics are visible.'
+            emptyMessage={t`All available metrics are visible.`}
           />
         </Card>
       </div>
@@ -376,7 +390,7 @@ export function DashboardSettings() {
       <div className='pt-4'>
         <div className='flex flex-col gap-2 pt-4 sm:flex-row'>
           <a href='/' className='btn btn-outline flex-1 sm:flex-none'>
-            Back
+            <Trans>Back</Trans>
           </a>
         </div>
       </div>

@@ -89,8 +89,18 @@ struct Controller {
     Plugins plugins;
     Plugins *pluginManager = &plugins;
     Settings settings;
+    struct ProfileManager {
+        struct Profile { std::vector<int> phases{1}; String id = "test"; } profile;
+        const Profile &getSelectedProfile() const { return profile; }
+    } profiles;
+    ProfileManager *profileManager = &profiles;
+    struct { struct { bool scale = true; } capabilities; } systemInfo;
+    struct UI { bool isBrewConfirmVisible() const { return false; } };
+    UI *ui = nullptr;
     struct Warnings { bool error = false; bool hasError() const { return error; } } warnings;
     bool flushPending = false;
+    bool relaxPending = false;
+    unsigned long relaxRequestedAt = 0;
     Process *currentProcess = nullptr, *lastProcess = nullptr;
     bool ready = true, started = false, steamReady = false, processCompleted = false;
     bool hardwareScalePresent = true;
@@ -112,6 +122,7 @@ struct Controller {
         return availability;
     }
     bool isVolumetricAvailable() const { return true; }
+    void updateControl() {}
     void applyConnectionPriority() {}
     void startBrewProcess() {
         assert(brewTare.pending()); // manual tare remains excluded until process creation

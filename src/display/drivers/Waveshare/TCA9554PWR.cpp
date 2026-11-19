@@ -32,7 +32,7 @@ void Mode_EXIO(uint8_t Pin, uint8_t State) // Set the mode of the TCA9554PWR Pin
                                            // mode). State: 0= Output mode 1= input mode
 {
     uint8_t bitsStatus = I2C_Read_EXIO(TCA9554_CONFIG_REG);
-    uint8_t Data = (0x01 << (Pin - 1)) | bitsStatus;
+    uint8_t Data = State ? (bitsStatus | (0x01 << (Pin - 1))) : (bitsStatus & ~(0x01 << (Pin - 1)));
     uint8_t result = I2C_Write_EXIO(TCA9554_CONFIG_REG, Data);
     if (result != 0) {
         printf("I/O Configuration Failure !!!\r\n");
@@ -65,13 +65,9 @@ uint8_t Read_EXIOS(uint8_t REG = TCA9554_INPUT_REG) // Read the level of all pin
  * **********************************************************/
 void Set_EXIO(uint8_t Pin, uint8_t State) // Sets the level state of the Pin without affecting the other pins
 {
-    uint8_t Data;
     if (State < 2 && Pin < 9 && Pin > 0) {
         uint8_t bitsStatus = Read_EXIOS(TCA9554_OUTPUT_REG);
-        if (State == 1)
-            Data = (0x01 << (Pin - 1)) | bitsStatus;
-        else if (State == 0)
-            Data = (~(0x01 << (Pin - 1))) & bitsStatus;
+        uint8_t Data = State == 1 ? (0x01 << (Pin - 1)) | bitsStatus : ~(0x01 << (Pin - 1)) & bitsStatus;
         uint8_t result = I2C_Write_EXIO(TCA9554_OUTPUT_REG, Data);
         if (result != 0) {
             printf("Failed to set GPIO!!!\r\n");

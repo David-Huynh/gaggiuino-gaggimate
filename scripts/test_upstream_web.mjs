@@ -1,15 +1,33 @@
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
 // Status parsing shares warning metadata with the UI; SVG assets are inert on the host.
-registerHooks({ load(url, context, nextLoad) {
-  if (new URL(url).pathname.endsWith('.svg')) return { format: 'module', source: 'export default ""', shortCircuit: true };
-  return nextLoad(url, context);
-} });
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    // These imports are resolved by Vite in the browser.
+    if (specifier.endsWith('/app/platform.js')) {
+      return { url: 'data:text/javascript,export const isApp = false;', shortCircuit: true };
+    }
+    if (specifier.endsWith('/app/machines.js')) {
+      return { url: 'data:text/javascript,export const machineSocketUrl = () => null;', shortCircuit: true };
+    }
+    if (specifier === '@lingui/core/macro') {
+      return {
+        url: 'data:text/javascript,export const msg = value => Array.isArray(value) ? ({ message: value.join("") }) : value;',
+        shortCircuit: true,
+      };
+    }
+    return nextResolve(specifier, context);
+  },
+  load(url, context, nextLoad) {
+    if (new URL(url).pathname.endsWith('.svg')) return { format: 'module', source: 'export default ""', shortCircuit: true };
+    return nextLoad(url, context);
+  },
+});
 const { default: ApiService, machine } = await import('../web/src/services/ApiService.js');
 import { parseBinaryShot } from '../web/src/pages/ShotHistory/parseBinaryShot.js';
 import { calculatePumpedWater } from '../web/src/pages/ShotAnalyzer/services/analyzer/waterIntegration.js';
 
-const api = Object.create(ApiService.prototype);
+const api = new ApiService({ state: machine });
 api._onStatus({ tp: 'evt:status', m: 1, puid: 'profile-a', ct: 93, bsp: true,
   up: false, uptime: 100, ctof: true, gta: true, scale: { w: 12.3, pr: true, seq: 42 } });
 const count = machine.value.history.length;
@@ -62,7 +80,7 @@ function fixture(version, water = [0, 25, 50]) {
   }
   return data;
 }
-for (const version of [5, 6, 7]) {
+for (const version of [5, 6, 7, 8]) {
   const shot = parseBinaryShot(fixture(version), 'fixture');
   assert.deepEqual(shot.samples.map(s => s.t), version >= 6 ? [0, 380, 600] : [0, 250, 500]);
   assert.equal(shot.volume, 42);

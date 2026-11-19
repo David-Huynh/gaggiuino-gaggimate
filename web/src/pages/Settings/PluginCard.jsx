@@ -3,13 +3,84 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import homekitImage from '../../assets/homekit.png';
 import { faCalendarDays } from '@fortawesome/free-solid-svg-icons/faCalendarDays';
 import { computed } from '@preact/signals';
-import { machine } from '../../services/ApiService.js';
+import { machine, ApiServiceContext } from '../../services/ApiService.js';
+import { useContext, useEffect, useState } from 'preact/hooks';
+import { Trans, useLingui } from '@lingui/react/macro';
+import { useProfileList } from '../../services/hooks.js';
 import {
   communityUploadPipelineText,
   communityUploadQueueText,
 } from '../../utils/communityUploadStatus.js';
 
 const gearpumpAddon = computed(() => machine.value.capabilities.gearpumpAddon);
+const MAHLKONIG_MIN_RECIPES = 4;
+
+// Profile per grinder recipe slot, stored as "r1,r2,..."; the grinder reports only the recipe number.
+function MahlkonigRecipeProfiles({ formData, onChange }) {
+  const { t } = useLingui();
+  const apiService = useContext(ApiServiceContext);
+  const [lastRecipe, setLastRecipe] = useState(null);
+  const { profiles: allProfiles } = useProfileList();
+  const profiles = allProfiles.filter(p => !p.utility);
+  const mapped = String(formData.mahlkonigRecipeProfiles || '').split(',');
+  const count = Math.max(MAHLKONIG_MIN_RECIPES, mapped.length, lastRecipe || 0);
+  const recipes = Array.from({ length: count }, (_, i) => i + 1);
+
+  useEffect(() => {
+    apiService
+      .request({ tp: 'req:mahlkonig:status' })
+      .then(res => setLastRecipe(res.grind?.recipe || null))
+      .catch(() => setLastRecipe(null));
+  }, [apiService]);
+
+  const setProfile = (recipe, value) => {
+    const next = recipes.map(r => (r === recipe ? value : (mapped[r - 1] ?? '')));
+    while (next.length > MAHLKONIG_MIN_RECIPES && !next[next.length - 1]) next.pop();
+    onChange('mahlkonigRecipeProfiles')({ currentTarget: { value: next.join(',') } });
+  };
+
+  return (
+    <div className='form-control'>
+      <span className='mb-2 block text-sm font-medium'>
+        <Trans>Profile per grinder recipe</Trans>
+      </span>
+      <div className='grid grid-cols-1 gap-4 sm:grid-cols-2'>
+        {recipes.map(recipe => {
+          const value = mapped[recipe - 1] ?? '';
+          const missing = value && profiles.length > 0 && !profiles.some(p => p.id === value);
+          return (
+            <div key={recipe}>
+              <label htmlFor={`mahlkonigRecipe${recipe}`} className='mb-1 block text-sm opacity-70'>
+                <Trans>Recipe {recipe}</Trans>
+              </label>
+              <select
+                id={`mahlkonigRecipe${recipe}`}
+                className='select select-bordered w-full'
+                value={value}
+                onChange={e => setProfile(recipe, e.currentTarget.value)}
+              >
+                <option value=''>{t`Keep selected profile`}</option>
+                {missing && <option value={value}>{t`Deleted profile`}</option>}
+                {profiles.map(p => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          );
+        })}
+      </div>
+      <p className='mt-2 text-sm opacity-70'>
+        {lastRecipe
+          ? t`Your grinder last ground recipe ${lastRecipe}.`
+          : t`Grind once with GbS to see which recipe number your grinder reports.`}{' '}
+        <Trans>The profile's dose is saved to the shot history.</Trans>
+      </p>
+    </div>
+  );
+}
+
 const AUTO_TUNING_PROVIDER_OPTIONS = [
   { value: 'off_board', label: 'Off-board EspressoRL' },
   { value: 'on_board', label: 'On-board' },
@@ -151,6 +222,7 @@ export function PluginCard({
   updateAutoWakeupTime,
   updateAutoWakeupDay,
 }) {
+  const { t } = useLingui();
   return (
     <div className='space-y-4'>
       <div className='bg-base-200 rounded-lg p-4'>
@@ -271,30 +343,32 @@ export function PluginCard({
         )}
       </div>
 
-      <div className='bg-base-200 rounded-lg p-4'>
-        <div className='flex items-center justify-between'>
-          <span className='text-xl font-medium'>HomeKit</span>
-          <input
-            id='homekit'
-            name='homekit'
-            value='homekit'
-            type='checkbox'
-            className='toggle toggle-primary'
-            checked={!!formData.homekit}
-            onChange={onChange('homekit')}
-            aria-label='Enable HomeKit'
-          />
-        </div>
-        {formData.homekit && (
-          <div className='border-base-300 mt-4 flex flex-col items-center justify-center gap-4 border-t pt-4'>
-            <img src={homekitImage} alt='HomeKit Setup Code' />
-            <p className='text-center'>
-              Open the Home app on your iOS device, select Add Accessory, and enter the setup code
-              shown above.
-            </p>
+      {formData.homekitAvailable !== false && (
+        <div className='bg-base-200 rounded-lg p-4'>
+          <div className='flex items-center justify-between'>
+            <span className='text-xl font-medium'>HomeKit</span>
+            <input
+              id='homekit'
+              name='homekit'
+              value='homekit'
+              type='checkbox'
+              className='toggle toggle-primary'
+              checked={!!formData.homekit}
+              onChange={onChange('homekit')}
+              aria-label='Enable HomeKit'
+            />
           </div>
-        )}
-      </div>
+          {formData.homekit && (
+            <div className='border-base-300 mt-4 flex flex-col items-center justify-center gap-4 border-t pt-4'>
+              <img src={homekitImage} alt='HomeKit Setup Code' />
+              <p className='text-center'>
+                Open the Home app on your iOS device, select Add Accessory, and enter the setup code
+                shown above.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className='bg-base-200 rounded-lg p-4'>
         <div className='flex items-center justify-between'>
@@ -592,6 +666,72 @@ export function PluginCard({
       </div>
 
       <CommunityUploadSettings formData={formData} onChange={onChange} />
+
+      <div className='bg-base-200 rounded-lg p-4'>
+        <div className='flex items-center justify-between'>
+          <span className='text-xl font-medium'>Mahlkönig E64 WS Grind-by-Sync</span>
+          <input
+            id='mahlkonigActive'
+            name='mahlkonigActive'
+            value='mahlkonigActive'
+            type='checkbox'
+            className='toggle toggle-primary'
+            checked={!!formData.mahlkonigActive}
+            onChange={onChange('mahlkonigActive')}
+            aria-label={t`Enable Mahlkönig E64 WS Grind-by-Sync`}
+          />
+        </div>
+        {formData.mahlkonigActive && (
+          <div className='border-base-300 mt-4 space-y-4 border-t pt-4'>
+            <p className='text-sm opacity-70'>
+              <Trans>
+                Lets an E64 WS start shots with its knob and dial in its grind from the shot time
+                and weight. A grind selects the profile mapped to its recipe, and the grinder's
+                target weight overrides that profile's weight target. Save and restart to apply.
+              </Trans>
+            </p>
+            <div className='form-control'>
+              <span className='mb-2 block text-sm font-medium'>
+                <Trans>Machine address for the grinder</Trans>
+              </span>
+              <code className='bg-base-300 rounded px-2 py-1 text-lg'>
+                {formData.deviceIp || t`Not connected to Wi-Fi`}
+              </code>
+              <div className='mt-2 text-sm opacity-70'>
+                <Trans>
+                  The grinder reaches GaggiMate at this address, so both need to share a network
+                  (the E64 WS is 2.4 GHz only) and the address must not change: reserve it for
+                  GaggiMate in your router.
+                </Trans>
+              </div>
+            </div>
+            <div className='space-y-1 text-sm opacity-70'>
+              <div>
+                <Trans>
+                  <span className='font-medium'>Pairing:</span> GaggiMate shows up to the grinder as
+                  a Xenia machine. Under Settings → Connectivity → Machine To Machine, turn on
+                  Enable Xenia, then type the address above into Configuration. Automatic discovery
+                  does not see GaggiMate.
+                </Trans>
+              </div>
+              <div>
+                <Trans>
+                  <span className='font-medium'>Brewing:</span> recipes with GbS turned on report
+                  each grind here; pressing the rotary knob afterwards starts the shot.
+                </Trans>
+              </div>
+            </div>
+            <MahlkonigRecipeProfiles formData={formData} onChange={onChange} />
+            <div className='text-xs opacity-50'>
+              <Trans>
+                GaggiMate is not affiliated with, endorsed by or supported by Mahlkönig or its
+                parent company, the Hemro Group. Mahlkönig, E64 WS, Grind-by-Sync and Xenia are
+                trademarks of their respective owners.
+              </Trans>
+            </div>
+          </div>
+        )}
+      </div>
 
       {gearpumpAddon.value && (
         <div className='bg-base-200 rounded-lg p-4'>

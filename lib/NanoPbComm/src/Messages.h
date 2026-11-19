@@ -11,15 +11,18 @@ namespace gm {
 using Frame = gaggimate_Frame;
 using Payload = gaggimate_Payload;
 
+using MachineHardwareSettings = gaggimate_MachineHardwareSettings;
 using Ping = gaggimate_Ping;
 using BoilerControl = gaggimate_BoilerControl;
 using PumpControl = gaggimate_PumpControl;
 using RelayControl = gaggimate_RelayControl;
-using PidSettings = gaggimate_PidSettings;
+using HeaterSettings = gaggimate_HeaterSettings;
 using PumpSettings = gaggimate_PumpSettings;
 using AutotuneRequest = gaggimate_AutotuneRequest;
 using PressureScale = gaggimate_PressureScale;
 using Tare = gaggimate_Tare;
+using HardwareScaleTare = gaggimate_HardwareScaleTare;
+using ScaleFactors = gaggimate_ScaleFactors;
 using LedChannel = gaggimate_LedChannel;
 using LedControl = gaggimate_LedControl;
 using ScaleTare = gaggimate_ScaleTare;
@@ -35,6 +38,7 @@ using BoilerReading = gaggimate_BoilerReading;
 using ButtonState = gaggimate_ButtonState;
 using AutotuneResult = gaggimate_AutotuneResult;
 using VolumetricMeasurement = gaggimate_VolumetricMeasurement;
+using ScaleMeasurement = gaggimate_ScaleMeasurement;
 using TofMeasurement = gaggimate_TofMeasurement;
 using Error = gaggimate_Error;
 using WeightMeasurement = gaggimate_WeightMeasurement;

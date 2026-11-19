@@ -36,23 +36,28 @@ message Frame {
 // receiving Endpoint -- there is no run-time type erasure.
 message Payload {
     reserved 5; // retired AltControl (merged into RelayControl: relay index 1)
+    reserved 6; // retired PidSettings (merged into HeaterSettings)
     oneof content {
         // Commands: display -> controller
+        MachineHardwareSettings machine_hardware = 17;
         Ping ping = 1;
         BoilerControl boiler = 2;
         PumpControl pump = 3;
         RelayControl relay = 4;
-        PidSettings pid = 6;
         PumpSettings pump_model = 7;
         AutotuneRequest autotune = 8;
         PressureScale pressure_scale = 9;
         Tare tare = 10;
+        HardwareScaleTare hardware_scale_tare = 31;
         LedControl led = 11;
-        ScaleTare scale_tare = 12;
-        ScaleCalibration scale_calibration = 13;
-        ScaleCalibrationStart scale_calibration_start = 14;
+        ScaleFactors scale_factors = 12;
+        HeaterSettings heater = 13;
+        ScaleTare scale_tare = 32;
+        ScaleCalibration scale_calibration = 33;
+        ScaleCalibrationStart scale_calibration_start = 34;
 
         // Responses: controller -> display
+        MachineHardwareStatus machine_hardware_status = 30;
         SystemInfo system_info = 20;
         SensorData sensor = 21;
         ButtonState button = 22;
@@ -60,10 +65,11 @@ message Payload {
         VolumetricMeasurement volumetric = 24;
         TofMeasurement tof = 25;
         Error error = 26;
-        WeightMeasurement weight = 27;
-        ScaleOffsets scale_offsets = 28;
-        ScaleCalibrationResult scale_calibration_result = 29;
-        ScaleSample scale_sample = 30;
+        ScaleMeasurement scale = 27;
+        WeightMeasurement weight = 35;
+        ScaleOffsets scale_offsets = 36;
+        ScaleCalibrationResult scale_calibration_result = 37;
+        ScaleSample scale_sample = 38;
     }
 }
 
@@ -110,11 +116,46 @@ message RelayControl {
     bool open = 2;
 }
 
-message PidSettings {
+// Complete heater configuration; the controller keeps its heaters off until it has received one.
+message HeaterSettings {
     float kp = 1;
     float ki = 2;
     float kd = 3;
     float kf = 4; // combined thermal feedforward gain
+    bool heater_coordination_enabled = 5; // dual boiler: power heaters one at a time instead of in parallel, brew first
+    uint32 handover_ms = 6;               // dual boiler: dead time between heaters when coordinated (clamped 20..5000)
+    float steam_kp = 7;
+    float steam_ki = 8;
+    float steam_kd = 9;
+}
+
+message MachineHardwareSettings {
+    float ntc_brew_nominal_resistance = 1;
+    float ntc_brew_series_resistance = 2;
+    float ntc_brew_supply_voltage = 3;
+    float ntc_brew_beta = 4;
+    float ntc_steam_nominal_resistance = 5;
+    float ntc_steam_series_resistance = 6;
+    float ntc_steam_supply_voltage = 7;
+    float ntc_steam_beta = 8;
+    bool tank_level_enabled = 9;
+    bool steam_level_enabled = 10;
+    reserved 11;
+    reserved 12;
+    reserved 13, 14;
+    uint32 steam_level_debounce_checks = 15;
+    uint32 version = 16;
+    reserved 17, 18;
+    bool restart_if_required = 19;
+    reserved 20;
+    reserved 21;
+    reserved 22;
+}
+
+message MachineHardwareStatus {
+    uint32 hash = 1;
+    bool ready = 2;
+    bool error = 3;
 }
 
 message PumpSettings {
@@ -149,12 +190,26 @@ message PressureScale {
     float scale = 1;
 }
 
+// Reset pump-derived volume counters only.
 message Tare {}
+
+message HardwareScaleTare {}
+
+message ScaleFactors {
+    float scale_factor1 = 1;
+    float scale_factor2 = 2;
+    uint32 sample_rate_sps = 3;
+    float idle_filter_alpha = 4;
+    float active_filter_alpha = 5;
+}
 
 // One LED output's target brightness.
 message LedChannel {
     uint32 channel = 1;    // PCA9634 output index (0..7)
     uint32 brightness = 2; // 0..255
+    uint32 effect = 3; // Onboard channels: 0 off, 1 flashing, 2 breathing, 3 on; Alba ignores this.
+    uint32 min_brightness = 4; // onboard animation floor (0..brightness)
+    uint32 cycle_time_ms = 5;  // onboard full animation cycle (500..10000 ms)
 }
 
 // Drive one or more LED channels in a single atomic update. Carrying every
@@ -191,7 +246,8 @@ message Capabilities {
     bool led_control = 3;
     bool tof = 4;
     repeated Addon addons = 5;
-    bool scale = 6;
+    bool dual_boiler = 6;
+    bool scale = 7;
 }
 
 message Addon {
@@ -225,7 +281,11 @@ message SensorData {
     float puck_resistance = 4;
     float pump_power = 5;   // pump power 0..100 %
     float water_pumped = 7; // cumulative water pumped in ml
-    ControllerDiagnostics diagnostics = 8;
+    bool has_tank_level = 8;
+    bool tank_level_ok = 9;
+    reserved 10 to 16;
+    optional bool steam_boiler_low = 17; // Present once the enabled level sensor has a debounced reading.
+    ControllerDiagnostics diagnostics = 18;
 }
 
 // Runtime controller diagnostics. This is telemetry, not control protocol; it is
@@ -272,6 +332,17 @@ message AutotuneResult {
 
 message VolumetricMeasurement {
     float volume = 1;
+}
+
+// Hardware-scale weight, sent on its own channel (distinct from the pump-derived
+// VolumetricMeasurement estimate) so the display can offer both as independently
+// selectable volumetric sources.
+message ScaleMeasurement {
+    float weight = 1;
+    float cell1_weight = 2;
+    float cell2_weight = 3;
+    bool cell1_valid = 4;
+    bool cell2_valid = 5;
 }
 
 message TofMeasurement {

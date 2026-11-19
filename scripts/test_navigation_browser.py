@@ -41,6 +41,34 @@ window.__navigate = path => {
 """
 
 
+def check_uart_update(page):
+    prior_checks = page.evaluate("window.__sent.filter(m => m.tp === 'req:ota-settings').length")
+    page.evaluate("window.__emit({tp:'evt:status',hl:true,lnk:'uart'})")
+    page.evaluate("window.__navigate('/settings/system')")
+    page.wait_for_function("count => window.__sent.filter(m => m.tp === 'req:ota-settings').length > count", arg=prior_checks)
+    page.evaluate("""window.__emit({tp:'res:ota-settings', channel:'latest', controllerOtaEnabled:false,
+            displayVersion:'v1.8.36', checkError:'no_stable_release'})""")
+    page.get_by_text("This fork has no Stable release.", exact=False).wait_for()
+    assert page.get_by_role("button", name="Update Controller", exact=True).count() == 0
+    assert page.get_by_role("button", name="Update both", exact=True).count() == 0
+    page.evaluate("""window.__emit({tp:'res:ota-settings', channel:'nightly', controllerOtaEnabled:false,
+            displayVersion:'v1.8.36', latestVersion:'v1.9.0-nightly.37', displayUpdateAvailable:true})""")
+    update = page.get_by_role("button", name="Update Headless", exact=True)
+    update.click()
+    page.wait_for_function("window.__sent.some(m => m.tp === 'req:ota-start' && m.cp === 'display')")
+    assert page.get_by_text("Updating Headless firmware", exact=True).count() == 0
+    page.evaluate("window.__reply(window.__sent.filter(m => m.tp === 'req:ota-start').at(-1))")
+    page.evaluate("window.__emit({tp:'evt:ota-progress',phase:1,progress:7})")
+    page.get_by_text("7%", exact=True).wait_for()
+    page.evaluate("window.__emit({tp:'evt:ota-progress',phase:6,progress:7})")
+    page.get_by_text("Reconnecting to resume the firmware download", exact=True).wait_for()
+    page.evaluate("window.__emit({tp:'evt:ota-progress',phase:5,progress:0,error:'image_missing'})")
+    page.get_by_text("The selected release does not contain firmware for this board.", exact=True).wait_for()
+    page.get_by_role("button", name="Back to updates").click()
+    update.wait_for()
+    assert update.is_enabled()
+
+
 def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Handler, directory=str(ROOT / 'web/dist')))
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -98,10 +126,11 @@ def main():
                 # destroyed Chart.js instance 100 ms later.
                 page.evaluate("window.dispatchEvent(new Event('orientationchange')); window.__navigate('/not-found')")
                 page.wait_for_function("document.querySelectorAll('canvas').length === 0")
+                check_uart_update(page)
                 page.wait_for_timeout(200)
                 assert not errors, errors
                 assert not page.evaluate('window.__errors'), page.evaluate('window.__errors')
-                print(f'PASS {viewport}: delayed startup, 10 early navigations, stale replies, reconnect and chart disposal')
+                print(f'PASS {viewport}: delayed startup, navigation, reconnect, chart disposal and UART OTA retry/failure')
                 page.close()
             browser.close()
     finally:

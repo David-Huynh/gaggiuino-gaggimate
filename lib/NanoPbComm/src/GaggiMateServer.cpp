@@ -3,33 +3,32 @@
 #include <cstring>
 #if defined(ARDUINO_ARCH_STM32)
 #define ESP_LOGE(tag, fmt, ...) ((void)0)
+#define ESP_LOGI(tag, fmt, ...) ((void)0)
 #else
 #include <esp_log.h>
 #endif
 
-namespace {
-#if defined(ARDUINO_ARCH_STM32)
-constexpr uint32_t SERVER_PUMP_STACK = 768; // STM32 FreeRTOS stack depth is in words, not bytes
-#else
-constexpr uint32_t SERVER_PUMP_STACK = 4096;
-#endif
-} // namespace
+GaggiMateServer::GaggiMateServer() = default;
 
-GaggiMateServer::GaggiMateServer()
-#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
-    : _transport(Serial2), _endpoint(_transport) {
-}
-#else
-    : _endpoint(_transport) {
-}
+void GaggiMateServer::enableUart(uint8_t rxPin, uint8_t txPin, HardwareSerial &port, uint32_t baud) {
+    if (_uart)
+        return;
+    _uartPort = &port;
+    _uartRxPin = rxPin;
+    _uartTxPin = txPin;
+    _uartBaud = baud;
+    _uart = std::make_unique<UartTransport>(port);
+#if !defined(ARDUINO_ARCH_STM32)
+    _uartOta = std::make_unique<UartOtaReceiver>(*_uart);
 #endif
+}
 
 void GaggiMateServer::init(const String &deviceName, const String &hardware, const String &version,
                            const gm::DeviceCapabilities &capabilities, bool pairingWindow) {
     setSystemInfo(hardware, version, capabilities);
     registerHandlers();
     _endpoint.onConnection([this](bool connected) {
-        if (_connectionCb) _connectionCb(connected);
+        if (_connCb) _connCb(connected);
         _sentSystemInfoAfterHandshake = false;
         if (connected) {
             _systemInfoAcknowledged = false;
@@ -38,44 +37,91 @@ void GaggiMateServer::init(const String &deviceName, const String &hardware, con
             _systemInfoAcknowledged = false;
         }
     });
+#if !defined(ARDUINO_ARCH_STM32)
+    _link.add(LinkType::Ble, _ble);
+#endif
+    if (_uart) {
+        _link.add(LinkType::Uart, *_uart);
+        _link.setPreferred(LinkType::Uart);
+    }
+    _link.onSelect([this](LinkType active) { onLinkSelected(active); });
+#if !defined(ARDUINO_ARCH_STM32)
+    _link.onReject([this](LinkType) { _ble.disconnect(); });
+#endif
     _endpoint.begin();
-#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
+#if defined(ARDUINO_ARCH_STM32)
     (void)deviceName;
-    _transport.begin();
+    (void)pairingWindow;
 #else
-    _transport.init(deviceName, pairingWindow);
+    _ble.init(deviceName, pairingWindow);
 #endif
 
+    if (_uart) {
+#if !defined(ARDUINO_ARCH_STM32)
+        _uartOta->onStart([this]() {
+            if (_updateStartCb)
+                _updateStartCb();
+        });
+        _uartOta->begin();
+        _uartPort->setRxBufferSize(gm_uart::RX_BUFFER_SIZE);
+        _uartPort->setTxBufferSize(gm_uart::TX_BUFFER_SIZE);
+        _uartPort->begin(_uartBaud, SERIAL_8N1, _uartRxPin, _uartTxPin);
+#endif
+        _uart->begin();
+        ESP_LOGI("GaggiMateServer", "Display link on UART rx=%u tx=%u @ %u baud", _uartRxPin, _uartTxPin,
+                 static_cast<unsigned>(_uartBaud));
+    }
+
 #if defined(ARDUINO_ARCH_STM32)
-    if (xTaskCreate(pumpTask, "GaggiMateServer", SERVER_PUMP_STACK, this, 1, &_taskHandle) != pdPASS) {
+    if (xTaskCreate(pumpTask, "GaggiMateServer", 768, this, 1, &_taskHandle) != pdPASS) {
 #else
-    if (xTaskCreatePinnedToCore(pumpTask, "GaggiMateServer", SERVER_PUMP_STACK, this, 1, &_taskHandle, 0) != pdPASS) {
+    if (xTaskCreatePinnedToCore(pumpTask, "GaggiMateServer", 4096, this, 1, &_taskHandle, 0) != pdPASS) {
 #endif
         _taskHandle = nullptr;
-        ESP_LOGE("GaggiMateServer", "Failed to create pump task; ACK/retransmit will not run");
+        ESP_LOGE("GaggiMateServer", "Failed to create pump task; comms will not run");
+        return;
     }
+    _endpoint.setPumpTask(_taskHandle);
+#if !defined(ARDUINO_ARCH_STM32)
+    if (_uart) {
+        TaskHandle_t task = _taskHandle;
+        _uartPort->onReceive([task]() { xTaskNotifyGive(task); });
+    }
+#endif
+}
+
+// The wire keeps listening while BLE carries the session; once it is up, the radio link goes away and stops advertising.
+void GaggiMateServer::onLinkSelected(LinkType active) {
+#if !defined(ARDUINO_ARCH_STM32)
+    _ble.setAdvertisingEnabled(active != LinkType::Uart);
+    if (active == LinkType::Uart)
+        _ble.disconnect();
+#else
+    (void)active;
+#endif
+}
+
+void GaggiMateServer::disconnect() {
+    if (_link.activeType() == LinkType::Uart)
+        _uart->disconnect();
+#if !defined(ARDUINO_ARCH_STM32)
+    else
+        _ble.disconnect();
+#endif
 }
 
 void GaggiMateServer::pumpTask(void *arg) {
     auto *self = static_cast<GaggiMateServer *>(arg);
-    TickType_t lastWake = xTaskGetTickCount();
     for (;;) {
         self->loop();
-#if defined(ARDUINO_ARCH_STM32)
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(15));
-#else
-        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(15));
-#endif
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15));
     }
 }
 
 void GaggiMateServer::loop() {
-#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
-    _transport.loop();
-    if (_endpoint.isConnected() && !_systemInfoAcknowledged && millis() - _lastSystemInfoPushMs >= SYSTEM_INFO_RETRY_MS) {
+    if (_uart) _uart->loop();
+    if (_endpoint.isConnected() && !_systemInfoAcknowledged && millis() - _lastSystemInfoPushMs >= SYSTEM_INFO_RETRY_MS)
         pushSystemInfo();
-    }
-#endif
     _endpoint.loop();
 }
 
@@ -94,12 +140,9 @@ void GaggiMateServer::setSystemInfo(const String &hardware, const String &versio
              "{\"hw\":\"%s\",\"v\":\"%s\",\"pv\":%u,\"cp\":{\"ps\":%s,\"dm\":%s,\"led\":%s,\"tof\":%s,\"sc\":%s}}",
              hardware.c_str(), version.c_str(), static_cast<unsigned>(gm_proto::PROTOCOL_VERSION),
              capabilities.pressure ? "true" : "false", capabilities.dimming ? "true" : "false",
-             capabilities.led_control ? "true" : "false", capabilities.tof ? "true" : "false",
-             capabilities.scale ? "true" : "false");
-#if !defined(GAGGIMATE_UART_COMMS) && !defined(ARDUINO_ARCH_STM32)
-    _transport.setInfo(json);
-#else
-    (void)json;
+             capabilities.led_control ? "true" : "false", capabilities.tof ? "true" : "false");
+#if !defined(ARDUINO_ARCH_STM32)
+    _ble.setInfo(json);
 #endif
 }
 
@@ -184,6 +227,18 @@ gm::Payload GaggiMateServer::buildVolumetricMeasurement(float volume) {
     return p;
 }
 
+gm::Payload GaggiMateServer::buildScaleMeasurement(float weight, float cell1Weight, float cell2Weight, bool cell1Valid,
+                                                   bool cell2Valid) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_scale_tag;
+    p.content.scale.weight = weight;
+    p.content.scale.cell1_weight = cell1Weight;
+    p.content.scale.cell2_weight = cell2Weight;
+    p.content.scale.cell1_valid = cell1Valid;
+    p.content.scale.cell2_valid = cell2Valid;
+    return p;
+}
+
 gm::Payload GaggiMateServer::buildTofMeasurement(uint32_t distance) {
     gm::Payload p = gaggimate_Payload_init_zero;
     p.which_content = gaggimate_Payload_tof_tag;
@@ -257,6 +312,10 @@ void GaggiMateServer::sendAutotuneResult(float kp, float ki, float kd, float kf)
 
 void GaggiMateServer::sendVolumetricMeasurement(float volume) { _endpoint.sendUnreliable(buildVolumetricMeasurement(volume)); }
 
+void GaggiMateServer::sendScaleMeasurement(float weight, float cell1Weight, float cell2Weight, bool cell1Valid, bool cell2Valid) {
+    _endpoint.sendUnreliable(buildScaleMeasurement(weight, cell1Weight, cell2Weight, cell1Valid, cell2Valid));
+}
+
 void GaggiMateServer::sendTofMeasurement(uint32_t distance) { _endpoint.sendUnreliable(buildTofMeasurement(distance)); }
 
 void GaggiMateServer::sendError(int code) { _endpoint.send(buildError(code)); }
@@ -273,10 +332,7 @@ void GaggiMateServer::sendScaleCalibrationResult(uint8_t channel, float calibrat
 
 void GaggiMateServer::registerHandlers() {
     _endpoint.on(gaggimate_Payload_ping_tag, [this](const gm::Payload &) {
-        // A SystemInfo notification sent synchronously from the BLE subscribe
-        // callback can beat the client's notification handler. Once a ping has
-        // crossed the framed protocol, the link is fully established; resend
-        // SystemInfo once so reliable delivery starts from a usable session.
+        // The connect-time SystemInfo can beat the display's receive path; a ping proves the link, so resend it once.
         if (!_sentSystemInfoAfterHandshake) {
             _sentSystemInfoAfterHandshake = true;
             pushSystemInfo();
@@ -298,10 +354,9 @@ void GaggiMateServer::registerHandlers() {
         if (_relayCb)
             _relayCb(static_cast<uint8_t>(p.content.relay.index), p.content.relay.open);
     });
-    _endpoint.on(gaggimate_Payload_pid_tag, [this](const gm::Payload &p) {
-        acknowledgeSystemInfo();
-        if (_pidCb)
-            _pidCb(p.content.pid.kp, p.content.pid.ki, p.content.pid.kd, p.content.pid.kf);
+    _endpoint.on(gaggimate_Payload_heater_tag, [this](const gm::Payload &p) {
+        if (_heaterSettingsCb)
+            _heaterSettingsCb(p.content.heater);
     });
     _endpoint.on(gaggimate_Payload_pump_model_tag, [this](const gm::Payload &p) {
         acknowledgeSystemInfo();
@@ -312,6 +367,10 @@ void GaggiMateServer::registerHandlers() {
         if (_autotuneCb)
             _autotuneCb(p.content.autotune.test_time, p.content.autotune.samples, p.content.autotune.heater_wattage);
     });
+    _endpoint.on(gaggimate_Payload_machine_hardware_tag, [this](const gm::Payload &p) {
+        if (_machineHardwareCb)
+            _machineHardwareCb(p.content.machine_hardware);
+    });
     _endpoint.on(gaggimate_Payload_pressure_scale_tag, [this](const gm::Payload &p) {
         acknowledgeSystemInfo();
         if (_pressureScaleCb)
@@ -321,13 +380,30 @@ void GaggiMateServer::registerHandlers() {
         if (_tareCb)
             _tareCb();
     });
+    _endpoint.on(gaggimate_Payload_hardware_scale_tare_tag, [this](const gm::Payload &) {
+        if (_hardwareScaleTareCb)
+            _hardwareScaleTareCb();
+    });
+    _endpoint.on(gaggimate_Payload_scale_factors_tag, [this](const gm::Payload &p) {
+        if (_scaleFactorsCb)
+            _scaleFactorsCb(p.content.scale_factors.scale_factor1, p.content.scale_factors.scale_factor2,
+                            static_cast<uint16_t>(p.content.scale_factors.sample_rate_sps),
+                            p.content.scale_factors.idle_filter_alpha, p.content.scale_factors.active_filter_alpha);
+    });
     _endpoint.on(gaggimate_Payload_led_tag, [this](const gm::Payload &p) {
         if (!_ledCb)
             return;
         // One message carries every changed channel; apply them in order.
-        for (pb_size_t i = 0; i < p.content.led.channels_count; i++)
-            _ledCb(static_cast<uint8_t>(p.content.led.channels[i].channel),
-                   static_cast<uint8_t>(p.content.led.channels[i].brightness));
+        for (pb_size_t i = 0; i < p.content.led.channels_count; i++) {
+            const auto &led = p.content.led.channels[i];
+            if (led.channel > BARISTA_LED_CHANNEL || led.effect > 3)
+                continue;
+            if (led.channel >= SYSTEM_LED_CHANNEL &&
+                (led.min_brightness > led.brightness || led.cycle_time_ms < MIN_LED_CYCLE_MS ||
+                 led.cycle_time_ms > MAX_LED_CYCLE_MS))
+                continue;
+            _ledCb(led.channel, led.brightness, static_cast<LedEffect>(led.effect), led.min_brightness, led.cycle_time_ms);
+        }
     });
     _endpoint.on(gaggimate_Payload_scale_tare_tag, [this](const gm::Payload &p) {
         if (_scaleTareCb)
@@ -343,4 +419,13 @@ void GaggiMateServer::registerHandlers() {
             _scaleCalibrationStartCb(static_cast<uint8_t>(p.content.scale_calibration_start.channel),
                                      p.content.scale_calibration_start.reference_weight);
     });
+}
+
+void GaggiMateServer::sendMachineHardwareStatus(uint32_t hash, bool ready, bool error) {
+    gm::Payload p = gaggimate_Payload_init_zero;
+    p.which_content = gaggimate_Payload_machine_hardware_status_tag;
+    p.content.machine_hardware_status.hash = hash;
+    p.content.machine_hardware_status.ready = ready;
+    p.content.machine_hardware_status.error = error;
+    _endpoint.send(p);
 }

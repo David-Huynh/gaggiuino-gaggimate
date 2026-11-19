@@ -1,6 +1,7 @@
 #include "Endpoint.h"
 #include "Heater.h"
 #include "Max31855Thermocouple.h"
+#include "uart/UartTransport.h"
 #include <pb_encode.h>
 #include <pb_decode.h>
 #include <cassert>
@@ -119,6 +120,7 @@ struct Link : Transport {
    assert(length<=256); outgoing.emplace_back(data,data+length); return true;
  }
  bool isConnected() const override { return up; }
+ size_t maxDatagram() const override { return 256; }
  void connect() { emitConnection(true); }
  void inject(std::vector<uint8_t> const &bytes) { emitData(bytes.data(),bytes.size()); }
 };
@@ -214,6 +216,25 @@ static void testSessions() {
  }
  settle(*a,la,*b,lb);
  assert(a->_queue.empty()&&!a->_inFlight);
+ std::array<gm::Payload, 7> stopBatch{};
+ std::array<bool, 7> receivedStop{};
+ b->on(gaggimate_Payload_relay_tag, [&](gm::Payload const &p) {
+    const auto &relay = p.content.relay;
+    assert(relay.index < receivedStop.size() && !relay.open);
+    receivedStop[relay.index] = true;
+ });
+ for (size_t i = 0; i < stopBatch.size(); ++i) {
+    stopBatch[i].which_content = gaggimate_Payload_relay_tag;
+    stopBatch[i].content.relay.index = i;
+ }
+ gm::Payload staleRelay = stopBatch.back();
+ staleRelay.content.relay.open = true;
+ a->send(staleRelay);
+ a->loop();
+ la.outgoing.clear(); // Stop supersedes an unacknowledged command, including one queued in a second frame.
+ a->sendUrgentBatch(stopBatch.data(), stopBatch.size());
+ settle(*a, la, *b, lb);
+ assert(std::all_of(receivedStop.begin(), receivedStop.end(), [](bool received) { return received; }));
  puts("PASS sessions: loss/retry, independent ESP/STM restarts, duplicate commands, stale ACKs/targets, missing session IDs and bounded frames");
 }
 static void testHeatingAcrossSessions() {
@@ -225,8 +246,8 @@ static void testHeatingAcrossSessions() {
  auto controller=std::make_unique<Endpoint>(controllerLink);
  auto attach=[&]{
    controller->onConnection([&](bool){ heater.invalidateConfiguration(); });
-   controller->on(gaggimate_Payload_pid_tag,[&](gm::Payload const &p){
-     auto const &pid=p.content.pid;
+   controller->on(gaggimate_Payload_heater_tag,[&](gm::Payload const &p){
+     auto const &pid=p.content.heater;
      heater.configure(pid.kp,pid.ki,pid.kd,pid.kf);
    });
    controller->on(gaggimate_Payload_boiler_tag,[&](gm::Payload const &p){ heater.setSetpoint(p.content.boiler.setpoint); });
@@ -234,7 +255,7 @@ static void testHeatingAcrossSessions() {
  display->begin();controller->begin();attach();displayLink.connect();controllerLink.connect();
  settle(*display,displayLink,*controller,controllerLink);
  gm::Payload pid=gaggimate_Payload_init_zero;
- pid.which_content=gaggimate_Payload_pid_tag;pid.content.pid.kp=30;pid.content.pid.ki=0.3f;pid.content.pid.kd=100;
+ pid.which_content=gaggimate_Payload_heater_tag;pid.content.heater.kp=30;pid.content.heater.ki=0.3f;pid.content.heater.kd=100;
  gm::Payload initial[]={pid,boiler(85)};
  display->sendBatch(initial,2);settle(*display,displayLink,*controller,controllerLink);heater.loop();
  assert(heater.hasConfiguration() && heater.getSetpoint()==0 && !heaterPinHigh);
@@ -262,4 +283,64 @@ static void testHeatingAcrossSessions() {
  assert(heater.hasConfiguration() && heater.getSetpoint()==85 && !heaterPinHigh);
  puts("PASS integration: partial board restarts inhibit heat; stale steam and pre-configuration targets cannot energize a warm boiler");
 }
-int main() { testHeater();testSensor();testSessions();testHeatingAcrossSessions(); }
+class MemorySerial : public Stream {
+  public:
+    MemorySerial *peer = nullptr;
+    std::deque<uint8_t> input;
+
+    int available() override { return input.size(); }
+    int read() override {
+        if (input.empty())
+            return -1;
+        const uint8_t next = input.front();
+        input.pop_front();
+        return next;
+    }
+    size_t write(const uint8_t *data, size_t length) override {
+        if (peer)
+            peer->input.insert(peer->input.end(), data, data + length);
+        return length;
+    }
+};
+
+static void testUart() {
+    MemorySerial display, controller;
+    UartTransport a(display), b(controller);
+    display.peer = &controller;
+    a.begin();
+    b.begin();
+    const auto advance = [&] {
+        for (int i = 0; i < 30; ++i) {
+            testMillis += 50;
+            a.loop();
+            b.loop();
+        }
+    };
+    advance();
+    assert(!a.isConnected() && !b.isConnected());
+    controller.peer = &display;
+    advance();
+    assert(a.isConnected() && b.isConnected());
+    std::vector<uint8_t> received;
+    b.onData([&](const uint8_t *data, size_t length) { received.assign(data, data + length); });
+    const std::array<uint8_t, 7> payload{0, 255, 1, 0, 0, 4, 0};
+    assert(a.send(payload.data(), payload.size()));
+    controller.input[2] ^= 0x80;
+    b.loop();
+    assert(received.empty());
+    assert(a.send(payload.data(), payload.size()));
+    b.loop();
+    assert(std::equal(received.begin(), received.end(), payload.begin(), payload.end()));
+    b.begin(); // Reset one transport while the display remains powered.
+    advance();
+    assert(a.isConnected() && b.isConnected());
+    puts("PASS UART: bidirectional handshake, CRC rejection, embedded zeros, independent restart");
+}
+
+int main() {
+    testHeater();
+    testSensor();
+    testSessions();
+    testHeatingAcrossSessions();
+    testUart();
+}

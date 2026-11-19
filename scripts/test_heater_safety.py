@@ -29,6 +29,7 @@ def main():
     for folder in folders:
         command += ["-I", str(folder)]
     sources = [ROOT/"test/host_heater/test.cpp", ROOT/"lib/NanoPbComm/src/Endpoint.cpp",
+        ROOT/"lib/NanoPbComm/src/uart/UartTransport.cpp",
         generated/"gaggimate.pb.c", nanopb/"pb_common.c", nanopb/"pb_encode.c", nanopb/"pb_decode.c",
         ROOT/"lib/GaggiMateController/src/peripherals/Heater.cpp",
         ROOT/"lib/GaggiMateController/src/peripherals/Max31855Thermocouple.cpp",

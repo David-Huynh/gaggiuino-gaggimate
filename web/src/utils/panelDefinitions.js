@@ -1,16 +1,20 @@
+import SmartDoseControl from '../components/SmartDoseControl.jsx';
 import { ModeCard } from '../pages/Home/cards/ModeCard.jsx';
 import { ProfileCard } from '../pages/Home/cards/ProfileCard.jsx';
 import { FavoriteProfilesCard } from '../pages/Home/cards/FavoriteProfilesCard.jsx';
 import { MetricsPanelWrapper } from '../pages/Home/cards/MetricsPanelWrapper.jsx';
+import { MachineLevelsCard } from '../pages/Home/cards/MachineLevelsCard.jsx';
 import { WaterLevelCard } from '../pages/Home/cards/WaterLevelCard.jsx';
 import { ActionCard } from '../pages/Home/cards/ActionCard.jsx';
+import { msg } from '@lingui/core/macro';
+import { withTranslatedLabel } from './translatedLabel.js';
 
 /**
  * Each entry describes one panel in the dashboard control column.
  *
  * Fields:
  *   id               — unique string key; stored in localStorage to represent order/visibility
- *   label            — display name shown in the Settings configurator
+ *   labelMsg         — msg descriptor; exposed translated as `label` (name in the Settings configurator)
  *   required         — if true: always visible, freely reorderable, cannot be removed by the user
  *   available        — (ds) => bool — return false to hide from dashboard AND settings pool.
  *                      ds is the useDashboardState() return value.
@@ -29,31 +33,31 @@ export const SPACER_ID = '__spacer__';
  * top-packed group and a bottom-packed group. Deliberately has no
  * component/props/containerClass since it's never rendered as a real panel.
  */
-export const SPACER_DEFINITION = {
+export const SPACER_DEFINITION = withTranslatedLabel({
   id: SPACER_ID,
-  label: 'Flexible Space',
+  labelMsg: msg`Flexible Space`,
   required: false,
   available: () => true,
-};
+});
 
 export const PANEL_DEFINITIONS = [
   {
     id: 'mode',
-    label: 'Mode Selector',
+    labelMsg: msg`Mode Selector`,
     required: true,
     supportsCompact: true,
     available: () => true,
     component: ModeCard,
     props: ds => ({
       mode: ds.mode,
-      showGrindTab: ds.showGrindTab,
+      modes: ds.visibleModes,
       changeMode: ds.changeMode,
       locked: !ds.systemReady,
     }),
   },
   {
     id: 'profile',
-    label: 'Profile Selector',
+    labelMsg: msg`Profile Selector`,
     required: false,
     supportsCompact: true,
     available: ds => ds.mode !== 4,
@@ -70,7 +74,7 @@ export const PANEL_DEFINITIONS = [
   },
   {
     id: 'favorites',
-    label: 'Quick Select',
+    labelMsg: msg`Quick Select`,
     required: false,
     supportsCompact: true,
     available: ds => ds.mode !== 4,
@@ -81,7 +85,7 @@ export const PANEL_DEFINITIONS = [
   },
   {
     id: 'metrics',
-    label: 'Shot Metrics',
+    labelMsg: msg`Shot Metrics`,
     required: true,
     supportsCompact: true,
     available: () => true,
@@ -89,11 +93,32 @@ export const PANEL_DEFINITIONS = [
     props: ds => ({ ds }),
   },
   {
-    id: 'watertank',
-    label: 'Water Tank',
+    id: 'dose',
+    labelMsg: msg`Smart Dosing`,
     required: false,
-    available: ds => ds.waterLevelPercent !== null,
-    availableInSettings: status => !!status.tofDistance,
+    available: ds => !!ds.smartDose?.enabled,
+    availableInSettings: status => !!status.smartDose?.enabled,
+    component: SmartDoseControl,
+    props: ds => ({ dose: ds.smartDose }),
+  },
+  {
+    id: 'machinelevels',
+    labelMsg: msg`Water Levels`,
+    required: false,
+    available: ds => !!ds.hasTankLevel || !!ds.hasSteamLevel,
+    component: MachineLevelsCard,
+    props: ds => ({
+      hasTankLevel: ds.hasTankLevel,
+      tankLevelOK: ds.tankLevelOK,
+      hasSteamLevel: ds.hasSteamLevel,
+      steamBoilerLow: ds.steamBoilerLow,
+    }),
+  },
+  {
+    id: 'watertank',
+    labelMsg: msg`Water Tank`,
+    required: false,
+    available: ds => !!ds.albaWaterLevelAvailable,
     component: WaterLevelCard,
     props: ds => ({
       waterLevelPercent: ds.waterLevelPercent,
@@ -101,7 +126,7 @@ export const PANEL_DEFINITIONS = [
   },
   {
     id: 'action',
-    label: 'Shot Controls',
+    labelMsg: msg`Shot Controls`,
     required: true,
     available: () => true,
     availableInSettings: () => true,
@@ -123,6 +148,8 @@ export const PANEL_DEFINITIONS = [
       systemMessage: ds.systemMessage,
       currentTemperature: ds.currentTemperature,
       targetTemperature: ds.targetTemperature,
+      currentSteamTemperature: ds.currentSteamTemperature,
+      targetSteamTemperature: ds.targetSteamTemperature,
       changeTarget: ds.changeTarget,
       grindTarget: ds.grindTarget,
       grindTargetDuration: ds.grindTargetDuration,
@@ -138,4 +165,4 @@ export const PANEL_DEFINITIONS = [
       brewStartError: ds.brewStartError,
     }),
   },
-];
+].map(withTranslatedLabel);

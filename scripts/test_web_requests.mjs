@@ -1,12 +1,30 @@
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
-registerHooks({ load(url, context, nextLoad) {
-  if (new URL(url).pathname.endsWith('.svg')) return { format: 'module', source: 'export default ""', shortCircuit: true };
-  return nextLoad(url, context);
-} });
-const { default: ApiService } = await import('../web/src/services/ApiService.js');
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    // These imports are resolved by Vite in the browser.
+    if (specifier.endsWith('/app/platform.js')) {
+      return { url: 'data:text/javascript,export const isApp = false;', shortCircuit: true };
+    }
+    if (specifier.endsWith('/app/machines.js')) {
+      return { url: 'data:text/javascript,export const machineSocketUrl = () => null;', shortCircuit: true };
+    }
+    if (specifier === '@lingui/core/macro') {
+      return {
+        url: 'data:text/javascript,export const msg = value => Array.isArray(value) ? ({ message: value.join("") }) : value;',
+        shortCircuit: true,
+      };
+    }
+    return nextResolve(specifier, context);
+  },
+  load(url, context, nextLoad) {
+    if (new URL(url).pathname.endsWith('.svg')) return { format: 'module', source: 'export default ""', shortCircuit: true };
+    return nextLoad(url, context);
+  },
+});
+const { default: ApiService, machine } = await import('../web/src/services/ApiService.js');
 globalThis.WebSocket = { OPEN: 1 };
-const api = Object.create(ApiService.prototype);
+const api = new ApiService({ state: machine });
 api.listeners = {};
 api.pendingRequests = new Set();
 const sent = [];

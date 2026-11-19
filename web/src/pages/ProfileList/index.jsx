@@ -1,7 +1,7 @@
 import Sortable, { MultiDrag } from 'sortablejs';
 try {
   Sortable?.mount(new MultiDrag());
-} catch (error) {
+} catch {
   // to avoid error when vite is reloading the page in dev mode
 }
 
@@ -21,12 +21,21 @@ import { ExtendedProfileChart } from '../../components/ExtendedProfileChart.jsx'
 import { useConfirmAction } from '../../hooks/useConfirmAction.js';
 import { ProfileAddCard } from './ProfileAddCard.jsx';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { computed } from '@preact/signals';
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { Spinner } from '../../components/Spinner.jsx';
 import Card from '../../components/Card.jsx';
 import { parseProfile } from './utils.js';
 import { downloadJson } from '../../utils/download.js';
+import { exportProfileImage, importProfileImage } from '../../utils/profileImage.js';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faStar } from '@fortawesome/free-solid-svg-icons/faStar';
 import { faPen } from '@fortawesome/free-solid-svg-icons/faPen';
@@ -45,6 +54,10 @@ import { faScaleBalanced } from '@fortawesome/free-solid-svg-icons/faScaleBalanc
 import { faSearch } from '@fortawesome/free-solid-svg-icons/faSearch';
 import { faAnglesDown, faAnglesUp, faGripVertical } from '@fortawesome/free-solid-svg-icons';
 import { buildStatisticsProfileHref } from '../Statistics/utils/statisticsRoute.js';
+import { isSystemProfile } from '../../utils/systemProfiles.js';
+import { msg } from '@lingui/core/macro';
+import { Plural, Trans, useLingui } from '@lingui/react/macro';
+import { useProfileList } from '../../services/hooks.js';
 
 Chart.register(
   LineController,
@@ -58,19 +71,33 @@ Chart.register(
 );
 
 const PhaseLabels = {
-  preinfusion: 'Pre-Infusion',
-  brew: 'Brew',
+  preinfusion: msg`Pre-Infusion`,
+  brew: msg({ message: 'Brew', context: 'phase type' }),
 };
 
-const connected = computed(() => machine.value.connected);
+// Delay function for turning icons into spinners while awaiting response
+function useDelayedValue(value, delayMs) {
+  const [delayed, setDelayed] = useState();
+  useEffect(() => {
+    if (!value) {
+      setDelayed(undefined);
+      return undefined;
+    }
+    const timer = setTimeout(() => setDelayed(value), delayMs);
+    return () => clearTimeout(timer);
+  }, [value, delayMs]);
+  return value ? delayed : undefined;
+}
+
+const PENDING_VISUAL_DELAY_MS = 200;
 
 function ProfileCard({
   data,
   onDelete,
   onSelect,
-  onFavorite,
-  onUnfavorite,
+  onSetFavorite,
   onDuplicate,
+  pending,
   favoriteDisabled,
   unfavoriteDisabled,
   disabledDrag,
@@ -80,6 +107,9 @@ function ProfileCard({
   isFirst,
   isLast,
 }) {
+  const { t } = useLingui();
+  const visiblePending = useDelayedValue(pending, PENDING_VISUAL_DELAY_MS);
+  const busy = Boolean(pending);
   const { armed: confirmDelete, armOrRun: confirmOrDelete } = useConfirmAction(4000);
   const [tooltipsDisabled, setTooltipsDisabled] = useState(false);
 
@@ -96,20 +126,24 @@ function ProfileCard({
   }, [onMoveBottom, data.id]);
 
   const bookmarkClass = data.favorite ? 'text-warning' : 'text-base-content/60';
-  const typeText = data.type === 'pro' ? 'Pro' : 'Simple';
+  const label = data.label;
+  const typeText =
+    data.type === 'pro'
+      ? t({ message: 'Pro', context: 'profile type' })
+      : t({ message: 'Simple', context: 'profile type' });
+  const isSystem = isSystemProfile(data.id);
   const typeClass = data.type === 'pro' ? 'badge badge-primary' : 'badge badge-neutral';
   const favoriteToggleDisabled = data.favorite ? unfavoriteDisabled : favoriteDisabled;
   const favoriteToggleClass = favoriteToggleDisabled ? 'opacity-50 cursor-not-allowed' : '';
+  const deleteDisabled = data.selected;
+  const deleteClass = deleteDisabled ? 'opacity-50 cursor-not-allowed' : '';
 
   const onFavoriteToggle = useCallback(() => {
-    if (data.favorite && !unfavoriteDisabled) onUnfavorite(data.id);
-    else if (!data.favorite && !favoriteDisabled) onFavorite(data.id);
-  }, [data.favorite, unfavoriteDisabled, favoriteDisabled, onUnfavorite, onFavorite, data.id]);
+    if (!favoriteToggleDisabled) onSetFavorite(data.id, !data.favorite);
+  }, [favoriteToggleDisabled, onSetFavorite, data.id, data.favorite]);
 
-  const onDownload = useCallback(() => {
-    const download = {
-      ...data,
-    };
+  const onDownload = useCallback(async () => {
+    const download = await withExportedImage(data);
     delete download.id;
     delete download.selected;
     delete download.favorite;
@@ -168,7 +202,7 @@ function ProfileCard({
     setMenuOpen(v => !v);
   }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!menuOpen) return;
     // Position now (DOM is mounted because the conditional render put the div
     // in the tree this tick) and then re-position on resize/scroll.
@@ -199,26 +233,40 @@ function ProfileCard({
   }, [menuOpen, positionPopover]);
 
   return (
-    <Card sm={12} role='listitem' className='profile-card-container mb-2'>
+    <Card
+      sm={12}
+      role='listitem'
+      className={`profile-card-container mb-2 ${pending ? 'pointer-events-none' : ''}`}
+    >
       <div
-        className='flex flex-row items-center'
+        className={`flex flex-row items-center transition-opacity ${visiblePending ? 'opacity-50' : ''}`}
         role='group'
         aria-labelledby={`profile-${data.id}-title`}
+        aria-busy={Boolean(pending)}
       >
         <div className='flex flex-grow flex-col overflow-hidden'>
           <div className='mx-2 flex flex-row items-center gap-2 align-middle'>
             <div className='flex min-w-0 flex-grow flex-row items-center gap-4'>
               {/* CheckBox */}
-              <div>
+              <div className='flex size-5 items-center justify-center'>
+                {visiblePending === 'select' ? (
+                  <Spinner size={4} />
+                ) : (
                 <label className='cursor-pointer'>
                   <input
                     checked={data.selected}
                     type='checkbox'
-                    onClick={() => onSelect(data.id)}
+                      onClick={e => {
+                        // Keep the box driven by data.selected: the browser must not toggle it itself
+                        e.preventDefault();
+                        onSelect(data.id, data.selected);
+                      }}
+                      disabled={busy}
                     className='checkbox checkbox-success checkbox-sm'
-                    aria-label={`Select ${data.label} profile`}
+                      aria-label={t`Select ${label} profile`}
                   />
                 </label>
+                )}
               </div>
               {/* Label and Type */}
               <div className='flex flex-row flex-wrap items-center gap-4'>
@@ -230,17 +278,27 @@ function ProfileCard({
                 </span>
                 <span
                   className={`${typeClass} badge-sm lg:badge-md font-medium`}
-                  aria-label={`Profile type: ${typeText}`}
+                  aria-label={t`Profile type: ${typeText}`}
                 >
                   {typeText}
                 </span>
+                {isSystem && (
+                  <span
+                    className='badge badge-outline badge-sm lg:badge-md font-medium'
+                    title={t`Built-in profile, can be edited but not deleted`}
+                  >
+                    <Trans context='profile badge'>System</Trans>
+                  </span>
+                )}
                 <button
                   onClick={onToggleDetails}
                   className='btn btn-xs btn-ghost self-start'
-                  aria-label={`${detailsCollapsed ? 'Show' : 'Hide'} details for ${data.label}`}
+                  aria-label={
+                    detailsCollapsed ? t`Show details for ${label}` : t`Hide details for ${label}`
+                  }
                   aria-expanded={!detailsCollapsed}
                   aria-controls={detailsSectionId}
-                  title={detailsCollapsed ? 'Show details' : 'Hide details'}
+                  title={detailsCollapsed ? t`Show details` : t`Hide details`}
                 >
                   <FontAwesomeIcon
                     icon={faChevronRight}
@@ -252,20 +310,25 @@ function ProfileCard({
               <div
                 className='flex flex-1 flex-row justify-end gap-2'
                 role='group'
-                aria-label={`Actions for ${data.label} profile`}
+                aria-label={t`Actions for ${label} profile`}
               >
                 {/* Mobile: Popover actions menu */}
                 <div>
                   <button
                     ref={kebabRef}
                     onClick={toggleMenu}
+                    disabled={busy}
                     className='btn btn-sm btn-ghost sm:hidden'
-                    aria-label={`Open actions menu for ${data.label} profile`}
+                    aria-label={t`Open actions menu for ${label} profile`}
                     aria-haspopup='menu'
                     aria-expanded={menuOpen}
                     aria-controls={`profile-${data.id}-menu`}
                   >
+                    {visiblePending ? (
+                      <Spinner size={4} />
+                    ) : (
                     <FontAwesomeIcon icon={faEllipsisVertical} />
+                    )}
                   </button>
                   {menuOpen && (
                     <div
@@ -273,6 +336,7 @@ function ProfileCard({
                       ref={popoverRef}
                       role='menu'
                       className='bg-base-100 rounded-box z-50 w-56 p-2 shadow'
+                      style={{ position: 'fixed', top: 0, left: 0 }}
                       onKeyDown={e => {
                         if (e.key === 'Escape') closeMenu();
                       }}
@@ -285,17 +349,17 @@ function ProfileCard({
                               onFavoriteToggle();
                               closeMenu();
                             }}
-                            disabled={favoriteToggleDisabled}
+                            disabled={favoriteToggleDisabled || busy}
                             className={`justify-start ${favoriteToggleClass}`}
                             aria-label={
                               data.favorite
-                                ? `Remove ${data.label} from favorites`
-                                : `Add ${data.label} to favorites`
+                                ? t`Remove ${label} from favorites`
+                                : t`Add ${label} to favorites`
                             }
                             aria-pressed={data.favorite}
                           >
                             <FontAwesomeIcon icon={faStar} className={bookmarkClass} />
-                            <span>{data.favorite ? 'Unfavorite' : 'Favorite'}</span>
+                            <span>{data.favorite ? t`Unfavorite` : t`Favorite`}</span>
                           </button>
                         </li>
                         <li role='none'>
@@ -303,10 +367,12 @@ function ProfileCard({
                             role='menuitem'
                             href={`/profiles/${data.id}`}
                             onClick={closeMenu}
-                            aria-label={`Edit ${data.label} profile`}
+                            aria-label={t`Edit ${label} profile`}
                           >
                             <FontAwesomeIcon icon={faPen} />
-                            <span>Edit</span>
+                            <span>
+                              <Trans>Edit</Trans>
+                            </span>
                           </a>
                         </li>
                         <li role='none'>
@@ -315,10 +381,12 @@ function ProfileCard({
                             href={statsHref}
                             onClick={closeMenu}
                             className='text-success justify-start'
-                            aria-label={`View statistics for ${data.label} profile`}
+                            aria-label={t`View statistics for ${label} profile`}
                           >
                             <FontAwesomeIcon icon={faChartSimple} />
-                            <span>Statistics</span>
+                            <span>
+                              <Trans>Statistics</Trans>
+                            </span>
                           </a>
                         </li>
                         <li role='none'>
@@ -328,11 +396,14 @@ function ProfileCard({
                               onDownload();
                               closeMenu();
                             }}
+                            disabled={busy}
                             className='text-primary justify-start'
-                            aria-label={`Export ${data.label} profile`}
+                            aria-label={t`Export ${label} profile`}
                           >
                             <FontAwesomeIcon icon={faFileExport} />
-                            <span>Export</span>
+                            <span>
+                              <Trans>Export</Trans>
+                            </span>
                           </button>
                         </li>
                         <li role='none'>
@@ -342,13 +413,17 @@ function ProfileCard({
                               onDuplicate(data.id);
                               closeMenu();
                             }}
+                            disabled={busy}
                             className='text-success justify-start'
-                            aria-label={`Duplicate ${data.label} profile`}
+                            aria-label={t`Duplicate ${label} profile`}
                           >
                             <FontAwesomeIcon icon={faCopy} />
-                            <span>Duplicate</span>
+                            <span>
+                              <Trans>Duplicate</Trans>
+                            </span>
                           </button>
                         </li>
+                        {!isSystem && (
                         <li role='none'>
                           <button
                             role='menuitem'
@@ -358,18 +433,20 @@ function ProfileCard({
                                 closeMenu();
                               });
                             }}
-                            className={`justify-start ${confirmDelete ? 'bg-error text-error-content rounded font-semibold' : 'text-error'}`}
+                              disabled={deleteDisabled || busy}
+                              className={`justify-start ${deleteClass} ${confirmDelete ? 'bg-error text-error-content rounded font-semibold' : 'text-error'}`}
                             aria-label={
                               confirmDelete
-                                ? `Confirm deletion of ${data.label} profile`
-                                : `Delete ${data.label} profile`
+                                  ? t`Confirm deletion of ${label} profile`
+                                  : t`Delete ${label} profile`
                             }
-                            title={confirmDelete ? 'Click to confirm delete' : 'Delete profile'}
+                              title={confirmDelete ? t`Click to confirm delete` : t`Delete profile`}
                           >
                             <FontAwesomeIcon icon={faTrashCan} />
-                            <span>{confirmDelete ? 'Confirm' : 'Delete'}</span>
+                              <span>{confirmDelete ? t`Confirm` : t`Delete`}</span>
                           </button>
                         </li>
+                        )}
                       </ul>
                     </div>
                   )}
@@ -379,75 +456,104 @@ function ProfileCard({
                 <div
                   className='hidden flex-row justify-end gap-2 sm:flex'
                   role='group'
-                  aria-label={`Actions for ${data.label} profile`}
+                  aria-label={t`Actions for ${label} profile`}
                 >
-                  <Tooltip content={data.favorite ? 'Remove from favorites' : 'Add to favorites'}>
+                  <Tooltip content={data.favorite ? t`Remove from favorites` : t`Add to favorites`}>
                     <button
                       onClick={onFavoriteToggle}
-                      disabled={favoriteToggleDisabled}
+                      disabled={favoriteToggleDisabled || busy}
                       className={`btn btn-sm btn-ghost ${favoriteToggleClass}`}
                       aria-label={
                         data.favorite
-                          ? `Remove ${data.label} from favorites`
-                          : `Add ${data.label} to favorites`
+                          ? t`Remove ${label} from favorites`
+                          : t`Add ${label} to favorites`
                       }
                       aria-pressed={data.favorite}
                     >
+                      {visiblePending === 'favorite' ? (
+                        <Spinner size={4} />
+                      ) : (
                       <FontAwesomeIcon icon={faStar} className={bookmarkClass} />
+                      )}
                     </button>
                   </Tooltip>
-                  <Tooltip content='Edit profile'>
+                  <Tooltip content={t`Edit profile`}>
                     <a
                       href={`/profiles/${data.id}`}
                       className='btn btn-sm btn-ghost'
-                      aria-label={`Edit ${data.label} profile`}
+                      aria-label={t`Edit ${label} profile`}
                     >
                       <FontAwesomeIcon icon={faPen} />
                     </a>
                   </Tooltip>
-                  <Tooltip content='View statistics for this profile'>
+                  <Tooltip content={t`View statistics for this profile`}>
                     <a
                       href={statsHref}
                       className='btn btn-sm btn-ghost text-success'
-                      aria-label={`View statistics for ${data.label} profile`}
+                      aria-label={t`View statistics for ${label} profile`}
                     >
                       <FontAwesomeIcon icon={faChartSimple} />
                     </a>
                   </Tooltip>
-                  <Tooltip content='Export profile'>
+                  <Tooltip content={t`Export profile`}>
                     <button
                       onClick={onDownload}
+                      disabled={busy}
                       className='btn btn-sm btn-ghost text-primary'
-                      aria-label={`Export ${data.label} profile`}
+                      aria-label={t`Export ${label} profile`}
                     >
                       <FontAwesomeIcon icon={faFileExport} />
                     </button>
                   </Tooltip>
-                  <Tooltip content='Duplicate profile'>
+                  <Tooltip content={t`Duplicate profile`}>
                     <button
                       onClick={() => onDuplicate(data.id)}
+                      disabled={busy}
                       className='btn btn-sm btn-ghost text-success'
-                      aria-label={`Duplicate ${data.label} profile`}
+                      aria-label={t`Duplicate ${label} profile`}
                     >
+                      {visiblePending === 'duplicate' ? (
+                        <Spinner size={4} />
+                      ) : (
                       <FontAwesomeIcon icon={faCopy} />
+                      )}
                     </button>
                   </Tooltip>
-                  <Tooltip content={confirmDelete ? 'Click to confirm' : 'Delete profile'}>
+                  {!isSystem && (
+                    <Tooltip
+                      content={
+                        deleteDisabled
+                          ? t`The selected profile can't be deleted`
+                          : confirmDelete
+                            ? t`Click to confirm`
+                            : t`Delete profile`
+                      }
+                    >
                     <button
                       onClick={() => {
                         confirmOrDelete(() => onDelete(data.id));
                       }}
-                      className={`btn btn-sm btn-ghost ${confirmDelete ? 'bg-error text-error-content' : 'text-error'}`}
+                        disabled={deleteDisabled || busy}
+                        className={`btn btn-sm btn-ghost ${deleteClass} ${confirmDelete ? 'bg-error text-error-content' : 'text-error'}`}
                       aria-label={
                         confirmDelete
-                          ? `Confirm deletion of ${data.label} profile`
-                          : `Delete ${data.label} profile`
+                            ? t`Confirm deletion of ${label} profile`
+                            : t`Delete ${label} profile`
                       }
                     >
+                        {visiblePending === 'delete' ? (
+                          <Spinner size={4} />
+                        ) : (
                       <FontAwesomeIcon icon={faTrashCan} />
-                      {confirmDelete && <span className='ml-2 font-semibold'>Confirm</span>}
+                        )}
+                        {confirmDelete && (
+                          <span className='ml-2 font-semibold'>
+                            <Trans>Confirm</Trans>
+                          </span>
+                        )}
                     </button>
                   </Tooltip>
+                  )}
                 </div>
               </div>
             </div>
@@ -466,38 +572,35 @@ function ProfileCard({
                     {totalDurationSeconds}s
                   </span>
                   {phases.length > 0 &&
-                    phases[phases.length - 1]?.targets?.some(t => t.type === 'volumetric') && (
+                    phases[phases.length - 1]?.targets?.some(tg => tg.type === 'volumetric') && (
                       <span className='text-base-content/60 badge badge-xs md:badge-sm badge-outline'>
                         <FontAwesomeIcon icon={faScaleBalanced} />
-                        {`${phases[phases.length - 1].targets.find(t => t.type === 'volumetric').value}g`}
+                        {`${phases[phases.length - 1].targets.find(tg => tg.type === 'volumetric').value}g`}
                       </span>
                     )}
                   {phases.length > 0 && (
                     <span className='text-base-content/60 badge badge-xs md:badge-sm badge-outline'>
-                      {phases.length} phase{phases.length === 1 ? '' : 's'}
+                      <Plural value={phases.length} one='# phase' other='# phases' />
                     </span>
                   )}
                 </div>
               </div>
             )}
-            <div
-              className='flex flex-row gap-2 py-2'
-              aria-label={`Profile details for ${data.label}`}
-            >
+            <div className='flex flex-row gap-2 py-2' aria-label={t`Profile details for ${label}`}>
               <div className='flex flex-col justify-evenly pr-1'>
-                <Tooltip content='Move to top' disabled={isDragging || tooltipsDisabled}>
+                <Tooltip content={t`Move to top`} disabled={isDragging || tooltipsDisabled}>
                   <button
                     onClick={handleMoveTop}
-                    disabled={isFirst}
+                    disabled={isFirst || busy}
                     className='drag-to-top btn btn-sm btn-ghost'
-                    aria-label={`Move ${data.label} to top`}
+                    aria-label={t`Move ${label} to top`}
                     aria-disabled={isFirst}
                   >
                     <FontAwesomeIcon icon={faAnglesUp} />
                   </button>
                 </Tooltip>
                 <Tooltip
-                  content={`${disabledDrag ? 'Drag disabled on search result' : 'Drag to reorder'}`}
+                  content={disabledDrag ? t`Drag disabled on search result` : t`Drag to reorder`}
                   disabled={isDragging}
                 >
                   <div
@@ -506,12 +609,12 @@ function ProfileCard({
                     <FontAwesomeIcon icon={faGripVertical} />
                   </div>
                 </Tooltip>
-                <Tooltip content='Move to bottom' disabled={isDragging || tooltipsDisabled}>
+                <Tooltip content={t`Move to bottom`} disabled={isDragging || tooltipsDisabled}>
                   <button
                     onClick={handleMoveBottom}
-                    disabled={isLast}
+                    disabled={isLast || busy}
                     className='drag-to-bottom btn btn-sm btn-ghost'
-                    aria-label={`Move ${data.label} to bottom`}
+                    aria-label={t`Move ${label} to bottom`}
                     aria-disabled={isLast}
                   >
                     <FontAwesomeIcon icon={faAnglesDown} />
@@ -534,12 +637,17 @@ function ProfileCard({
 }
 
 function SimpleContent({ phases }) {
+  const { t } = useLingui();
   if (phases.length === 0) {
-    return <div className='text-base-content/60 text-sm'>No phases</div>;
+    return (
+      <div className='text-base-content/60 text-sm'>
+        <Trans>No phases</Trans>
+      </div>
+    );
   }
 
   return (
-    <div className='flex flex-row items-center gap-2' role='list' aria-label='Brew phases'>
+    <div className='flex flex-row items-center gap-2' role='list' aria-label={t`Brew phases`}>
       {phases.map((phase, i) => (
         <div key={i} className='flex flex-row items-center gap-2' role='listitem'>
           {i > 0 && <SimpleDivider />}
@@ -562,29 +670,61 @@ function SimpleDivider() {
 }
 
 function SimpleStep(props) {
+  const { i18n } = useLingui();
+  const duration = props.duration;
+  const phaseLabel = PhaseLabels[props.phase];
   return (
     <div className='bg-base-100 border-base-300 flex flex-col gap-1 rounded-lg border p-3'>
       <div className='flex flex-row gap-2'>
-        <span className='text-base-content text-sm font-bold'>{PhaseLabels[props.phase]}</span>
+        <span className='text-base-content text-sm font-bold'>
+          {phaseLabel ? i18n._(phaseLabel) : undefined}
+        </span>
         <span className='text-base-content/70 text-sm'>{props.type}</span>
       </div>
       <div className='text-base-content/60 text-sm italic'>
-        {props.targets.length === 0 && <span>Duration: {props.duration}s</span>}
-        {props.targets.map((t, i) => (
-          <span key={i}>
-            Exit on: {t.value}
-            {t.type === 'volumetric' && 'g'}
+        {props.targets.length === 0 && (
+          <span>
+            <Trans>Duration: {duration}s</Trans>
           </span>
-        ))}
+        )}
+        {props.targets.map((target, i) => {
+          const value = target.value;
+          return (
+            <span key={i}>
+              <Trans>Exit on: {value}</Trans>
+              {target.type === 'volumetric' && 'g'}
+            </span>
+          );
+        })}
       </div>
     </div>
   );
 }
 
+// Cards whose props did not change skip rendering, e.g. on another card's select or favorite (GM-292)
+const MemoProfileCard = memo(ProfileCard);
+
+// Profile images only exist with an SD card; without one the export carries no "image" field.
+async function withExportedImage(profile) {
+  const copy = { ...profile };
+  delete copy.image;
+  if (machine.value.capabilities.sdCard) {
+    const image = await exportProfileImage(profile.id).catch(() => null);
+    if (image) copy.image = image;
+  }
+  return copy;
+}
+
 export function ProfileList() {
+  const { t } = useLingui();
   const apiService = useContext(ApiServiceContext);
-  const [profiles, setProfiles] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const {
+    profiles,
+    loading,
+    invalidate: invalidateProfiles,
+    setLoading,
+    setProfiles,
+  } = useProfileList();
   const [searchTerm, setSearchTerm] = useState('');
   const [activeTab, setActiveTab] = useState('extraction');
   const [isDragging, setIsDragging] = useState(false);
@@ -599,12 +739,6 @@ export function ProfileList() {
       setActiveTab('extraction');
     }
   }, [hasUtilityProfiles]);
-
-  const loadProfiles = async () => {
-    const response = await apiService.request({ tp: 'req:profiles:list' });
-    setProfiles(response.profiles);
-    setLoading(false);
-  };
 
   // Placeholder for future persistence of order (intentionally empty)
   // Debounced persistence of profile order (300ms)
@@ -621,7 +755,7 @@ export function ProfileList() {
         if (!orderedIds) return;
         try {
           await apiService.request({ tp: 'req:profiles:reorder', order: orderedIds });
-        } catch (e) {
+        } catch {
           // optional: log or surface error
         }
       }, 300);
@@ -684,7 +818,7 @@ export function ProfileList() {
         return normalized;
       });
     },
-    [persistProfileOrder],
+    [persistProfileOrder, setProfiles],
   );
 
   const moveProfileBottom = useCallback(
@@ -707,7 +841,7 @@ export function ProfileList() {
         return normalized;
       });
     },
-    [persistProfileOrder],
+    [persistProfileOrder, setProfiles],
   );
 
   const onDragStart = useCallback(() => {
@@ -780,7 +914,7 @@ export function ProfileList() {
         return next;
       });
     },
-    [activeTab, clearDropHighlights, persistProfileOrder],
+    [activeTab, clearDropHighlights, persistProfileOrder, setProfiles],
   );
 
   // Sorting via SortableJS
@@ -805,93 +939,119 @@ export function ProfileList() {
     };
   }, [loading, searchTerm, onDragStart, onDragChange, onDragEnd]);
 
-  const isConnected = connected.value;
-  useEffect(() => {
-    if (!isConnected || !apiService) return;
-    const abort = new AbortController();
-    setLoading(true);
-    apiService.request({ tp: 'req:profiles:list' }, { signal: abort.signal })
-      .then(response => {
-        if (abort.signal.aborted) return;
-        setProfiles(response.profiles ?? []);
-        setLoading(false);
-      })
-      .catch(() => {
-        if (!abort.signal.aborted) setLoading(false);
+  const [pendingById, setPendingById] = useState({});
+  const withPending = useCallback(async (id, kind, task) => {
+    setPendingById(prev => ({ ...prev, [id]: kind }));
+    try {
+      await task();
+    } finally {
+      setPendingById(prev => {
+        const { [id]: _done, ...rest } = prev;
+        return rest;
       });
-    return () => {
-      abort.abort();
-    };
-  }, [apiService, isConnected]);
+    }
+  }, []);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const onDelete = useCallback(
-    async id => {
-      setLoading(true);
-      await apiService.request({ tp: 'req:profiles:delete', id });
-      await loadProfiles();
-    },
-    [apiService, setLoading],
+    id =>
+      withPending(id, 'delete', async () => {
+        try {
+          const response = await apiService.request({ tp: 'req:profiles:delete', id });
+          if (response?.error) {
+            await invalidateProfiles();
+            return;
+          }
+          setProfiles(prev => prev.filter(p => p.id !== id));
+        } catch {
+          await invalidateProfiles();
+        }
+      }),
+    [apiService, setProfiles, invalidateProfiles, withPending],
   );
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // onSelect will exit early if the requested id is the same as the pending id
+  // or if there is no pending selection and the requested id is already selected
+  const pendingSelectionRef = useRef(null);
   const onSelect = useCallback(
-    async id => {
-      setLoading(true);
+    async (id, alreadySelected) => {
+      if (pendingSelectionRef.current === id) return;
+      if (alreadySelected && pendingSelectionRef.current === null) return;
+      pendingSelectionRef.current = id;
+      return withPending(id, 'select', async () => {
+        try {
       await apiService.request({ tp: 'req:profiles:select', id });
-      await loadProfiles();
+        } catch {
+          // Timeout or closed socket: the checkbox simply stays where it was.
+        } finally {
+          if (pendingSelectionRef.current === id) pendingSelectionRef.current = null;
+        }
+      });
     },
-    [apiService, setLoading],
+    [apiService, withPending],
   );
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const onFavorite = useCallback(
-    async id => {
-      setLoading(true);
-      await apiService.request({ tp: 'req:profiles:favorite', id });
-      await loadProfiles();
+  const setFavorite = useCallback(
+    (id, favorite) => {
+      const apply = value =>
+        setProfiles(prev => prev.map(p => (p.id === id ? { ...p, favorite: value } : p)));
+      apply(favorite);
+      return withPending(id, 'favorite', async () => {
+        try {
+          const response = await apiService.request({
+            tp: favorite ? 'req:profiles:favorite' : 'req:profiles:unfavorite',
+            id,
+          });
+          if (response?.error) {
+            await invalidateProfiles();
+            return;
+          }
+          apply(favorite);
+        } catch {
+          // A thrown request has an unknown outcome (the machine may have applied it), so resync
+          // from the machine instead of guessing a rollback.
+          await invalidateProfiles();
+        }
+      });
     },
-    [apiService, setLoading],
+    [apiService, setProfiles, invalidateProfiles, withPending],
   );
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const onUnfavorite = useCallback(
-    async id => {
-      setLoading(true);
-      await apiService.request({ tp: 'req:profiles:unfavorite', id });
-      await loadProfiles();
-    },
-    [apiService, setLoading],
-  );
+  // Read through a ref so onDuplicate keeps its identity when the list changes
+  const profilesRef = useRef(profiles);
+  profilesRef.current = profiles;
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // The machine assigns the new id and may favorite the copy on its own, so the list is reloaded
+  // quietly (no page spinner) once the copy is saved, while the source card shows a spinner.
   const onDuplicate = useCallback(
-    async id => {
-      setLoading(true);
-      const original = profiles.find(p => p.id === id);
+    id =>
+      withPending(id, 'duplicate', async () => {
+        const original = profilesRef.current.find(p => p.id === id);
       if (original) {
         const copy = { ...original };
         delete copy.id;
         delete copy.selected;
         delete copy.favorite;
         copy.label = `${original.label} Copy`;
+          try {
         await apiService.request({ tp: 'req:profiles:save', profile: copy });
+          } catch {
+            // Resynced below.
       }
-      await loadProfiles();
-    },
-    [apiService, profiles, setLoading],
+        }
+        await invalidateProfiles();
+      }),
+    [apiService, invalidateProfiles, withPending],
   );
 
-  const onExport = useCallback(() => {
-    const exportedProfiles = profiles.map(p => {
-      const ep = {
-        ...p,
-      };
+  const onExport = useCallback(async () => {
+    const exportedProfiles = [];
+    for (const p of profiles) {
+      const ep = await withExportedImage(p);
       delete ep.id;
       delete ep.selected;
       delete ep.favorite;
-      return ep;
-    });
+      exportedProfiles.push(ep);
+    }
 
     downloadJson(exportedProfiles, 'profiles.json');
   }, [profiles]);
@@ -906,13 +1066,17 @@ export function ProfileList() {
           setLoading(true);
           try {
             const profiles = parseProfile(result);
-            for (const p of profiles) {
-              await apiService.request({ tp: 'req:profiles:save', profile: p });
+            for (const { image, ...p } of profiles) {
+              const response = await apiService.request({ tp: 'req:profiles:save', profile: p });
+              const id = response?.profile?.id;
+              if (image && id && machine.value.capabilities.sdCard) {
+                await importProfileImage(id, image).catch(() => {});
+              }
             }
           } catch {
             // Individual save errors are surfaced by WS timeout; continue to reload list.
           }
-          await loadProfiles();
+          await invalidateProfiles();
         }
       };
       reader.readAsText(file);
@@ -922,12 +1086,12 @@ export function ProfileList() {
   const onClear = useCallback(async () => {
     setLoading(true);
     for (const p of profiles) {
-      if (!p.selected) {
+      if (!p.selected && !isSystemProfile(p.id)) {
         await apiService.request({ tp: 'req:profiles:delete', id: p.id });
       }
     }
-    await loadProfiles();
-  }, [profiles, apiService]);
+    await invalidateProfiles();
+  }, [profiles, apiService, setLoading, invalidateProfiles]);
 
   if (loading) {
     return (
@@ -935,7 +1099,7 @@ export function ProfileList() {
         className='flex w-full flex-row items-center justify-center py-16'
         role='status'
         aria-live='polite'
-        aria-label='Loading profiles'
+        aria-label={t`Loading profiles`}
       >
         <Spinner size={8} />
       </div>
@@ -945,7 +1109,9 @@ export function ProfileList() {
   return (
     <>
       <div className='mb-4 flex flex-row items-center gap-2'>
-        <h1 className='flex-grow text-2xl font-bold sm:text-3xl'>Profiles</h1>
+        <h1 className='flex-grow text-2xl font-bold sm:text-3xl'>
+          <Trans>Profiles</Trans>
+        </h1>
       </div>
 
       <div className='mb-4 flex flex-col items-center gap-2 sm:flex-row'>
@@ -956,7 +1122,7 @@ export function ProfileList() {
             <FontAwesomeIcon icon={faSearch} />
             <input
               type='text'
-              placeholder='Search...'
+              placeholder={t`Search...`}
               value={searchTerm}
               onChange={e => {
                 setSearchTerm(e.target.value);
@@ -966,21 +1132,21 @@ export function ProfileList() {
           </label>
         </div>
         <div className='flex flex-grow items-center justify-end gap-2'>
-          <Tooltip content='Export all profiles'>
+          <Tooltip content={t`Export all profiles`}>
             <button
               id='export-profiles'
               onClick={onExport}
               className='btn btn-ghost btn-sm'
-              aria-label='Export all profiles'
+              aria-label={t`Export all profiles`}
             >
               <FontAwesomeIcon icon={faFileExport} />
             </button>
           </Tooltip>
-          <Tooltip content='Import profiles'>
+          <Tooltip content={t`Import profiles`}>
             <label
               htmlFor='profileImport'
               className='btn btn-ghost btn-sm cursor-pointer'
-              aria-label='Import profiles'
+              aria-label={t`Import profiles`}
             >
               <FontAwesomeIcon icon={faFileImport} />
             </label>
@@ -991,17 +1157,17 @@ export function ProfileList() {
             id='profileImport'
             type='file'
             accept='.json,application/json,.tcl'
-            aria-label='Select a JSON file containing profile data to import'
+            aria-label={t`Select a JSON file containing profile data to import`}
           />
           <ConfirmButton
             onAction={onClear}
             icon={faTrashCan}
-            tooltip='Delete all profiles'
-            confirmTooltip='Confirm deletion'
+            tooltip={t`Delete all profiles`}
+            confirmTooltip={t`Confirm deletion`}
           />
         </div>
       </div>
-      <div className='mb-4' aria-label='Add profile'>
+      <div className='mb-4' aria-label={t`Add profile`}>
         <ProfileAddCard />
       </div>
       {hasUtilityProfiles && (
@@ -1010,38 +1176,38 @@ export function ProfileList() {
             role='tab'
             className={`tab ${activeTab === 'extraction' ? 'tab-active' : ''}`}
             onClick={() => setActiveTab('extraction')}
-            aria-label='Switch to extraction tab'
+            aria-label={t`Switch to extraction tab`}
           >
-            Extraction
+            <Trans context='profile tab'>Extraction</Trans>
           </button>
           <button
             role='tab'
             className={`tab ${activeTab === 'utility' ? 'tab-active' : ''}`}
             onClick={() => setActiveTab('utility')}
-            aria-label='Switch to utility tab'
+            aria-label={t`Switch to utility tab`}
           >
-            Utility
+            <Trans context='profile tab'>Utility</Trans>
           </button>
         </div>
       )}
       <div
         className='grid grid-cols-1 gap-4 lg:grid-cols-12'
         role='list'
-        aria-label='Profile list'
+        aria-label={t`Profile list`}
         ref={containerRef}
       >
         {profilesToShow
           .filter(p => (activeTab === 'utility' ? p.utility : !p.utility))
           .map((data, idx, filtered) => (
-            <ProfileCard
+            <MemoProfileCard
               key={data.id}
               data={data}
               onDelete={onDelete}
+              pending={pendingById[data.id]}
               onSelect={onSelect}
               favoriteDisabled={favoriteDisabled}
               unfavoriteDisabled={unfavoriteDisabled}
-              onUnfavorite={onUnfavorite}
-              onFavorite={onFavorite}
+              onSetFavorite={setFavorite}
               onDuplicate={onDuplicate}
               disabledDrag={!!searchTerm.trim()}
               isDragging={isDragging}

@@ -3,6 +3,7 @@
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <atomic>
 #include <display/core/Controller.h>
 #include <display/core/Event.h>
 #include <display/core/Plugin.h>
@@ -10,7 +11,6 @@
 #include <display/core/utils.h>
 #include <display/models/shot_log_format.h>
 #include <display/util/PsramStlAllocator.h>
-#include <atomic>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -36,6 +36,13 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
     bool appendToIndex(const ShotIndexEntry &entry);
     void updateIndexMetadata(uint32_t shotId, uint8_t rating, uint16_t volume);
     void markIndexDeleted(uint32_t shotId);
+    // Removes every shot log and notes file under /h and resets the index; false when anything could not be removed
+    bool deleteAllHistory(size_t &deleted);
+    // Runs deleteAllHistory on its own task and reports via evt:history-delete-all; returns an error text when refused
+    const char *startAsyncDeleteAll();
+    // Body of the delete-all task; the simulator spawns no tasks and pumps it from its main loop
+    void runDeleteAll();
+    bool isDeleteAllInProgress() const { return deleteAllInProgress; }
     bool rebuildIndex();
     void startAsyncRebuild();
     bool ensureIndexExists();
@@ -56,6 +63,7 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
 
     void saveNotes(const String &id, const JsonDocument &notes);
     void loadNotes(const String &id, JsonDocument &notes);
+    String resolveNotesPath(uint32_t id);
     void startRecording(Event const &event);
 
     uint16_t getSystemInfo(); // Helper to pack system state bits
@@ -103,6 +111,7 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
     VolumetricMeasurementSource shotSource = VolumetricMeasurementSource::INACTIVE;
     bool shotStartedVolumetric = false; // Track initial volumetric mode
     double currentBrewDelay = 0.0;      // Brew delay (ms) the active shot was started with
+    float shotDose = 0.0f;              // Dose (g) of the brew process's profile snapshot; captured at brew end
     unsigned long shotStart = 0;
     unsigned long extendedRecordingStart = 0;
     unsigned long lastWeightChangeTime = 0;
@@ -115,7 +124,10 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
     float lastScaleWeight = 0.0f;
     float currentScaleFlow = 0.0f;
     float currentEstimatedWeight = 0.0f;
+    float nativeScaleFlow = 0.0f;        // native flow from the BLE scale (g/s)
+    unsigned long lastScaleFlowTime = 0; // millis() of the last native flow update
     float currentPuckResistance = 0.0f;
+    float maxRecordedWeight = 0.0f;
     bool sawShotHistoryControlTarget = false;
     uint8_t hardwareScaleFinishSettleSamples = 0;
     unsigned long lastLoggedElapsedMs = 0;
@@ -135,6 +147,7 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
 
     // Async rebuild state
     bool rebuildInProgress = false;
+    std::atomic<bool> deleteAllInProgress{false};
 
     xTaskHandle taskHandle;
     static void loopTask(void *arg);

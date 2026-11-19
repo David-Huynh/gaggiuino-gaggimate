@@ -3,14 +3,13 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faHome } from '@fortawesome/free-solid-svg-icons/faHome';
 import { faList } from '@fortawesome/free-solid-svg-icons/faList';
 import { faTimeline } from '@fortawesome/free-solid-svg-icons/faTimeline';
-import { faBluetoothB } from '@fortawesome/free-brands-svg-icons/faBluetoothB';
 import { faCog } from '@fortawesome/free-solid-svg-icons/faCog';
-import { faRotate } from '@fortawesome/free-solid-svg-icons/faRotate';
+import { faMobileScreen } from '@fortawesome/free-solid-svg-icons/faMobileScreen';
 import { faMagnifyingGlassChart } from '@fortawesome/free-solid-svg-icons/faMagnifyingGlassChart';
 import { faChartSimple } from '@fortawesome/free-solid-svg-icons/faChartSimple';
 import { faCircleChevronLeft } from '@fortawesome/free-solid-svg-icons/faCircleChevronLeft';
 import { faCircleChevronRight } from '@fortawesome/free-solid-svg-icons/faCircleChevronRight';
-import { GmLogoIcon } from '../pages/ShotAnalyzer/components/SourceMarker.jsx';
+import { GmLogoIcon } from './GmLogoIcon.jsx';
 import { faGithub } from '@fortawesome/free-brands-svg-icons/faGithub';
 import { faDiscord } from '@fortawesome/free-brands-svg-icons/faDiscord';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
@@ -23,6 +22,10 @@ import {
 } from '../utils/dashboardManager.js';
 import { machine } from '../services/ApiService.js';
 import { computed } from '@preact/signals';
+import { isApp } from '../app/platform.js';
+import { MachineSwitcher } from '../app/MachineSwitcher.jsx';
+import { msg } from '@lingui/core/macro';
+import { Trans, useLingui } from '@lingui/react/macro';
 
 // List of random icons to display - add your icons here (SVG strings, text, or emojis)
 const RANDOM_ICONS = [
@@ -37,7 +40,7 @@ const RANDOM_ICONS = [
     viewBox='0 0 20 20'
     fill='currentColor'
     aria-hidden='true'
-    className='text-error size-4'
+    className='text-error inline-block size-4 align-[-0.125em]'
   >
     <path d='M9.653 16.915l-.005-.003-.019-.01a20.759 20.759 0 01-1.162-.682 22.045 22.045 0 01-2.582-1.9C4.045 12.733 2 10.352 2 7.5a4.5 4.5 0 018-2.828A4.5 4.5 0 0118 7.5c0 2.852-2.044 5.233-3.885 6.82a22.049 22.049 0 01-3.744 2.582l-.019.01-.005.003h-.002a.739.739 0 01-.69.001l-.002-.001z' />
   </svg>,
@@ -56,7 +59,7 @@ const buildNavigationSections = autoTuningVisible => [
     showDivider: true,
     items: [
       {
-        label: 'Dashboard',
+        label: msg`Dashboard`,
         link: '/',
         icon: faHome,
         editLink: '/dashboard-settings',
@@ -68,23 +71,27 @@ const buildNavigationSections = autoTuningVisible => [
     id: 'analysis',
     showDivider: true,
     items: [
-      { label: 'Profiles', link: '/profiles', icon: faList },
+      { label: msg`Profiles`, link: '/profiles', icon: faList },
       ...(autoTuningVisible
-        ? [{ label: 'Auto Tuning', link: '/autotuning', icon: faChartSimple }]
+        ? [{ label: msg`Auto Tuning`, link: '/autotuning', icon: faChartSimple }]
         : []),
-      { label: 'Shot History', link: '/history', icon: faTimeline },
-      { label: 'Shot Analyzer', link: '/analyzer', icon: faMagnifyingGlassChart, isNew: false },
-      { label: 'Statistics', link: '/statistics', icon: faChartSimple, isNew: false },
+      { label: msg`Shot History`, link: '/history', icon: faTimeline },
+      { label: msg`Shot Analyzer`, link: '/analyzer', icon: faMagnifyingGlassChart, isNew: false },
+      { label: msg`Statistics`, link: '/statistics', icon: faChartSimple, isNew: false },
     ],
   },
   {
     id: 'settings',
     showDivider: true,
-    items: [{ label: 'Settings', link: '/settings', icon: faCog }],
+    // The app may get its own settings later, so the machine's are named explicitly there.
+    items: [
+      { label: isApp ? msg`Device Settings` : msg`Settings`, link: '/settings', icon: faCog },
+    ],
   },
 ];
 
 function DashboardModeDropdown({ editLink, editIcon, editActive, isActive }) {
+  const { t } = useLingui();
   const mode = dashboardModeSignal.value;
 
   // daisyUI dropdowns are focus-driven — blur to close after a selection.
@@ -94,8 +101,11 @@ function DashboardModeDropdown({ editLink, editIcon, editActive, isActive }) {
   };
 
   const options = [
-    { value: DASHBOARD_MODES.SIMPLE, label: 'Simple' },
-    { value: DASHBOARD_MODES.ADVANCED, label: 'Advanced' },
+    { value: DASHBOARD_MODES.SIMPLE, label: t({ message: 'Simple', context: 'dashboard view' }) },
+    {
+      value: DASHBOARD_MODES.ADVANCED,
+      label: t({ message: 'Advanced', context: 'dashboard view' }),
+    },
   ];
 
   return (
@@ -105,8 +115,8 @@ function DashboardModeDropdown({ editLink, editIcon, editActive, isActive }) {
       <div
         tabIndex={0}
         role='button'
-        aria-label='Dashboard view'
-        title='Dashboard view'
+        aria-label={t`Dashboard view`}
+        title={t`Dashboard view`}
         className={`flex h-full cursor-pointer items-center justify-center rounded-r-xl px-2.5 ${
           editActive
             ? 'bg-primary text-primary-content'
@@ -131,7 +141,9 @@ function DashboardModeDropdown({ editLink, editIcon, editActive, isActive }) {
         ))}
         <li>
           <a href={editLink} onClick={() => selectMode(DASHBOARD_MODES.CUSTOM)}>
-            <span className='flex-grow'>Customize</span>
+            <span className='flex-grow'>
+              <Trans>Customize</Trans>
+            </span>
             {mode === DASHBOARD_MODES.CUSTOM && (
               <FontAwesomeIcon icon={faCheck} className='h-3 w-3' />
             )}
@@ -179,12 +191,14 @@ function MenuItem({
       >
         <FontAwesomeIcon size='md' icon={icon} />
         {isUnread && (
-          <span className='indicator-item status status-warning absolute -top-0 -right-0'></span>
+          <span className='indicator-item status status-warning absolute -top-0 -right-0' />
         )}
         {isExpanded ? (
           <div className='indicator'>
             {isNew ? (
-              <span className='indicator-item text-success pl-8 text-xs font-bold'>NEW</span>
+              <span className='indicator-item text-success pl-8 text-xs font-bold'>
+                <Trans>NEW</Trans>
+              </span>
             ) : null}
             <span>{label}</span>
           </div>
@@ -203,6 +217,7 @@ function MenuItem({
 }
 
 export function Navigation({ collapsed = false, onToggleCollapsed }) {
+  const { t, i18n } = useLingui();
   const [autoTuningVisible, setAutoTuningVisible] = useState(false);
   // Compute the icon once per mount so the avatar doesn't reshuffle on every render.
   const randomIcon = useMemo(() => getRandomIcon(), []);
@@ -250,7 +265,7 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
         />
       )}
       <aside
-        className={`sidebar border-base-300 bg-base-100 fixed top-0 left-0 z-9999 flex h-[calc(100dvh_-_4.5rem_-_env(safe-area-inset-bottom))] flex-col overflow-y-auto border-r p-5 md:static md:h-dvh landscape:static landscape:h-dvh ${
+        className={`sidebar border-base-300 bg-base-100 fixed top-0 left-0 z-9999 flex h-[calc(100dvh_-_4.5rem_-_env(safe-area-inset-bottom))] flex-col overflow-y-auto border-r px-5 pt-[max(1.25rem,env(safe-area-inset-top))] pb-[max(1.25rem,env(safe-area-inset-bottom))] md:static md:h-dvh landscape:static landscape:h-dvh ${
           collapsed ? 'hidden md:flex md:w-[90px] landscape:flex landscape:w-[90px]' : 'w-[290px]'
         }`}
       >
@@ -350,6 +365,7 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
                       collapsed={collapsed}
                       isUnread={item.link === '/settings' && update.value}
                       {...item}
+                      label={i18n._(item.label)}
                     />
                   );
                 })}
@@ -358,6 +374,19 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
           ))}
 
           <div className='flex-grow'>&nbsp;</div>
+
+          {/* App-level entries sit apart from the machine's pages, next to the machine switcher. */}
+          {isApp && (
+            <div className='mb-4 space-y-1.5'>
+              <MenuItem
+                collapsed={collapsed}
+                label={t`App Settings`}
+                link='/app-settings'
+                icon={faMobileScreen}
+              />
+              <MachineSwitcher collapsed={collapsed} />
+            </div>
+          )}
 
           {!collapsed && (
             <>
@@ -387,11 +416,8 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
                 </div>
               </div>
               <div className='my-5 text-center'>
-                <span>Crafted with</span>
-                <span className='mx-1'>{randomIcon}</span>
-                <span>
-                  {' '}
-                  in Italy by&nbsp;
+                <Trans>
+                  Crafted with <span className='mx-0.5'>{randomIcon}</span> in Italy by&nbsp;
                   <a
                     className='text-primary hover:text-primary/80 font-medium transition'
                     href='https://gaggimate.eu'
@@ -400,7 +426,7 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
                   >
                     Caffinnova S.r.l.
                   </a>
-                </span>
+                </Trans>
               </div>
             </>
           )}
@@ -414,8 +440,8 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
                   ? 'btn btn-square btn-md text-base-content hover:bg-base-content/10 hover:text-base-content h-12 min-h-0 w-12 min-w-0 rounded-xl border-none bg-transparent px-0'
                   : 'btn btn-md text-base-content hover:text-base-content hover:bg-base-content/10 h-12 w-full justify-start gap-3 border-none bg-transparent px-2'
               }
-              aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}
-              title={collapsed ? 'Expand navigation' : 'Collapse navigation'}
+              aria-label={collapsed ? t`Expand navigation` : t`Collapse navigation`}
+              title={collapsed ? t`Expand navigation` : t`Collapse navigation`}
             >
               <FontAwesomeIcon
                 size='md'
@@ -423,7 +449,9 @@ export function Navigation({ collapsed = false, onToggleCollapsed }) {
               />
               {!collapsed ? (
                 <div className='indicator'>
-                  <span>Collapse</span>
+                  <span>
+                    <Trans>Collapse</Trans>
+                  </span>
                 </div>
               ) : null}
             </button>

@@ -223,6 +223,8 @@ static void writeResponse(int fd, AsyncWebServerResponse *resp) {
     head += "Content-Length: " + std::to_string(bodyLen) + "\r\n";
     for (auto &h : resp->_headers)
         head += std::string(h.first.c_str()) + ": " + std::string(h.second.c_str()) + "\r\n";
+    // The companion app (web/, `vite --mode app`) is served from another origin; let it talk to the simulator.
+    head += "Access-Control-Allow-Origin: *\r\n";
     head += "Connection: close\r\n\r\n";
     sendAll(fd, head.data(), head.size());
     if (bodyLen)
@@ -501,6 +503,14 @@ bool AsyncWebServer::handleHttp(Conn &c) {
         query = target.substr(q + 1);
     }
 
+    if (method == "OPTIONS") { // CORS preflight from the companion app
+        const std::string head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
+                                 "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                                 "Access-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        sendAll(c.fd, head.data(), head.size());
+        return true;
+    }
+
     AsyncWebServerRequest req(c.fd, this);
     req._url = String(path.c_str());
     req._body = body;
@@ -535,8 +545,11 @@ bool AsyncWebServer::handleHttp(Conn &c) {
 void AsyncWebServer::dispatch(Conn &c, AsyncWebServerRequest &req) {
     std::string path(req._url.c_str());
     for (auto &r : _routes) {
-        if ((r.method == HTTP_ANY || (r.method & req._method)) && r.uri == path) {
-            r.handler(&req);
+        const bool uriMatch = r._prefix ? path.rfind(r._uri, 0) == 0 : r._uri == path;
+        if ((r._method == HTTP_ANY || (r._method & req._method)) && uriMatch && (!r._filter || r._filter(&req))) {
+            if (r._onBody && !req._body.empty())
+                r._onBody(&req, (uint8_t *)req._body.data(), req._body.size(), 0, req._body.size());
+            r._handler(&req);
             return;
         }
     }

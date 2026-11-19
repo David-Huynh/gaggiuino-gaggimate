@@ -2,6 +2,8 @@
 
 import { Fragment } from 'preact';
 import { useRef } from 'preact/hooks';
+import { t } from '@lingui/core/macro';
+import { Trans } from '@lingui/react/macro';
 import { cleanName, columnConfig } from '../../utils/analyzerUtils';
 import { ColumnControls } from './ColumnControls';
 import {
@@ -10,10 +12,10 @@ import {
   StatusBadge,
 } from './AnalysisTableChrome';
 import { CellContent, ComparePhaseLabel } from './AnalysisTableCells';
+import { getAnalysisTableResults } from './analysisTablePhases';
 import {
   buildAnalysisWarningBadges,
   getCompareRowStyle,
-  getMaxComparePhaseCount,
   hasAnalysisProfilePhaseStops,
 } from './analysisTableModel';
 import {
@@ -24,6 +26,14 @@ import {
   useTouchOptimizedPointer,
   useVerticalWheelForwarding,
 } from './useAnalysisTableInteraction';
+
+function getShotAriaLabel(shotNumber) {
+  return t`Shot ${shotNumber}`;
+}
+
+function getPhaseHeading(phaseNumber) {
+  return t`Phase ${phaseNumber}`;
+}
 
 export function AnalysisTable({
   results,
@@ -38,8 +48,19 @@ export function AnalysisTable({
 
   const tableContainerRef = useRef(null);
   const visibleColumns = columnConfig.filter(col => activeColumns.has(col.id));
-  const compareTableColumnCount = visibleColumns.length + 2;
-  const maxComparePhaseCount = getMaxComparePhaseCount(compareMode, compareEntries);
+  const compareTableColumnCount = visibleColumns.length + 3;
+  const tableResults = getAnalysisTableResults(results);
+  const tablePhases = tableResults?.phases || [];
+  const compareTableEntries = compareMode
+    ? compareEntries.map(entry => ({
+        ...entry,
+        tableResults: getAnalysisTableResults(entry.results),
+      }))
+    : [];
+  const maxComparePhaseCount = Math.max(
+    ...compareTableEntries.map(entry => entry.tableResults?.phases?.length || 0),
+    0,
+  );
   const hasProfilePhaseStops = hasAnalysisProfilePhaseStops(results);
 
   const scrollTable = amount => scrollAnalysisTable(tableContainerRef, amount);
@@ -59,7 +80,10 @@ export function AnalysisTable({
   const primaryTableTextClass = 'text-base-content/90 font-medium';
   const tableSubtextClass = 'text-base-content/55 leading-tight font-medium';
   const tableLegendTextClass = 'text-base-content/75 text-xs font-normal tracking-normal';
-  const analysisWarningBadges = buildAnalysisWarningBadges(results);
+  const analysisWarningBadges = buildAnalysisWarningBadges(
+    results,
+    compareMode ? compareEntries : [],
+  );
   return (
     <div className='flex w-full flex-col'>
       {/* Inject CSS to hide Webkit Scrollbars */}
@@ -149,11 +173,11 @@ export function AnalysisTable({
                         colSpan={compareTableColumnCount}
                         className={`border-base-content/10 px-3 py-2 text-left text-xs ${tableHeaderTextClass}`}
                       >
-                        Phase {phaseIndex + 1}
+                        {getPhaseHeading(phaseIndex + 1)}
                       </td>
                     </tr>
-                    {compareEntries.map((entry, compareIndex) => {
-                      const phase = entry?.results?.phases?.[phaseIndex] || null;
+                    {compareTableEntries.map((entry, compareIndex) => {
+                      const phase = entry.tableResults?.phases?.[phaseIndex] || null;
 
                       return (
                         <tr
@@ -172,7 +196,7 @@ export function AnalysisTable({
                                 ]
                                   .filter(Boolean)
                                   .join(' ')}
-                                aria-label={`Shot ${compareIndex + 1}`}
+                                aria-label={getShotAriaLabel(compareIndex + 1)}
                               >
                                 {compareIndex + 1}
                               </span>
@@ -194,7 +218,18 @@ export function AnalysisTable({
                             <ComparePhaseLabel
                               phase={phase}
                               phaseIndex={phaseIndex}
-                              results={entry.results}
+                              results={entry.tableResults}
+                              section='phase'
+                            />
+                          </td>
+                          <td
+                            className={`analysis-table-stop-reason border-l px-2 py-2 text-right whitespace-nowrap ${subtleDividerClass}`}
+                          >
+                            <ComparePhaseLabel
+                              phase={phase}
+                              phaseIndex={phaseIndex}
+                              results={entry.tableResults}
+                              section='reason'
                             />
                           </td>
                           {visibleColumns.map(col => (
@@ -202,7 +237,7 @@ export function AnalysisTable({
                               key={`${entry.key}-${phaseIndex}-${col.id}`}
                               className={`border-l px-3 py-2 text-right whitespace-nowrap tabular-nums ${subtleDividerClass}`}
                             >
-                              <CellContent phase={phase} col={col} results={entry.results} />
+                              <CellContent phase={phase} col={col} results={entry.tableResults} />
                             </td>
                           ))}
                         </tr>
@@ -216,10 +251,10 @@ export function AnalysisTable({
                     colSpan={compareTableColumnCount}
                     className={`border-base-content/10 border-t-2 px-3 py-2 text-left text-xs ${tableHeaderTextClass}`}
                   >
-                    Totals
+                    <Trans>Totals</Trans>
                   </td>
                 </tr>
-                {compareEntries.map((entry, compareIndex) => (
+                {compareTableEntries.map((entry, compareIndex) => (
                   <tr
                     key={`${entry.key}-total`}
                     className='analysis-table-compare-row border-base-content/5 group border-b align-top transition-colors'
@@ -234,7 +269,7 @@ export function AnalysisTable({
                           ]
                             .filter(Boolean)
                             .join(' ')}
-                          aria-label={`Shot ${compareIndex + 1}`}
+                          aria-label={getShotAriaLabel(compareIndex + 1)}
                         >
                           {compareIndex + 1}
                         </span>
@@ -248,8 +283,9 @@ export function AnalysisTable({
                     <td
                       className={`px-2 py-2 text-left whitespace-nowrap ${strongDividerClass} ${primaryTableTextClass}`}
                     >
-                      Total
+                      <Trans>Total</Trans>
                     </td>
+                    <td />
                     {visibleColumns.map(col => (
                       <td
                         key={`${entry.key}-total-${col.id}`}
@@ -258,7 +294,7 @@ export function AnalysisTable({
                         <CellContent
                           phase={null}
                           col={col}
-                          results={entry.results}
+                          results={entry.tableResults}
                           isTotal={true}
                         />
                       </td>
@@ -269,7 +305,7 @@ export function AnalysisTable({
             ) : (
               <>
                 <tbody>
-                  {results.phases.map((phase, idx) => (
+                  {tablePhases.map((phase, idx) => (
                     <tr
                       key={
                         phase.key ||
@@ -291,14 +327,29 @@ export function AnalysisTable({
                         {idx + 1}
                       </td>
                       <td className={`px-2 py-2 text-left whitespace-nowrap ${strongDividerClass}`}>
-                        <ComparePhaseLabel phase={phase} phaseIndex={idx} results={results} />
+                        <ComparePhaseLabel
+                          phase={phase}
+                          phaseIndex={idx}
+                          results={tableResults}
+                          section='phase'
+                        />
+                      </td>
+                      <td
+                        className={`analysis-table-stop-reason border-l px-2 py-2 text-right whitespace-nowrap ${subtleDividerClass}`}
+                      >
+                        <ComparePhaseLabel
+                          phase={phase}
+                          phaseIndex={idx}
+                          results={tableResults}
+                          section='reason'
+                        />
                       </td>
                       {visibleColumns.map(col => (
                         <td
                           key={col.id}
                           className={`border-l px-3 py-2 text-right whitespace-nowrap tabular-nums ${subtleDividerClass}`}
                         >
-                          <CellContent phase={phase} col={col} results={results} />
+                          <CellContent phase={phase} col={col} results={tableResults} />
                         </td>
                       ))}
                     </tr>
@@ -311,14 +362,15 @@ export function AnalysisTable({
                     <td
                       className={`px-2 py-2 text-left ${strongDividerClass} ${tableHeaderTextClass}`}
                     >
-                      Total
+                      <Trans>Total</Trans>
                     </td>
+                    <td />
                     {visibleColumns.map(col => (
                       <td
                         key={col.id}
                         className={`border-l px-3 py-2 text-right tabular-nums ${subtleDividerClass} ${primaryTableTextClass}`}
                       >
-                        <CellContent phase={null} col={col} results={results} isTotal={true} />
+                        <CellContent phase={null} col={col} results={tableResults} isTotal={true} />
                       </td>
                     ))}
                   </tr>
@@ -332,13 +384,7 @@ export function AnalysisTable({
         <div className='bg-base-100 border-base-content/10 flex rounded-b-lg border-t py-2 text-xs sm:justify-end'>
           <div className='text-base-content grid w-full grid-cols-3 gap-x-3 gap-y-1 select-none sm:ml-auto sm:flex sm:w-auto sm:items-center sm:gap-4'>
             <span className={`leading-tight whitespace-normal ${tableLegendTextClass}`}>
-              Avg Average (time weighted)
-            </span>
-            <span className={`leading-tight whitespace-normal ${tableLegendTextClass}`}>
-              S/E Start/End
-            </span>
-            <span className={`leading-tight whitespace-normal ${tableLegendTextClass}`}>
-              Range Min/Max
+              Avg = Average (time weighted)
             </span>
           </div>
         </div>

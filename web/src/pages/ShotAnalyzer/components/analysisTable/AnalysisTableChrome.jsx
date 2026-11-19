@@ -1,10 +1,9 @@
-/* global globalThis */
-
 /** Provides the table header, toolbar actions, and warning popover UI. */
 
 import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { Trans } from '@lingui/react/macro';
 import {
   faAngleRight,
   faAngleDoubleRight,
@@ -47,12 +46,10 @@ export function AnalysisTableToolbarActions({ onScrollTable, onScrollToBound }) 
 
 export function AnalysisTableHeader({
   compareMode,
-  hasProfilePhaseStops,
   visibleColumns,
   subtleDividerClass,
   strongDividerClass,
   tableHeaderTextClass,
-  tableHeaderSubtextClass,
 }) {
   return (
     <thead>
@@ -68,18 +65,20 @@ export function AnalysisTableHeader({
           <th
             className={`min-w-[140px] px-2 py-2 text-left whitespace-nowrap ${subtleDividerClass} ${tableHeaderTextClass}`}
           >
-            Shot
+            <Trans context='table column'>Shot</Trans>
           </th>
         )}
         <th
           className={`min-w-[120px] px-2 py-2 text-left whitespace-nowrap ${strongDividerClass} ${tableHeaderTextClass}`}
         >
-          <div className='leading-none'>Phase</div>
-          {hasProfilePhaseStops && (
-            <div className={`mt-0.5 ${tableHeaderSubtextClass}`} style={{ fontSize: '0.85em' }}>
-              Stop reason
-            </div>
-          )}
+          <div className='leading-none'>
+            <Trans context='table column'>Phase</Trans>
+          </div>
+        </th>
+        <th
+          className={`min-w-[120px] border-l px-2 py-2 text-right whitespace-nowrap ${subtleDividerClass} ${tableHeaderTextClass}`}
+        >
+          <Trans>Stop reason</Trans>
         </th>
         {visibleColumns.map(col => {
           const columnVisual = getAnalyzerColumnVisual(col);

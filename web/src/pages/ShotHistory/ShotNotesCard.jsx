@@ -4,6 +4,7 @@ import { ApiServiceContext } from '../../services/ApiService.js';
 import { Spinner } from '../../components/Spinner.jsx';
 import { faEdit } from '@fortawesome/free-solid-svg-icons/faEdit';
 import { faSave } from '@fortawesome/free-solid-svg-icons/faSave';
+import { Trans, useLingui } from '@lingui/react/macro';
 import {
   deriveLegacyBalanceTaste,
   formatTasteTags,
@@ -53,6 +54,7 @@ const shotParameterBaseline = (notes, summary) => ({
 });
 
 export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAutoTuningLoaded }) {
+  const { t } = useLingui();
   const apiService = useContext(ApiServiceContext);
 
   const [notes, setNotes] = useState({
@@ -307,12 +309,13 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
     return stars;
   };
 
+  const ratioLabel = notes.ratio || '—';
   // Don't render until initial load is complete
   if (!initialLoaded) {
     return (
       <div className='mt-6 border-t pt-6'>
         <div className='flex items-center justify-center py-8'>
-          <span className='loading loading-spinner loading-md'></span>
+          <span className='loading loading-spinner loading-md' />
         </div>
       </div>
     );
@@ -321,7 +324,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
   return (
     <div className='border-t-base-content/10 accent mt-6 border-t-2 pt-6'>
       <div className='mb-4 flex items-center justify-between'>
-        <h3 className='text-lg font-semibold'>Shot Notes</h3>
+        <h3 className='text-lg font-semibold'>
+          <Trans>Shot Notes</Trans>
+        </h3>
         {!isEditing ? (
           <button
             onClick={() => {
@@ -331,7 +336,7 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
             className='btn btn-sm btn-outline'
           >
             <FontAwesomeIcon icon={faEdit} />
-            Edit
+            <Trans>Edit</Trans>
           </button>
         ) : (
           <div className='flex gap-2'>
@@ -343,7 +348,7 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
               className='btn btn-sm btn-ghost'
               disabled={loading}
             >
-              Cancel
+              <Trans>Cancel</Trans>
             </button>
             <button onClick={saveNotes} className='btn btn-sm btn-primary' disabled={loading}>
               {loading ? (
@@ -351,7 +356,7 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
               ) : (
                 <>
                   <FontAwesomeIcon icon={faSave} />
-                  Save
+                  <Trans>Save</Trans>
                 </>
               )}
             </button>
@@ -364,20 +369,24 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
       <div className='grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-4'>
         {/* Rating */}
         <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Rating</label>
+          <label className='mb-2 block text-sm font-medium'>
+            <Trans>Rating</Trans>
+          </label>
           <div className='flex gap-1'>{renderStars(notes.rating, isEditing)}</div>
         </div>
 
         {/* Bean Type */}
         <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Bean Type</label>
+          <label className='mb-2 block text-sm font-medium'>
+            <Trans>Bean Type</Trans>
+          </label>
           {isEditing ? (
             <input
               type='text'
               className='input input-bordered w-full'
               value={notes.beanType}
               onChange={e => handleInputChange('beanType', e.target.value)}
-              placeholder='e.g., Single Origin, Blend'
+              placeholder={t`e.g., Single Origin, Blend`}
             />
           ) : (
             <div className='input input-bordered bg-base-200 w-full cursor-default'>
@@ -388,7 +397,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
 
         {/* Dose In */}
         <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Dose In (g)</label>
+          <label className='mb-2 block text-sm font-medium'>
+            <Trans>Dose In (g)</Trans>
+          </label>
           {isEditing ? (
             <input
               type='number'
@@ -407,7 +418,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
 
         {/* Dose Out */}
         <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Dose Out (g)</label>
+          <label className='mb-2 block text-sm font-medium'>
+            <Trans>Dose Out (g)</Trans>
+          </label>
           {isEditing ? (
             <input
               type='number'
@@ -445,7 +458,9 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
 
         {/* Ratio */}
         <div className='form-control'>
-          <label className='mb-2 block text-sm font-medium'>Ratio (1:{notes.ratio || '—'})</label>
+          <label className='mb-2 block text-sm font-medium'>
+            <Trans>Ratio (1:{ratioLabel})</Trans>
+          </label>
           <div className='input input-bordered bg-base-200 w-full cursor-default'>
             {notes.ratio ? `1:${notes.ratio}` : '—'}
           </div>
@@ -515,7 +530,7 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
       {/* Notes Text Area - Full Width */}
       <div className='form-control mt-6'>
         <label className='mb-2 block text-sm font-medium'>
-          Notes{' '}
+          <Trans>Notes</Trans>{' '}
           {isEditing && <span className='text-xs text-gray-500'>({notes.notes.length}/200)</span>}
         </label>
         {isEditing ? (
@@ -525,11 +540,11 @@ export default function ShotNotesCard({ shot, onNotesUpdate, onNotesLoaded, onAu
             value={notes.notes}
             maxLength={200}
             onChange={e => handleInputChange('notes', e.target.value)}
-            placeholder='Tasting notes, brewing observations, etc...'
+            placeholder={t`Tasting notes, brewing observations, etc...`}
           />
         ) : (
           <div className='textarea textarea-bordered bg-base-200 min-h-[6rem] w-full cursor-default'>
-            {notes.notes || 'No notes added'}
+            {notes.notes || t`No notes added`}
           </div>
         )}
       </div>

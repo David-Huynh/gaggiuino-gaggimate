@@ -1,7 +1,7 @@
 on:
   push:
     tags:
-      - "*"
+      - "v*" # one-off tags from scripts/release.sh must not reach the stable channel
 
 name: Build
 jobs:
@@ -10,25 +10,28 @@ jobs:
   build:
     needs: ota-testbench
     runs-on: ubuntu-latest
+    # Holds RELEASE_SIGNING_KEY. The environment only admits master and v* tags, so no other branch or
+    # pull request can get at the key that devices trust.
+    environment: release-signing
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           fetch-tags: true
           fetch-depth: 0
           submodules: 'recursive'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
           key: ${{ runner.os }}-pio
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: 'npm'
@@ -39,15 +42,13 @@ jobs:
           mkdir -p upload/display
           mkdir -p upload/headless
           mkdir -p upload/controller
-          git tag -d nightly || true
-          git tag -d db || true
-          version="$(git describe --tags --dirty --exclude nightly --exclude db 2>/dev/null || true)"
-          if [[ -z "$version" ]]; then
-            version="v1.8.${GITHUB_RUN_NUMBER}"
-          fi
-          echo "$version" > out/version.txt
+          echo "$GITHUB_REF_NAME" > out/version.txt
+          echo "GAGGIMATE_BUILD_VERSION=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
       - name: Build Web
         run: ./scripts/build_webui.sh
+      - name: Package app web bundle
+        # Live update for the native app (web/src/app/updates.js), attached to the same release as the firmware.
+        run: BUNDLE_VERSION="$(cat out/version.txt)" web/scripts/package-app-bundle.sh out "${{ github.ref_name }}"
       - name: Build controller
         run: |
           pio run -e controller
@@ -61,6 +62,7 @@ jobs:
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         with:
           channel: 'stable'
           target: 'controller'
@@ -86,6 +88,7 @@ jobs:
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         with:
           channel: 'stable'
           target: 'display'
@@ -104,6 +107,7 @@ jobs:
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         with:
           channel: 'stable'
           target: 'headless'
@@ -121,8 +125,12 @@ jobs:
           cp .pio/build/display-headless-uart-n16r8/firmware.bin out/display-headless-uart-n16r8-firmware.bin
           cp .pio/build/display-headless-uart-n16r8/partitions.bin out/display-headless-uart-n16r8-partitions.bin
           cp .pio/build/display-headless-uart-n16r8/bootloader.bin out/display-headless-uart-n16r8-bootloader.bin
+      - name: Build STM32 for manual installation
+        run: |
+          pio run -e stm32f4
+          cp .pio/build/stm32f4/firmware.bin out/stm32f4-firmware.bin
       - name: Archive Firmware Files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gaggimate-firmware
           path: "out/*"
@@ -134,12 +142,12 @@ jobs:
       contents: write
     steps:
       - name: Download Firmware Files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gaggimate-firmware
           path: release
       - name: Release Firmware
-        uses: ncipollo/release-action@bcfe5470707e8832e12347755757cec0eb3c22af
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd
         if: startsWith(github.ref, 'refs/tags/')
         with:
           artifacts: release/*

@@ -1,11 +1,5 @@
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-
 #include "common.h"
 #include "logging.h"
-#include "semver.h"
-#include "semver_extensions.h"
-#include <ArduinoJson.h>
 
 namespace {
 constexpr uint16_t OTA_HTTP_TIMEOUT_MS = 5000;
@@ -16,84 +10,35 @@ void configureRequestTimeouts(HTTPClient &client) {
 }
 } // namespace
 
-String get_updated_base_url_via_redirect(WiFiClientSecure &wifi_client, String &release_url) {
-    const char *TAG = "get_updated_base_url_via_redirect";
-
-    String location = get_redirect_location(wifi_client, release_url);
-    ESP_LOGV(TAG, "location: %s\n", location.c_str());
-
-    if (location.length() <= 0) {
-        ESP_LOGE(TAG, "[HTTPS] No redirect url\n");
-        return "";
-    }
-
-    String base_url = "";
-    base_url = location + "/";
-    base_url.replace("tag", "download");
-
-    ESP_LOGV(TAG, "returns: %s\n", base_url.c_str());
-    return base_url;
-}
-
-String get_redirect_location(WiFiClientSecure &wifi_client, String &initial_url) {
-    const char *TAG = "get_redirect_location";
-    ESP_LOGV(TAG, "initial_url: %s\n", initial_url.c_str());
-
+String get_redirect_location(WiFiClientSecure &client, const String &url, int &status) {
     HTTPClient https;
     https.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
     configureRequestTimeouts(https);
-
-    if (!https.begin(wifi_client, initial_url)) {
-        ESP_LOGE(TAG, "[HTTPS] Unable to connect\n");
+    if (!https.begin(client, url)) {
+        status = 0;
         return "";
     }
-
-    int httpCode = https.GET();
-    if (httpCode != HTTP_CODE_FOUND) {
-        ESP_LOGE(TAG, "[HTTPS] GET... failed, No redirect\n");
-        char errorText[128];
-        int errCode = wifi_client.lastError(errorText, sizeof(errorText));
-        ESP_LOGV(TAG, "httpCode: %d, errorCode %d: %s\n", httpCode, errCode, errorText);
-    }
-
-    String redirect_url = https.getLocation();
+    status = https.GET();
+    const String location = status == HTTP_CODE_FOUND ? https.getLocation() : String();
     https.end();
-
-    ESP_LOGI(TAG, "returns: %s\n", redirect_url.c_str());
-    return redirect_url;
+    return location;
 }
 
-String get_updated_version_via_txt_file(WiFiClientSecure &wifi_client, String &_release_url) {
-    const char *TAG = "get_updated_version_via_txt_file";
+String get_updated_version_via_txt_file(WiFiClientSecure &client, const String &release_url) {
     HTTPClient https;
     https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     configureRequestTimeouts(https);
-
-    String url = _release_url + "version.txt";
-    ESP_LOGI(TAG, "url: %s\n", url.c_str());
-    if (!https.begin(wifi_client, url)) {
-        ESP_LOGE(TAG, "[HTTPS] Unable to connect\n");
+    if (!https.begin(client, release_url + "version.txt"))
         return "";
-    }
 
-    int httpCode = https.GET();
-    if (httpCode != HTTP_CODE_OK) {
-        ESP_LOGE(TAG, "[HTTPS] GET... failed\n");
-        char errorText[128];
-        int errCode = wifi_client.lastError(errorText, sizeof(errorText));
-        ESP_LOGV(TAG, "httpCode: %d, errorCode %d: %s\n", httpCode, errCode, errorText);
-        https.end();
-        return "";
+    const int status = https.GET();
+    String version;
+    if (status == HTTP_CODE_OK && https.getSize() > 0 && https.getSize() <= 128) {
+        version = https.getString();
+        version.trim();
+    } else {
+        ESP_LOGW("OTA", "Could not read release version (HTTP %d)", status);
     }
-    String version = https.getString();
-    version.trim();
     https.end();
-    ESP_LOGI(TAG, "returns: %s\n", version.c_str());
     return version;
-}
-
-bool update_required(semver_t _new_version, semver_t _current_version) {
-    ESP_LOGI("update_required", "Comparing versions %s > %s", render_to_string(_new_version).c_str(),
-             render_to_string(_current_version).c_str());
-    return _new_version > _current_version;
 }

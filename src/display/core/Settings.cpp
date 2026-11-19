@@ -1,9 +1,13 @@
 #include "Settings.h"
+#include "MachineProfiles.h"
 
 #include <algorithm>
+#include <cmath>
 #include <display/core/AutoTuning.h>
 #include <display/core/StorageCoordinator.h>
 #include <display/util/ColorConversion.h>
+#include <memory>
+#include <nvs.h>
 #include <utility>
 
 #ifndef ESPRESSORL_SUPABASE_BASE_URL
@@ -80,13 +84,85 @@ bool PreferencesCodec<std::vector<AutoWakeupSchedule>>::write(Preferences &prefs
     return written > 0 || (serialized.isEmpty() && prefs.getString(key, "__write_failed__").isEmpty());
 }
 
+std::atomic<esp_err_t> MachineProfileSelectionCodec::lastError{ESP_OK};
+
+String MachineProfileSelectionCodec::read(Preferences &prefs, const char *key, const String &def) {
+    if (prefs.getType(key) != PT_BLOB)
+        return prefs.getString(key, def); // Existing firmware stored a string.
+    const size_t size = prefs.getBytesLength(key);
+    if (size == 0 || size > 3501)
+        return def;
+    std::unique_ptr<char[]> bytes(new (std::nothrow) char[size]);
+    if (!bytes || prefs.getBytes(key, bytes.get(), size) != size || bytes[size - 1] != '\0')
+        return def;
+    return String(bytes.get());
+}
+
+bool MachineProfileSelectionCodec::write(Preferences &, const char *key, const String &value) {
+    // Use the NVS API here to retain the precise error; Preferences only returns a byte count.
+    nvs_handle_t handle;
+    esp_err_t error = nvs_open(PREFERENCES_KEY, NVS_READWRITE, &handle);
+    if (error == ESP_OK) {
+        error = nvs_set_blob(handle, key, value.c_str(), value.length() + 1);
+        if (error == ESP_OK)
+            error = nvs_commit(handle);
+        nvs_close(handle);
+    }
+    lastError = error;
+    return error == ESP_OK;
+}
+
+String Settings::getSaveError() const {
+    const esp_err_t error = MachineProfileSelectionCodec::lastError.load();
+    return error == ESP_OK ? String("Settings storage readback failed")
+                           : String("Machine profile storage: ") + esp_err_to_name(error);
+}
+
+bool Settings::setMachineProfileSelection(const String &value) {
+    String reference;
+    if (!machineProfileReference(value, reference))
+        return false;
+    machineProfileSelection.set(reference);
+    return true;
+}
+
 Settings::Settings() {
     auto flashLease = StorageCoordinator::instance().acquireFlash();
     preferences.begin(PREFERENCES_KEY, true);
     for (auto *property : registry) {
         property->load(preferences);
     }
+    // Copy the saved brew gains once when upgrading to separate steam tuning.
+    if (steamPid.get().isEmpty()) {
+        const String brewPid = pid.get();
+        const int firstSeparator = brewPid.indexOf(',');
+        const int secondSeparator = brewPid.indexOf(',', firstSeparator + 1);
+        const int feedforwardSeparator = brewPid.indexOf(',', secondSeparator + 1);
+        steamPid.set(feedforwardSeparator >= 0 ? brewPid.substring(0, feedforwardSeparator) : brewPid);
+    }
+    // Migrate an older full snapshot without reapplying any machine values.
+    if (!setMachineProfileSelection(machineProfileSelection.get()))
+        ESP_LOGW("MachineProfile", "Could not convert saved profile reference; keeping the existing selection");
 
+    // Persist the initial copy, so later Cup scale edits remain independent.
+    if (!preferences.isKey("sd_pf_scale")) {
+        portafilterScale.initDefault("");
+        portafilterScale.set(smartDoseScale.get());
+    }
+
+    if (preferences.isKey("pss") && preferences.getType("pss") == PT_U8) {
+        preferredScaleSource.initDefault("");
+        preferredScaleSource.set("auto");
+        if (!preferences.isKey("sst"))
+            persistentSteamState.set(preferences.getBool("pss", false));
+    }
+    if (!preferences.isKey("steam_mode")) {
+        const bool independent = preferences.getBool("steam_ind", false);
+        const bool remember = preferences.getBool("rss", false);
+        defaultSteamMode.set(independent ? (remember ? 2 : 0) : 1);
+        defaultSteamMode.persist();
+    }
+    // Legacy migrations: derive defaults for keys that were never persisted
     // Derive defaults for keys that were never persisted.
     if (!preferences.isKey("rl_up_base")) {
         rlUploadBaseUrl.initDefault(ESPRESSORL_SUPABASE_BASE_URL);
@@ -126,7 +202,16 @@ Settings::Settings() {
     if (!preferences.isKey("sr_i")) {
         sunriseIdle.initDefault(ColorConversion::toHex(sunriseR, sunriseG, sunriseB, sunriseW));
     }
+    // Installs from before the setup wizard already generated an AP password; don't send them through it
+    const bool setupKnown = preferences.isKey("setup_ok");
+    const bool legacyInstall = !setupKnown && preferences.isKey("wap");
     preferences.end();
+    logMachineProfile("Loaded", machineProfileSelection.get());
+    if (legacyInstall) {
+        setupDone.set(true);
+    } else if (!setupKnown) {
+        setupDone.persist(); // record "not done" now, or the AP password saved this boot reads as a legacy install next boot
+    }
 
     xTaskCreate(loopTask, "Settings::loop", configMINIMAL_STACK_SIZE * 6, this, 1, &taskHandle);
 }
@@ -136,11 +221,7 @@ void Settings::batchUpdate(const SettingsCallback &callback) {
     callback(this);
 }
 
-void Settings::save(bool noDelay) {
-    if (noDelay) {
-        doSave();
-    }
-}
+bool Settings::save(bool noDelay) { return !noDelay || doSave(); }
 
 void Settings::setTargetSteamTemp(const int target_steam_temp) { targetSteamTemp.set(target_steam_temp); }
 
@@ -151,6 +232,27 @@ void Settings::setTemperatureOffset(const int temperature_offset) { temperatureO
 void Settings::setPressureOffset(const float pressure_offset) { pressureOffset.set(pressure_offset); }
 
 void Settings::setPressureScaling(const float pressure_scaling) { pressureScaling.set(pressure_scaling); }
+
+void Settings::setScaleFactors(float scale_factor_1, float scale_factor_2) {
+    scaleFactor1.set(scale_factor_1);
+    scaleFactor2.set(scale_factor_2);
+}
+
+void Settings::setHardwareScaleConfiguration(uint16_t sample_rate_sps, float idle_alpha, float active_alpha) {
+    hardwareScaleSampleRateSps.set((sample_rate_sps == 10 || sample_rate_sps == 80) ? sample_rate_sps
+                                                                                    : DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS);
+    hardwareScaleIdleAlpha.set(
+        std::isfinite(idle_alpha) && idle_alpha > 0.0f && idle_alpha <= 1.0f ? idle_alpha : DEFAULT_HARDWARE_SCALE_IDLE_ALPHA);
+    hardwareScaleActiveAlpha.set(std::isfinite(active_alpha) && active_alpha > 0.0f && active_alpha <= 1.0f
+                                     ? active_alpha
+                                     : DEFAULT_HARDWARE_SCALE_ACTIVE_ALPHA);
+}
+
+void Settings::setPreferredScaleSource(const String &scaleSource) {
+    if (scaleSource == "hardware" || scaleSource == "bluetooth" || scaleSource == "auto") {
+        preferredScaleSource.set(scaleSource);
+    }
+}
 
 void Settings::setTargetGrindVolume(double target_grind_volume) { targetGrindVolume.set(target_grind_volume); }
 
@@ -171,6 +273,14 @@ void Settings::setStartupMode(const int startup_mode) { startupMode.set(startup_
 void Settings::setStandbyTimeout(int standby_timeout) { standbyTimeout.set(standby_timeout); }
 
 void Settings::setPid(const String &pid) { this->pid.set(pid); }
+
+void Settings::setSteamPid(const String &pid) { steamPid.set(pid); }
+
+void Settings::setHeaterCoordinationEnabled(bool enabled) { heaterCoordinationEnabled.set(enabled); }
+
+void Settings::setHeaterHandoverMs(int handoverMs) {
+    heaterHandoverMs.set(std::clamp(handoverMs, MIN_HEATER_HANDOVER_MS, MAX_HEATER_HANDOVER_MS));
+}
 
 void Settings::setPumpModelCoeffs(const String &pumpModelCoeffs) { this->pumpModelCoeffs.set(pumpModelCoeffs); }
 
@@ -200,6 +310,8 @@ void Settings::setSavedBrewScale(const String &savedScale) { this->savedBrewScal
 
 void Settings::setSavedGrindScale(const String &savedScale) { this->savedGrindScale.set(savedScale); }
 
+void Settings::setSavedScaleName(const String &savedScaleName) { this->savedScaleName.set(savedScaleName); }
+
 void Settings::setBoilerFillActive(bool boiler_fill_active) { boilerFillActive.set(boiler_fill_active); }
 
 void Settings::setStartupFillTime(int startup_fill_time) { startupFillTime.set(startup_fill_time); }
@@ -207,6 +319,12 @@ void Settings::setStartupFillTime(int startup_fill_time) { startupFillTime.set(s
 void Settings::setSteamFillTime(int steam_fill_time) { steamFillTime.set(steam_fill_time); }
 
 void Settings::setSmartGrindActive(bool smart_grind_active) { smartGrindActive.set(smart_grind_active); }
+
+void Settings::setSetupDone(bool setup_done) { setupDone.set(setup_done); }
+
+void Settings::setMahlkonigActive(bool mahlkonig_active) { mahlkonigActive.set(mahlkonig_active); }
+
+void Settings::setMahlkonigRecipeProfiles(String profiles) { mahlkonigRecipeProfiles.set(profiles); }
 
 void Settings::setSmartGrindIp(String smart_grind_ip) { smartGrindIp.set(smart_grind_ip); }
 
@@ -247,6 +365,26 @@ void Settings::setWarnScaleBattery(int level) { warnScaleBattery.set(clampWarnin
 
 void Settings::setWarnTemperature(int level) { warnTemperature.set(clampWarningLevel(level)); }
 
+void Settings::setWarnBackflush(int level) { warnBackflush.set(clampWarningLevel(level)); }
+
+void Settings::setWarnDescaling(int level) { warnDescaling.set(clampWarningLevel(level)); }
+
+void Settings::setBackflushIntervalDays(int days) { backflushIntervalDays.set(std::max(0, days)); }
+
+void Settings::setBackflushIntervalShots(int shots) { backflushIntervalShots.set(std::max(0, shots)); }
+
+void Settings::setDescalingIntervalWeeks(int weeks) { descalingIntervalWeeks.set(std::max(0, weeks)); }
+
+void Settings::setDescalingIntervalShots(int shots) { descalingIntervalShots.set(std::max(0, shots)); }
+
+void Settings::setLastBackflushTime(unsigned long time) { lastBackflushTime.set(time); }
+
+void Settings::setLastDescalingTime(unsigned long time) { lastDescalingTime.set(time); }
+
+void Settings::setShotsSinceBackflush(int shots) { shotsSinceBackflush.set(std::max(0, shots)); }
+
+void Settings::setShotsSinceDescaling(int shots) { shotsSinceDescaling.set(std::max(0, shots)); }
+
 void Settings::setTimezone(String timezone) { this->timezone.set(timezone); }
 
 void Settings::setClockFormat(bool clock_24h_format) { clock24hFormat.set(clock_24h_format); }
@@ -255,7 +393,7 @@ void Settings::setSelectedProfile(String selected_profile) { selectedProfile.set
 
 void Settings::setStartupProfile(String startup_profile) { startupProfile.set(startup_profile); }
 
-void Settings::setFavoritedProfiles(std::vector<String> favorited_profiles) { favoritedProfiles.set(favorited_profiles); }
+void Settings::setFavoritedProfiles(const std::vector<String> &favorited_profiles) { favoritedProfiles.set(favorited_profiles); }
 
 void Settings::addFavoritedProfile(String profile) {
     std::vector<String> profiles = favoritedProfiles.get();
@@ -302,7 +440,14 @@ void Settings::setSteamPumpCutoff(float steam_pump_cutoff) { steamPumpCutoff.set
 
 void Settings::setThemeMode(int theme_mode) { themeMode.set(theme_mode); }
 
+void Settings::setStatusDisplayMode(int status_display_mode) { statusDisplayMode.set(status_display_mode); }
+
 void Settings::setHistoryIndex(int history_index) { historyIndex.set(history_index); }
+
+bool Settings::saveHistoryClearedBefore(int nextHistoryId) {
+    historyClearedBefore.set(std::max(historyClearedBefore.get(), nextHistoryId));
+    return save(true) && !historyClearedBefore.isDirty();
+}
 
 void Settings::setSunriseR(int sunrise_r) { sunriseR = sunrise_r; }
 
@@ -486,27 +631,38 @@ void Settings::setIntegralGain(float integral_gain) { integralGain.set(integral_
 
 void Settings::setMaxPumpPower(float max_pump_power) { maxPumpPower.set(max_pump_power); }
 
-void Settings::doSave() {
-    bool dirty = false;
-    for (auto *property : registry) {
-        if (property->isDirty()) {
-            dirty = true;
-            break;
-        }
-    }
-    if (!dirty) {
-        return;
+bool Settings::doSave() {
+    // The periodic task and immediate WebUI saves share one Preferences handle.
+    std::lock_guard<std::mutex> lock(saveMutex);
+    if (std::none_of(registry.begin(), registry.end(), [](const PropertyBase *property) { return property->isDirty(); })) {
+        return true;
     }
     auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
     if (!flashLease) {
-        return;
+        return false;
     }
     ESP_LOGI("Settings", "Saving changed settings");
-    preferences.begin(PREFERENCES_KEY, false);
+    if (!preferences.begin(PREFERENCES_KEY, false)) {
+        ESP_LOGE("Settings", "Could not open settings storage");
+        return false;
+    }
+    const bool profileChanged = machineProfileSelection.isDirty();
     for (auto *property : registry) {
         property->store(preferences);
     }
+    const bool profileSaved =
+        !profileChanged || (preferences.isKey("mc_profile") &&
+                            MachineProfileSelectionCodec::read(preferences, "mc_profile", "") == machineProfileSelection.get());
+    if (!profileSaved) {
+        // Retry a failed readback even if the write itself succeeded.
+        machineProfileSelection.persist();
+        ESP_LOGE("Settings", "Could not persist machine profile selection (free NVS entries: %u)",
+                 static_cast<unsigned>(preferences.freeEntries()));
+    }
     preferences.end();
+    if (profileChanged && profileSaved)
+        logMachineProfile("Selected", machineProfileSelection.get());
+    return profileSaved;
 }
 
 [[noreturn]] void Settings::loopTask(void *arg) {
@@ -515,4 +671,33 @@ void Settings::doSave() {
         settings->doSave();
         vTaskDelay(5000 / portTICK_PERIOD_MS);
     }
+}
+
+void Settings::setPersistentSteamState(bool enabled) {
+    persistentSteamState.set(enabled);
+    save(true);
+}
+
+gm::MachineHardwareSettings Settings::getMachineHardware() const {
+    auto value = defaultMachineHardware();
+    if (ntcBrewNominalResistance.get() > 0)
+        value.ntc_brew_nominal_resistance = ntcBrewNominalResistance.get();
+    if (ntcBrewSeriesResistance.get() > 0)
+        value.ntc_brew_series_resistance = ntcBrewSeriesResistance.get();
+    if (ntcBrewSupplyVoltage.get() > 0)
+        value.ntc_brew_supply_voltage = ntcBrewSupplyVoltage.get();
+    if (ntcBrewBeta.get() > 0)
+        value.ntc_brew_beta = ntcBrewBeta.get();
+    if (ntcSteamNominalResistance.get() > 0)
+        value.ntc_steam_nominal_resistance = ntcSteamNominalResistance.get();
+    if (ntcSteamSeriesResistance.get() > 0)
+        value.ntc_steam_series_resistance = ntcSteamSeriesResistance.get();
+    if (ntcSteamSupplyVoltage.get() > 0)
+        value.ntc_steam_supply_voltage = ntcSteamSupplyVoltage.get();
+    if (ntcSteamBeta.get() > 0)
+        value.ntc_steam_beta = ntcSteamBeta.get();
+    value.tank_level_enabled = tankLevelEnabled.get();
+    value.steam_level_enabled = steamLevelEnabled.get();
+    value.steam_level_debounce_checks = steamLevelDebounceChecks.get();
+    return value;
 }

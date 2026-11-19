@@ -29,6 +29,19 @@ CLI. For an ESP32-S3 N16R8 communicating with the controller over UART:
 pio run -e display-headless-uart-n16r8 -t upload
 ```
 
+When moving to fork protocol 10016, also update the STM32 controller with
+the matching `stm32f4` image over ST-Link. The headless UART builds retain
+115200 baud, GPIO44 RX/GPIO43 TX on the ESP32, and PA3 RX/PA2 TX on the
+Black Pill. The upstream controller updater supports Gaggimate's ESP32
+controller boards. The Black Pill uses ST-Link for subsequent controller
+updates, and the ESP32 display continues to use the fork's OTA assets.
+
+In **Settings → System & Updates**, select the channel that has a release for
+this fork. The UART N16R8 display downloads
+`display-headless-uart-n16r8-firmware.bin`. The loader resumes after a lost
+connection and shows a failure if it exhausts its retries. A successful update
+boots the new ESP32 application and preserves LittleFS.
+
 Other UART variants:
 
 ```bash
@@ -59,7 +72,7 @@ use OTA and leave LittleFS untouched.
 
 | Environment | Board | Notes |
 |---|---|---|
-| `display-headless-uart` | ESP32-S3 DevKitC-1 N8 | 8 MB flash, no PSRAM, UART |
+| `display-headless-uart` | ESP32-S3 DevKitC-1 N8 | 8 MB flash, no PSRAM, UART, HomeKit omitted to fit the OTA slot |
 | `display-headless-uart-n16r8` | ESP32-S3 DevKitC-1 N16R8 | 16 MB flash, 8 MB OPI PSRAM, UART |
 | `display-headless-uart-no-hwscale` | ESP32-S3 DevKitC-1 N8 | UART with hardware scale support disabled |
 | `display-headless` | LilyGo T-RGB | Headless build using the N16R8 display board |
@@ -67,6 +80,7 @@ use OTA and leave LittleFS untouched.
 | `display-headless-4m` | ESP32-S3 SuperMini | 4 MB flash variant |
 | `display` | LilyGo T-RGB | Full display build |
 | `controller` | GaggiMate Controller | Controller firmware |
+| `stm32f4` | Black Pill STM32F411CE | UART controller with HX711 scale support |
 | `stm32f4-no-hwscale` | Black Pill STM32F411CE | STM32 controller without hardware scales |
 
 ## Initial Setup (headless)

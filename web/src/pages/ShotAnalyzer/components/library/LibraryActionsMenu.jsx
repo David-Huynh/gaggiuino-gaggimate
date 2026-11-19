@@ -1,6 +1,7 @@
 import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { useLingui } from '@lingui/react/macro';
 import { faEllipsisVertical } from '@fortawesome/free-solid-svg-icons/faEllipsisVertical';
 import {
   getAnalyzerIconButtonClasses,
@@ -40,6 +41,7 @@ function getMenuPosition(anchor, actionCount, preferredPlacement) {
 }
 
 export function LibraryActionsMenu({ actions, ariaLabel, buttonClassName, placement = 'bottom' }) {
+  const { t } = useLingui();
   const [isOpen, setIsOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState({
     top: VIEWPORT_MARGIN,
@@ -94,6 +96,7 @@ export function LibraryActionsMenu({ actions, ariaLabel, buttonClassName, placem
       ref={menuRef}
       role='menu'
       tabIndex={-1}
+      data-library-actions-menu='true'
       className='app-card-surface fixed z-[10000] rounded-xl p-1.5 shadow-xl'
       style={{
         top: `${menuPosition.top}px`,
@@ -156,7 +159,7 @@ export function LibraryActionsMenu({ actions, ariaLabel, buttonClassName, placem
           className: `cursor-pointer list-none ${buttonClassName} [&::-webkit-details-marker]:hidden`,
         })}
         aria-label={ariaLabel}
-        title='More actions'
+        title={t`More actions`}
       >
         <FontAwesomeIcon icon={faEllipsisVertical} size='sm' />
       </summary>

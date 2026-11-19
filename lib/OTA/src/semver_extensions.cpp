@@ -1,59 +1,39 @@
+#include "semver_extensions.h"
 
-#include <Arduino.h>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 
-#include <sstream>
-#include <vector>
+bool parseFirmwareVersion(const char *text, semver_t &version) {
+    if (*text == 'v')
+        ++text;
 
-#include "semver.h"
-
-using namespace std;
-
-vector<string> split(const string &s, char delim) {
-    vector<string> result;
-    stringstream ss(s);
-    string item;
-
-    while (getline(ss, item, delim)) {
-        result.push_back(item);
-    }
-
-    return result;
-}
-
-semver_t from_string(const string &version) {
-    if (version.empty()) {
-        return {0, 0, 0, nullptr, nullptr};
-    }
-    auto numbers = split(version, '.');
-    auto major = atoi(numbers.at(0).c_str());
-    auto minor = atoi(numbers.at(1).c_str());
-    int patch;
-    char *prerelease_ptr = nullptr;
-
-    auto split_at = numbers.at(2).find('-');
-    if (split_at != string::npos) {
-        patch = atoi(numbers.at(2).substr(0, split_at).c_str());
-        auto prerelease = numbers.at(2).substr(split_at + 1);
-        prerelease_ptr = (char *)malloc(prerelease.length() + 1);
-        if (prerelease_ptr != nullptr) {
-            prerelease.copy(prerelease_ptr, prerelease.length());
-            prerelease_ptr[prerelease.length()] = '\0';
+    // semver_parse also accepts short versions and unchecked integers.
+    const char *component = text;
+    for (int i = 0; i < 3; ++i) {
+        if (*component < '0' || *component > '9')
+            return false;
+        char *end = nullptr;
+        errno = 0;
+        const long value = std::strtol(component, &end, 10);
+        if (errno || value > INT_MAX)
+            return false;
+        if (i == 2) {
+            if (*end && ((*end != '-' && *end != '+') || !end[1]))
+                return false;
+        } else {
+            if (*end != '.')
+                return false;
+            component = end + 1;
         }
-    } else {
-        patch = atoi(numbers.at(2).c_str());
     }
 
-    semver_t _ver = {major, minor, patch, nullptr, prerelease_ptr};
-
-    return _ver;
-}
-
-String render_to_string(const semver_t &version) {
-    String rendered = String(version.major) + "." + String(version.minor) + "." + String(version.patch);
-    if (version.prerelease != nullptr) {
-        rendered += "-" + String(version.prerelease);
+    semver_t parsed{};
+    if (semver_parse(text, &parsed) != 0) {
+        semver_free(&parsed);
+        return false;
     }
-    return rendered;
+    semver_free(&version);
+    version = parsed;
+    return true;
 }
-
-bool operator>(const semver_t &x, const semver_t &y) { return semver_compare(x, y) > 0; }

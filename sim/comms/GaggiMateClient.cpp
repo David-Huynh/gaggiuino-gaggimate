@@ -2,9 +2,9 @@
 
 GaggiMateClient::GaggiMateClient() {
     // Forward the mock's telemetry to whatever the firmware registered.
-    _mock.onSensor = [this](float t, float p, float pf, float mf, float pr, float pp, float hp, float wp) {
+    _mock.onSensor = [this](float t, float t2, float p, float pf, float mf, float pr, float pp, float hp, float wp) {
         if (_sensorCb)
-            _sensorCb(t, p, pf, mf, pr, pp, hp, wp);
+            _sensorCb(t, t2, p, pf, mf, pr, pp, hp, wp);
     };
     _mock.onVolumetric = [this](float v) {
         if (_volumetricCb)
@@ -32,7 +32,7 @@ void GaggiMateClient::loop() {
         if (_connCb)
             _connCb(true);
         if (_systemInfoCb)
-            _systemInfoCb("GaggiMate Sim", "sim-3.0", gm_proto::PROTOCOL_VERSION, true, true, true, true, {});
+            _systemInfoCb("GaggiMate Sim", "sim-3.0", gm_proto::PROTOCOL_VERSION, true, true, true, true, false, {});
         _mock.begin();
     }
     if (_autotunePending && (int32_t)(millis() - _autotuneDueMs) >= 0) {
@@ -60,13 +60,16 @@ gm::Payload GaggiMateClient::buildRelayControl(uint8_t index, bool open) {
     p.relay = {index, open};
     return p;
 }
-gm::Payload GaggiMateClient::buildPidSettings(float, float, float, float) { return {gm::Payload::Pid}; }
+gm::Payload GaggiMateClient::buildHeaterSettings(float, float, float, float, bool, uint32_t, float, float, float) {
+    return {gm::Payload::Heater};
+}
 gm::Payload GaggiMateClient::buildPumpSettings(float, float, float, float, float, float, float, float) {
     return {gm::Payload::PumpSettings};
 }
 gm::Payload GaggiMateClient::buildAutotune(uint32_t, uint32_t, uint32_t) { return {gm::Payload::Autotune}; }
 gm::Payload GaggiMateClient::buildPressureScale(float) { return {gm::Payload::PressureScale}; }
 gm::Payload GaggiMateClient::buildTare() { return {gm::Payload::Tare}; }
+gm::Payload GaggiMateClient::buildHardwareScaleTare() { return {gm::Payload::HardwareScaleTare}; }
 gm::Payload GaggiMateClient::buildLedControl(const LedChannelCommand *, size_t) { return {gm::Payload::Led}; }
 
 void GaggiMateClient::send(const gm::Payload &payload) {
@@ -84,7 +87,7 @@ void GaggiMateClient::send(const gm::Payload &payload) {
         _mock.tareScale();
         break;
     default:
-        break; // ping/pid/settings/led have no effect on the model
+        break; // ping/heater/settings/led have no effect on the model
     }
 }
 
@@ -101,7 +104,7 @@ void GaggiMateClient::sendPumpControl(uint8_t index, PumpControlMode mode, float
     send(buildPumpControl(index, mode, power, pressure, flow));
 }
 void GaggiMateClient::sendRelayControl(uint8_t index, bool open) { send(buildRelayControl(index, open)); }
-void GaggiMateClient::sendPidSettings(float, float, float, float) {}
+void GaggiMateClient::sendHeaterSettings(float, float, float, float, bool, uint32_t, float, float, float) {}
 void GaggiMateClient::sendPumpSettings(float, float, float, float, float, float, float, float, float, float, float, float) {}
 void GaggiMateClient::sendAutotune(uint32_t, uint32_t, uint32_t) {
     _autotunePending = true;
@@ -109,4 +112,5 @@ void GaggiMateClient::sendAutotune(uint32_t, uint32_t, uint32_t) {
 }
 void GaggiMateClient::sendPressureScale(float) {}
 void GaggiMateClient::tare() { _mock.tareScale(); }
+void GaggiMateClient::tareHardwareScale() {} // The simulator has no hardware-scale model.
 void GaggiMateClient::sendLedControl(const LedChannelCommand *, size_t) {}

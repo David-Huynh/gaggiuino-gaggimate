@@ -1,11 +1,14 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
+import { Trans, useLingui } from '@lingui/react/macro';
 import { ApiServiceContext, machine } from '../../../services/ApiService.js';
 import { downloadJson } from '../../../utils/download.js';
 import { SystemTabSkeleton } from '../../../components/skeletons/SettingsSkeletons.jsx';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faCheck } from '@fortawesome/free-solid-svg-icons/faCheck';
+import { faCaretRight } from '@fortawesome/free-solid-svg-icons/faCaretRight';
 import { Spinner } from '../../../components/Spinner.jsx';
 import Section from '../../../components/Card.jsx';
+import { PatchNotes } from '../PatchNotes.jsx';
 
 const imageUrlToBase64 = async blob => {
   return new Promise((onSuccess, onError) => {
@@ -35,32 +38,40 @@ const clampProgress = value => {
   return Number.isFinite(numeric) ? Math.max(0, Math.min(100, Math.round(numeric))) : 0;
 };
 
-function OtaProgressView({ phase, progress }) {
+// A wire has no signal strength to grade; only BLE can be weak.
+const getLinkStatusClass = (link, rssi) => {
+  if (link === 'none') return 'status-error';
+  return link === 'ble' ? getRssiStatusClass(rssi) : 'status-success';
+};
+
+function OtaProgressView({ phase, progress, error, headless, onBack }) {
+  const { t } = useLingui();
   const finished = phase === 4;
   const failed = phase === 5;
   const getOtaPhaseText = p => {
     switch (p) {
       case 1:
-        return 'Updating Display firmware';
+        return headless ? t`Updating Headless firmware` : t`Updating Display firmware`;
       case 2:
-        return 'Updating Display filesystem';
+        return headless ? t`Updating Headless filesystem` : t`Updating Display filesystem`;
       case 3:
-        return 'Updating controller firmware';
+        return t`Updating controller firmware`;
       case 5:
-        return 'Update failed';
+        return t`Update failed`;
+      case 6:
+        return t`Reconnecting to resume the firmware download`;
       default:
-        return 'Finished';
+        return t`Finished`;
     }
   };
 
   return (
     <div className='flex flex-col items-center gap-4 py-12'>
-      {!failed && <Spinner size={8} />}
+      {!failed && !finished && <Spinner size={8} />}
       <span className='text-base-content text-xl font-medium'>{getOtaPhaseText(phase)}</span>
       {failed ? (
         <span role='alert' className='text-base-content/70 max-w-md text-center'>
-          The update could not be completed and the device kept its current firmware. Check the
-          network connection and start the update again.
+          {otaErrorMessage(t, error)}
         </span>
       ) : (
         <span className='text-base-content text-lg font-medium'>{finished ? 100 : progress}%</span>
@@ -76,22 +87,59 @@ function OtaProgressView({ phase, progress }) {
         Keep the machine powered. The update continues after this browser page is closed.
       </span>
       </>)}
-      {(finished || failed) && (
+      {failed && (
+        <button type='button' className='btn btn-primary' onClick={onBack}>
+          <Trans>Back to updates</Trans>
+        </button>
+      )}
+      {finished && (
         <a href='/' className='btn btn-primary'>
-          Back
+          <Trans>Back</Trans>
         </a>
       )}
     </div>
   );
 }
 
+function otaErrorMessage(t, error) {
+  switch (error) {
+    case 'no_ota_partition':
+      return t`This flash layout requires a USB firmware update.`;
+    case 'image_too_large':
+      return t`This firmware is too large for the update slot.`;
+    case 'image_missing':
+      return t`The selected release does not contain firmware for this board.`;
+    case 'image_invalid':
+      return t`Firmware verification failed. The current ESP32 firmware is still installed.`;
+    case 'flash_failed':
+      return t`Writing the firmware failed. The current ESP32 firmware is still installed.`;
+    case 'machine_busy':
+      return t`Finish the current machine operation before updating.`;
+    case 'no_update':
+      return t`There is no newer firmware in the selected channel.`;
+    case 'check_unavailable':
+      return t`Wait for the update check and confirm the machine is connected to Wi-Fi.`;
+    case 'ota_unavailable':
+      return t`This board cannot be updated over Wi-Fi.`;
+    case 'already_updating':
+      return t`An update is already running.`;
+    case 'controller_update_failed':
+      return t`The controller update failed. Check the controller connection and retry.`;
+    default:
+      return t`The firmware download could not be completed. Check the connection and retry.`;
+  }
+}
+
 function StorageAndMemorySection({ formData }) {
+  const { t } = useLingui();
   return (
-    <Section title='Storage & Memory' className='h-full'>
+    <Section title={t`Storage & Memory`} className='h-full'>
       <div className='grid grid-cols-1 gap-6'>
         {formData.spiffsTotal !== undefined && (
           <div className='flex flex-col space-y-2'>
-            <span className='text-base-content/70 text-sm font-medium'>Storage (LittleFS)</span>
+            <span className='text-base-content/70 text-sm font-medium'>
+              <Trans>Storage (LittleFS)</Trans>
+            </span>
             <div className='bg-base-300 h-3 w-full overflow-hidden rounded'>
               <div
                 className='bg-primary h-full transition-all'
@@ -107,7 +155,9 @@ function StorageAndMemorySection({ formData }) {
 
         {formData.sdTotal !== undefined && (
           <div className='flex flex-col space-y-2'>
-            <span className='text-base-content/70 text-sm font-medium'>Storage (SD-Card)</span>
+            <span className='text-base-content/70 text-sm font-medium'>
+              <Trans>Storage (SD-Card)</Trans>
+            </span>
             <div className='bg-base-300 h-3 w-full overflow-hidden rounded'>
               <div
                 className='bg-primary h-full transition-all'
@@ -123,7 +173,9 @@ function StorageAndMemorySection({ formData }) {
 
         {formData.heapTotal !== undefined && (
           <div className='flex flex-col space-y-2'>
-            <span className='text-base-content/70 text-sm font-medium'>Free Memory (Heap)</span>
+            <span className='text-base-content/70 text-sm font-medium'>
+              <Trans>Free Memory (Heap)</Trans>
+            </span>
             <div className='bg-base-300 h-3 w-full overflow-hidden rounded'>
               <div
                 className='bg-primary h-full transition-all'
@@ -139,7 +191,7 @@ function StorageAndMemorySection({ formData }) {
                 ? ((formData.heapTotal - formData.heapFree) / formData.heapTotal) * 100
                 : 0
               ).toFixed(2)}
-              %) (Frag:{' '}
+              %) ({t`Frag:`}{' '}
               {(formData.heapFree > 0
                 ? 100 - (formData.heapLargest * 100) / formData.heapFree
                 : 0
@@ -178,12 +230,19 @@ function MaintenanceSection({
   rebuilt,
   rebuildProgress,
 }) {
+  const { t } = useLingui();
+  const current = rebuildProgress.current;
+  const total = rebuildProgress.total;
   return (
-    <Section title='Maintenance & Support' className='h-full'>
+    <Section title={t`Maintenance & Support`} className='h-full'>
       <div className='flex flex-col flex-wrap gap-4 sm:flex-row'>
         <button type='button' className='btn btn-outline btn-sm' onClick={downloadSupportData}>
-          Download Support Data
+          <Trans>Download Support Data</Trans>
         </button>
+
+        <a href='/setup' className='btn btn-outline btn-sm'>
+          <Trans>Run Setup Wizard</Trans>
+        </a>
 
         <button
           type='button'
@@ -191,7 +250,7 @@ function MaintenanceSection({
           onClick={onHistoryRebuild}
           disabled={rebuilding}
         >
-          Rebuild Shot History
+          <Trans>Rebuild Shot History</Trans>
           {rebuilding && (
             <>
               <Spinner size={4} className='ml-2' />
@@ -204,7 +263,7 @@ function MaintenanceSection({
           )}
           {rebuilt && (
             <span className='text-success ml-2'>
-              <FontAwesomeIcon icon={faCheck}></FontAwesomeIcon>
+              <FontAwesomeIcon icon={faCheck} />
             </span>
           )}
         </button>
@@ -216,8 +275,8 @@ function MaintenanceSection({
             {rebuildProgress.status === 'starting' ||
             rebuildProgress.status === 'scanning' ||
             rebuildProgress.total === 0
-              ? 'Scanning shot history files...'
-              : `Processing shot history files (${rebuildProgress.current}/${rebuildProgress.total})`}
+              ? t`Scanning shot history files...`
+              : t`Processing shot history files (${current}/${total})`}
           </div>
           <div className='bg-base-300 h-2 w-full overflow-hidden rounded'>
             <div
@@ -239,14 +298,22 @@ function MaintenanceSection({
 }
 
 export function SystemTab() {
+  const { t } = useLingui();
   const apiService = useContext(ApiServiceContext);
   const [isLoading, setIsLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [formData, setFormData] = useState({});
   const [phase, setPhase] = useState(0);
   const [progress, setProgress] = useState(0);
+  const [updateError, setUpdateError] = useState('');
+  const [startingUpdate, setStartingUpdate] = useState(false);
+  const connected = machine.value.connected;
   const rssi = machine.value.status.rssi;
+  // Firmware without the link field only ever talks BLE.
+  const controllerLink = machine.value.status.controllerLink ?? 'ble';
   const lat = machine.value.status.lat;
+  const rtx = machine.value.status.rtx;
+  const headless = !!machine.value.capabilities.headless;
 
   const downloadSupportData = useCallback(async () => {
     try {
@@ -274,6 +341,11 @@ export function SystemTab() {
       setFormData(msg);
       setIsLoading(false);
       setSubmitting(false);
+      if (msg.phase > 0 && (msg.updating || msg.phase >= 4)) {
+        setPhase(msg.phase);
+        setProgress(clampProgress(msg.progress));
+        setUpdateError(msg.updateError || '');
+      }
     });
     return () => {
       apiService.off('res:ota-settings', listenerId);
@@ -284,12 +356,9 @@ export function SystemTab() {
     const listenerId = apiService.on('evt:ota-progress', msg => {
       const nextPhase = Number(msg.phase) || 0;
       const nextProgress = nextPhase === 4 ? 100 : clampProgress(msg.progress);
-      setPhase(currentPhase => {
-        setProgress(currentProgress =>
-          currentPhase === nextPhase ? Math.max(currentProgress, nextProgress) : nextProgress,
-        );
-        return nextPhase;
-      });
+      setPhase(nextPhase);
+      setProgress(nextProgress);
+      setUpdateError(msg.error || '');
     });
     return () => {
       apiService.off('evt:ota-progress', listenerId);
@@ -315,10 +384,10 @@ export function SystemTab() {
   }, [apiService]);
 
   useEffect(() => {
-    setTimeout(() => {
+    if (connected) {
       apiService.send({ tp: 'req:ota-settings' });
-    }, 500);
-  }, [apiService]);
+    }
+  }, [apiService, connected]);
 
   const formRef = useRef();
 
@@ -334,10 +403,17 @@ export function SystemTab() {
   );
 
   const onUpdate = useCallback(
-    component => {
-      setPhase(component === 'controller' ? 3 : 1);
-      setProgress(0);
-      apiService.send({ tp: 'req:ota-start', cp: component });
+    async component => {
+      setStartingUpdate(true);
+      setUpdateError('');
+      try {
+        const result = await apiService.request({ tp: 'req:ota-start', cp: component });
+        if (result.error) setUpdateError(result.error);
+      } catch {
+        setUpdateError('check_unavailable');
+      } finally {
+        setStartingUpdate(false);
+      }
     },
     [apiService],
   );
@@ -354,104 +430,178 @@ export function SystemTab() {
   }, [apiService]);
 
   if (phase > 0) {
-    return <OtaProgressView phase={phase} progress={progress} />;
+    return (
+      <OtaProgressView
+        phase={phase}
+        progress={progress}
+        error={updateError}
+        headless={headless}
+        onBack={() => {
+          setPhase(0);
+          setUpdateError('');
+        }}
+      />
+    );
   }
 
   if (isLoading) {
     return <SystemTabSkeleton />;
   }
 
+  const canUpdateController = formData.controllerOtaEnabled !== false;
+  const updateBlocked = !connected || startingUpdate || submitting || formData.checking || formData.updating;
   return (
     <div className='space-y-4 sm:space-y-6 lg:grid lg:grid-cols-2 lg:gap-4'>
       {/* Firmware updates channel */}
-      <Section title='System Version & Updates' className='h-full'>
+      <Section title={t`System Version & Updates`} className='h-full'>
         <form ref={formRef} onSubmit={onSubmit} className='space-y-4'>
           <div className='form-control max-w-md'>
             <label htmlFor='channel' className='mb-2 block text-sm font-medium'>
-              Update Channel
+              <Trans>Update Channel</Trans>
             </label>
-            <div className='flex w-full items-center gap-2'>
+            <div className='mb-2 flex w-full items-center gap-2'>
               <select id='channel' name='channel' className='select select-bordered grow'>
                 <option value='latest' selected={formData.channel === 'latest'}>
-                  Stable
+                  {t({ message: 'Stable', context: 'update channel' })}
                 </option>
                 <option value='nightly' selected={formData.channel === 'nightly'}>
-                  Nightly
+                  {t({ message: 'Nightly', context: 'update channel' })}
                 </option>
               </select>
               <button type='submit' className='btn btn-secondary' disabled={submitting}>
-                Save Channel & Refresh
+                <Trans>Save Channel & Refresh</Trans>
               </button>
             </div>
           </div>
         </form>
+        {formData.checking && <p role='status'><Trans>Checking for updates…</Trans></p>}
+        {!formData.checking && formData.checkError === 'no_stable_release' && (
+          <p role='status'><Trans>This fork has no Stable release. Select Nightly to check its published builds.</Trans></p>
+        )}
+        {!formData.checking && formData.checkError && formData.checkError !== 'no_stable_release' && (
+          <p role='status'><Trans>The release version could not be checked. Refresh when the machine is online.</Trans></p>
+        )}
+        {updateError && <p role='alert'>{otaErrorMessage(t, updateError)}</p>}
 
         <div className='border-base-content/5 mt-6 grid grid-cols-1 gap-6 border-t pt-6 md:grid-cols-2'>
           <div className='flex flex-col space-y-1'>
-            <span className='text-base-content/70 text-sm font-medium'>Hardware</span>
+            <span className='text-base-content/70 text-sm font-medium'>
+              <Trans>Hardware</Trans>
+            </span>
             <span className='text-base-content font-semibold'>{formData.hardware}</span>
           </div>
 
           <div className='flex flex-col space-y-1'>
             <span className='text-base-content/70 text-sm font-medium'>
-              Controller Signal Strength
+              <Trans>Controller Connection</Trans>
             </span>
             <span className='text-base-content flex items-center gap-2 font-semibold'>
-              {rssi}dB (Roundtrip: {lat} ms)
-              <span className={`indicator-item status ${getRssiStatusClass(rssi)}`} />
+              {controllerLink === 'uart' && (
+                <Trans>
+                  UART (Roundtrip: {lat} ms, Resends: {rtx})
+                </Trans>
+              )}
+              {controllerLink === 'ble' && (
+                <Trans>
+                  Bluetooth, {rssi}dB (Roundtrip: {lat} ms, Resends: {rtx})
+                </Trans>
+              )}
+              {controllerLink === 'none' && <Trans>Not connected</Trans>}
+              <span
+                className={`indicator-item status ${getLinkStatusClass(controllerLink, rssi)}`}
+              />
             </span>
           </div>
 
           <div className='flex flex-col space-y-2'>
-            <span className='text-base-content/70 text-sm font-medium'>Controller Version</span>
-            <div className='flex flex-wrap items-center gap-4'>
+            <span className='text-base-content/70 text-sm font-medium'>
+              <Trans>Controller Version</Trans>
+            </span>
+            <div className='flex flex-wrap items-center gap-2'>
               <span className='text-base-content font-semibold break-all'>
                 {formData.controllerVersion}
               </span>
               {formData.controllerUpdateAvailable && (
-                <span className='text-primary text-sm font-bold'>
-                  Update available: {formData.latestVersion}
-                </span>
-              )}
-              {formData.controllerOtaEnabled !== false && (
-                <button
-                  type='button'
-                  className='btn btn-secondary btn-sm'
-                  disabled={!formData.controllerUpdateAvailable || submitting}
-                  onClick={() => onUpdate('controller')}
-                >
-                  Update Controller
-                </button>
+                <>
+                  <FontAwesomeIcon icon={faCaretRight} className='text-primary' />
+                  <span className='text-primary text-sm font-bold'>{formData.latestVersion}</span>
+                </>
               )}
             </div>
+            {!canUpdateController && <span className='text-sm'><Trans>Controller updates use ST-Link.</Trans></span>}
           </div>
 
           <div className='flex flex-col space-y-2'>
-            <span className='text-base-content/70 text-sm font-medium'>Display Version</span>
-            <div className='flex flex-wrap items-center gap-4'>
+            <span className='text-base-content/70 text-sm font-medium'>
+              {headless ? <Trans>Headless Version</Trans> : <Trans>Display Version</Trans>}
+            </span>
+            <div className='flex flex-wrap items-center gap-2'>
               <span className='text-base-content font-semibold break-all'>
                 {formData.displayVersion}
               </span>
               {formData.displayUpdateAvailable && (
-                <span className='text-primary text-sm font-bold'>
-                  Update available: {formData.latestVersion}
-                </span>
+                <>
+                  <FontAwesomeIcon icon={faCaretRight} className='text-primary' />
+                  <span className='text-primary text-sm font-bold'>{formData.latestVersion}</span>
+                </>
               )}
-              <button
-                type='button'
-                className='btn btn-secondary btn-sm'
-                disabled={!formData.displayUpdateAvailable || submitting}
-                onClick={() => onUpdate('display')}
-              >
-                Update Display
-              </button>
             </div>
           </div>
+          {/* Own grid row, so the update buttons below stay on one line */}
+          <div className='flex md:col-span-2'>
+            <PatchNotes
+              repository={formData.repository}
+              channel={formData.channel}
+              // shortcut: when both are behind, the display wins even if the controller is older; both share one build.
+              installedVersion={
+                formData.displayUpdateAvailable || !formData.controllerUpdateAvailable
+                  ? formData.displayVersion
+                  : formData.controllerVersion
+              }
+              latestVersion={formData.latestVersion}
+            />
+          </div>
+          {canUpdateController && (
+            <button
+              type='button'
+              className='btn btn-secondary btn-sm'
+              disabled={!formData.controllerUpdateAvailable || updateBlocked}
+              onClick={() => onUpdate('controller')}
+            >
+              <Trans>Update Controller</Trans>
+            </button>
+          )}
+          <button
+            type='button'
+            className='btn btn-secondary btn-sm'
+            disabled={!formData.displayUpdateAvailable || updateBlocked}
+            onClick={() => onUpdate('display')}
+          >
+            {headless ? <Trans>Update Headless</Trans> : <Trans>Update Display</Trans>}
+          </button>
+          {canUpdateController && (
+            <div className='flex flex-col space-y-2 md:col-span-2'>
+              <button
+                type='button'
+                className='btn btn-secondary btn-sm flex-auto'
+                disabled={
+                  (!formData.controllerUpdateAvailable && !formData.displayUpdateAvailable) ||
+                  updateBlocked
+                }
+                onClick={() => onUpdate('both')}
+              >
+                <Trans>Update both</Trans>
+              </button>
+            </div>
+          )}
         </div>
 
         <div className='alert alert-warning mt-6'>
           <span>
-            Make sure to backup your profiles from the profiles screen before updating the display.
+            <Trans>
+              Make sure to backup your profiles from the profiles screen before updating the
+              display.
+            </Trans>
           </span>
         </div>
       </Section>

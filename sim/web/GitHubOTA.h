@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <functional>
 
-class NimBLEClient;
+class OtaSender;
 
 using phase_callback_t = std::function<void(uint8_t phase)>;
 using progress_callback_t = std::function<void(uint8_t phase, int progress)>;
@@ -14,14 +14,16 @@ class GitHubOTA {
   public:
     GitHubOTA(const String &display_version, const String &controller_version, const String &release_url,
               phase_callback_t = nullptr, progress_callback_t = nullptr, const String & = "firmware.bin",
-              const String & = "filesystem.bin", const String & = "controller.bin")
+              const String & = "controller.bin")
         : _version(display_version) {}
 
     void init() {}
     void checkForUpdates() {}
     bool isUpdateAvailable(bool = false) const { return false; }
     String getCurrentVersion() const { return _version; }
-    void update(bool = true, bool = true, NimBLEClient * = nullptr) {}
+    const char *getCheckError() const { return ""; }
+    const char *getUpdateError() const { return ""; }
+    void update(bool = true, bool = true, OtaSender * = nullptr) {}
     void setReleaseUrl(const String &) {}
     void setControllerVersion(const String &) {}
 

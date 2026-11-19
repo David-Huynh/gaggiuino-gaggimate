@@ -31,7 +31,7 @@ struct Controller {
         std::vector<gm::Payload> sent;
         std::function<void()> duringSend;
         bool isConnected() const { return connected; }
-        gm::Payload buildBoilerControl(int, BoilerControlMode, float value) { return {1, value}; }
+        gm::Payload buildBoilerControl(int index, BoilerControlMode, float value) { return {index ? 7 : 1, value}; }
         gm::Payload buildPumpControl(int, PumpControlMode, float power, float, float) { return {2, power}; }
         gm::Payload buildRelayControl(int index, bool value) { return {3 + index, float(value)}; }
         void sendBatch(gm::Payload const *values, size_t count) {
@@ -45,14 +45,30 @@ struct Controller {
         int getAltRelayFunction() const { return ALT_RELAY_GRIND; }
         float getSteamPumpCutoff() const { return 9; }
         float getPressureOffset() const { return 0; }
+        int getSteamRefillMode() const { return 0; }
+        bool getSteamLevelEnabled() const { return false; }
+        unsigned getSteamRefillPostClearSeconds() const { return 2; }
     } settings;
-    struct Info { bool protocolMismatch = false; struct { bool pressure = true; } capabilities; } systemInfo;
+    struct Info {
+        bool protocolMismatch = false;
+        struct { bool pressure = true, dualBoiler = false; } capabilities;
+    } systemInfo;
     std::atomic<bool> infoApplied{false}, controllerHeaterStatusKnown{false};
+    std::atomic<bool> controlStateSent{false};
     bool initialized = true, waitingForController = false;
+    bool hardwareSessionReady = true, tankLevelKnown = false, tofLevelKnown = false, steamLevelKnown = false;
+    bool waterValveActive = false, steamBoilerLow = false, steamRefillPostClear = false;
+    unsigned long steamRefillClearedAt = 0;
+    int mode = MODE_BREW;
+    gm::Payload controlBatch[7];
     unsigned standbyCommands = 0;
     struct Plugins { void trigger(char const *) {} } plugins;
     Plugins *pluginManager = &plugins;
     void applyConnectionPriority(bool) {}
+    void requestStateResend() {}
+    bool isMachineHardwareReady() const { return !systemInfo.capabilities.dualBoiler || hardwareSessionReady; }
+    bool isSteamRefillTankLevelOK() const { return true; }
+    bool isActiveLocked() const { return currentProcess && currentProcess->isActive(); }
     void postCommand(CtrlCmd, int mode) { assert(mode == MODE_STANDBY); ++standbyCommands; }
     void onControllerConnection(bool);
     std::recursive_mutex processMutex;
@@ -61,12 +77,13 @@ struct Controller {
     uint32_t sentControlRevision = 0;
     unsigned long lastFullControlSend = 0;
     static constexpr unsigned long CONTROL_REFRESH_MS = 1000;
-    BoilerCommand lastBoiler{};
+    BoilerCommand lastBoiler{}, lastBoiler2{};
     PumpCommand lastPump{};
-    RelayCommand lastRelay{};
+    RelayCommand lastRelay{}, lastRefill{}, lastWater{};
     bool lastAlt = false;
     float targetPressure = 0, targetFlow = 0, temperature = 93;
     float getTargetTemp() const { return temperature; }
+    float getTargetSteamTemp() const { return 120; }
     void updateControl(bool urgent = false);
 };
 #include "controller_control.inc"
@@ -83,6 +100,11 @@ int main() {
     c.updateControl();
     assert(c.comms.sent.empty()); // A configured UART port is not controller readiness.
     c.infoApplied = true;
+    c.systemInfo.capabilities.dualBoiler = true;
+    c.updateControl();
+    assert(c.comms.sent.empty()); // Discovery alone is not hardware configuration.
+    c.hardwareSessionReady = true;
+    c.systemInfo.capabilities.dualBoiler = false;
     c.updateControl();
     assert(c.comms.sent.size() == 4 && c.comms.sent[0].value == 93);
     c.comms.sent.clear();
@@ -109,6 +131,10 @@ int main() {
     c.updateControl(true);
     assert(c.comms.sent.empty());
     c.systemInfo.protocolMismatch = false;
+    c.systemInfo.capabilities.dualBoiler = true;
+    c.updateControl(true);
+    assert(c.comms.sent.size() == 7 && c.comms.sent[1].kind == 7 && c.comms.sent[1].value == 120);
+    c.comms.sent.clear();
     c.comms.connected = false;
     c.updateControl(true);
     assert(c.comms.sent.empty());

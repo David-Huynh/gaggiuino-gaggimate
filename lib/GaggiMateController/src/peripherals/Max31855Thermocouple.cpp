@@ -32,7 +32,7 @@ bool Max31855Thermocouple::hasUsableReading() {
 }
 
 void Max31855Thermocouple::setup() {
-    SPI.begin();
+    // Software SPI on our own pins; starting the hardware bus would claim GPIO11-13, which carry the display UART.
     pinMode(csPin, OUTPUT);
     digitalWrite(csPin, HIGH);
     max31855->begin();

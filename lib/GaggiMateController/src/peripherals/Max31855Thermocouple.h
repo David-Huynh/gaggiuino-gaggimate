@@ -33,7 +33,7 @@ class Max31855Thermocouple : public TemperatureSensor {
     uint32_t getReadCount() const { return readCount; }
     bool isTaskRunning() const { return taskHandle != nullptr; }
 
-    void setup();
+    void setup() override;
     void loop();
 
   private:

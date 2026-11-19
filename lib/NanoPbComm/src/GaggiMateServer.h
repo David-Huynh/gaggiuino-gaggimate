@@ -3,42 +3,59 @@
 
 #include "Endpoint.h"
 #include "GaggiMateComm.h"
-#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
-#include "uart/UartTransport.h"
-#else
+#include "LinkSelector.h"
+#if !defined(ARDUINO_ARCH_STM32)
 #include "ble/BleServerTransport.h"
+#include "uart/UartOtaReceiver.h"
 #endif
+#include "uart/UartTransport.h"
 #include <Arduino.h>
 #include <functional>
+#include <memory>
 
-// Controller-side protocol facade: owns transport + Endpoint, exposes semantic sends and typed command callbacks;
-// pushes SystemInfo to the display on connect.
+// Controller-side protocol facade: owns the links + Endpoint, exposes semantic sends and typed command callbacks;
+// pushes SystemInfo to the display on connect. BLE and (if wired) UART are offered in parallel, UART wins when it is up.
 class GaggiMateServer {
   public:
+    using ConnectionCallback = std::function<void(bool connected)>;
     using PingCallback = std::function<void()>;
     using BoilerCallback = std::function<void(uint8_t index, BoilerControlMode mode, float setpoint)>;
     using PumpCallback = std::function<void(uint8_t index, PumpControlMode mode, float power, float pressure, float flow)>;
     // Binary output: index 0 = brew valve, index 1 = alt relay.
     using RelayCallback = std::function<void(uint8_t index, bool open)>;
-    using PidCallback = std::function<void(float kp, float ki, float kd, float kf)>;
+    using HeaterSettingsCallback = std::function<void(const gm::HeaterSettings &settings)>;
     using PumpSettingsCallback = std::function<void(gm::PumpSettings settings)>;
     using AutotuneCallback = std::function<void(uint32_t testTime, uint32_t samples, uint32_t heaterWattage)>;
+    using MachineHardwareCallback = std::function<void(const gm::MachineHardwareSettings &settings)>;
     using PressureScaleCallback = std::function<void(float scale)>;
     using TareCallback = std::function<void()>;
-    using LedCallback = std::function<void(uint8_t channel, uint8_t brightness)>;
+    using ScaleFactorsCallback = std::function<void(float scaleFactor1, float scaleFactor2, uint16_t sampleRateSps,
+                                                    float idleFilterAlpha, float activeFilterAlpha)>;
+    using LedCallback =
+        std::function<void(uint8_t channel, uint8_t brightness, LedEffect effect, uint8_t minBrightness, uint16_t cycleTimeMs)>;
     using ScaleTareCallback = std::function<void(uint32_t requestId)>;
     using ScaleCalibrationCallback = std::function<void(float calibration1, float calibration2, long offset1, long offset2)>;
     using ScaleCalibrationStartCallback = std::function<void(uint8_t channel, float referenceWeight)>;
 
     GaggiMateServer();
 
+    // Adds a wired link on `port`; call before init().
+    void enableUart(uint8_t rxPin, uint8_t txPin, HardwareSerial &port, uint32_t baud = gm_uart::DEFAULT_BAUD);
     // pairingWindow: let a new display replace the paired one this boot (steam switch held at power-on).
     void init(const String &deviceName, const String &hardware, const String &version, const gm::DeviceCapabilities &capabilities,
               bool pairingWindow = false);
     void loop();
-    void onConnectionChanged(std::function<void(bool)> callback) { _connectionCb = std::move(callback); }
     bool isConnected() const { return _endpoint.isConnected(); }
-    bool isUpdating() const { return _transport.isUpdating(); }
+#if defined(ARDUINO_ARCH_STM32)
+    bool isUartUpdating() const { return false; }
+    bool isUpdating() const { return false; }
+#else
+    bool isUartUpdating() const { return _uartOta && _uartOta->isUpdating(); }
+    bool isUpdating() const { return _ble.isUpdating() || isUartUpdating(); }
+#endif
+    // Fired on the OTA worker task when a firmware update over UART starts; register before init().
+    void onUpdateStart(std::function<void()> cb) { _updateStartCb = std::move(cb); }
+    LinkType getLinkType() const { return _link.activeType(); }
 
     void setSystemInfo(const String &hardware, const String &version, const gm::DeviceCapabilities &capabilities);
     void setControllerDiagnostics(const ControllerDiagnostics &diagnostics) {
@@ -50,7 +67,7 @@ class GaggiMateServer {
     }
     UartDiagnostics getDiagnostics() const {
 #if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
-        return _transport.getDiagnostics();
+        return _uart ? _uart->getDiagnostics() : UartDiagnostics{};
 #else
         return {};
 #endif
@@ -62,6 +79,8 @@ class GaggiMateServer {
     gm::Payload buildButtonState(uint8_t index, bool pressed);
     gm::Payload buildAutotuneResult(float kp, float ki, float kd, float kf);
     gm::Payload buildVolumetricMeasurement(float volume);
+    gm::Payload buildScaleMeasurement(float weight, float cell1Weight = 0.0f, float cell2Weight = 0.0f, bool cell1Valid = false,
+                                      bool cell2Valid = false);
     gm::Payload buildTofMeasurement(uint32_t distance);
     gm::Payload buildError(int code);
     gm::Payload buildWeightMeasurement(float weight);
@@ -75,6 +94,8 @@ class GaggiMateServer {
     void sendButtonState(uint8_t index, bool pressed);
     void sendAutotuneResult(float kp, float ki, float kd, float kf);
     void sendVolumetricMeasurement(float volume);
+    void sendScaleMeasurement(float weight, float cell1Weight = 0.0f, float cell2Weight = 0.0f, bool cell1Valid = false,
+                              bool cell2Valid = false);
     void sendTofMeasurement(uint32_t distance);
     void sendError(int code);
     void sendWeightMeasurement(float weight);
@@ -82,13 +103,13 @@ class GaggiMateServer {
     void sendScaleOffsets(const ScaleTareResult &result);
     void sendScaleCalibrationResult(uint8_t channel, float calibration);
 
-    // Drop the BLE link; the ping watchdog uses this so the display sees a real disconnect, not an in-band error.
-    void disconnect() { _transport.disconnect(); }
+    // Drop the active link; the ping watchdog uses this so the display sees a real disconnect, not an in-band error.
+    void disconnect();
 
     // Forget the paired display and advertise openly again (re-pairing escape hatch, e.g. after a screen swap).
     void clearBonds() {
-#ifndef GAGGIMATE_UART_COMMS
-        _transport.clearBonds();
+#if !defined(ARDUINO_ARCH_STM32)
+        _ble.clearBonds();
 #endif
     }
 
@@ -100,29 +121,41 @@ class GaggiMateServer {
     void sendUnreliable(const gm::Payload &payload) { _endpoint.sendUnreliable(payload); }
     void sendUnreliableBatch(const gm::Payload *payloads, size_t count) { _endpoint.sendUnreliable(payloads, count); }
 
+    // Link up/down, after the server's own session handling.
+    void onConnectionChange(ConnectionCallback cb) { _connCb = std::move(cb); }
+
     // Command registrations (display -> controller)
     void onPing(PingCallback cb) { _pingCb = std::move(cb); }
     void onBoilerControl(BoilerCallback cb) { _boilerCb = std::move(cb); }
     void onPumpControl(PumpCallback cb) { _pumpCb = std::move(cb); }
     void onRelayControl(RelayCallback cb) { _relayCb = std::move(cb); }
-    void onPidSettings(PidCallback cb) { _pidCb = std::move(cb); }
+    void onHeaterSettings(HeaterSettingsCallback cb) { _heaterSettingsCb = std::move(cb); }
     void onPumpSettings(PumpSettingsCallback cb) { _pumpSettingsCb = std::move(cb); }
     void onAutotune(AutotuneCallback cb) { _autotuneCb = std::move(cb); }
+    void sendMachineHardwareStatus(uint32_t hash, bool ready, bool error);
+    void onMachineHardware(MachineHardwareCallback cb) { _machineHardwareCb = std::move(cb); }
     void onPressureScale(PressureScaleCallback cb) { _pressureScaleCb = std::move(cb); }
     void onTare(TareCallback cb) { _tareCb = std::move(cb); }
+    void onHardwareScaleTare(TareCallback cb) { _hardwareScaleTareCb = std::move(cb); }
+    void onScaleFactors(ScaleFactorsCallback cb) { _scaleFactorsCb = std::move(cb); }
     void onLedControl(LedCallback cb) { _ledCb = std::move(cb); }
     void onScaleTare(ScaleTareCallback cb) { _scaleTareCb = std::move(cb); }
     void onScaleCalibration(ScaleCalibrationCallback cb) { _scaleCalibrationCb = std::move(cb); }
     void onScaleCalibrationStart(ScaleCalibrationStartCallback cb) { _scaleCalibrationStartCb = std::move(cb); }
 
   private:
-#if defined(GAGGIMATE_UART_COMMS) || defined(ARDUINO_ARCH_STM32)
-    UartTransport _transport;
-#else
-    BleServerTransport _transport;
+#if !defined(ARDUINO_ARCH_STM32)
+    BleServerTransport _ble;
+    std::unique_ptr<UartOtaReceiver> _uartOta;
 #endif
-    Endpoint _endpoint;
-    std::function<void(bool)> _connectionCb;
+    std::unique_ptr<UartTransport> _uart;
+    HardwareSerial *_uartPort = nullptr;
+    uint8_t _uartRxPin = 0;
+    uint8_t _uartTxPin = 0;
+    uint32_t _uartBaud = gm_uart::DEFAULT_BAUD;
+    LinkSelector _link;
+    Endpoint _endpoint{_link};
+    std::function<void()> _updateStartCb;
     gm::SystemInfo _systemInfo = gaggimate_SystemInfo_init_zero;
 #if defined(GAGGIMATE_UART_DIAGNOSTICS)
     ControllerDiagnostics _controllerDiagnostics{};
@@ -130,20 +163,22 @@ class GaggiMateServer {
     bool _systemInfoAcknowledged = false;
     unsigned long _lastSystemInfoPushMs = 0;
     static constexpr unsigned long SYSTEM_INFO_RETRY_MS = 1000;
-    // The BLE subscribe callback can run before the client has finished
-    // installing its notification handler. The first received ping is the
-    // application-level proof that the new session is ready in both directions.
+    // The connect-time SystemInfo can go out before the display is listening; the first ping proves the session is ready.
     bool _sentSystemInfoAfterHandshake = false;
 
+    ConnectionCallback _connCb;
     PingCallback _pingCb;
     BoilerCallback _boilerCb;
     PumpCallback _pumpCb;
     RelayCallback _relayCb;
-    PidCallback _pidCb;
+    HeaterSettingsCallback _heaterSettingsCb;
     PumpSettingsCallback _pumpSettingsCb;
     AutotuneCallback _autotuneCb;
+    MachineHardwareCallback _machineHardwareCb;
     PressureScaleCallback _pressureScaleCb;
     TareCallback _tareCb;
+    TareCallback _hardwareScaleTareCb;
+    ScaleFactorsCallback _scaleFactorsCb;
     LedCallback _ledCb;
     ScaleTareCallback _scaleTareCb;
     ScaleCalibrationCallback _scaleCalibrationCb;
@@ -151,9 +186,10 @@ class GaggiMateServer {
 
     void registerHandlers();
     void pushSystemInfo();
+    void onLinkSelected(LinkType active);
     void acknowledgeSystemInfo();
 
-    // Drives the endpoint send pump / retransmit on the NimBLE core, independent of the slow 250ms main loop.
+    // Drains UART RX and drives the endpoint send pump / retransmit, independent of the slow 250ms main loop.
     TaskHandle_t _taskHandle = nullptr;
     static void pumpTask(void *arg);
 };

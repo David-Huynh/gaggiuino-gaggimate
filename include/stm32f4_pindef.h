@@ -89,8 +89,6 @@
 #define ADC_RESOLUTION 12
 // ===== System Configuration =====
 #define SYSTEM_BOARD_NAME "GaggiMate STM32F4 Controller"
-#define SYSTEM_VERSION "1.0.0"
-#define FIRMWARE_VERSION SYSTEM_VERSION
 
 // Board autodetect value (not used in STM32 build, but included for compatibility)
 #define AUTODETECT_VALUE 99 // Unique ID for this board variant

@@ -3,6 +3,9 @@
 #endif
 #include "Heater.h"
 #include "logging.h"
+#if !defined(ARDUINO_ARCH_STM32)
+#include "HeaterCoordinator.h"
+#endif
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>
@@ -17,8 +20,8 @@ Heater::Heater(TemperatureSensor *sensor, uint8_t heaterPin, const heater_error_
       autotune_fail_callback(autotune_fail_callback) {
 
     configurationMutex = xSemaphoreCreateMutex();
-    simplePid = new SimplePID(&output, &temperature, &setpoint);
-    autotuner = new Autotune();
+    simplePid = std::make_unique<SimplePID>(&output, &temperature, &setpoint);
+    autotuner = std::make_unique<Autotune>();
 }
 
 void Heater::setup() {
@@ -51,9 +54,8 @@ void Heater::setupAutotune(int testTimeSec, int windowSize, int heaterWattage) {
 }
 
 void Heater::driveRelayOff() {
-    relayStatus.store(false);
     reportedOutput.store(0);
-    digitalWrite(heaterPin, LOW);
+    requestOutput(false);
 }
 
 void Heater::stopOutput() {
@@ -174,6 +176,12 @@ void Heater::setSetpoint(float target) {
     if (target == 0) driveRelayOff();
 }
 
+void Heater::stop() {
+    autotuning = false;
+    setSetpoint(0.0f);
+    requestOutput(false); // cut the relay now instead of on the heater task's next tick
+}
+
 void Heater::setThermalFeedforward(float *pumpFlowPtr, float incomingWaterTemp, int *valveStatusPtr) {
     pumpFlowRate = pumpFlowPtr;
     valveStatus = valveStatusPtr;
@@ -273,7 +281,6 @@ void Heater::loopAutotune() {
     }
     const bool cancelled = !autotuning.load() || !hasConfiguration();
     output = 0.0f;
-    autotuning = false;
     softPwm(TUNER_OUTPUT_SPAN);
     if (cancelled) return;
 
@@ -329,11 +336,26 @@ float Heater::softPwm(uint32_t windowSize) {
     const float duty = enabled && std::isfinite(output) ? std::clamp(output, 0.0f, float(windowSize)) : 0;
     reportedOutput.store(duty);
     const bool on = duty > 0 && duty > now - static_cast<uint32_t>(windowStartTime);
-    digitalWrite(heaterPin, on ? HIGH : LOW);
-    relayStatus.store(on);
+    requestOutput(on);
     // A stop/target change can arrive while this task is writing the pin.
     if (!canEnergize(millis())) driveRelayOff();
     return duty;
+}
+
+void Heater::requestOutput(bool on) {
+#if !defined(ARDUINO_ARCH_STM32)
+    if (coordinator != nullptr) {
+        coordinator->request(this, on);
+        return;
+    }
+#endif
+    writeOutput(on);
+}
+
+void Heater::writeOutput(bool on) {
+    const bool active = on && canEnergize(millis());
+    digitalWrite(heaterPin, active ? HIGH : LOW);
+    relayStatus.store(active);
 }
 
 void Heater::plot(float optimumOutput, float outputScale, uint8_t everyNth) {

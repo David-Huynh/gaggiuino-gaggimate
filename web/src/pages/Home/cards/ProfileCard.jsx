@@ -2,6 +2,7 @@ import { useContext, useEffect, useState } from 'preact/hooks';
 import { computed } from '@preact/signals';
 import { ApiServiceContext, machine } from '../../../services/ApiService.js';
 import PropTypes from 'prop-types';
+import { Trans, useLingui } from '@lingui/react/macro';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { faRectangleList } from '@fortawesome/free-solid-svg-icons/faRectangleList';
 import { faCheck } from '@fortawesome/free-solid-svg-icons/faCheck';
@@ -14,6 +15,7 @@ import { parseBinaryIndex, indexToShotList } from '../../ShotHistory/parseBinary
 const connected = computed(() => machine.value.connected);
 
 function ProgressCard({ processInfo, isBrewing, isGrinding, selectedProfile }) {
+  const { t } = useLingui();
   const p = processInfo;
   const progress = Math.max(0, Math.min(100, ((p?.pp ?? 0) / (p?.pt || 1)) * 100));
   const phase = getPhaseLabel(p, isGrinding);
@@ -22,7 +24,8 @@ function ProgressCard({ processInfo, isBrewing, isGrinding, selectedProfile }) {
   return (
     <div className='card bg-primary/10 border-primary/30 flex flex-col gap-1 rounded-xl border p-3'>
       <div className='text-primary text-[0.65rem] font-semibold tracking-wider uppercase'>
-        {isBrewing ? 'Now Brewing' : 'Grinding'} · {selectedProfile || 'Default'}
+        {isBrewing ? t`Now Brewing` : t`Grinding`} ·{' '}
+        {selectedProfile || t({ message: 'Default', context: 'profile' })}
       </div>
       <div className='flex items-baseline justify-between'>
         <div className='flex flex-col gap-0.5'>
@@ -36,7 +39,7 @@ function ProgressCard({ processInfo, isBrewing, isGrinding, selectedProfile }) {
         {target && (
           <div className='text-right'>
             <div className='text-base-content/50 text-[0.6rem] tracking-wider uppercase'>
-              Target
+              <Trans context='process'>Target</Trans>
             </div>
             <div className='text-base-content text-lg font-bold tabular-nums'>{target}</div>
           </div>
@@ -60,22 +63,23 @@ ProgressCard.propTypes = {
 };
 
 function FinishedProcessCard({ processInfo, isBrewing, selectedProfile, stats, weight }) {
+  const { t } = useLingui();
   const p = processInfo;
   const weightLabel = weight != null && weight > 0 ? `${weight.toFixed(1)}g` : null;
   const pressureLabel =
     isBrewing && stats?.maxPressure != null ? `${stats.maxPressure.toFixed(1)} bar` : null;
   const flowLabel = isBrewing && stats?.avgFlow != null ? `${stats.avgFlow.toFixed(2)} ml/s` : null;
   const items = [
-    weightLabel && { key: 'weight', label: 'Weight', value: weightLabel },
-    pressureLabel && { key: 'pressure', label: 'Pressure', value: pressureLabel },
-    flowLabel && { key: 'flow', label: 'Flow', value: flowLabel },
+    weightLabel && { key: 'weight', label: t`Weight`, value: weightLabel },
+    pressureLabel && { key: 'pressure', label: t`Pressure`, value: pressureLabel },
+    flowLabel && { key: 'flow', label: t`Flow`, value: flowLabel },
   ].filter(Boolean);
 
   return (
     <div className='card bg-success/10 border-success/30 flex flex-col gap-1 rounded-xl border p-3'>
       <div className='text-success flex items-center gap-1.5 text-[0.65rem] font-semibold tracking-wider uppercase'>
         <FontAwesomeIcon icon={faCheck} />
-        Finished · {selectedProfile || 'Default'}
+        <Trans>Finished</Trans> · {selectedProfile || t({ message: 'Default', context: 'profile' })}
       </div>
       <span className='text-base-content text-center text-2xl font-bold tabular-nums'>
         {fmtElapsed(p?.e)}
@@ -118,6 +122,7 @@ export function ProfileCard({
   inCard = false,
   compact = false,
 }) {
+  const { t } = useLingui();
   const apiService = useContext(ApiServiceContext);
   const isConnected = connected.value;
   const [profileData, setProfileData] = useState(null);
@@ -218,10 +223,12 @@ export function ProfileCard({
 
   const inner = (
     <>
-      <div className='text-base-content/50 text-[0.6rem] tracking-wider uppercase'>Profile</div>
+      <div className='text-base-content/50 text-[0.6rem] tracking-wider uppercase'>
+        <Trans>Profile</Trans>
+      </div>
       <div className='flex items-center justify-between gap-2'>
         <span className='text-base-content truncate text-sm font-semibold'>
-          {selectedProfile || 'Default'}
+          {selectedProfile || t({ message: 'Default', context: 'profile' })}
         </span>
         <a href='/profiles'>
           <FontAwesomeIcon

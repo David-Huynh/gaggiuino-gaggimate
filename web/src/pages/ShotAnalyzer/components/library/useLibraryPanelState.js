@@ -1,5 +1,3 @@
-/* global globalThis */
-
 /** Owns asynchronous library loading, persisted filters, hotkeys, and sticky layout state. */
 
 import { libraryService } from '../../services/LibraryService';
@@ -216,7 +214,9 @@ export function useCloseLibraryOnOutsideClick({ collapsed, panelRef, setCollapse
   useEffect(() => {
     if (collapsed) return;
     const handleOutsideClick = event => {
-      if (panelRef.current && !panelRef.current.contains(event.target)) {
+      const target = event.target;
+      const isLibraryActionMenuClick = target?.closest?.('[data-library-actions-menu]');
+      if (panelRef.current && !panelRef.current.contains(target) && !isLibraryActionMenuClick) {
         setCollapsed(true);
       }
     };

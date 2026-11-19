@@ -3,19 +3,31 @@
 #define SETTINGS_H
 
 #include <Arduino.h>
+#include <LedEffect.h>
+#include <MachineHardwareSettings.h>
 #include <Preferences.h>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <display/core/AutoTuning.h>
 #include <display/core/PredictiveDelayPolicy.h>
 #include <display/core/Property.h>
 #include <display/core/constants.h>
 #include <display/core/utils.h>
+#include <esp_err.h>
+#include <mutex>
 #include <functional>
 #include <vector>
 
-#define PREFERENCES_KEY "controller"
+constexpr uint16_t DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS = 10;
+constexpr float DEFAULT_HARDWARE_SCALE_IDLE_ALPHA = 0.80f;
+constexpr float DEFAULT_HARDWARE_SCALE_ACTIVE_ALPHA = 0.80f;
+
+constexpr char PREFERENCES_KEY[] = "controller";
 
 // Per-warning severity: hidden, shown as a warning, or shown as an error that needs confirmation before brewing.
 enum WarningLevel { WARNING_LEVEL_IGNORE = 0, WARNING_LEVEL_WARN = 1, WARNING_LEVEL_ERROR = 2 };
+enum StatusDisplayMode { STATUS_DISPLAY_PROGRESS = 0, STATUS_DISPLAY_CHART = 1 };
 
 struct AutoWakeupSchedule {
     String time;    // HH:MM format
@@ -34,6 +46,12 @@ struct AutoWakeupSchedule {
             days[i] = true;
         }
     }
+
+    AutoWakeupSchedule(const AutoWakeupSchedule &) = default;
+    AutoWakeupSchedule(AutoWakeupSchedule &&) noexcept = default;
+    AutoWakeupSchedule &operator=(const AutoWakeupSchedule &) = default;
+    AutoWakeupSchedule &operator=(AutoWakeupSchedule &&) noexcept = default;
+    ~AutoWakeupSchedule() = default;
 
     [[nodiscard]] bool isDayEnabled(const int dayOfWeek) const {
         // dayOfWeek: 1=Monday, 2=Tuesday, ..., 7=Sunday
@@ -66,6 +84,13 @@ template <> struct PreferencesCodec<std::vector<AutoWakeupSchedule>> {
     static bool write(Preferences &prefs, const char *key, const std::vector<AutoWakeupSchedule> &value);
 };
 
+// Persist only a compact profile reference, retaining legacy JSON reads.
+struct MachineProfileSelectionCodec {
+    static String read(Preferences &prefs, const char *key, const String &def);
+    static bool write(Preferences &prefs, const char *key, const String &value);
+    static std::atomic<esp_err_t> lastError;
+};
+
 class Settings;
 using SettingsCallback = std::function<void(Settings *)>;
 
@@ -74,7 +99,116 @@ class Settings {
     Settings();
 
     void batchUpdate(const SettingsCallback &callback);
-    void save(bool noDelay = false);
+    bool save(bool noDelay = false);
+    String getSaveError() const;
+
+    // Controller hardware settings (applied at controller startup).
+    gm::MachineHardwareSettings getMachineHardware() const;
+    float getNtcBrewNominalResistance() const { return ntcBrewNominalResistance.get(); }
+    float getNtcBrewSeriesResistance() const { return ntcBrewSeriesResistance.get(); }
+    float getNtcBrewSupplyVoltage() const { return ntcBrewSupplyVoltage.get(); }
+    float getNtcBrewBeta() const { return ntcBrewBeta.get(); }
+    float getNtcSteamNominalResistance() const { return ntcSteamNominalResistance.get(); }
+    float getNtcSteamSeriesResistance() const { return ntcSteamSeriesResistance.get(); }
+    float getNtcSteamSupplyVoltage() const { return ntcSteamSupplyVoltage.get(); }
+    float getNtcSteamBeta() const { return ntcSteamBeta.get(); }
+    bool getTankLevelEnabled() const { return tankLevelEnabled.get(); }
+    bool getSteamLevelEnabled() const { return steamLevelEnabled.get(); }
+    int getSystemLedFunction() const { return systemLedFunction.get(); }
+    int getBaristaLedFunction() const { return baristaLedFunction.get(); }
+    int getSystemLedBrightness() const { return systemLedBrightness.get(); }
+    int getSystemLedMinBrightness() const { return std::min(systemLedMinBrightness.get(), systemLedBrightness.get()); }
+    int getSystemLedCycleTimeMs() const { return systemLedCycleTimeMs.get(); }
+    void setSystemLedMinBrightness(int value) {
+        if (value >= 0 && value <= 255)
+            systemLedMinBrightness.set(std::min(value, systemLedBrightness.get()));
+    }
+    void setSystemLedCycleTimeMs(int value) {
+        if (value >= MIN_LED_CYCLE_MS && value <= MAX_LED_CYCLE_MS)
+            systemLedCycleTimeMs.set(value);
+    }
+    int getBaristaLedBrightness() const { return baristaLedBrightness.get(); }
+    int getBaristaLedMinBrightness() const { return std::min(baristaLedMinBrightness.get(), baristaLedBrightness.get()); }
+    int getBaristaLedCycleTimeMs() const { return baristaLedCycleTimeMs.get(); }
+    void setBaristaLedMinBrightness(int value) {
+        if (value >= 0 && value <= 255)
+            baristaLedMinBrightness.set(std::min(value, baristaLedBrightness.get()));
+    }
+    void setBaristaLedCycleTimeMs(int value) {
+        if (value >= MIN_LED_CYCLE_MS && value <= MAX_LED_CYCLE_MS)
+            baristaLedCycleTimeMs.set(value);
+    }
+    void setSystemLedBrightness(int value) {
+        if (value >= 0 && value <= 255) {
+            systemLedBrightness.set(value);
+            if (systemLedMinBrightness.get() > value)
+                systemLedMinBrightness.set(value);
+        }
+    }
+    void setBaristaLedBrightness(int value) {
+        if (value >= 0 && value <= 255) {
+            baristaLedBrightness.set(value);
+            if (baristaLedMinBrightness.get() > value)
+                baristaLedMinBrightness.set(value);
+        }
+    }
+    int getSteamRefillMode() const { return steamRefillMode.get(); }
+    int getSteamRefillPostClearSeconds() const { return steamRefillPostClearSeconds.get(); }
+    int getSteamLevelDebounceChecks() const { return steamLevelDebounceChecks.get(); }
+    void setNtcBrewNominalResistance(float value) {
+        if (std::isfinite(value) && value >= 100 && value <= 1000000)
+            ntcBrewNominalResistance.set(value);
+    }
+    void setNtcBrewSeriesResistance(float value) {
+        if (std::isfinite(value) && value >= 100 && value <= 1000000)
+            ntcBrewSeriesResistance.set(value);
+    }
+    void setNtcBrewSupplyVoltage(float value) {
+        if (std::isfinite(value) && value >= 0.5 && value <= 5.5)
+            ntcBrewSupplyVoltage.set(value);
+    }
+    void setNtcBrewBeta(float value) {
+        if (std::isfinite(value) && value >= 1000 && value <= 10000)
+            ntcBrewBeta.set(value);
+    }
+    void setNtcSteamNominalResistance(float value) {
+        if (std::isfinite(value) && value >= 100 && value <= 1000000)
+            ntcSteamNominalResistance.set(value);
+    }
+    void setNtcSteamSeriesResistance(float value) {
+        if (std::isfinite(value) && value >= 100 && value <= 1000000)
+            ntcSteamSeriesResistance.set(value);
+    }
+    void setNtcSteamSupplyVoltage(float value) {
+        if (std::isfinite(value) && value >= 0.5 && value <= 5.5)
+            ntcSteamSupplyVoltage.set(value);
+    }
+    void setNtcSteamBeta(float value) {
+        if (std::isfinite(value) && value >= 1000 && value <= 10000)
+            ntcSteamBeta.set(value);
+    }
+    void setTankLevelEnabled(bool value) { tankLevelEnabled.set(value); }
+    void setSteamLevelEnabled(bool value) { steamLevelEnabled.set(value); }
+    void setSystemLedFunction(int value) {
+        if (value >= 0 && value <= 6)
+            systemLedFunction.set(value);
+    }
+    void setBaristaLedFunction(int value) {
+        if (value >= 0 && value <= 6)
+            baristaLedFunction.set(value);
+    }
+    void setSteamRefillMode(int value) {
+        if (value >= 0 && value <= 2)
+            steamRefillMode.set(value);
+    }
+    void setSteamRefillPostClearSeconds(int value) {
+        if (value >= 0 && value <= 120)
+            steamRefillPostClearSeconds.set(value);
+    }
+    void setSteamLevelDebounceChecks(int value) {
+        if (value >= 1 && value <= 100)
+            steamLevelDebounceChecks.set(value);
+    }
 
     // Getters and setters
     int getTargetSteamTemp() const { return targetSteamTemp.get(); }
@@ -82,6 +216,12 @@ class Settings {
     int getTemperatureOffset() const { return temperatureOffset.get(); }
     float getPressureOffset() const { return pressureOffset.get(); }
     float getPressureScaling() const { return pressureScaling.get(); }
+    float getScaleFactor1() const { return scaleFactor1.get(); }
+    float getScaleFactor2() const { return scaleFactor2.get(); }
+    uint16_t getHardwareScaleSampleRateSps() const { return static_cast<uint16_t>(hardwareScaleSampleRateSps.get()); }
+    float getHardwareScaleIdleAlpha() const { return hardwareScaleIdleAlpha.get(); }
+    float getHardwareScaleActiveAlpha() const { return hardwareScaleActiveAlpha.get(); }
+    String getPreferredScaleSource() const { return preferredScaleSource.get(); }
     double getTargetGrindVolume() const { return targetGrindVolume.get(); }
     int getTargetGrindDuration() const { return targetGrindDuration.get(); }
     int getStartupMode() const { return startupMode.get(); }
@@ -90,7 +230,12 @@ class Settings {
     double getHardwareBrewDelay() const { return hardwareBrewDelay.get(); }
     double getGrindDelay() const { return grindDelay.get(); }
     bool isDelayAdjust() const { return delayAdjust.get(); }
+    bool isHeaterCoordinationEnabled() const { return heaterCoordinationEnabled.get(); }
+    int getHeaterHandoverMs() const { return heaterHandoverMs.get(); }
+    String getMachineProfileSelection() const { return machineProfileSelection.get(); }
+    bool setMachineProfileSelection(const String &v);
     String getPid() const { return pid.get(); }
+    String getSteamPid() const { return steamPid.get(); }
     String getPumpModelCoeffs() const { return pumpModelCoeffs.get(); }
     String getPumpSlipCoeffs() const { return pumpSlipCoeffs.get(); }
     String getWifiSsid() const { return wifiSsid.get(); }
@@ -101,12 +246,64 @@ class Settings {
     bool isVolumetricTarget() const { return volumetricTarget.get(); }
     String getOTAChannel() const { return otaChannel.get(); }
     String getSavedScale() const { return savedScale.get(); }
+    String getSavedScaleName() const { return savedScaleName.get(); }
+    int getDefaultSteamMode() const { return defaultSteamMode.get(); }
+    void setDefaultSteamMode(int value) {
+        if (value >= 0 && value <= 2)
+            defaultSteamMode.set(value);
+    }
+    bool getPersistentSteamState() const { return persistentSteamState.get(); }
+    void setPersistentSteamState(bool enabled);
+
     String getSavedBrewScale() const { return savedBrewScale.get(); }
     String getSavedGrindScale() const { return savedGrindScale.get(); }
     bool isBoilerFillActive() const { return boilerFillActive.get(); }
     int getStartupFillTime() const { return startupFillTime.get(); }
     int getSteamFillTime() const { return steamFillTime.get(); }
+    bool isDosingCupEnabled() const { return dosingCupEnabled.get(); }
+    bool isPortafilterEnabled() const { return portafilterEnabled.get(); }
+    String getPortafilterScale() const { return portafilterScale.get(); }
+    float getPortafilterWeight() const { return portafilterWeight.get(); }
+    String getSmartDoseMode() const { return smartDoseMode.get(); }
+    void setDosingCupEnabled(bool value) { dosingCupEnabled.set(value); }
+    void setPortafilterEnabled(bool value) { portafilterEnabled.set(value); }
+    void setPortafilterScale(const String &value) {
+        if (value == "bluetooth" || value == "hardware")
+            portafilterScale.set(value);
+    }
+    void setPortafilterWeight(float value) {
+        if (value >= 0 && value <= 2000)
+            portafilterWeight.set(value);
+    }
+    void setSmartDoseMode(const String &value) {
+        if (value == "" || value == "cup" || value == "automatic" || value == "portafilter")
+            smartDoseMode.set(value);
+    }
+    bool isSmartDoseActive() const { return smartDoseActive.get(); }
+    bool isSmartDoseAutomagic() const { return smartDoseAutomagic.get(); }
+    String getSmartDoseScale() const { return smartDoseScale.get(); }
+    String getManualDoseScale() const { return manualDoseScale.get(); }
+    void setManualDoseScale(const String &value) {
+        if (value == "bluetooth" || value == "hardware")
+            manualDoseScale.set(value);
+    }
+    float getDosingCupWeight() const { return dosingCupWeight.get(); }
+    void setSmartDoseActive(bool value) { smartDoseActive.set(value); }
+    void setSmartDoseAutomagic(bool value) { smartDoseAutomagic.set(value); }
+    void setSmartDoseScale(const String &value) {
+        if (value == "bluetooth" || value == "hardware")
+            smartDoseScale.set(value);
+    }
+    void setDosingCupWeight(float value) {
+        if (value >= 0.0f && value <= 2000.0f)
+            dosingCupWeight.set(value);
+    }
     bool isSmartGrindActive() const { return smartGrindActive.get(); }
+    String getSetupStep() const { return setupStep.get(); }
+    void setSetupStep(const String &value) { setupStep.set(value); }
+    bool isSetupDone() const { return setupDone.get(); }
+    bool isMahlkonigActive() const { return mahlkonigActive.get(); }
+    String getMahlkonigRecipeProfiles() const { return mahlkonigRecipeProfiles.get(); }
     int getSmartGrindMode() const { return smartGrindMode.get(); }
     String getSmartGrindIp() const { return smartGrindIp.get(); }
     bool isHomeAssistant() const { return homeAssistant.get(); }
@@ -132,11 +329,23 @@ class Settings {
     int getWarnScaleConnected() const { return warnScaleConnected.get(); }
     int getWarnScaleBattery() const { return warnScaleBattery.get(); }
     int getWarnTemperature() const { return warnTemperature.get(); }
+    int getWarnBackflush() const { return warnBackflush.get(); }
+    int getWarnDescaling() const { return warnDescaling.get(); }
+    int getBackflushIntervalDays() const { return backflushIntervalDays.get(); }   // 0 = off
+    int getBackflushIntervalShots() const { return backflushIntervalShots.get(); } // 0 = off
+    int getDescalingIntervalWeeks() const { return descalingIntervalWeeks.get(); } // 0 = off
+    int getDescalingIntervalShots() const { return descalingIntervalShots.get(); } // 0 = off
+    unsigned long getLastBackflushTime() const { return lastBackflushTime.get(); } // epoch seconds, 0 = never
+    unsigned long getLastDescalingTime() const { return lastDescalingTime.get(); } // epoch seconds, 0 = never
+    int getShotsSinceBackflush() const { return shotsSinceBackflush.get(); }
+    int getShotsSinceDescaling() const { return shotsSinceDescaling.get(); }
     int getWifiApTimeout() const { return wifiApTimeout.get(); }
     float getSteamPumpPercentage() const { return steamPumpPercentage.get(); }
     float getSteamPumpCutoff() const { return steamPumpCutoff.get(); }
     int getThemeMode() const { return themeMode.get(); }
+    int getStatusDisplayMode() const { return statusDisplayMode.get(); } // STATUS_DISPLAY_*
     int getHistoryIndex() const { return historyIndex.get(); }
+    int getHistoryClearedBefore() const { return historyClearedBefore.get(); }
 
     [[deprecated]]
     int getSunriseR() const {
@@ -159,6 +368,7 @@ class Settings {
     String getSunriseFinished() const { return sunriseFinished.get(); }
     String getSunriseError() const { return sunriseError.get(); }
     int getSunriseExtBrightness() const { return sunriseExtBrightness.get(); }
+    bool getAlbaRefillInterlock() const { return albaRefillInterlock.get(); }
     int getEmptyTankDistance() const { return emptyTankDistance.get(); }
     int getFullTankDistance() const { return fullTankDistance.get(); }
     int getAltRelayFunction() const { return altRelayFunction.get(); }
@@ -229,6 +439,9 @@ class Settings {
     void setTemperatureOffset(int temperature_offset);
     void setPressureOffset(float pressure_offset);
     void setPressureScaling(float pressure_scaling);
+    void setScaleFactors(float scale_factor_1, float scale_factor_2);
+    void setHardwareScaleConfiguration(uint16_t sample_rate_sps, float idle_alpha, float active_alpha);
+    void setPreferredScaleSource(const String &scaleSource);
     void setTargetGrindVolume(double target_grind_volume);
     void setTargetGrindDuration(int target_duration);
     void setStartupMode(int startup_mode);
@@ -238,6 +451,9 @@ class Settings {
     void setGrindDelay(double grindDelay);
     void setDelayAdjust(bool delay_adjust);
     void setPid(const String &pid);
+    void setSteamPid(const String &pid);
+    void setHeaterCoordinationEnabled(bool enabled);
+    void setHeaterHandoverMs(int handoverMs);
     void setPumpModelCoeffs(const String &pumpModelCoeffs);
     void setPumpSlipCoeffs(const String &pumpSlipCoeffs);
     void setWifiSsid(const String &wifiSsid);
@@ -248,12 +464,16 @@ class Settings {
     void setVolumetricTarget(bool volumetric_target);
     void setOTAChannel(const String &otaChannel);
     void setSavedScale(const String &savedScale);
+    void setSavedScaleName(const String &savedScaleName);
     void setSavedBrewScale(const String &savedScale);
     void setSavedGrindScale(const String &savedScale);
     void setBoilerFillActive(bool boiler_fill_active);
     void setStartupFillTime(int startup_fill_time);
     void setSteamFillTime(int steam_fill_time);
     void setSmartGrindActive(bool smart_grind_active);
+    void setSetupDone(bool setup_done);
+    void setMahlkonigActive(bool mahlkonig_active);
+    void setMahlkonigRecipeProfiles(String profiles);
     void setSmartGrindIp(String smart_grind_ip);
     void setSmartGrindMode(int smart_grind_mode);
     void setHomeAssistant(bool homeAssistant);
@@ -270,11 +490,21 @@ class Settings {
     void setWarnScaleConnected(int level);
     void setWarnScaleBattery(int level);
     void setWarnTemperature(int level);
+    void setWarnBackflush(int level);
+    void setWarnDescaling(int level);
+    void setBackflushIntervalDays(int days);
+    void setBackflushIntervalShots(int shots);
+    void setDescalingIntervalWeeks(int weeks);
+    void setDescalingIntervalShots(int shots);
+    void setLastBackflushTime(unsigned long time);
+    void setLastDescalingTime(unsigned long time);
+    void setShotsSinceBackflush(int shots);
+    void setShotsSinceDescaling(int shots);
     void setTimezone(String timezone);
     void setClockFormat(bool format_24h);
     void setSelectedProfile(String selected_profile);
     void setStartupProfile(String startup_profile);
-    void setFavoritedProfiles(std::vector<String> favorited_profiles);
+    void setFavoritedProfiles(const std::vector<String> &favorited_profiles);
     void addFavoritedProfile(String profile);
     void removeFavoritedProfile(String profile);
     void setProfileOrder(std::vector<String> profile_order);
@@ -285,7 +515,9 @@ class Settings {
     void setSteamPumpPercentage(float steam_pump_percentage);
     void setSteamPumpCutoff(float steam_pump_cutoff);
     void setThemeMode(int theme_mode);
+    void setStatusDisplayMode(int status_display_mode);
     void setHistoryIndex(int history_index);
+    bool saveHistoryClearedBefore(int nextHistoryId);
     [[deprecated]]
     void setSunriseR(int sunrise_r);
     [[deprecated]]
@@ -299,6 +531,7 @@ class Settings {
     void setSunriseFinished(String hexColor);
     void setSunriseError(String hexColor);
     void setSunriseExtBrightness(int sunrise_ext_brightness);
+    void setAlbaRefillInterlock(bool enabled) { albaRefillInterlock.set(enabled); }
     void setEmptyTankDistance(int empty_tank_distance);
     void setFullTankDistance(int full_tank_distance);
     void setAltRelayFunction(int alt_relay_function);
@@ -345,8 +578,31 @@ class Settings {
     void setMaxPumpPower(float maxPumpPower);
 
   private:
+    std::mutex saveMutex;
     Preferences preferences;
     PropertyRegistry registry; // must precede the properties, they register themselves here
+
+    Property<float> ntcBrewNominalResistance{registry, "nbr0", 50000.0f};
+    Property<float> ntcBrewSeriesResistance{registry, "nbrs", 10000.0f};
+    Property<float> ntcBrewSupplyVoltage{registry, "nbvs", 4.096f};
+    Property<float> ntcBrewBeta{registry, "nbbt", 3988.0f};
+    Property<float> ntcSteamNominalResistance{registry, "nsr0", 50000.0f};
+    Property<float> ntcSteamSeriesResistance{registry, "nsrs", 10000.0f};
+    Property<float> ntcSteamSupplyVoltage{registry, "nsvs", 4.096f};
+    Property<float> ntcSteamBeta{registry, "nsbt", 3988.0f};
+    Property<bool> tankLevelEnabled{registry, "tl_en", false};
+    Property<bool> steamLevelEnabled{registry, "sl_en", true};
+    Property<int> systemLedFunction{registry, "led_sys_mode", 1};
+    Property<int> baristaLedFunction{registry, "led_bar_mode", 3};
+    Property<int> systemLedBrightness{registry, "led_sys_bri", 255};
+    Property<int> systemLedMinBrightness{registry, "led_sys_min", 0};
+    Property<int> systemLedCycleTimeMs{registry, "led_sys_ms", DEFAULT_LED_CYCLE_MS};
+    Property<int> baristaLedBrightness{registry, "led_bar_bri", 255};
+    Property<int> baristaLedMinBrightness{registry, "led_bar_min", 0};
+    Property<int> baristaLedCycleTimeMs{registry, "led_bar_ms", DEFAULT_LED_CYCLE_MS};
+    Property<int> steamRefillMode{registry, "rf_mode", 1};
+    Property<int> steamRefillPostClearSeconds{registry, "rf_post", 0};
+    Property<int> steamLevelDebounceChecks{registry, "sl_db", 25};
 
     Property<String> selectedProfile{registry, "sp", ""};
     Property<String> startupProfile{registry, "sup", ""}; // Empty = last used profile, otherwise profile ID
@@ -355,6 +611,12 @@ class Settings {
     Property<int> temperatureOffset{registry, "to", DEFAULT_TEMPERATURE_OFFSET};
     Property<float> pressureOffset{registry, "poff", DEFAULT_PRESSURE_OFFSET};
     Property<float> pressureScaling{registry, "ps", DEFAULT_PRESSURE_SCALING};
+    Property<float> scaleFactor1{registry, "sf1", 0.0f};
+    Property<float> scaleFactor2{registry, "sf2", 0.0f};
+    Property<int> hardwareScaleSampleRateSps{registry, "hs_rate", DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS};
+    Property<float> hardwareScaleIdleAlpha{registry, "hs_ia", DEFAULT_HARDWARE_SCALE_IDLE_ALPHA};
+    Property<float> hardwareScaleActiveAlpha{registry, "hs_aa", DEFAULT_HARDWARE_SCALE_ACTIVE_ALPHA};
+    Property<String> preferredScaleSource{registry, "pss", "auto"};
     Property<double> targetGrindVolume{registry, "tgv", 18.0};
     Property<int> targetGrindDuration{registry, "tgd", 25000};
     Property<double> brewDelay{registry, "del_br", 800.0};
@@ -366,22 +628,38 @@ class Settings {
     Property<std::vector<AutoWakeupSchedule>> autowakeupSchedules{registry, "ab_schedules", {AutoWakeupSchedule("07:00")}};
     Property<int> standbyTimeout{registry, "sbt", DEFAULT_STANDBY_TIMEOUT_MS};
     Property<String> pid{registry, "pid", DEFAULT_PID};
+    Property<String> steamPid{registry, "steamPid", ""};
     Property<String> wifiSsid{registry, "ws", ""};
     Property<String> wifiPassword{registry, "wp", ""};
     Property<String> wifiApPassword{registry, "wap", ""}; // empty until generated on first start
     Property<String> mdnsName{registry, "mn", DEFAULT_MDNS_NAME};
     Property<String> savedScale{registry, "ssc", ""};
+    Property<String> savedScaleName{registry, "sscn", ""}; // advertised BLE name, shown while the scale is out of range
     Property<String> savedBrewScale{registry, "ssc_br", ""};
     Property<String> savedGrindScale{registry, "ssc_gr", ""};
     Property<bool> homekit{registry, "hk", false};
+    Property<bool> setupDone{registry, "setup_ok", false}; // first-run wizard finished
     Property<bool> volumetricTarget{registry, "vt", false};
     Property<bool> boilerFillActive{registry, "bf_a", false};
     Property<int> startupFillTime{registry, "bf_su", 5000};
     Property<int> steamFillTime{registry, "bf_st", 5000};
+    Property<bool> dosingCupEnabled{registry, "sd_cup_on", true};
+    Property<bool> portafilterEnabled{registry, "sd_pf_on", true};
+    Property<String> portafilterScale{registry, "sd_pf_scale", "bluetooth"};
+    Property<float> portafilterWeight{registry, "sd_pf", 0.0f};
+    // Empty means system default; an explicit preference survives temporary ineligibility.
+    Property<String> smartDoseMode{registry, "sd_mode", ""};
+    Property<bool> smartDoseActive{registry, "sd_a", false};
+    Property<bool> smartDoseAutomagic{registry, "sd_auto", false};
+    Property<String> smartDoseScale{registry, "sd_scale", "bluetooth"};
+    Property<String> manualDoseScale{registry, "sd_manual", "bluetooth"};
+    Property<float> dosingCupWeight{registry, "sd_cup", 0.0f};
     Property<bool> smartGrindActive{registry, "sg_a", false};
     Property<bool> smartGrindToggle{registry, "sg_t", false}; // legacy, seeds the smartGrindMode default
     Property<int> smartGrindMode{registry, "sg_m", 0};
     Property<String> smartGrindIp{registry, "sg_i", ""};
+    Property<bool> mahlkonigActive{registry, "mk_a", false};
+    Property<String> mahlkonigRecipeProfiles{registry, "mk_rp", ""}; // profile id per grinder recipe slot, "r1,r2,..."
     Property<bool> homeAssistant{registry, "ha_a", false};
     Property<String> homeAssistantUser{registry, "ha_u", ""};
     Property<String> homeAssistantPassword{registry, "ha_pw", ""};
@@ -395,9 +673,18 @@ class Settings {
     Property<String> otaChannel{registry, "oc", DEFAULT_OTA_CHANNEL};
     Property<std::vector<String>> favoritedProfiles{registry, "fp", {}};
     Property<std::vector<String>> profileOrder{registry, "po", {}}; // persisted profile ordering
+    Property<int> defaultSteamMode{registry, "steam_mode", 1};      // 0 = Off, 1 = On, 2 = Last
+    Property<bool> persistentSteamState{registry, "sst", false};
     Property<float> steamPumpPercentage{registry, "spp", DEFAULT_STEAM_PUMP_PERCENTAGE};
     Property<float> steamPumpCutoff{registry, "spc", DEFAULT_STEAM_PUMP_CUTOFF};
     Property<int> historyIndex{registry, "hi", 0};
+    Property<int> historyClearedBefore{registry, "hist_clear", 0};
+
+    Property<bool> heaterCoordinationEnabled{registry, "hco", true};
+    Property<int> heaterHandoverMs{registry, "hcg", DEFAULT_HEATER_HANDOVER_MS};
+
+    Property<String> setupStep{registry, "setup_step", "machine"};
+    Property<String, MachineProfileSelectionCodec> machineProfileSelection{registry, "mc_profile", ""};
 
     // Display settings
     Property<int> mainBrightness{registry, "main_b", 16};
@@ -405,6 +692,7 @@ class Settings {
     Property<int> standbyBrightnessTimeout{registry, "standby_bt", 60000}; // 60 seconds default
     Property<int> wifiApTimeout{registry, "wifi_apt", DEFAULT_WIFI_AP_TIMEOUT_MS};
     Property<int> themeMode{registry, "theme", 0};
+    Property<int> statusDisplayMode{registry, "sdm", STATUS_DISPLAY_PROGRESS};
 
     // Warning levels (WarningLevel)
     Property<int> warnWaterLevel{registry, "wl_water", WARNING_LEVEL_WARN};
@@ -413,6 +701,18 @@ class Settings {
     Property<int> warnScaleConnected{registry, "wl_scale", WARNING_LEVEL_WARN};
     Property<int> warnScaleBattery{registry, "wl_scale_bat", WARNING_LEVEL_ERROR};
     Property<int> warnTemperature{registry, "wl_temp", WARNING_LEVEL_WARN};
+    Property<int> warnBackflush{registry, "wl_backflush", WARNING_LEVEL_WARN};
+    Property<int> warnDescaling{registry, "wl_descale", WARNING_LEVEL_WARN};
+
+    // Cleaning schedule
+    Property<int> backflushIntervalDays{registry, "cl_bid", 14};
+    Property<int> backflushIntervalShots{registry, "cl_bis", 0};
+    Property<int> descalingIntervalWeeks{registry, "cl_diw", 6};
+    Property<int> descalingIntervalShots{registry, "cl_dis", 0};
+    Property<unsigned long> lastBackflushTime{registry, "cl_lbt", 0};
+    Property<unsigned long> lastDescalingTime{registry, "cl_ldt", 0};
+    Property<int> shotsSinceBackflush{registry, "cl_sbf", 0};
+    Property<int> shotsSinceDescaling{registry, "cl_sds", 0};
 
     // Sunrise settings (r/g/b/w are legacy load-only values that seed the idle color default)
     int sunriseR = 0;
@@ -424,6 +724,7 @@ class Settings {
     Property<String> sunriseFinished{registry, "sr_f", "#00FF00"};
     Property<String> sunriseError{registry, "sr_e", "#FF0000"};
     Property<int> sunriseExtBrightness{registry, "sr_exb", 75};
+    Property<bool> albaRefillInterlock{registry, "alba_refill", false};
     Property<int> emptyTankDistance{registry, "sr_ed", 210};
     Property<int> fullTankDistance{registry, "sr_fd", 30};
 
@@ -481,7 +782,7 @@ class Settings {
     Property<float> integralGain{registry, "p_ig", DEFAULT_INTEGRAL_GAIN};
     Property<float> maxPumpPower{registry, "p_mp", 1.0f};
 
-    void doSave();
+    bool doSave();
     xTaskHandle taskHandle;
     [[noreturn]] static void loopTask(void *arg);
 };

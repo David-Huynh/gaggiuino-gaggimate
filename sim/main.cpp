@@ -5,6 +5,7 @@
 #include "ESPAsyncWebServer.h"
 #include "SdlDriver.h"
 #include <Arduino.h>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <display/core/Controller.h>
@@ -18,7 +19,10 @@ int main(int argc, char **argv) {
     // Optional: `--screenshot <path> [delayMs]` renders for a bit, saves a BMP, exits.
     const char *shotPath = nullptr;
     unsigned long shotDelayMs = 4000;
+    bool apMode = false; // `--ap`: no Wi-Fi credentials, so setupWifi() falls back to the access point
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ap") == 0)
+            apMode = true;
         if (strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
             shotPath = argv[++i];
             if (i + 1 < argc)
@@ -33,10 +37,15 @@ int main(int argc, char **argv) {
     // WiFi shim's begin() reports WL_CONNECTED. This makes the standby screen show
     // the clock and Wi-Fi icon (and avoids captive-portal AP mode). Seed only once.
     Settings &settings = controller.getSettings();
-    if (settings.getWifiSsid().isEmpty())
-        settings.setWifiSsid("GaggiMate-Sim");
-    if (settings.getWifiPassword().isEmpty())
-        settings.setWifiPassword("simulator");
+    if (apMode) {
+        settings.setWifiSsid(""); // also drops credentials saved by an earlier run; the next normal run re-seeds
+        settings.setWifiPassword("");
+    } else {
+        if (settings.getWifiSsid().isEmpty())
+            settings.setWifiSsid("GaggiMate-Sim");
+        if (settings.getWifiPassword().isEmpty())
+            settings.setWifiPassword("simulator");
+    }
 
     SdlDriver *drv = SdlDriver::getInstance();
     DefaultUI *ui = controller.getUI();
@@ -63,6 +72,11 @@ int main(int argc, char **argv) {
         }
         gm_web_pump(); // service the embedded WebUI HTTP/WS server
 
+        // Delete-all runs on its own task on the device (a no-op in the sim), so run it here
+        if (ShotHistory.isDeleteAllInProgress()) {
+            ShotHistory.runDeleteAll();
+        }
+
         // Settings persistence normally runs in a deferred save task (a no-op in the
         // sim), so flush dirty settings to NVS periodically. save(true) is a cheap
         // no-op when nothing changed.
@@ -71,6 +85,21 @@ int main(int argc, char **argv) {
             if (millis() - lastSave >= 2000) {
                 lastSave = millis();
                 controller.getSettings().save(true);
+            }
+        }
+
+        // Simulated Bluetooth scale: feed the weight chosen with keys 0/3/4/5/6 into the controller like a
+        // real scale would, settling over a few readings.
+        {
+            static unsigned long lastScale = 0;
+            static float scaleWeight = 0.0f;
+            if (g_simScaleTarget >= 0.0f && millis() - lastScale >= 100) {
+                lastScale = millis();
+                const float net = g_simScaleTarget - g_simScaleOffset; // what the scale displays after its last tare
+                scaleWeight += (net - scaleWeight) * 0.35f;
+                if (fabsf(net - scaleWeight) < 0.05f)
+                    scaleWeight = net;
+                controller.onVolumetricMeasurement(scaleWeight, VolumetricMeasurementSource::BLUETOOTH);
             }
         }
 

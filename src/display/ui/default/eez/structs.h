@@ -52,6 +52,7 @@ enum SystemStatusFlowStructureFields {
     FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_NETWORK = 15,
     FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_IP = 16,
     FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_AP_ACTIVE = 17,
+    FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_DUAL_BOILER = 18,
     FLOW_STRUCTURE_SYSTEM_STATUS_NUM_FIELDS
 };
 
@@ -65,6 +66,9 @@ enum ProfileInfoFlowStructureFields {
     FLOW_STRUCTURE_PROFILE_INFO_FIELD_IS_CURRENT = 6,
     FLOW_STRUCTURE_PROFILE_INFO_FIELD_TARGET_WEIGHT = 7,
     FLOW_STRUCTURE_PROFILE_INFO_FIELD_DIRTY = 8,
+    FLOW_STRUCTURE_PROFILE_INFO_FIELD_IS_PRO = 9,
+    FLOW_STRUCTURE_PROFILE_INFO_FIELD_HAS_IMAGE = 10,
+    FLOW_STRUCTURE_PROFILE_INFO_FIELD_IMAGE_LOADED = 11,
     FLOW_STRUCTURE_PROFILE_INFO_NUM_FIELDS
 };
 
@@ -88,6 +92,9 @@ enum UIFlagsFlowStructureFields {
     FLOW_STRUCTURE_UI_FLAGS_FIELD_HAS_PREV_PROFILE = 6,
     FLOW_STRUCTURE_UI_FLAGS_FIELD_HAS_NEXT_PROFILE = 7,
     FLOW_STRUCTURE_UI_FLAGS_FIELD_BREW_CONFIRM_VISIBLE = 8,
+    FLOW_STRUCTURE_UI_FLAGS_FIELD_CHART_MODE = 9,
+    FLOW_STRUCTURE_UI_FLAGS_FIELD_PROFILE_DETAILS_VISIBLE = 10,
+    FLOW_STRUCTURE_UI_FLAGS_FIELD_STEAM_ACTIVE = 11,
     FLOW_STRUCTURE_UI_FLAGS_NUM_FIELDS
 };
 
@@ -109,6 +116,9 @@ enum BrewProcessFlowStructureFields {
     FLOW_STRUCTURE_BREW_PROCESS_FIELD_ELAPSED_PERCENTAGE = 14,
     FLOW_STRUCTURE_BREW_PROCESS_FIELD_IS_COMPLETE = 15,
     FLOW_STRUCTURE_BREW_PROCESS_FIELD_CURRENT_VOLUME = 16,
+    FLOW_STRUCTURE_BREW_PROCESS_FIELD_CURRENT_FLOW = 17,
+    FLOW_STRUCTURE_BREW_PROCESS_FIELD_SHOT_MAX_PRESSURE = 18,
+    FLOW_STRUCTURE_BREW_PROCESS_FIELD_SHOT_AVG_FLOW = 19,
     FLOW_STRUCTURE_BREW_PROCESS_NUM_FIELDS
 };
 
@@ -125,7 +135,9 @@ enum WarningsFlowStructureFields {
     FLOW_STRUCTURE_WARNINGS_FIELD_SCALE_BATTERY_ERROR = 9,
     FLOW_STRUCTURE_WARNINGS_FIELD_TEMPERATURE_WARN = 10,
     FLOW_STRUCTURE_WARNINGS_FIELD_TEMPERATURE_ERROR = 11,
-    FLOW_STRUCTURE_WARNINGS_FIELD_LABELS = 12,
+    FLOW_STRUCTURE_WARNINGS_FIELD_CLEAN_ERROR = 12,
+    FLOW_STRUCTURE_WARNINGS_FIELD_CLEAN_WARN = 13,
+    FLOW_STRUCTURE_WARNINGS_FIELD_LABELS = 14,
     FLOW_STRUCTURE_WARNINGS_NUM_FIELDS
 };
 
@@ -227,6 +239,11 @@ struct SystemStatusValue {
     void ap_active(bool ap_active) {
         value.getArray()->values[FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_AP_ACTIVE] = BooleanValue(ap_active);
     }
+
+    bool dual_boiler() { return value.getArray()->values[FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_DUAL_BOILER].getBoolean(); }
+    void dual_boiler(bool dual_boiler) {
+        value.getArray()->values[FLOW_STRUCTURE_SYSTEM_STATUS_FIELD_DUAL_BOILER] = BooleanValue(dual_boiler);
+    }
 };
 
 typedef ArrayOf<SystemStatusValue, FLOW_ARRAY_OF_STRUCTURE_SYSTEM_STATUS> ArrayOfSystemStatusValue;
@@ -275,6 +292,19 @@ struct ProfileInfoValue {
 
     bool dirty() { return value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_DIRTY].getBoolean(); }
     void dirty(bool dirty) { value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_DIRTY] = BooleanValue(dirty); }
+
+    bool is_pro() { return value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_IS_PRO].getBoolean(); }
+    void is_pro(bool is_pro) { value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_IS_PRO] = BooleanValue(is_pro); }
+
+    bool has_image() { return value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_HAS_IMAGE].getBoolean(); }
+    void has_image(bool has_image) {
+        value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_HAS_IMAGE] = BooleanValue(has_image);
+    }
+
+    bool image_loaded() { return value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_IMAGE_LOADED].getBoolean(); }
+    void image_loaded(bool image_loaded) {
+        value.getArray()->values[FLOW_STRUCTURE_PROFILE_INFO_FIELD_IMAGE_LOADED] = BooleanValue(image_loaded);
+    }
 };
 
 typedef ArrayOf<ProfileInfoValue, FLOW_ARRAY_OF_STRUCTURE_PROFILE_INFO> ArrayOfProfileInfoValue;
@@ -375,6 +405,23 @@ struct UIFlagsValue {
     }
     void brew_confirm_visible(bool brew_confirm_visible) {
         value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_BREW_CONFIRM_VISIBLE] = BooleanValue(brew_confirm_visible);
+    }
+
+    bool chart_mode() { return value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_CHART_MODE].getBoolean(); }
+    void chart_mode(bool chart_mode) {
+        value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_CHART_MODE] = BooleanValue(chart_mode);
+    }
+
+    bool profile_details_visible() {
+        return value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_PROFILE_DETAILS_VISIBLE].getBoolean();
+    }
+    void profile_details_visible(bool profile_details_visible) {
+        value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_PROFILE_DETAILS_VISIBLE] = BooleanValue(profile_details_visible);
+    }
+
+    bool steam_active() { return value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_STEAM_ACTIVE].getBoolean(); }
+    void steam_active(bool steam_active) {
+        value.getArray()->values[FLOW_STRUCTURE_UI_FLAGS_FIELD_STEAM_ACTIVE] = BooleanValue(steam_active);
     }
 };
 
@@ -493,6 +540,21 @@ struct BrewProcessValue {
     void current_volume(float current_volume) {
         value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_CURRENT_VOLUME] = FloatValue(current_volume);
     }
+
+    float current_flow() { return value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_CURRENT_FLOW].getFloat(); }
+    void current_flow(float current_flow) {
+        value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_CURRENT_FLOW] = FloatValue(current_flow);
+    }
+
+    float shot_max_pressure() { return value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_SHOT_MAX_PRESSURE].getFloat(); }
+    void shot_max_pressure(float shot_max_pressure) {
+        value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_SHOT_MAX_PRESSURE] = FloatValue(shot_max_pressure);
+    }
+
+    float shot_avg_flow() { return value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_SHOT_AVG_FLOW].getFloat(); }
+    void shot_avg_flow(float shot_avg_flow) {
+        value.getArray()->values[FLOW_STRUCTURE_BREW_PROCESS_FIELD_SHOT_AVG_FLOW] = FloatValue(shot_avg_flow);
+    }
 };
 
 typedef ArrayOf<BrewProcessValue, FLOW_ARRAY_OF_STRUCTURE_BREW_PROCESS> ArrayOfBrewProcessValue;
@@ -569,6 +631,16 @@ struct WarningsValue {
     bool temperatureError() { return value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_TEMPERATURE_ERROR].getBoolean(); }
     void temperatureError(bool temperatureError) {
         value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_TEMPERATURE_ERROR] = BooleanValue(temperatureError);
+    }
+
+    bool cleanError() { return value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_CLEAN_ERROR].getBoolean(); }
+    void cleanError(bool cleanError) {
+        value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_CLEAN_ERROR] = BooleanValue(cleanError);
+    }
+
+    bool cleanWarn() { return value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_CLEAN_WARN].getBoolean(); }
+    void cleanWarn(bool cleanWarn) {
+        value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_CLEAN_WARN] = BooleanValue(cleanWarn);
     }
 
     const char *labels() { return value.getArray()->values[FLOW_STRUCTURE_WARNINGS_FIELD_LABELS].getString(); }

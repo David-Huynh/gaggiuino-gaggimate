@@ -32,12 +32,14 @@ struct DownloadPolicy {
 class ResumableDownloader {
   public:
     ResumableDownloader(HttpTransport &transport, DownloadEnv &env, std::string url, DownloadSink sink,
-                        download_progress_t progress = nullptr, DownloadPolicy policy = DownloadPolicy());
+                        download_progress_t progress = nullptr, DownloadPolicy policy = DownloadPolicy(),
+                        download_progress_t retrying = nullptr);
 
     bool run();
     size_t received() const { return _received; }
     size_t total() const { return _total; }
     int attempts() const { return _attempts; }
+    int lastStatus() const { return _lastStatus; }
     const std::string &etag() const { return _etag; }
 
     // Parses "bytes <start>-<end>/<total>"; false for anything else, including "bytes */<total>".
@@ -58,11 +60,13 @@ class ResumableDownloader {
     std::string _url;
     DownloadSink _sink;
     download_progress_t _progress;
+    download_progress_t _retrying;
     DownloadPolicy _policy;
     std::string _etag; // validator sent as If-Range, taken from the first full response
     size_t _received = 0;
     size_t _total = 0;
     int _attempts = 0;
+    int _lastStatus = 0;
     bool _progressed = false; // the current attempt delivered at least one new byte
     int _lastReported = -1;
 };

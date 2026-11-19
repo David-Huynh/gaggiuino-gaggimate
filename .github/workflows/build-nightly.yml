@@ -13,25 +13,28 @@ jobs:
   build:
     needs: ota-testbench
     runs-on: ubuntu-latest
+    # Holds RELEASE_SIGNING_KEY. The environment only admits master and v* tags, so no other branch or
+    # pull request can get at the key that devices trust.
+    environment: release-signing
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
           fetch-tags: true
           fetch-depth: 0
           submodules: 'recursive'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cache/pip
             ~/.platformio/.cache
           key: ${{ runner.os }}-pio
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - name: Install PlatformIO Core
         run: pip install --upgrade platformio
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: 'npm'
@@ -42,15 +45,14 @@ jobs:
           mkdir -p upload/display
           mkdir -p upload/headless
           mkdir -p upload/controller
-          git tag -d nightly || true
-          git tag -d db || true
-          version="$(git describe --tags --dirty --exclude nightly --exclude db 2>/dev/null || true)"
-          if [[ -z "$version" ]]; then
-            version="v1.8.${GITHUB_RUN_NUMBER}"
-          fi
+          version="$(python scripts/firmware_version.py)"
           echo "$version" > out/version.txt
+          echo "GAGGIMATE_BUILD_VERSION=$version" >> "$GITHUB_ENV"
       - name: Build Web
         run: ./scripts/build_webui.sh
+      - name: Package app web bundle
+        # Live update for the native app (web/src/app/updates.js), attached to the same release as the firmware.
+        run: BUNDLE_VERSION="$(cat out/version.txt)" web/scripts/package-app-bundle.sh out "nightly"
       - name: Build controller
         run: |
           export PLATFORMIO_BUILD_FLAGS="'-DNIGHTLY_BUILD'"
@@ -65,6 +67,7 @@ jobs:
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         with:
           channel: 'nightly'
           target: 'controller'
@@ -91,6 +94,7 @@ jobs:
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         with:
           channel: 'nightly'
           target: 'display'
@@ -110,6 +114,7 @@ jobs:
         env:
           UPDATE_SERVER_HOST: ${{ secrets.UPDATE_SERVER_HOST }}
           UPDATE_SERVER_API_KEY: ${{ secrets.UPDATE_SERVER_API_KEY }}
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
         with:
           channel: 'nightly'
           target: 'headless'
@@ -129,8 +134,12 @@ jobs:
           cp .pio/build/display-headless-uart-n16r8/firmware.bin out/display-headless-uart-n16r8-firmware.bin
           cp .pio/build/display-headless-uart-n16r8/partitions.bin out/display-headless-uart-n16r8-partitions.bin
           cp .pio/build/display-headless-uart-n16r8/bootloader.bin out/display-headless-uart-n16r8-bootloader.bin
+      - name: Build STM32 for manual installation
+        run: |
+          pio run -e stm32f4
+          cp .pio/build/stm32f4/firmware.bin out/stm32f4-firmware.bin
       - name: Archive Firmware Files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gaggimate-firmware
           path: "out/*"
@@ -143,14 +152,47 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
+          fetch-tags: true
           fetch-depth: 0
       - name: Download Firmware Files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: gaggimate-firmware
           path: release
+      - name: Generate changelog
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="$(cat release/version.txt)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          PREVIOUS="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name || true)"
+          {
+            echo "Nightly build **${VERSION}**, use the nightly channel in the UI to download this firmware."
+            echo
+          } > notes.md
+          if [ -z "${PREVIOUS}" ]; then
+            exit 0
+          fi
+          # Same generator the stable release uses; the nightly tag still points at the previous build, so name the new one.
+          if gh api --method POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${VERSION}" -f target_commitish="${GITHUB_SHA}" -f previous_tag_name="${PREVIOUS}" \
+              --jq .body > generated.md; then
+            sed "s#/compare/${PREVIOUS}\.\.\.${VERSION}#/compare/${PREVIOUS}...nightly#" generated.md >> notes.md
+          else
+            echo "Changelog generation failed, see the commit history since ${PREVIOUS}." >> notes.md
+          fi
+          # The generator only lists merged pull requests; add what was pushed to master directly.
+          COMMITS="$(git log "${PREVIOUS}..${GITHUB_SHA}" --no-merges --format='* %s (%h)' | grep -vE '\(#[0-9]+\) \([0-9a-f]+\)$' || true)"
+          if [ -n "${COMMITS}" ]; then
+            {
+              echo
+              echo "## Commits without a pull request"
+              echo "${COMMITS}"
+            } >> notes.md
+          fi
       - name: Move nightly tag
         run: |
           git config user.name "github-actions[bot]"
@@ -163,13 +205,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: nightly
-          name: 'Nightly Release $$'
+          name: 'Nightly Release ${{ steps.changelog.outputs.version }} ($$)'
           prerelease: true
-          body: 'Latest nightly release, use the nightly channel in the UI to download this firmware.'
+          body_path: notes.md
           files: |
             release/*
       - name: Deploy to GitHub Pages subdirectory
-        uses: peaceiris/actions-gh-pages@4f9cc6602d3f66b9c108549d475ec49e8ef4d45e
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./release

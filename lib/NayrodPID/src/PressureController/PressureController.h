@@ -7,7 +7,8 @@ static constexpr float M_PI = 3.14159265358979323846f;
 
 #include "SimpleKalmanFilter/SimpleKalmanFilter.h"
 #include <algorithm>
-#include <cmath>
+#include <cmath> // std::fmax (getCoffeeOutputEstimate())
+#include <memory>
 
 class PressureController {
   private:
@@ -23,7 +24,7 @@ class PressureController {
     void setFlowLimit(float lim) { /* Flow limit not currently implemented */ };
     void setPressureLimit(float lim) { /* Pressure limit not currently implemented */ };
 
-    void update(ControlMode mode);
+    void update(ControlMode mode, bool freshPressure = true, float sampleTime = 0.0f, float elapsed = 0.0f);
     void tare();
     void reset();
 
@@ -42,7 +43,8 @@ class PressureController {
   private:
     float getPumpDutyCycleForPressure();
     void virtualScale();
-    void filterSensor();
+    void filterSensor(float sampleTime);
+    bool _pressureInitialized = false;
     void filterSetpoint(float rawSetpoint);
     float pumpFlowModel(float alpha = 100.0f) const;
     float getAvailableFlow() const;
@@ -107,7 +109,7 @@ class PressureController {
     bool _puckState[3] = {};
     int _puckCounter = 0;
     float exportPumpFlowRate = 0.0f; // To disociate the exported value from the internal because of filtering (cosmetic) purpose
-    SimpleKalmanFilter *_pressureKalmanFilter;
+    std::unique_ptr<SimpleKalmanFilter> _pressureKalmanFilter;
 };
 
 #endif // PRESSURE_CONTROLLER_H

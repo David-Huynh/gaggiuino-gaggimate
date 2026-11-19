@@ -9,7 +9,9 @@ static constexpr const char *NVS_PEER_KEY = "peer";
 void BleClientTransport::init(const String &deviceName) {
     NimBLEDevice::init(deviceName.c_str());
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-    NimBLEDevice::setMTU(256);
+    NimBLEDevice::setMTU(BLE_MTU);
+    if (int rc = ble_gap_write_sugg_def_data_len(BLE_DLE_OCTETS, BLE_DLE_TIME_US); rc != 0)
+        ESP_LOGW(LOG_TAG, "Setting suggested data length failed: %d", rc);
     // Just Works bonding with LE Secure Connections, mirroring the controller.
     NimBLEDevice::setSecurityAuth(true, false, true);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
@@ -24,7 +26,27 @@ void BleClientTransport::init(const String &deviceName) {
     scan();
 }
 
+void BleClientTransport::setSearchEnabled(bool enabled) {
+    if (_searchEnabled == enabled)
+        return;
+    _searchEnabled = enabled;
+    ESP_LOGI(LOG_TAG, "Controller search %s", enabled ? "resumed" : "paused");
+    if (_client == nullptr || _scanner == nullptr)
+        return;
+    if (enabled) {
+        if (!_client->isConnected())
+            scan();
+        return;
+    }
+    _readyForConnection = false;
+    _haveServerAddress = false;
+    if (_scanner->isScanning())
+        _scanner->stop();
+}
+
 void BleClientTransport::scan() {
+    if (!_searchEnabled)
+        return;
     _readyForConnection = false;
     _scanner->clearDuplicateCache();
     _scanner->setAdvertisedDeviceCallbacks(this, true);
@@ -39,14 +61,14 @@ void BleClientTransport::scan() {
 void BleClientTransport::maintain() {
     if (_client == nullptr || _scanner == nullptr)
         return; // init() failed to create the client/scanner
-    if (!_readyForConnection && !_client->isConnected() && !_scanner->isScanning()) {
+    if (_searchEnabled && !_readyForConnection && !_client->isConnected() && !_scanner->isScanning()) {
         ESP_LOGI(LOG_TAG, "Scan stalled, restarting");
         scan();
     }
 }
 
 bool BleClientTransport::connectToServer() {
-    if (!_haveServerAddress)
+    if (!_haveServerAddress || !_searchEnabled)
         return false;
 
     ESP_LOGI(LOG_TAG, "Connecting to advertised device");
@@ -83,6 +105,10 @@ bool BleClientTransport::connectToServer() {
         }
     }
 
+    // ATT MTU does not enlarge link-layer packets. Request DLE on the machine
+    // link so telemetry needs fewer radio fragments when a BLE scale is also connected.
+    _client->setDataLen(BLE_DLE_OCTETS);
+
     NimBLERemoteService *service = _client->getService(NimBLEUUID(gm_proto::SERVICE_UUID));
     if (service == nullptr) {
         ESP_LOGE(LOG_TAG, "Service not found");
@@ -93,6 +119,13 @@ bool BleClientTransport::connectToServer() {
 
     _writeChar = service->getCharacteristic(NimBLEUUID(gm_proto::RX_CHAR_UUID));
     _notifyChar = service->getCharacteristic(NimBLEUUID(gm_proto::TX_CHAR_UUID));
+    // A link that dropped mid-discovery also yields no characteristics; that is not an old controller.
+    if (!_client->isConnected()) {
+        ESP_LOGW(LOG_TAG, "Link dropped during discovery, waiting for rescan");
+        _writeChar = nullptr;
+        _notifyChar = nullptr;
+        return false;
+    }
     if (_writeChar == nullptr || _notifyChar == nullptr) {
         // Missing comms chars -> old/incompatible firmware; keep the link up so the separate OTA service stays reachable.
         ESP_LOGW(LOG_TAG, "Comms characteristics missing -- incompatible controller firmware (OTA only)");
@@ -117,6 +150,22 @@ bool BleClientTransport::connectToServer() {
         ESP_LOGE(LOG_TAG, "Failed to subscribe to TX characteristic");
         _client->disconnect();
         scan();
+        return false;
+    }
+
+    // NimBLE 1.4 reports a subscribe as successful when the CCCD lookup failed because the link dropped mid-discovery;
+    // onDisconnect already emitted the drop and restarted the scan, so don't follow it with a stale connect.
+    if (!_client->isConnected()) {
+        ESP_LOGW(LOG_TAG, "Link dropped during setup, waiting for rescan");
+        _writeChar = nullptr;
+        _notifyChar = nullptr;
+        return false;
+    }
+
+    // Another link won the race while we were connecting; hand the radio back.
+    if (!_searchEnabled) {
+        ESP_LOGI(LOG_TAG, "Search paused during setup, dropping the BLE link");
+        _client->disconnect();
         return false;
     }
 
@@ -193,10 +242,48 @@ void BleClientTransport::setLowLatency(bool active) {
 void BleClientTransport::applyConnParams() {
     if (_client == nullptr || !_client->isConnected())
         return;
-    if (_lowLatency)
-        _client->updateConnParams(ACTIVE_MIN_INTERVAL, ACTIVE_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT);
+    if (!_lowLatency) {
+        requestConnParams(IDLE_MIN_INTERVAL, IDLE_MAX_INTERVAL);
+        return;
+    }
+    // Walk down the rungs while the controller answers "invalid parameters"; any other error ends the attempt.
+    for (const auto &rung : ACTIVE_RUNGS) {
+        const int rc = requestConnParams(rung[0], rung[1]);
+        if (rc == 0)
+            return;
+        if (rc != BLE_HS_HCI_ERR(BLE_ERR_INV_HCI_CMD_PARMS))
+            return;
+    }
+    ESP_LOGE(LOG_TAG, "No active interval accepted, link stays at its current interval");
+    logOtherLinks();
+}
+
+// Returns NimBLE's rc; 0 only means the request was accepted, the result arrives as a CONN_UPDATE event.
+int BleClientTransport::requestConnParams(uint16_t minInterval, uint16_t maxInterval) {
+    ble_gap_upd_params params;
+    params.itvl_min = minInterval;
+    params.itvl_max = maxInterval;
+    params.latency = CONN_LATENCY;
+    params.supervision_timeout = CONN_TIMEOUT;
+    params.min_ce_len = BLE_GAP_INITIAL_CONN_MIN_CE_LEN;
+    params.max_ce_len = BLE_GAP_INITIAL_CONN_MAX_CE_LEN;
+    const int rc = ble_gap_update_params(_client->getConnId(), &params);
+    if (rc == 0)
+        ESP_LOGI(LOG_TAG, "Requested %.2f-%.2f ms connection interval", minInterval * 1.25f, maxInterval * 1.25f);
     else
-        _client->updateConnParams(IDLE_MIN_INTERVAL, IDLE_MAX_INTERVAL, CONN_LATENCY, CONN_TIMEOUT);
+        ESP_LOGW(LOG_TAG, "Interval %.2f-%.2f ms refused, rc=%d", minInterval * 1.25f, maxInterval * 1.25f, rc);
+    return rc;
+}
+
+// The other links (scales) decide what the radio still has room for; log their parameters next to a refusal.
+void BleClientTransport::logOtherLinks() const {
+    for (uint16_t handle = 0; handle < CONFIG_BT_NIMBLE_MAX_CONNECTIONS; handle++) {
+        ble_gap_conn_desc desc;
+        if (handle == _client->getConnId() || ble_gap_conn_find(handle, &desc) != 0)
+            continue;
+        ESP_LOGW(LOG_TAG, "Other link %u: interval %u ms, latency %u, timeout %u ms", handle, desc.conn_itvl * 5 / 4,
+                 desc.conn_latency, desc.supervision_timeout * 10);
+    }
 }
 
 bool BleClientTransport::send(const uint8_t *data, size_t length) {
@@ -217,6 +304,8 @@ bool BleClientTransport::isEncrypted() const {
 }
 
 void BleClientTransport::onResult(NimBLEAdvertisedDevice *advertisedDevice) {
+    if (!_searchEnabled)
+        return;
     if (_havePairedPeer) {
         // Our controller advertises directed PDUs, which carry no payload -- match on address alone.
         if (advertisedDevice->getAddress() != _pairedPeer)
@@ -236,9 +325,9 @@ void BleClientTransport::onResult(NimBLEAdvertisedDevice *advertisedDevice) {
         }
     }
     ESP_LOGI(LOG_TAG, "Found controller, ready to connect");
-    _scanner->stop();
     // Value-copy the address now -- the device object is freed when this callback returns (see header note).
     _serverAddress = advertisedDevice->getAddress();
+    _scanner->stop();
     _haveServerAddress = true;
     _readyForConnection = true;
 }

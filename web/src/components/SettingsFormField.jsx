@@ -4,11 +4,13 @@ import { faChevronDown } from '@fortawesome/free-solid-svg-icons/faChevronDown';
 import { faChevronUp } from '@fortawesome/free-solid-svg-icons/faChevronUp';
 import { faLock } from '@fortawesome/free-solid-svg-icons/faLock';
 import { faXmark } from '@fortawesome/free-solid-svg-icons/faXmark';
+import { Trans } from '@lingui/react/macro';
 
 export function SettingsFormField({
   label,
   htmlFor,
   helpText,
+  error,
   children,
   className = '',
   noMargin = false,
@@ -20,6 +22,11 @@ export function SettingsFormField({
       </label>
       {children}
       {helpText && <div className='mt-1 text-xs opacity-70'>{helpText}</div>}
+      {error && (
+        <div id={`${htmlFor}-error`} role='alert' className='text-error mt-1 text-xs'>
+          {error}
+        </div>
+      )}
     </div>
   );
 }
@@ -53,7 +60,8 @@ export function ToggleField({ label, htmlFor, checked, onChange, helpText }) {
   return (
     <div className='form-control'>
       <label htmlFor={htmlFor} className='label cursor-pointer'>
-        <span className='label-text text-sm font-medium'>{label}</span>
+        {/* Explicit color: older WebViews resolve daisyUI's color-mix(currentColor) label color to transparent. */}
+        <span className='label-text text-base-content text-sm font-medium'>{label}</span>
         <input
           id={htmlFor}
           name={htmlFor}
@@ -132,7 +140,7 @@ export function SortableConfigurator({
     <div className='grid grid-cols-2 gap-3'>
       <div>
         <div className='mb-2 text-xs font-semibold tracking-wider uppercase opacity-50'>
-          Visible
+          <Trans>Visible</Trans>
         </div>
         <div
           className={`flex flex-col gap-1 rounded-lg transition-all duration-200${draggingSource === 'available' ? 'bg-primary/5 ring-primary/40 ring-1' : ''}`}
@@ -235,7 +243,7 @@ export function SortableConfigurator({
 
       <div>
         <div className='mb-2 text-xs font-semibold tracking-wider uppercase opacity-50'>
-          Hidden / Available
+          <Trans>Hidden / Available</Trans>
         </div>
         <div className='flex flex-col gap-1'>
           {hidden.map(def => (
@@ -253,7 +261,7 @@ export function SortableConfigurator({
                 onClick={() => add(def.id)}
                 className='btn btn-ghost btn-xs border-base-content/20 border text-xs'
               >
-                + Add
+                + <Trans>Add</Trans>
               </button>
             </div>
           ))}

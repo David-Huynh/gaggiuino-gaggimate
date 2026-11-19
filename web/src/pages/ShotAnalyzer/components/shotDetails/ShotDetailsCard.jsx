@@ -1,14 +1,16 @@
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { Trans, useLingui } from '@lingui/react/macro';
 import { faGears } from '@fortawesome/free-solid-svg-icons/faGears';
 import { faTag } from '@fortawesome/free-solid-svg-icons/faTag';
 import { faPenToSquare } from '@fortawesome/free-solid-svg-icons/faPenToSquare';
 import { faYinYang } from '@fortawesome/free-solid-svg-icons/faYinYang';
 import { faWeightScale } from '@fortawesome/free-solid-svg-icons/faWeightScale';
+import { faDivide } from '@fortawesome/free-solid-svg-icons/faDivide';
 import { CardTitle } from '../../../../components/CardTitle';
 import { TASTE_TAG_GROUPS } from '../../../../utils/tasteTags.js';
+import { useShotNotesState } from '../useShotNotesState';
 import { ShotMainInfoCard } from './ShotMainInfoCard';
 import { MetricValueGrid } from './ShotMetricCards';
-import { ShotRatioCard, useRatioCardState } from './ShotRatioCard';
 
 const fieldLabelClass =
   'text-base-content/55 mb-0.5 flex items-center gap-1.5 text-xs leading-tight font-medium';
@@ -16,6 +18,29 @@ const inputClass =
   'border-base-content/10 bg-base-100/80 text-base-content input input-xs min-h-8 w-full rounded-md text-xs lg:min-h-7 xl:min-h-8';
 const textareaClass =
   'border-base-content/10 bg-base-100/80 text-base-content textarea textarea-bordered textarea-xs min-h-[5rem] w-full rounded-md !text-xs leading-relaxed lg:min-h-[4rem] xl:min-h-[5rem]';
+const EMPTY_DOSE_DEFAULTS = {
+  doseIn: 18,
+  doseOut: 36,
+};
+
+function initializeEmptyDoseStepper(event, fallbackValue) {
+  const input = event.currentTarget;
+  if (input.value !== '') return;
+
+  const bounds = input.getBoundingClientRect();
+  const stepperWidth = Math.min(24, bounds.width);
+  if (event.clientX < bounds.right - stepperWidth) return;
+
+  const isIncrement = event.clientY < bounds.top + bounds.height / 2;
+  input.value = (fallbackValue + (isIncrement ? -0.1 : 0.1)).toFixed(1);
+}
+
+function initializeEmptyDoseKeyboardStepper(event, fallbackValue) {
+  const input = event.currentTarget;
+  if (input.value !== '' || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+
+  input.value = (fallbackValue + (event.key === 'ArrowUp' ? -0.1 : 0.1)).toFixed(1);
+}
 
 function DetailField({ icon, label, children, className = '', action = null }) {
   return (
@@ -33,25 +58,11 @@ function DetailField({ icon, label, children, className = '', action = null }) {
 }
 
 export function ShotDetailsCard({ entry, isCompare }) {
-  const {
-    flushSave,
-    handleFieldChange,
-    handleRatioCommit,
-    loading,
-    notes,
-    isEditingRatio,
-    sliderRatio,
-    sliderTouched,
-    updateAndSave,
-    setIsEditingRatio,
-    setSliderRatio,
-    setSliderTouched,
-  } = useRatioCardState({
+  const { t } = useLingui();
+  const { flushSave, handleFieldChange, loading, notes, updateAndSave } = useShotNotesState({
     currentShot: entry.shot,
-    entryKey: entry.key,
   });
   const duplicateMobileSummaryClass = isCompare ? '' : 'hidden lg:flex';
-  const duplicateMobileRatioClass = isCompare ? '' : 'hidden sm:flex';
   const duplicateMobileMetricsClass = isCompare ? 'hidden lg:block' : 'hidden sm:block';
   const toggleTasteTag = tag => {
     const selected = new Set(notes.tasteTags || []);
@@ -71,29 +82,11 @@ export function ShotDetailsCard({ entry, isCompare }) {
         className={duplicateMobileSummaryClass || 'flex'}
       />
 
-      <ShotRatioCard
-        notes={notes}
-        isEditingRatio={isEditingRatio}
-        sliderRatio={sliderRatio}
-        sliderTouched={sliderTouched}
-        onSliderInput={value => {
-          setSliderRatio(value);
-          if (!sliderTouched) setSliderTouched(true);
-        }}
-        onSliderActivate={() => {
-          if (!sliderTouched) setSliderTouched(true);
-        }}
-        onRatioCommit={handleRatioCommit}
-        onEditRatio={() => {
-          setSliderTouched(true);
-          setIsEditingRatio(true);
-        }}
-        className={duplicateMobileRatioClass}
-      />
-
       <div className={duplicateMobileMetricsClass}>
         <div className='app-card-surface min-w-0 flex-col rounded-xl p-3 lg:p-2.5 xl:p-3'>
-          <CardTitle className='mb-3'>Shot Metrics</CardTitle>
+          <CardTitle className='mb-3'>
+            <Trans>Shot Metrics</Trans>
+          </CardTitle>
           <MetricValueGrid
             total={entry.results?.total}
             excludeKeys={['duration', 'w', 'tt']}
@@ -103,31 +96,52 @@ export function ShotDetailsCard({ entry, isCompare }) {
       </div>
 
       <div className='app-card-surface flex flex-1 flex-col gap-3 rounded-xl p-3 lg:p-2.5 xl:p-3'>
-        <CardTitle>Shot Notes</CardTitle>
+        <CardTitle>
+          <Trans>Shot Notes</Trans>
+        </CardTitle>
         <div className='grid grid-cols-2 gap-3'>
-          <DetailField icon={faWeightScale} label='Dose In'>
+          <DetailField icon={faWeightScale} label={t`Dose In`}>
             <input
               type='number'
               step='0.1'
               className={inputClass}
               value={notes.doseIn || ''}
+              onPointerDown={event => initializeEmptyDoseStepper(event, EMPTY_DOSE_DEFAULTS.doseIn)}
+              onKeyDown={event =>
+                initializeEmptyDoseKeyboardStepper(event, EMPTY_DOSE_DEFAULTS.doseIn)
+              }
               onInput={event => handleFieldChange('doseIn', event.target.value)}
               onBlur={flushSave}
               placeholder='18.0'
             />
           </DetailField>
-          <DetailField icon={faWeightScale} label='Dose Out'>
+          <DetailField icon={faWeightScale} label={t`Dose Out`}>
             <input
               type='number'
               step='0.1'
               className={inputClass}
               value={notes.doseOut || ''}
+              onPointerDown={event =>
+                initializeEmptyDoseStepper(event, EMPTY_DOSE_DEFAULTS.doseOut)
+              }
+              onKeyDown={event =>
+                initializeEmptyDoseKeyboardStepper(event, EMPTY_DOSE_DEFAULTS.doseOut)
+              }
               onInput={event => handleFieldChange('doseOut', event.target.value)}
               onBlur={flushSave}
               placeholder='36.0'
             />
           </DetailField>
-          <DetailField icon={faGears} label='Grind' className='col-span-2'>
+          <DetailField icon={faDivide} label={t`Ratio`} className='col-span-2'>
+            <input
+              type='text'
+              readOnly
+              aria-label={t`Ratio`}
+              className={`${inputClass} bg-base-200/50 text-base-content/70 cursor-default`}
+              value={notes.ratio ? `1:${notes.ratio}` : '—'}
+            />
+          </DetailField>
+          <DetailField icon={faGears} label={t`Grind`} className='col-span-2'>
             <input
               type='text'
               className={inputClass}
@@ -137,14 +151,14 @@ export function ShotDetailsCard({ entry, isCompare }) {
               placeholder='2.5'
             />
           </DetailField>
-          <DetailField icon={faTag} label='Beans' className='col-span-2'>
+          <DetailField icon={faTag} label={t`Beans`} className='col-span-2'>
             <input
               type='text'
               className={inputClass}
               value={notes.beanType || ''}
               onInput={event => handleFieldChange('beanType', event.target.value)}
               onBlur={flushSave}
-              placeholder='Single Origin, Blend...'
+              placeholder={t`Single Origin, Blend...`}
             />
           </DetailField>
           <DetailField icon={faYinYang} label='Taste Tags' className='col-span-2'>
@@ -177,7 +191,7 @@ export function ShotDetailsCard({ entry, isCompare }) {
         </div>
         <DetailField
           icon={faPenToSquare}
-          label='Notes'
+          label={t`Notes`}
           className='flex min-h-0 flex-1 flex-col'
           action={
             <span className='text-base-content/45 text-xs'>{(notes.notes || '').length}/200</span>
@@ -189,7 +203,7 @@ export function ShotDetailsCard({ entry, isCompare }) {
             maxLength={200}
             onInput={event => handleFieldChange('notes', event.target.value)}
             onBlur={flushSave}
-            placeholder='Tasting notes, brewing observations...'
+            placeholder={t`Tasting notes, brewing observations...`}
           />
         </DetailField>
       </div>

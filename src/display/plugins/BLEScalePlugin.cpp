@@ -187,6 +187,9 @@ void BLEScalePlugin::setup(Controller *controller, PluginManager *manager) {
 }
 
 void BLEScalePlugin::loop() {
+    if (forgetRequested.exchange(false)) {
+        disconnect();
+    }
     if (brewSlot.doConnect && brewSlot.scale == nullptr) {
         establishConnection(ScaleRole::BREW);
     }
@@ -295,6 +298,14 @@ void BLEScalePlugin::scan() const {
         return;
     }
     scanner->initializeAsyncScan();
+}
+
+void BLEScalePlugin::forget() {
+    controller->getSettings().setSavedScale("");
+    controller->getSettings().setSavedBrewScale("");
+    controller->getSettings().setSavedGrindScale("");
+    controller->getSettings().setSavedScaleName("");
+    forgetRequested.store(true);
 }
 
 void BLEScalePlugin::disconnect() {

@@ -11,6 +11,12 @@
 // The .slog encoding, chunked writes and recovery use the real method unchanged.
 class ShotHistoryPlugin {
   public:
+    struct Controller {
+        int clearedBefore = 0;
+        const Controller &getSettings() const { return *this; }
+        int getHistoryClearedBefore() const { return clearedBefore; }
+    } machine;
+    Controller *controller = &machine;
     MemoryFS *fs = &LittleFS;
     std::map<uint32_t, ShotIndexEntry> index;
     String savedNotes;

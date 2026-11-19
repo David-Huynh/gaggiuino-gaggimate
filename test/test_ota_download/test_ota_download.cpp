@@ -6,10 +6,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "ResumableDownloader.cpp"
+#include "semver.c"
+#include "semver_extensions.cpp"
 #include "asset_gen.h"
 
 enum class Fault { NONE, CONNECT_FAIL, STATUS, DROP_AFTER, STALL_AFTER, IGNORE_RANGE, BAD_RANGE, SWAP_ASSET, OVERSEND };
@@ -137,7 +140,7 @@ class FakeTransport : public HttpTransport {
         }
         return "";
     }
-    void end() override {}
+    void end() override { /* fake holds no connection */ }
 
   private:
     AttemptLog &current() { return attempts.back(); }
@@ -164,8 +167,12 @@ struct FakeEnv : public DownloadEnv {
         networkWaits++;
         return true;
     }
-    uint8_t *allocBuffer(size_t size) override { return failAlloc ? nullptr : static_cast<uint8_t *>(malloc(size)); }
-    void freeBuffer(uint8_t *buffer) override { free(buffer); }
+    std::unique_ptr<uint8_t[]> buffer;
+    uint8_t *allocBuffer(size_t size) override {
+        buffer = failAlloc ? nullptr : std::make_unique<uint8_t[]>(size);
+        return buffer.get();
+    }
+    void freeBuffer(uint8_t *) override { buffer.reset(); }
 };
 
 struct MemorySink {
@@ -204,15 +211,20 @@ struct Rig {
     FakeEnv env;
     MemorySink sink;
     std::vector<size_t> progress;
+    std::vector<size_t> retriedOffsets;
     bool result = false;
     int attempts = 0;
+    int lastStatus = 0;
     std::string etag;
 
     bool run() {
         ResumableDownloader downloader(transport, env, "https://github.com/x/releases/latest/download/fake.bin", sink.sink(),
-                                       [this](size_t received, size_t) { progress.push_back(received); });
+                                       [this](size_t received, size_t) { progress.push_back(received); },
+                                       DownloadPolicy(),
+                                       [this](size_t received, size_t) { retriedOffsets.push_back(received); });
         result = downloader.run();
         attempts = downloader.attempts();
+        lastStatus = downloader.lastStatus();
         etag = downloader.etag();
         return result;
     }
@@ -230,8 +242,8 @@ struct Rig {
     }
 };
 
-void setUp() {}
-void tearDown() {}
+void setUp() { /* no shared fixture state */ }
+void tearDown() { /* no shared fixture state */ }
 
 void test_clean_download_single_attempt() {
     Rig rig;
@@ -264,12 +276,15 @@ void test_drop_resumes_with_range_and_if_range() {
 
 void test_stall_resumes() {
     Rig rig;
-    rig.transport.faults[1] = {Fault::STALL_AFTER, 50000};
+    rig.transport.faults[1] = {Fault::STALL_AFTER, 21000};
     rig.transport.faults[2] = {Fault::STALL_AFTER, 200000};
     TEST_ASSERT_TRUE(rig.run());
     TEST_ASSERT_EQUAL(3, rig.attempts);
     rig.expectAsset();
     TEST_ASSERT_EQUAL(206, rig.transport.attempts[2].status);
+    TEST_ASSERT_EQUAL(2, rig.retriedOffsets.size());
+    TEST_ASSERT_TRUE(rig.retriedOffsets[0] >= 21000 && rig.retriedOffsets[0] < 21000 + 4096);
+    TEST_ASSERT_TRUE(rig.retriedOffsets[1] >= 200000 && rig.retriedOffsets[1] < 200000 + 4096);
 }
 
 void test_transient_status_retries_then_succeeds() {
@@ -288,6 +303,8 @@ void test_client_error_is_fatal() {
     Rig rig;
     rig.transport.faults[1] = {Fault::STATUS, 0, 404};
     TEST_ASSERT_FALSE(rig.run());
+    TEST_ASSERT_EQUAL(404, rig.lastStatus);
+    TEST_ASSERT_TRUE(rig.retriedOffsets.empty());
     TEST_ASSERT_EQUAL(1, rig.attempts);
     TEST_ASSERT_EQUAL(0, rig.env.delays.size());
     TEST_ASSERT_EQUAL(0, rig.sink.data.size());
@@ -495,11 +512,33 @@ void test_parse_content_range() {
     TEST_ASSERT_FALSE(ResumableDownloader::parseContentRange("items 1-2/3", start, total));
 }
 
+void test_fork_release_versions() {
+    semver_t installed{}, latest{};
+    TEST_ASSERT_TRUE(parseFirmwareVersion("v1.8.36", installed));
+    TEST_ASSERT_TRUE(parseFirmwareVersion("v1.9.0-nightly.37", latest));
+    TEST_ASSERT_TRUE(semver_gt(latest, installed));
+    TEST_ASSERT_TRUE(parseFirmwareVersion("v1.8.1-214-g4f30e15f-dirty", installed));
+    TEST_ASSERT_TRUE(semver_gt(latest, installed));
+    TEST_ASSERT_TRUE(parseFirmwareVersion("1.9.0-nightly.9", installed));
+    TEST_ASSERT_TRUE(semver_gt(latest, installed));
+    TEST_ASSERT_FALSE(parseFirmwareVersion("v1.9", latest));
+    TEST_ASSERT_FALSE(parseFirmwareVersion("v1.9.0.4", latest));
+    TEST_ASSERT_FALSE(parseFirmwareVersion("v1.9.0+", latest));
+    TEST_ASSERT_FALSE(parseFirmwareVersion("v1.9.4000000000", latest));
+    TEST_ASSERT_FALSE(parseFirmwareVersion("v1.9.0/nightly", latest));
+    TEST_ASSERT_TRUE(semver_gt(latest, installed)); // Failed parsing leaves the prior value intact.
+    TEST_ASSERT_TRUE(parseFirmwareVersion("v1.9.0-nightly.37+build", installed));
+    TEST_ASSERT_TRUE(semver_eq(latest, installed));
+    semver_free(&latest);
+    semver_free(&installed);
+}
+
 int main() {
     UNITY_BEGIN();
     RUN_TEST(test_clean_download_single_attempt);
     RUN_TEST(test_drop_resumes_with_range_and_if_range);
     RUN_TEST(test_stall_resumes);
+    RUN_TEST(test_fork_release_versions);
     RUN_TEST(test_transient_status_retries_then_succeeds);
     RUN_TEST(test_client_error_is_fatal);
     RUN_TEST(test_asset_swap_restarts_from_zero);

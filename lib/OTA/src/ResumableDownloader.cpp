@@ -4,12 +4,12 @@
 #include <cstdio>
 #include <utility>
 
-static const char *TAG = "ResumableDownloader";
+static constexpr const char *TAG = "ResumableDownloader";
 
 ResumableDownloader::ResumableDownloader(HttpTransport &transport, DownloadEnv &env, std::string url, DownloadSink sink,
-                                         download_progress_t progress, DownloadPolicy policy)
+                                         download_progress_t progress, DownloadPolicy policy, download_progress_t retrying)
     : _transport(transport), _env(env), _url(std::move(url)), _sink(std::move(sink)), _progress(std::move(progress)),
-      _policy(policy) {}
+      _retrying(std::move(retrying)), _policy(policy) {}
 
 bool ResumableDownloader::run() {
     uint8_t *buffer = _env.allocBuffer(_policy.chunkSize);
@@ -22,6 +22,7 @@ bool ResumableDownloader::run() {
     int withoutProgress = 0;
     for (_attempts = 1; _attempts <= _policy.maxTotalAttempts; _attempts++) {
         _progressed = false;
+        _lastStatus = 0;
         Outcome outcome = runAttempt(buffer);
         if (outcome == Outcome::DONE) {
             ok = true;
@@ -40,6 +41,8 @@ bool ResumableDownloader::run() {
         if (withoutProgress >= _policy.maxAttempts || _attempts == _policy.maxTotalAttempts) {
             break;
         }
+        if (_retrying)
+            _retrying(_received, _total);
         OTA_LOGW(TAG, "Attempt %d failed at %u/%u bytes (%d without progress), retrying in %u ms", _attempts,
                  static_cast<unsigned>(_received), static_cast<unsigned>(_total), withoutProgress,
                  static_cast<unsigned>(backoffMs));
@@ -102,6 +105,7 @@ bool ResumableDownloader::openWithRedirects(int &status, int &contentLength) {
 }
 
 ResumableDownloader::Outcome ResumableDownloader::consumeResponse(int status, int contentLength, uint8_t *buffer) {
+    _lastStatus = status;
     OTA_LOGI(TAG, "HTTP %d, content length %d, offset %u", status, contentLength, static_cast<unsigned>(_received));
     if (status == 200) {
         // A full body on a resume means the asset changed (If-Range mismatch) or Range was ignored.

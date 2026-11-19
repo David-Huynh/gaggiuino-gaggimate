@@ -1,3 +1,4 @@
+#if defined(ARDUINO_ARCH_STM32)
 #ifndef LEDCONTROLLER_H
 #define LEDCONTROLLER_H
 
@@ -21,3 +22,47 @@ class LedController {
 };
 
 #endif // LEDCONTROLLER_H
+
+#else
+#ifndef LEDCONTROLLER_H
+#define LEDCONTROLLER_H
+
+#include "SoftWireBus.h"
+#include <Arduino.h>
+#include <PCA9634/PCA9634.h>
+#include <memory>
+
+class LedController {
+  public:
+    explicit LedController(SoftWireBus *bus);
+    void setup();
+    bool isAvailable();
+    void setChannel(uint8_t channel, uint8_t brightness);
+    void disable();
+    // Detects a PCA9634 that lost its config and re-initialises it with the last commanded values.
+    void healthCheck();
+
+  private:
+    static constexpr uint8_t CHANNEL_COUNT = 8;
+
+    bool initialize();
+    bool recover();
+    // Bus-level helpers below expect the caller to hold the bus lock.
+    bool applyEnabledState();
+    bool applyDisabledState();
+    bool writeChannel(uint8_t channel);
+    bool isChannelOff(uint8_t channel) const;
+    bool allChannelsOff() const;
+    static bool isHeldLowChannel(uint8_t channel) { return channel == 4 || channel == 5; }
+
+    SoftWireBus *bus;
+    std::unique_ptr<PCA9634> pca9634;
+    bool initialized = false;
+    bool healthy = true;
+    bool outputsEnabled = false;
+    uint8_t channels[CHANNEL_COUNT] = {0, 0, 0, 0, 0xFF, 0xFF, 0, 0};
+};
+
+#endif // LEDCONTROLLER_H
+
+#endif

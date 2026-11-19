@@ -1,5 +1,7 @@
+import { resolveProfilePhaseIndices } from './profilePhases.js';
 /** Orchestrates full-shot aggregation while delegating phase-level decisions. */
 
+import { t } from '@lingui/core/macro';
 import {
   analyzerDebug,
   createDelayTotals,
@@ -7,6 +9,7 @@ import {
   isAnalyzerDebugEnabled,
 } from './delayTracking';
 import { getMetricStats } from './metricStats';
+import { getLiquidResistanceStats, getNativePuckResistanceStats } from './puckResistance';
 import { analyzeExecutedPhase } from './phaseAnalysis';
 import { getSlowSampleIntervalSummary } from './sampleIntervals';
 import { mergeSkippedProfilePhases } from './skippedPhases';
@@ -16,12 +19,12 @@ import {
   buildRecordedExitReasonByPhase,
   getBrewCompletionLabel,
   getBrewModeLabel,
-  getPhaseExitReasonMeta,
+  getPhaseExitReasonLabel,
   isSafetyExitReason,
   normalizePhaseExitReasonCode,
 } from './exitReasons.js';
 
-const CONFIGURED_SCALE_DELAY_WARNING_THRESHOLD_MS = 1200;
+const CONFIGURED_SCALE_DELAY_WARNING_THRESHOLD_MS = 1400;
 
 function buildPhaseNameMap(phaseTransitions = []) {
   const transitions = Array.isArray(phaseTransitions) ? phaseTransitions : [];
@@ -60,7 +63,9 @@ function applySkippedPhaseSystemStats(analyzedPhases, brewModeLabel, configuredS
   analyzedPhases.forEach(phase => {
     if (!phase.skipped) return;
     phase.stats.sys_brew_mode = brewModeLabel;
-    phase.stats.sys_recorded_stop_reason = 'Not recorded';
+    phase.stats.sys_recorded_stop_reason = phase.exit?.code
+      ? getPhaseExitReasonLabel(phase.exit.code)
+      : t`Not recorded`;
     phase.stats.sys_scale_delay = configuredScaleDelayMs;
   });
 }
@@ -105,6 +110,24 @@ function getDelayReviewSummary(analyzedPhases) {
   };
 }
 
+/** Converts ratio targets to grams using the shot's dose (notes, then profile); without a dose the firmware skips them too. */
+function resolveRatioTargets(profileData, shotData) {
+  if (!profileData?.phases?.some(phase => phase.targets?.some(t => t.type === 'ratio')))
+    return profileData;
+
+  const dose = Number.parseFloat(shotData.notes?.doseIn) || Number(profileData.dose) || 0;
+  return {
+    ...profileData,
+    phases: profileData.phases.map(phase => ({
+      ...phase,
+      targets: (phase.targets || []).flatMap(target => {
+        if (target.type !== 'ratio') return [target];
+        return dose > 0 ? [{ ...target, value: target.value * dose, ratio: target.value }] : [];
+      }),
+    })),
+  };
+}
+
 /**
  * Main Analysis Function
  * Calculates all metrics for a shot with optional profile comparison
@@ -116,11 +139,12 @@ function getDelayReviewSummary(analyzedPhases) {
  * @param {boolean} settings.isAutoAdjusted - Whether delay was auto-detected
  * @returns {Object} Analysis results with phases and totals
  */
-export function calculateShotMetrics(shotData, profileData, settings) {
+export function calculateShotMetrics(shotData, rawProfileData, settings) {
   // Defensive guard: ensure valid shot data with samples
   if (!shotData || !Array.isArray(shotData.samples) || shotData.samples.length === 0) {
-    return { phases: [], warnings: ['No sample data available for analysis.'] };
+    return { phases: [], warnings: [t`No sample data available for analysis.`] };
   }
+  const profileData = resolveRatioTargets(rawProfileData, shotData);
 
   const { scaleDelayMs, sensorDelayMs, isAutoAdjusted } = settings;
   const debugEnabled = isAnalyzerDebugEnabled();
@@ -134,6 +158,11 @@ export function calculateShotMetrics(shotData, profileData, settings) {
 
   const sortedPhaseKeys = Object.keys(phases).sort((a, b) => a - b);
   const lastPhaseKey = sortedPhaseKeys.at(-1);
+  const profilePhaseIndices = resolveProfilePhaseIndices(
+    sortedPhaseKeys,
+    new Map(Object.entries(phaseNameMap).map(([number, name]) => [Number(number), name])),
+    profileData,
+  );
   const recordedExitReasonByPhase = buildRecordedExitReasonByPhase(shotData);
 
   // --- 2. BREW MODE DETECTION ---
@@ -142,7 +171,7 @@ export function calculateShotMetrics(shotData, profileData, settings) {
   const brewModeLabel = getBrewModeLabel(isBrewByWeight);
   const configuredScaleDelayMs = Math.max(0, Number(shotData.brewDelay) || 0);
   const finalExitReasonCode = normalizePhaseExitReasonCode(shotData.finalExitReason);
-  const finalExitReasonLabel = getPhaseExitReasonMeta(finalExitReasonCode).label;
+  const finalExitReasonLabel = getPhaseExitReasonLabel(finalExitReasonCode);
 
   let globalScaleLost = false;
   if (isBrewByWeight) {
@@ -151,7 +180,10 @@ export function calculateShotMetrics(shotData, profileData, settings) {
   const { hasSlowSampleInterval, maxSampleIntervalMs } = getSlowSampleIntervalSummary(gSamples);
 
   // --- 3. GLOBAL TOTALS ---
-  const gDuration = (gSamples.at(-1).t - gSamples[0].t) / 1000;
+  // The first extended sample marks the start of post-stop recording.
+  const brewEndSample =
+    gSamples.find(sample => sample.systemInfo?.extendedRecording) || gSamples.at(-1);
+  const gDuration = (brewEndSample.t - gSamples[0].t) / 1000;
   const gWater = calculatePumpedWater(gSamples, gSamples.length - 1, null, pumpedWaterSource);
   const gWeightSamples = getFinalWeightSamples(gSamples);
   const gWeight = (getFinalWeightSample(gSamples) || gSamples.at(-1)).v;
@@ -172,6 +204,7 @@ export function calculateShotMetrics(shotData, profileData, settings) {
       lastPhaseKey,
       phaseNameMap,
       phaseNum,
+      profilePhaseIndex: profilePhaseIndices.get(phaseNum) ?? null,
       phases,
       profileData,
       pumpedWaterSource,
@@ -193,7 +226,13 @@ export function calculateShotMetrics(shotData, profileData, settings) {
   );
 
   // --- 4b. DETECT SKIPPED PHASES (phases defined in profile but absent from shot) ---
-  mergeSkippedProfilePhases({ analyzedPhases, phases, profileData });
+  mergeSkippedProfilePhases({
+    analyzedPhases,
+    phases,
+    profileData,
+    finalExitReasonCode,
+    recordedExitReasonByPhase,
+  });
   applySkippedPhaseSystemStats(analyzedPhases, brewModeLabel, configuredScaleDelayMs);
 
   // Calculate distinct Average Delays
@@ -229,10 +268,12 @@ export function calculateShotMetrics(shotData, profileData, settings) {
     tt: getMetricStats(gSamples, 'tt'),
     w: getMetricStats(gWeightSamples, 'v'),
     wf: getMetricStats(gSamples, 'vf'),
+    pr: getNativePuckResistanceStats(gSamples),
+    lr: getLiquidResistanceStats(gSamples),
     sys_raw: finalSysInfo.raw,
     sys_shot_vol: finalSysInfo.shotStartedVolumetric,
     sys_curr_vol: finalSysInfo.currentlyVolumetric,
-    sys_scale: finalSysInfo.bluetoothScaleConnected,
+    sys_scale: finalSysInfo.activeScaleConnected,
     sys_vol_avail: finalSysInfo.volumetricAvailable,
     sys_ext: finalSysInfo.extendedRecording,
     sys_brew_mode: brewModeLabel,

@@ -1,12 +1,13 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useMemo, useRef } from 'preact/hooks';
 import { Chart } from 'chart.js';
 import { ChartComponent } from './Chart';
+import { t } from '@lingui/core/macro';
+import { useLingui } from '@lingui/react/macro';
 
 const POINT_INTERVAL = 0.1; // s
 
 const skipped = (ctx, value) => (!ctx.p0.raw.target ? value : undefined);
 const pressureDatasetDefaults = {
-  label: 'Pressure',
   borderColor: 'rgb(75, 192, 192)',
   tension: 0.4,
   cubicInterpolationMode: 'monotone',
@@ -18,7 +19,6 @@ const pressureDatasetDefaults = {
 };
 
 const flowDatasetDefaults = {
-  label: 'Flow',
   borderColor: 'rgb(255, 192, 192)',
   tension: 0.4,
   cubicInterpolationMode: 'monotone',
@@ -135,10 +135,12 @@ function makeChartData(
       datasets: [
         {
           ...pressureDatasetDefaults,
+          label: t`Pressure`,
           data: prepareData(phases, 'pressure'),
         },
         {
           ...flowDatasetDefaults,
+          label: t`Flow`,
           data: prepareData(phases, 'flow'),
         },
       ],
@@ -162,7 +164,7 @@ function makeChartData(
             font: {
               size: window.innerWidth < 640 ? 10 : 12,
             },
-            generateLabels: function (chart) {
+            generateLabels(chart) {
               const original = Chart.defaults.plugins.legend.labels.generateLabels;
               const labels = original.call(this, chart);
 
@@ -180,7 +182,7 @@ function makeChartData(
         },
         title: {
           display: false,
-          text: 'Temperature History',
+          text: t`Temperature History`,
           font: {
             size: window.innerWidth < 640 ? 14 : 16,
           },
@@ -198,7 +200,7 @@ function makeChartData(
           title: {},
           ticks: {
             source: 'auto',
-            callback: (value, index, ticks) => {
+            callback: value => {
               return `${value?.toFixed()}s`;
             },
             font: {
@@ -213,7 +215,7 @@ function makeChartData(
           position: 'left',
           title: {
             display: true,
-            text: 'Pressure (bar)',
+            text: t`Pressure (bar)`,
           },
           min: 0,
           max: 12,
@@ -229,7 +231,7 @@ function makeChartData(
           position: 'right',
           title: {
             display: true,
-            text: 'Flow (ml/s)',
+            text: t`Flow (ml/s)`,
           },
           min: 0,
           max: 10,
@@ -272,7 +274,8 @@ function makeChartData(
 
   for (let i = 0; i < phases.length; i++) {
     const phase = phases[i];
-    const phaseName = phase.name || `Phase ${i + 1}`;
+    const phaseNumber = i + 1;
+    const phaseName = phase.name || t`Phase ${phaseNumber}`;
 
     chartData.options.plugins.annotation.annotations.push({
       type: 'line',
@@ -354,13 +357,6 @@ function buildPhaseRanges(phases) {
   return ranges;
 }
 
-function getPhaseIndexForX(phaseRanges, xValue) {
-  for (let i = 0; i < phaseRanges.length; i++) {
-    if (xValue <= phaseRanges[i].end) return i;
-  }
-  return -1;
-}
-
 export function ExtendedProfileChart({
   data,
   className = 'max-h-36 w-full',
@@ -369,20 +365,32 @@ export function ExtendedProfileChart({
   showPhaseLabels = true,
   style,
 }) {
-  const isDarkMode = () =>
-    window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  const phases = Array.isArray(data?.phases) ? data.phases : [];
-  const phaseRanges = buildPhaseRanges(phases);
-  const phaseRangesRef = useRef(phaseRanges);
-  phaseRangesRef.current = phaseRanges;
-  const config = makeChartData(
-    data,
+  const { i18n } = useLingui();
+  const onPhaseClickRef = useRef(onPhaseClick);
+  onPhaseClickRef.current = onPhaseClick;
+  // Content key of everything the config is built from; callers pass fresh objects on every render
+  const configKey = JSON.stringify({
+    phases: Array.isArray(data?.phases) ? data.phases : [],
     selectedPhase,
-    phaseRanges,
-    onPhaseClick,
-    isDarkMode(),
+    clickable: !!onPhaseClick,
     showPhaseLabels,
-  );
+    darkMode: !!window.matchMedia?.('(prefers-color-scheme: dark)').matches,
+    labelsFit: window.innerWidth >= 520,
+    smallScreen: window.innerWidth < 640,
+    locale: i18n.locale,
+  });
+  // A new config object makes ChartComponent run a full chart.update(), so rebuild only when the key changes (GM-292)
+  const config = useMemo(() => {
+    const key = JSON.parse(configKey);
+    return makeChartData(
+      { phases: key.phases },
+      key.selectedPhase,
+      buildPhaseRanges(key.phases),
+      key.clickable ? index => onPhaseClickRef.current?.(index) : null,
+      key.darkMode,
+      key.showPhaseLabels,
+    );
+  }, [configKey]);
 
   return (
     <ChartComponent

@@ -9,11 +9,10 @@ rule out a sensor, power, or relay fault.
 
 ## Paired firmware and sessions
 
-Protocol version 8 requires updating both the ESP32 display and its controller
-(STM32 for UART machines, controller ESP32 for Bluetooth machines). Older peers
-cannot authorize outputs; read-only legacy INFO remains available for the
-protocol mismatch screen. EspressoRL/container changes are not required for the
-heating protocol.
+Fork protocol version 10016 uses upstream's v16 messages with session and STM32
+extensions. Update the display and controller together. Older peers cannot
+authorize outputs. Compatible legacy links can still supply read-only INFO for
+the protocol mismatch screen.
 
 Each connection negotiates two session identifiers before exchanging commands.
 A peer restart invalidates the old command queue, sequence numbers and ACKs,

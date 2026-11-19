@@ -19,6 +19,7 @@ inline int xSemaphoreGiveRecursive(SemaphoreHandle_t m) { return xSemaphoreGive(
 inline void vSemaphoreDelete(SemaphoreHandle_t m) { delete m; }
 inline int xTaskCreate(void(*)(void*),const char*,int,void*,int,void** task) { *task=reinterpret_cast<void*>(1); return pdPASS; }
 inline void vTaskDelete(void*) {}
+inline void xTaskNotifyGive(TaskHandle_t) {}
 inline TickType_t xTaskGetTickCount() { return testMillis; }
 inline void vTaskDelay(uint32_t ms) { testMillis+=std::max(1u,ms); if(delayHook) delayHook(); }
 inline void vTaskDelayUntil(TickType_t* t,TickType_t dt) { *t+=dt; testMillis=*t; }

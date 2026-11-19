@@ -1,6 +1,8 @@
 import subprocess
 import datetime
 import os
+import re
+import tempfile
 
 Import("env")
 
@@ -42,21 +44,25 @@ def repository_from_remote(remote_url):
 
 
 def get_firmware_specifier_build_flag():
+    explicit_version = os.environ.get("GAGGIMATE_BUILD_VERSION", "")
+    if explicit_version:
+        if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+-]+)?", explicit_version):
+            raise ValueError("GAGGIMATE_BUILD_VERSION must be a firmware version such as v1.9.0")
+        print("Build version: " + explicit_version)
+        return '#define BUILD_GIT_VERSION "' + explicit_version + '"'
     ret = subprocess.run(
-        ["git", "describe", "--tags", "--dirty", "--exclude", "nightly", "--exclude", "db"],
+        ["git", "describe", "--tags", "--dirty", "--match", "v*"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
     ) #Uses any tags
     build_version = ret.stdout.strip()
     if not build_version:
-        run_number = os.environ.get("GITHUB_RUN_NUMBER", "").strip()
-        if not run_number.isdigit():
-            count_ret = subprocess.run(["git", "rev-list", "--count", "HEAD"], stdout=subprocess.PIPE, text=True)
-            run_number = count_ret.stdout.strip()
+        count_ret = subprocess.run(["git", "rev-list", "--count", "HEAD"], stdout=subprocess.PIPE, text=True)
+        run_number = count_ret.stdout.strip()
         if not run_number.isdigit():
             run_number = "0"
-        build_version = DEFAULT_VERSION_PREFIX + "." + run_number
+        build_version = DEFAULT_VERSION_PREFIX + ".0-dev." + run_number
     build_flag = "#define BUILD_GIT_VERSION \"" + build_version + "\""
     print ("Build version: " + build_version)
     return build_flag
@@ -81,8 +87,7 @@ def get_time_specifier_build_flag():
     print ("Build date: " + build_timestamp)
     return build_flag
 
-with open('src/version.h', 'w') as f:
-    f.write(
+content = (
         '#pragma once\n' +
         '#ifndef GIT_VERSION_H\n' +
         '#define GIT_VERSION_H\n' +
@@ -90,4 +95,15 @@ with open('src/version.h', 'w') as f:
         get_repository_specifier_build_flag() + '\n' +
         get_time_specifier_build_flag() + '\n'
         '#endif\n'
-    )
+)
+
+# Write to a unique temp file and swap it in atomically, so a build running in
+# parallel in the same workspace never reads a truncated version.h.
+fd, tmp_path = tempfile.mkstemp(dir='src', prefix='version.h.', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f:
+        f.write(content)
+    os.replace(tmp_path, 'src/version.h')
+except BaseException:
+    os.unlink(tmp_path)
+    raise

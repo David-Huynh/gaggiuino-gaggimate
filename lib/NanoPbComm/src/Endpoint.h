@@ -41,7 +41,8 @@
  * the inbound queue is full the frame is left un-ACKed, which
  * back-pressures the sender into retransmitting. Queue + in-flight state are
  * guarded by a mutex; handlers run with the mutex released, so a handler may
- * call send() re-entrantly.
+ * call send() re-entrantly. With setPumpTask() the send pump runs on that one
+ * task only; senders and the RX path just enqueue and wake it.
  */
 class Endpoint {
   public:
@@ -57,6 +58,9 @@ class Endpoint {
     // Drive the send pump + retransmit logic. Call frequently (e.g. every
     // 10-20ms from a task or the main loop).
     void loop();
+
+    // Make one task the only pump runner: send() and the RX path then just wake it instead of pumping on their own thread.
+    void setPumpTask(TaskHandle_t task) { _pumpTask = task; }
 
     // Enqueue a payload for reliable, coalesced delivery (default priority by
     // message family).
@@ -90,6 +94,9 @@ class Endpoint {
     // link state has been reset. Used to push connect-time messages.
     void onConnection(ConnectionHandler handler) { _connHandler = std::move(handler); }
 
+    // Invoked (mutex released, on the thread that ran the pump) when a reliable frame is dropped after its retries.
+    void onSendFailed(std::function<void()> handler) { _sendFailedHandler = std::move(handler); }
+
     bool isConnected() const { return _applicationConnected.load() && _transport.isConnected(); }
 
     // Reliable-delivery round-trip latency (ms): time from transmitting a frame
@@ -99,15 +106,23 @@ class Endpoint {
     uint32_t latencyMs() const { return _smoothedRttMs; }
     uint32_t lastLatencyMs() const { return _lastRttMs; }
     bool hasLatency() const { return _rttValid; }
+    // Nothing queued and nothing awaiting an ACK.
+    bool isIdle();
+    // Frames sent again because no ACK arrived in time, since boot.
+    uint32_t retransmits() const { return _retransmits; }
 
   private:
     static constexpr size_t QUEUE_CAPACITY = 16;
-    static constexpr size_t MAX_KEYS = 256; // >= which_content_max * MAX_DEVICES
+    static constexpr size_t MAX_KEYS = 320; // >= which_content_max * MAX_DEVICES
     static constexpr size_t BUFFER_SIZE = 256;
     static constexpr size_t MAX_PAYLOADS_PER_FRAME = 6; // matches Frame.payloads max_count
-    static constexpr unsigned long ACK_TIMEOUT_MS = 150;
+    // Retransmit timeout = max(floor, factor x smoothed round trip), doubled per retransmit up to the cap.
+    static constexpr unsigned long ACK_TIMEOUT_MIN_MS = 150; // fits the 7.5-10 ms interval of a running process
+    static constexpr unsigned long ACK_TIMEOUT_MAX_MS = 2400;
+    static constexpr uint8_t ACK_TIMEOUT_MAX_SHIFT = 4;
+    static constexpr uint32_t ACK_TIMEOUT_RTT_FACTOR = 3; // an idle link needs 2-3 connection intervals per round trip
     static constexpr uint8_t MAX_RETRIES = 5;
-    static constexpr size_t HANDLER_SLOTS = 32;  // > highest Payload_*_tag
+    static constexpr size_t HANDLER_SLOTS = 40;  // > highest Payload_*_tag
     static constexpr size_t RX_QUEUE_DEPTH = 12; // inbound payloads awaiting dispatch
 #if defined(ARDUINO_ARCH_STM32)
     static constexpr uint32_t DISPATCH_STACK = 768; // STM32 FreeRTOS stack depth is in words, not bytes
@@ -126,6 +141,8 @@ class Endpoint {
     size_t _txLen = 0;
     uint32_t _inFlightId = 0;
     unsigned long _sentAt = 0;
+    uint8_t _timeoutShift = 0; // backoff kept across frames until a frame is ACKed without a retransmit
+    uint32_t _retransmits = 0;
     uint8_t _retries = 0;
     bool _inFlight = false;
     std::array<gm::Payload, MAX_PAYLOADS_PER_FRAME> _inFlightPayloads{};
@@ -150,6 +167,7 @@ class Endpoint {
     uint32_t _lastRxId = 0;
 
     ConnectionHandler _connHandler = nullptr;
+    std::function<void()> _sendFailedHandler = nullptr;
 
     // Serialize session changes with payload callbacks (upstream #873). A slow
     // result from the previous session must finish before readiness is reset.
@@ -162,6 +180,7 @@ class Endpoint {
     // Inbound events are drained off the transport task.
     QueueHandle_t _rxQueue = nullptr;
     TaskHandle_t _dispatchTask = nullptr;
+    TaskHandle_t _pumpTask = nullptr; // when set, the only thread that runs pump()
 
     gm::Frame _rxFrame{}; // decode scratch (onData is single-threaded per link)
     gm::Frame _txFrame{}; // encode scratch (guarded by _mutex in pump())
@@ -170,6 +189,9 @@ class Endpoint {
     void handleData(const uint8_t *data, size_t length);
     void handleConnection(bool connected);
     void pump();
+    bool pumpLocked();
+    void requestPump();
+    unsigned long ackTimeoutLocked() const;
     void sendAck(uint32_t id);
     void sendHello();
     void resetSession(); // caller holds _mutex
@@ -178,6 +200,7 @@ class Endpoint {
     void dispatch(const gm::Payload &payload);
     static void dispatchTaskFn(void *arg);
     static bool encodeFrame(const gm::Frame &frame, uint8_t *buf, size_t bufSize, size_t *outLen);
+    size_t frameLimit() const;
 
     void lock() {
         if (_mutex)

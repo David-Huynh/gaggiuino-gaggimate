@@ -39,8 +39,17 @@ channels:
           - $ref: '#/components/messages/ProfilesReorderResponse'
           - $ref: '#/components/messages/BrewConfirmEvent'
           - $ref: '#/components/messages/BrewConfirmCancelEvent'
+          - $ref: '#/components/messages/ScaleScanCompleteEvent'
+          - $ref: '#/components/messages/ScaleConnectErrorEvent'
+          - $ref: '#/components/messages/ScaleConnectSuccessEvent'
+          - $ref: '#/components/messages/ScaleDisconnectEvent'
           - $ref: '#/components/messages/FlushStartResponse'
+          - $ref: '#/components/messages/CleaningResponse'
           - $ref: '#/components/messages/FlushStopResponse'
+          - $ref: '#/components/messages/SetupTestResponse'
+          - $ref: '#/components/messages/SetupTestEvent'
+          - $ref: '#/components/messages/WifiScanResponse'
+          - $ref: '#/components/messages/WifiScanEvent'
     publish:
       description: Messages sent from the client to the server.
       message:
@@ -59,7 +68,12 @@ channels:
           - $ref: '#/components/messages/ProcessActivateRequest'
           - $ref: '#/components/messages/BrewConfirmCancelRequest'
           - $ref: '#/components/messages/FlushStartRequest'
+          - $ref: '#/components/messages/CleaningStartRequest'
+          - $ref: '#/components/messages/CleaningCompleteRequest'
           - $ref: '#/components/messages/FlushStopRequest'
+          - $ref: '#/components/messages/SetupTestStartRequest'
+          - $ref: '#/components/messages/SetupTestAbortRequest'
+          - $ref: '#/components/messages/WifiScanRequest'
 components:
   schemas:
     StatusPayload:
@@ -125,13 +139,29 @@ components:
         cd:
           type: boolean
           description: Indicates dimming capability
+        hl:
+          type: boolean
+          description: True on headless display firmware (no screen); the web UI hides display settings
+        lnk:
+          type: string
+          enum: [ble, uart, none]
+          description: Link carrying the controller session; none while the display is still searching
+        rssi:
+          type: integer
+          description: Controller BLE signal strength in dBm, 0 unless lnk is ble
+        lat:
+          type: integer
+          description: Smoothed controller round trip in ms, -1 until measured
+        rtx:
+          type: integer
+          description: Controller frames resent since boot
       required: [tp]
     WarningState:
       type: object
       properties:
         k:
           type: string
-          enum: [water, flush, switch, scaleConnected, scaleBattery, temperature]
+          enum: [water, flush, switch, scaleConnected, scaleBattery, temperature, backflush, descaling]
           description: Warning key
         l:
           type: integer
@@ -150,6 +180,9 @@ components:
           enum: ['res:ota-settings']
         latestVersion:
           type: string
+        repository:
+          type: string
+          description: GitHub owner and repository for the firmware release.
         displayVersion:
           type: string
         controllerVersion:
@@ -164,6 +197,18 @@ components:
           type: string
         updating:
           type: boolean
+        controllerOtaEnabled:
+          type: boolean
+        checking:
+          type: boolean
+        checkError:
+          type: string
+        phase:
+          type: integer
+        progress:
+          type: integer
+        updateError:
+          type: string
       required: [tp]
     OtaProgressPayload:
       type: object
@@ -175,11 +220,14 @@ components:
           type: integer
           description: >-
             0 idle, 1 display firmware, 2 display filesystem (unused), 3 controller firmware,
-            4 finished, 5 failed (download or flashing gave up; the device keeps its current firmware)
-          enum: [0, 1, 2, 3, 4, 5]
+            4 finished, 5 failed, 6 waiting to retry the firmware download
+          enum: [0, 1, 2, 3, 4, 5, 6]
         progress:
           type: integer
-          description: Percent of the current phase. Downloads retry and resume on connection loss, so it never goes backwards within a phase.
+          description: Percent downloaded or transferred. A restarted download can return to zero.
+        error:
+          type: string
+          description: Reason code when the update failed.
       required: [tp, phase, progress]
     AutotuneResultPayload:
       type: object
@@ -318,6 +366,9 @@ components:
             enum: ['req:ota-start']
           cp:
             type: string
+          rid:
+            type: string
+            description: Echoed by res:ota-start, which reports error when the update cannot be started.
         required: [tp]
     AutotuneStartRequest:
       payload:
@@ -480,6 +531,242 @@ components:
             enum: ['evt:brew:confirm:cancel']
         required: [tp]
 
+    ScaleScanCompleteEvent:
+      summary: The listening window (5 s) after POST /api/scales/scan closed, or a connect attempt aborted it. Sent immediately when no scan could run (a scale is already connected). Discovery itself keeps running in the background.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['evt:scale:scan:complete']
+          count:
+            type: integer
+            description: Number of supported scales discovered so far.
+        required: [tp, count]
+
+    ScaleConnectErrorEvent:
+      summary: Connecting to a BLE scale failed, after a user connect or the saved-scale auto-connect.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['evt:scale:connect:error']
+          address:
+            type: string
+          reason:
+            type: string
+            enum: ['not_found', 'connect_failed', 'unsupported']
+            description: not_found = not in the discovered list, connect_failed = BLE connection failed, unsupported = no driver could be created.
+        required: [tp, address, reason]
+
+    ScaleConnectSuccessEvent:
+      summary: A BLE scale connected.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['evt:scale:connect:success']
+          address:
+            type: string
+          name:
+            type: string
+            description: Advertised BLE name.
+        required: [tp, address, name]
+
+    ScaleDisconnectEvent:
+      summary: A connected BLE scale was lost while the machine is awake; the display rescans and reconnects automatically. Not sent for the intentional disconnect on standby.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['evt:scale:disconnect']
+          address:
+            type: string
+          name:
+            type: string
+            description: Advertised BLE name.
+        required: [tp, address, name]
+
+    CleaningStartRequest:
+      summary: Select the backflush or descaling system profile and start it in brew mode; error-level warnings trigger evt:brew:confirm as usual. Answered with res:cleaning:<task>:start (success false while a process is running).
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['req:cleaning:backflush:start', 'req:cleaning:descaling:start']
+          rid:
+            type: string
+        required: [tp]
+    CleaningCompleteRequest:
+      summary: Mark backflush or descaling as done now, resetting its time and shot counters. Running the profile to the end does the same. Answered with res:cleaning:<task>:complete.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['req:cleaning:backflush:complete', 'req:cleaning:descaling:complete']
+          rid:
+            type: string
+        required: [tp]
+    CleaningResponse:
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum:
+              - 'res:cleaning:backflush:start'
+              - 'res:cleaning:descaling:start'
+              - 'res:cleaning:backflush:complete'
+              - 'res:cleaning:descaling:complete'
+          rid:
+            type: string
+          success:
+            type: boolean
+        required: [tp, success]
+    SetupTestStartRequest:
+      summary: >-
+        Start a setup-wizard hardware test. heater: steam setpoint until the temperature rose by 2.5 °C (passes right away),
+        otherwise for 10 s, then heater off for up to 30 s settling, passing as soon as the rise shows up. pressure
+        (pressure sensor only): pump at 100 % against the closed 3-way valve until pressure plateaus (max 10 s), then
+        pump off with the valve open for 5 s; passes on a peak of at least 10 bar and at most 1 bar left after release.
+        Progress and the result arrive as evt:setup:test.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['req:setup:test:start']
+          rid:
+            type: string
+          test:
+            type: string
+            enum: [heater, pressure]
+          ack:
+            type: boolean
+            description: Required true for the pressure test; the user confirmed the safety notice.
+        required: [tp, test]
+    SetupTestAbortRequest:
+      summary: Stop the running setup test and return to standby. Answered with res:setup:test:abort.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['req:setup:test:abort']
+          rid:
+            type: string
+        required: [tp]
+    SetupTestResponse:
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['res:setup:test:start', 'res:setup:test:abort']
+          rid:
+            type: string
+          success:
+            type: boolean
+          error:
+            type: string
+            enum: [busy, notReady, noPressureSensor, ackRequired, unknownTest]
+        required: [tp, success]
+    SetupTestEvent:
+      summary: Setup test progress (every 250 ms while running) and its final state.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['evt:setup:test']
+          test:
+            type: string
+            enum: [heater, pressure]
+          state:
+            type: string
+            enum: [running, passed, failed, aborted]
+          phase:
+            type: string
+            enum: [idle, heating, settling, building, releasing, done]
+          reason:
+            type: string
+            description: >-
+              heater: sensor, alreadyHot (passed without heating), noRise. pressure: noPressure, lowPressure,
+              noRelease, highPressure (passed, OPV set above 12.5 bar).
+          startTemp:
+            type: number
+          temp:
+            type: number
+          rise:
+            type: number
+          targetRise:
+            type: number
+            description: Rise in °C the heater test needs to pass.
+          pressure:
+            type: number
+          maxPressure:
+            type: number
+          residualPressure:
+            type: number
+        required: [tp, test, state, phase]
+    WifiScanRequest:
+      summary: >-
+        Scan for Wi-Fi networks for the setup wizard. Only available in the AP fallback (APSTA, the station never
+        connects) and not while a setup test runs. The scan returns to the AP channel between channels. Results arrive
+        as evt:wifi:scan.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['req:wifi:scan']
+          rid:
+            type: string
+        required: [tp]
+    WifiScanResponse:
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['res:wifi:scan']
+          rid:
+            type: string
+          success:
+            type: boolean
+          error:
+            type: string
+            enum: [notAp, busy]
+        required: [tp, success]
+    WifiScanEvent:
+      summary: Scan result, one entry per SSID (strongest access point), strongest first, at most 25; hidden networks are left out.
+      payload:
+        type: object
+        properties:
+          tp:
+            type: string
+            enum: ['evt:wifi:scan']
+          success:
+            type: boolean
+          networks:
+            type: array
+            items:
+              type: object
+              properties:
+                ssid:
+                  type: string
+                rssi:
+                  type: integer
+                secure:
+                  type: boolean
+                channel:
+                  type: integer
+        required: [tp, success, networks]
     FlushStartRequest:
       summary: Start a flush (brew valve open, pump on) for the configured flush duration; with duration 0 it runs until req:flush:stop. The valve stays open for one more second after the pump stops.
       payload:

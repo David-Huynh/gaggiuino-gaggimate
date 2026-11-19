@@ -6,6 +6,7 @@
  * Input: Array of { analysis, meta: { id, timestamp, profileName, source } }
  * Output: StatisticsResult object
  */
+import { t } from '@lingui/core/macro';
 
 function averageOf(values) {
   if (!values.length) return 0;
@@ -41,6 +42,7 @@ function aggregateMetricStats(totals, key) {
 
   const avg = averageOf(avgs);
   return {
+    count: avgs.length,
     avg,
     min: mins.length ? Math.min(...mins) : 0,
     max: maxs.length ? Math.max(...maxs) : 0,
@@ -52,6 +54,7 @@ function aggregateValueStats(values) {
   const finiteValues = values.filter(Number.isFinite);
   const avg = averageOf(finiteValues);
   return {
+    count: finiteValues.length,
     avg,
     min: finiteValues.length ? Math.min(...finiteValues) : 0,
     max: finiteValues.length ? Math.max(...finiteValues) : 0,
@@ -131,7 +134,7 @@ function computeSummary(entries) {
 
 function computeMetricAverages(entries) {
   const totals = entries.map(e => e.analysis.total).filter(Boolean);
-  const keys = ['p', 'f', 'pf', 'tt', 't', 'w'];
+  const keys = ['p', 'f', 'pf', 'tt', 't', 'w', 'pr', 'lr'];
   const metrics = {};
   for (const key of keys) {
     metrics[key] =
@@ -311,7 +314,9 @@ function buildPhaseMap(entries) {
   for (const { analysis } of entries) {
     if (!analysis.phases) continue;
     for (const phase of analysis.phases) {
-      const name = phase.displayName || phase.name || `Phase ${phase.number + 1}`;
+      if (phase.notReached) continue;
+      const phaseNumber = phase.number + 1;
+      const name = phase.displayName || phase.name || t`Phase ${phaseNumber}`;
       if (!phaseMap.has(name)) {
         phaseMap.set(name, []);
       }

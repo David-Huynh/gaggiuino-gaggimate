@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useContext } from 'preact/hooks';
+import { Trans, useLingui } from '@lingui/react/macro';
 import { ApiServiceContext } from '../../../services/ApiService.js';
 import { OverviewChart } from '../../../components/OverviewChart.jsx';
 import { Spinner } from '../../../components/Spinner.jsx';
@@ -7,7 +8,8 @@ import PumpFlowCalibration from '../../../components/PumpFlowCalibration/index.j
 import { SettingsFormField } from '../../../components/SettingsFormField.jsx';
 import { hardwareScaleDisabled } from '../../../config/features.js';
 
-export function CalibrationTab({ formData, onChange }) {
+export function CalibrationTab({ formData, setField }) {
+  const { t } = useLingui();
   const apiService = useContext(ApiServiceContext);
 
   // Autotune state
@@ -50,7 +52,7 @@ export function CalibrationTab({ formData, onChange }) {
   return (
     <div className='space-y-4 sm:space-y-6 lg:grid lg:grid-cols-2 lg:gap-4'>
       {/* PID Autotune Section */}
-      <Section title='PID Autotune' className='h-full'>
+      <Section title={t`PID Autotune`} className='h-full'>
         {autotuneActive && (
           <div className='space-y-4'>
             <div className='w-full'>
@@ -59,13 +61,17 @@ export function CalibrationTab({ formData, onChange }) {
             <div className='flex flex-col items-center justify-center space-y-4 py-4'>
               <div className='flex items-center space-x-3'>
                 <Spinner size={8} />
-                <span className='text-base-content text-lg font-medium'>Autotune in Progress</span>
+                <span className='text-base-content text-lg font-medium'>
+                  <Trans>Autotune in Progress</Trans>
+                </span>
               </div>
               <div className='alert alert-warning max-w-md'>
                 <span>
+                  <Trans>
                   The boiler will heat at full power until its temperature inflection is detected,
                   then the SIMC tuning rule derives PID gains. Typically 1–3 minutes depending on
                   machine.
+                  </Trans>
                 </span>
               </div>
             </div>
@@ -76,8 +82,12 @@ export function CalibrationTab({ formData, onChange }) {
           <div className='space-y-4 text-center'>
             <div className='alert alert-success mx-auto max-w-md'>
               <div>
-                <h3 className='font-bold'>Autotune Complete!</h3>
-                <div className='text-sm'>Your new PID values have been saved successfully.</div>
+                <h3 className='font-bold'>
+                  <Trans>Autotune Complete!</Trans>
+                </h3>
+                <div className='text-sm'>
+                  <Trans>Your new PID values have been saved successfully.</Trans>
+                </div>
               </div>
             </div>
             <div className='mockup-code bg-base-200 mx-auto max-w-md'>
@@ -90,7 +100,7 @@ export function CalibrationTab({ formData, onChange }) {
               className='btn btn-outline btn-sm mt-2'
               onClick={() => setAutotuneResult(null)}
             >
-              Dismiss
+              <Trans>Dismiss</Trans>
             </button>
           </div>
         )}
@@ -99,10 +109,14 @@ export function CalibrationTab({ formData, onChange }) {
           <div className='space-y-4 text-center'>
             <div className='alert alert-error mx-auto max-w-md'>
               <div>
-                <h3 className='font-bold'>Autotune Failed</h3>
+                <h3 className='font-bold'>
+                  <Trans>Autotune Failed</Trans>
+                </h3>
                 <div className='text-sm'>
-                  No valid gains were produced. Your existing PID settings have been preserved. Try
-                  increasing Test Duration or confirm the boiler was cold at start.
+                  <Trans>
+                    No valid gains were produced. Your existing PID settings have been preserved.
+                    Try increasing Test Duration or confirm the boiler was cold at start.
+                  </Trans>
                 </div>
               </div>
             </div>
@@ -111,7 +125,7 @@ export function CalibrationTab({ formData, onChange }) {
               className='btn btn-outline btn-sm mt-2'
               onClick={() => setAutotuneFailed(false)}
             >
-              Retry
+              <Trans>Retry</Trans>
             </button>
           </div>
         )}
@@ -120,16 +134,18 @@ export function CalibrationTab({ formData, onChange }) {
           <div className='space-y-4'>
             <div className='alert alert-warning'>
               <span>
+                <Trans>
                 Please ensure the boiler temperature is below 50°C before starting the autotune
                 process.
+                </Trans>
               </span>
             </div>
 
             <div className='grid grid-cols-1 gap-4 sm:grid-cols-3'>
               <SettingsFormField
-                label='Test Duration (seconds)'
+                label={t`Test Duration (seconds)`}
                 htmlFor='testTime'
-                helpText='Upper bound on the identification test. Most espresso boilers resolve within 60–120 s. Extend if Autotune fails before peak slope is detected.'
+                helpText={t`Upper bound on the identification test. Most espresso boilers resolve within 60–120 s. Extend if Autotune fails before peak slope is detected.`}
                 noMargin
               >
                 <input
@@ -144,9 +160,9 @@ export function CalibrationTab({ formData, onChange }) {
                 />
               </SettingsFormField>
               <SettingsFormField
-                label='Slope Window'
+                label={t`Slope Window`}
                 htmlFor='slopeWindow'
-                helpText='Moving-window length (samples) used for slope estimation. Larger values smooth MAX31855 quantisation but lag the inflection. 6 is the sweet spot.'
+                helpText={t`Moving-window length (samples) used for slope estimation. Larger values smooth MAX31855 quantisation but lag the inflection. 6 is the sweet spot.`}
                 noMargin
               >
                 <input
@@ -161,9 +177,9 @@ export function CalibrationTab({ formData, onChange }) {
                 />
               </SettingsFormField>
               <SettingsFormField
-                label='Heater Wattage (W)'
+                label={t`Heater Wattage (W)`}
                 htmlFor='heaterWattage'
-                helpText='Heater wattage in Watts (e.g. Gaggia Classic: 1360 W, Rancilio Silvia 120V: 950W, Rancilio Silvia 230V: 1100W).'
+                helpText={t`Heater wattage in Watts (e.g. Gaggia Classic: 1360 W, Rancilio Silvia 120V: 950W, Rancilio Silvia 230V: 1100W).`}
                 noMargin
               >
                 <input
@@ -193,7 +209,7 @@ export function CalibrationTab({ formData, onChange }) {
                   autotuneWattage > 1500
                 }
               >
-                Start Autotune
+                <Trans>Start Autotune</Trans>
               </button>
             </div>
           </div>
@@ -201,8 +217,11 @@ export function CalibrationTab({ formData, onChange }) {
       </Section>
 
       {/* Pump Flow Tuning Section */}
-      <Section title='Pump Flow Calibration' className='h-full'>
-        <PumpFlowCalibration currentCoeffs={formData.pumpModelCoeffs} />
+      <Section title={t`Pump Flow Calibration`} className='h-full'>
+        <PumpFlowCalibration
+          currentCoeffs={formData.pumpModelCoeffs}
+          onApplied={coeffs => setField('pumpModelCoeffs', coeffs)}
+        />
       </Section>
 
       {!hardwareScaleDisabled && (

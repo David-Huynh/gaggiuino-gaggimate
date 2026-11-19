@@ -1,3 +1,5 @@
+import { t } from '@lingui/core/macro';
+
 export const TARGET_FLOW_MAX = 12;
 export const TARGET_PRESSURE_MAX = 16;
 export const STANDARD_LINE_WIDTH = 4;
@@ -13,6 +15,8 @@ export const SINGLE_METRIC_PAGE_KEYS = {
   PRESSURE_FLOW: 'pressureFlow',
   FLOW_VOLUME: 'flowVolume',
   TEMPERATURE: 'temperature',
+  PUCK_RESISTANCE: 'puckResistance',
+  ALL: 'all',
 };
 
 export const COMPARE_DETAIL_METRIC_PAGE_KEYS = {
@@ -42,17 +46,17 @@ export function getReplayExportStatusLabel(status, exportFormat = 'mp4') {
     case 'idle':
       return '';
     case 'preparing':
-      return exportFormat === 'webm' ? 'Preparing WebM export...' : 'Preparing MP4 export...';
+      return exportFormat === 'webm' ? t`Preparing WebM export...` : t`Preparing MP4 export...`;
     case 'renderingImage':
-      return 'Rendering PNG export...';
+      return t`Rendering PNG export...`;
     case 'preparingJson':
-      return 'Preparing shot JSON...';
+      return t`Preparing shot JSON...`;
     case 'recording':
-      return 'Recording replay...';
+      return t`Recording replay...`;
     case 'downloading':
-      return 'Downloading export...';
+      return t`Downloading export...`;
     case 'error':
-      return 'Replay export failed.';
+      return t`Replay export failed.`;
     default:
       return '';
   }
@@ -73,10 +77,12 @@ export const CHART_COLOR_FALLBACKS = {
   pressure: '#0066CC',
   flow: '#63993D',
   puckFlow: '#059669',
+  puckResistance: '#8B5E3C',
+  liquidResistance: '#B06E3C',
   weight: '#8B5CF6',
   weightFlow: '#6d28d9',
   phaseLine: 'rgba(107, 114, 128, 0.5)',
-  stopLabel: 'rgba(220, 38, 38, 0.85)',
+  stopLabel: '#b54747',
   warning: '#f59e0b',
 };
 
@@ -86,6 +92,8 @@ export const CHART_COLOR_TOKEN_MAP = {
   pressure: '--analyzer-pressure-anchor',
   flow: '--analyzer-flow-anchor',
   puckFlow: '--analyzer-puckflow-anchor',
+  puckResistance: '--analyzer-puckresistance-anchor',
+  liquidResistance: '--analyzer-liquidresistance-anchor',
   weight: '--analyzer-weight-anchor',
   weightFlow: '--analyzer-weightflow-anchor',
   phaseLine: '--analyzer-phase-line',
@@ -103,6 +111,8 @@ export const LEGEND_THIN_LINE_LABELS = new Set([
   'Target P',
   'Target F',
   'Puck Flow',
+  'Puck Resistance',
+  'Liquid Resistance',
   'Weight',
   'Weight Flow',
 ]);
@@ -117,6 +127,8 @@ export const LEGEND_ORDER = [
   'Pump Flow',
   'Target F',
   'Puck Flow',
+  'Puck Resistance',
+  'Liquid Resistance',
   'Weight',
   'Weight Flow',
   'Temp',
@@ -131,6 +143,8 @@ const TOOLTIP_ORDER = [
   'Pump Flow',
   'Target F',
   'Puck Flow',
+  'Puck Resistance',
+  'Liquid Resistance',
   'Weight Flow',
   'Weight',
   WATER_DRAWN_PHASE_LABEL,
@@ -150,6 +164,8 @@ export const TOOLTIP_GROUP_BY_LABEL = {
   'Pump Flow': 'flow',
   'Target F': 'flow',
   'Puck Flow': 'flow',
+  'Puck Resistance': 'resistance',
+  'Liquid Resistance': 'resistance',
   Weight: 'weight',
   'Weight Flow': 'weight',
   [WATER_DRAWN_PHASE_LABEL]: 'water',
@@ -168,6 +184,8 @@ export const VISIBILITY_KEY_BY_LABEL = {
   'Pump Flow': 'flow',
   'Target F': 'targetFlow',
   'Puck Flow': 'puckFlow',
+  'Puck Resistance': 'puckResistance',
+  'Liquid Resistance': 'liquidResistance',
   Weight: 'weight',
   'Weight Flow': 'weightFlow',
 };
@@ -183,6 +201,8 @@ export const INITIAL_VISIBILITY = {
   flow: true,
   targetFlow: true,
   puckFlow: true,
+  puckResistance: false,
+  liquidResistance: false,
   weight: true,
   weightFlow: true,
 };
@@ -195,6 +215,8 @@ export const UNIT_BY_LABEL = {
   'Pump Flow': 'ml/s',
   'Target F': 'ml/s',
   'Puck Flow': 'ml/s',
+  'Puck Resistance': 's·√bar/mL',
+  'Liquid Resistance': 'bar·s/mL',
   Weight: 'g',
   'Weight Flow': 'g/s',
   [WATER_DRAWN_PHASE_LABEL]: 'ml',

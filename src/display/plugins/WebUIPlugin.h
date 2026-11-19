@@ -4,8 +4,10 @@
 #define ELEGANTOTA_USE_ASYNC_WEBSERVER 1
 
 #include <DNSServer.h>
+#include <memory>
 
 #include "GitHubOTA.h"
+#include "WebSocketHandler.h"
 #include <ArduinoJson.h>
 #include <ESPAsyncWebServer.h>
 #include <atomic>
@@ -25,6 +27,7 @@ constexpr size_t DNS_PERIOD = 50;
 const String LOCAL_URL = "http://4.4.4.1/";
 
 class ProfileManager;
+class MachineProfileStore;
 
 class WebUIPlugin : public Plugin {
   public:
@@ -60,13 +63,15 @@ class WebUIPlugin : public Plugin {
     // Serves the web UI from the firmware-embedded, memory-mapped flash blob
     // (catch-all for any path not claimed by an explicit route). [GM-106]
     void serveWebAsset(AsyncWebServerRequest *request);
+    void handleMachineProfiles(AsyncWebServerRequest *request);
     void handleSettings(AsyncWebServerRequest *request) const;
     void handleBLEScaleList(AsyncWebServerRequest *request);
     void handleBLEScaleScan(AsyncWebServerRequest *request);
     void handleBLEScaleConnect(AsyncWebServerRequest *request);
     void handleBLEScaleInfo(AsyncWebServerRequest *request);
-    void updateOTAStatus(const String &version);
-    void updateOTAProgress(uint8_t phase, int progress);
+    void handleBLEScaleForget(AsyncWebServerRequest *request);
+    void updateOTAStatus();
+    void updateOTAProgress(uint8_t phase, int progress, const char *error = "");
     void startOTAUpdateCheck(unsigned long now);
     static void otaUpdateCheckTask(void *arg);
     void sendAutotuneResult();
@@ -81,24 +86,39 @@ class WebUIPlugin : public Plugin {
     // Core dump download
     void handleCoreDumpDownload(AsyncWebServerRequest *request);
 
+    // Profile images on the SD card (pre-converted 300x300 RGB565 from the web UI)
+    void handleProfileImage(AsyncWebServerRequest *request);
+    void handleProfileImageBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total);
+
     GitHubOTA *ota = nullptr;
     AsyncWebServer server;
     AsyncWebSocket ws;
+    WebSocketHandler wsHandler{ws};
     Controller *controller = nullptr;
     PluginManager *pluginManager = nullptr;
-    DNSServer *dnsServer = nullptr;
+    std::unique_ptr<DNSServer> dnsServer;
     ProfileManager *profileManager = nullptr;
+    MachineProfileStore *machineProfiles = nullptr;
 
-    long lastUpdateCheck = 0;
+    std::atomic<unsigned long> lastUpdateCheck{0};
     long lastStatus = 0;
     long lastCleanup = 0;
     long lastDns = 0;
-    bool updating = false;
+    enum class OtaRequest : uint8_t { None, Display, Controller, Both };
+    std::atomic<OtaRequest> otaRequest{OtaRequest::None};
+    std::atomic<bool> updating{false};
+    std::atomic<uint16_t> otaProgress{0};
+    std::atomic<const char *> otaError{""};
     std::atomic_bool otaUpdateCheckInProgress{false};
     std::atomic_bool otaUpdateCheckComplete{false};
     bool apMode = false;
     bool serverRunning = false;
-    String updateComponent = "";
+    bool pluginHooksRegistered = false;
+
+    // One upload at a time; a new upload takes over a stale one whose client went away.
+    AsyncWebServerRequest *imageUploadRequest = nullptr;
+    File imageUploadFile;
+    String imageUploadError;
     float currentBluetoothWeight = 0.0f;
     float currentHardwareWeight = 0.0f;
     float currentEstimatedWeight = 0.0f;

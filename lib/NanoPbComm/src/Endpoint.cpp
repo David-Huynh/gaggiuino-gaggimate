@@ -12,7 +12,7 @@
 #include <pb_decode.h>
 #include <pb_encode.h>
 
-static const char *ENDPOINT_TAG = "Endpoint";
+static constexpr const char *ENDPOINT_TAG = "Endpoint";
 
 Endpoint::Endpoint(Transport &transport) : _transport(transport) {
     _mutex = xSemaphoreCreateRecursiveMutex();
@@ -74,6 +74,13 @@ void Endpoint::processDispatchEvent(DispatchEvent const &event) {
 
 void Endpoint::loop() { pump(); }
 
+bool Endpoint::isIdle() {
+    lock();
+    const bool idle = _queue.empty() && !_inFlight;
+    unlock();
+    return idle;
+}
+
 void Endpoint::on(pb_size_t which, Handler handler) {
     if (which < HANDLER_SLOTS)
         _handlers[which] = std::move(handler);
@@ -83,26 +90,31 @@ void Endpoint::send(const gm::Payload &payload) { send(payload, gm_proto::defaul
 
 void Endpoint::send(const gm::Payload &payload, uint8_t priority) {
     lock();
-    _queue.upsert(gm_proto::coalescingKey(payload), priority, payload);
+    const bool queued = _queue.upsert(gm_proto::coalescingKey(payload), priority, payload);
     unlock();
-    pump();
+    if (!queued)
+        ESP_LOGW(ENDPOINT_TAG, "Outbound queue full, dropped payload %u", static_cast<unsigned>(payload.which_content));
+    requestPump();
 }
 
 void Endpoint::sendBatch(const gm::Payload *payloads, size_t count) {
     if (payloads == nullptr || count == 0)
         return;
     lock();
+    bool queued = true;
     for (size_t i = 0; i < count; i++)
-        _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::defaultPriority(payloads[i].which_content), payloads[i]);
+        queued &= _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::defaultPriority(payloads[i].which_content),
+                                payloads[i]);
     unlock();
-    pump();
+    if (!queued)
+        ESP_LOGW(ENDPOINT_TAG, "Outbound queue full, dropped part of a batch");
+    requestPump();
 }
 
 void Endpoint::sendUrgentBatch(const gm::Payload *payloads, size_t count) {
     if (payloads == nullptr || count == 0)
         return;
-    if (count > MAX_PAYLOADS_PER_FRAME)
-        count = MAX_PAYLOADS_PER_FRAME;
+    const size_t frameCount = count > MAX_PAYLOADS_PER_FRAME ? MAX_PAYLOADS_PER_FRAME : count;
 
     lock();
 
@@ -143,22 +155,25 @@ void Endpoint::sendUrgentBatch(const gm::Payload *payloads, size_t count) {
     _txFrame.id = _nextId++;
     if (_nextId == 0)
         _nextId = 1;
-    _txFrame.payloads_count = static_cast<pb_size_t>(count);
-    for (size_t i = 0; i < count; i++)
+    _txFrame.payloads_count = static_cast<pb_size_t>(frameCount);
+    for (size_t i = 0; i < frameCount; i++)
         _txFrame.payloads[i] = payloads[i];
 
-    if (!encodeFrame(_txFrame, _txBuf, BUFFER_SIZE, &_txLen)) {
-        ESP_LOGE(ENDPOINT_TAG, "Failed to encode urgent outbound frame (%u payloads)", static_cast<unsigned>(count));
+    if (!encodeFrame(_txFrame, _txBuf, frameLimit(), &_txLen)) {
+        ESP_LOGE(ENDPOINT_TAG, "Failed to encode urgent outbound frame (%u payloads)", static_cast<unsigned>(frameCount));
         for (size_t i = 0; i < count; i++)
             _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::PRIO_HIGH, payloads[i]);
         unlock();
+        requestPump();
         return;
     }
 
+    for (size_t i = frameCount; i < count; i++)
+        _queue.upsert(gm_proto::coalescingKey(payloads[i]), gm_proto::PRIO_HIGH, payloads[i]);
     _transport.send(_txBuf, _txLen);
     _inFlight = true;
-    _inFlightPayloadCount = static_cast<pb_size_t>(count);
-    for (size_t i = 0; i < count; i++)
+    _inFlightPayloadCount = static_cast<pb_size_t>(frameCount);
+    for (size_t i = 0; i < frameCount; i++)
         _inFlightPayloads[i] = payloads[i];
     _inFlightId = _txFrame.id;
     _sentAt = millis();
@@ -185,9 +200,14 @@ void Endpoint::sendUnreliable(const gm::Payload *payloads, size_t count) {
     for (size_t i = 0; i < count; i++)
         _txFrame.payloads[i] = payloads[i];
     size_t len = 0;
-    if (encodeFrame(_txFrame, _unrelBuf, BUFFER_SIZE, &len))
+    if (encodeFrame(_txFrame, _unrelBuf, frameLimit(), &len))
         _transport.send(_unrelBuf, len);
     unlock();
+}
+
+size_t Endpoint::frameLimit() const {
+    const size_t limit = _transport.maxDatagram();
+    return limit < BUFFER_SIZE ? limit : BUFFER_SIZE;
 }
 
 bool Endpoint::encodeFrame(const gm::Frame &frame, uint8_t *buf, size_t bufSize, size_t *outLen) {
@@ -211,42 +231,65 @@ void Endpoint::sendAck(uint32_t id) {
         _transport.send(buf, len);
 }
 
+// A fixed timeout shorter than the real round trip resends every frame that did arrive and overloads a slow link.
+unsigned long Endpoint::ackTimeoutLocked() const {
+    unsigned long timeout = ACK_TIMEOUT_MIN_MS;
+    if (_rttValid && _smoothedRttMs * ACK_TIMEOUT_RTT_FACTOR > timeout)
+        timeout = _smoothedRttMs * ACK_TIMEOUT_RTT_FACTOR;
+    timeout <<= _timeoutShift;
+    return timeout > ACK_TIMEOUT_MAX_MS ? ACK_TIMEOUT_MAX_MS : timeout;
+}
+
+// With a pump task registered the caller only wakes it; otherwise pump on the calling thread as before.
+void Endpoint::requestPump() {
+    if (_pumpTask != nullptr)
+        xTaskNotifyGive(_pumpTask);
+    else
+        pump();
+}
+
 void Endpoint::pump() {
     if (!_transport.isConnected())
         return;
 
     lock();
+    const bool dropped = pumpLocked();
+    unlock();
+    if (dropped && _sendFailedHandler)
+        _sendFailedHandler(); // mutex released, so the handler may call send()
+}
+
+// Returns true when the in-flight frame ran out of retries and was dropped.
+bool Endpoint::pumpLocked() {
     const unsigned long now = millis();
     if (!_sessionReady) {
         if (now - _lastHelloMs >= HELLO_INTERVAL_MS) sendHello();
-        unlock();
-        return;
+        return false;
     }
+    bool dropped = false;
 
     if (_inFlight) {
-        if (now - _sentAt < ACK_TIMEOUT_MS) {
-            unlock();
-            return; // still waiting for ACK
-        }
+        if (now - _sentAt < ackTimeoutLocked())
+            return false; // still waiting for ACK
         if (_retries >= MAX_RETRIES) {
-            // Give up; coalesced fresh values (or the next periodic update) will
-            // resend. The in-flight slot frees up for new traffic.
+            // Give up and free the slot; the send-failed handler lets the application re-send its state.
             _inFlight = false;
+            dropped = true;
             _inFlightPayloadCount = 0;
         } else {
             _transport.send(_txBuf, _txLen);
             _sentAt = now;
             _retries++;
-            unlock();
-            return;
+            _retransmits++;
+            if (_timeoutShift < ACK_TIMEOUT_MAX_SHIFT)
+                _timeoutShift++; // stays raised for the next frames until one is ACKed cleanly
+            return false;
         }
     }
 
     // Idle: drain the highest-priority entries into one frame.
-    if (_queue.empty()) {
-        unlock();
-        return;
-    }
+    if (_queue.empty())
+        return dropped;
 
     memset(&_txFrame, 0, sizeof(_txFrame));
     pb_size_t count = 0;
@@ -264,15 +307,17 @@ void Endpoint::pump() {
     if (_nextId == 0)
         _nextId = 1;
 
-    while (!encodeFrame(_txFrame, _txBuf, BUFFER_SIZE, &_txLen)) {
-        if (count <= 1) {
-            ESP_LOGE(ENDPOINT_TAG, "Outbound payload exceeds datagram budget");
-            unlock();
-            return;
-        }
-        const auto &deferred = _txFrame.payloads[--count];
-        _queue.upsert(gm_proto::coalescingKey(deferred), gm_proto::defaultPriority(deferred.which_content), deferred);
+    // Over the transport limit: push the lowest-priority payloads back for the next frame.
+    bool encoded;
+    while (!(encoded = encodeFrame(_txFrame, _txBuf, frameLimit(), &_txLen)) && count > 1) {
+        const gm::Payload &last = _txFrame.payloads[--count];
+        _queue.upsert(gm_proto::coalescingKey(last), gm_proto::defaultPriority(last.which_content), last);
         _txFrame.payloads_count = count;
+    }
+    if (!encoded) {
+        // An individual payload over the current link limit must not starve the controls behind it.
+        ESP_LOGE(ENDPOINT_TAG, "Outbound payload exceeds datagram budget");
+        return true;
     }
 
     _transport.send(_txBuf, _txLen);
@@ -283,7 +328,7 @@ void Endpoint::pump() {
     _inFlightId = _txFrame.id;
     _sentAt = now;
     _retries = 0;
-    unlock();
+    return dropped;
 }
 
 void Endpoint::handleData(const uint8_t *data, size_t length) {
@@ -352,8 +397,13 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
         if (_retries == 0) {
             const uint32_t rtt = static_cast<uint32_t>(millis() - _sentAt);
             _lastRttMs = rtt;
-            _smoothedRttMs = _rttValid ? (_smoothedRttMs * 7 + rtt) / 8 : rtt;
+            // Rise fast, fall slow: the round trip jumps ~5x when the link relaxes to its idle interval after a process.
+            if (!_rttValid || rtt > _smoothedRttMs)
+                _smoothedRttMs = _rttValid ? (_smoothedRttMs + rtt) / 2 : rtt;
+            else
+                _smoothedRttMs = (_smoothedRttMs * 7 + rtt) / 8;
             _rttValid = true;
+            _timeoutShift = 0; // a clean sample: the estimate is trustworthy again
         }
         _inFlight = false;
         _inFlightPayloadCount = 0;
@@ -364,7 +414,7 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
 
     if (id != 0 && duplicate) {
         sendAck(id); // peer's previous ACK was lost; re-ack without re-processing
-        pump();
+        requestPump();
         return;
     }
 
@@ -397,7 +447,7 @@ void Endpoint::handleData(const uint8_t *data, size_t length) {
     }
 
     // A received ACK may have freed the in-flight slot; send the next frame now.
-    pump();
+    requestPump();
 }
 
 uint32_t Endpoint::freshSessionId() {
@@ -439,6 +489,7 @@ void Endpoint::resetSession() {
     _inFlight = false;
     _inFlightPayloadCount = 0;
     _retries = 0;
+    _timeoutShift = 0;
     _txLen = 0;
     _inFlightId = 0;
     _lastRxId = 0;

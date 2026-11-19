@@ -1,48 +1,74 @@
+import './AnalysisTableLabels.css';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faExclamationTriangle, faCheck, faTimes } from '@fortawesome/free-solid-svg-icons';
+import { t } from '@lingui/core/macro';
+import { Trans } from '@lingui/react/macro';
+import {
+  faExclamationTriangle,
+  faCheck,
+  faTimes,
+  faScaleBalanced,
+  faClock,
+  faStop,
+} from '@fortawesome/free-solid-svg-icons';
 import { getDisplayStopReasonParts, utilityColors } from '../../utils/analyzerUtils';
-import { isSafetyExitReason } from '../../services/analyzer/exitReasons.js';
+import {
+  PHASE_EXIT_REASON,
+  isSafetyExitReason,
+  isWeightType,
+} from '../../services/analyzer/exitReasons.js';
 
-export function ComparePhaseLabel({ phase, results }) {
+export function ComparePhaseLabel({ phase, results, section = 'all' }) {
   if (!phase) {
     return <div className='text-base-content/45 leading-tight font-medium'>-</div>;
   }
 
   const { skipNotice, stopReason } = getDisplayStopReasonParts(phase.exit?.reason);
   const safetyStop = isSafetyExitReason(phase.exit?.code);
+  const brewModeIcon = results?.isBrewByWeight ? faScaleBalanced : faClock;
+  const completionIcon = [
+    PHASE_EXIT_REASON.ABORTED,
+    PHASE_EXIT_REASON.SAFETY,
+    PHASE_EXIT_REASON.HOLD_RELEASED,
+  ].includes(results?.finalExitReasonCode ?? phase.exit?.code)
+    ? faStop
+    : brewModeIcon;
 
   return (
     <>
-      <div className='text-base-content/90 mb-0.5 leading-none font-medium'>
-        {phase.displayName}
-      </div>
-      {skipNotice ? (
+      {section !== 'reason' && (
+        <div className='text-base-content/90 mb-0.5 leading-none font-medium'>
+          {phase.displayName}
+        </div>
+      )}
+      {section !== 'reason' && skipNotice ? (
         <div
-          className='text-base-content/55 leading-tight font-medium'
+          className='analysis-table-label analysis-table-label--skipped text-base-content/90 leading-tight font-medium'
           style={{ fontSize: '0.8em' }}
         >
           {skipNotice}
         </div>
       ) : null}
-      {stopReason ? (
+      {section !== 'phase' && stopReason ? (
         <div
-          className='font-normal'
+          className='analysis-table-label analysis-table-label--neutral analysis-table-label--reason text-base-content/90 font-normal'
           style={{
             fontSize: '0.85em',
-            color: safetyStop ? utilityColors.warningOrange : utilityColors.stopRed,
+            '--analysis-stop-label-color': safetyStop
+              ? utilityColors.warningOrange
+              : 'var(--analyzer-stop-label)',
           }}
         >
           {stopReason}
         </div>
       ) : null}
-      {phase.isFinalExecuted && (
+      {section !== 'reason' && phase.isFinalExecuted && (
         <div
-          className='text-base-content/55 leading-tight font-medium'
+          className='analysis-table-label analysis-table-label--neutral analysis-table-label--completion text-base-content/90 leading-tight font-medium'
           style={{
             fontSize: '0.8em',
-            color: results?.completionTone === 'warning' ? utilityColors.warningOrange : undefined,
           }}
         >
+          <FontAwesomeIcon icon={completionIcon} aria-hidden='true' />
           {results?.completionLabel || results?.brewModeLabel}
         </div>
       )}
@@ -62,6 +88,8 @@ const CELL_METRIC_UNITS = {
   f: 'ml/s',
   tf: 'ml/s',
   pf: 'ml/s',
+  pr: 's·√bar/mL',
+  lr: 'bar·s/mL',
   t: '°C',
   tt: '°C',
   w: 'g',
@@ -125,7 +153,7 @@ function getMetricCellValue(stats, metricKey, partKey) {
 
   return parts.length === 1
     ? formatPart(parts[0])
-    : `${formatPart(parts[0])}/${formatPart(parts[1])}`;
+    : `${formatPart(parts[0])} / ${formatPart(parts[1])}`;
 }
 
 function resolveCellValue({ data, stats, col, isSkipped = false }) {
@@ -211,7 +239,7 @@ function TargetDeltaDisplay({ targetVal, unit, subTextSize }) {
       style={subTextSize}
       className='text-base-content/55 mt-0.5 leading-tight font-medium tracking-normal whitespace-nowrap italic'
     >
-      Target {targetVal} {unit}
+      Target {formatCellNumber(targetVal)} {unit}
     </div>
   );
 }
@@ -219,7 +247,7 @@ function TargetDeltaDisplay({ targetVal, unit, subTextSize }) {
 function findPhaseTarget(phase, col) {
   const targets = Array.isArray(phase?.profilePhase?.targets) ? phase.profilePhase.targets : [];
   return targets.find(target => {
-    if (col.id === 'weight') return target.type === 'weight' || target.type === 'volumetric';
+    if (col.id === 'weight') return isWeightType(target.type);
     return target.type === col.targetType;
   });
 }
@@ -244,9 +272,12 @@ function getTargetDisplay({ phase, col, unit, subTextSize }) {
 }
 
 function getTargetCalcEntry(phase, col) {
+  if (phase?.useRecordedWeight && col.id === 'weight') return null;
   if (!col.targetType || !phase?.targetCalcValues) return null;
   return col.id === 'weight'
-    ? phase.targetCalcValues.volumetric || phase.targetCalcValues.weight
+    ? phase.targetCalcValues.volumetric ||
+        phase.targetCalcValues.weight ||
+        phase.targetCalcValues.ratio
     : phase.targetCalcValues[col.targetType];
 }
 
@@ -260,7 +291,7 @@ function replaceCellValueWithCalc({ mainValue, calcEntry, col }) {
     (col.type === 'se' || col.type === 'mm')
   ) {
     const parts = mainValue.split('/');
-    return `${parts.slice(0, -1).join('/')}/${calcValue}`;
+    return [...parts.slice(0, -1).map(part => part.trim()), calcValue].join(' / ');
   }
 
   return calcValue;
@@ -278,7 +309,9 @@ function getWeightWarnings({ phase, isWeightCol, subTextSize }) {
         className='mt-0.5 flex items-center justify-end gap-1 font-bold'
       >
         <FontAwesomeIcon icon={faExclamationTriangle} />
-        <span>Scale Lost</span>
+        <span>
+          <Trans>Scale Lost</Trans>
+        </span>
       </div>,
     );
   }
@@ -292,7 +325,7 @@ function getWeightWarnings({ phase, isWeightCol, subTextSize }) {
       >
         <FontAwesomeIcon icon={faExclamationTriangle} />
         <span>
-          High Scale Delay
+          <Trans>High Scale Delay</Trans>
           {phase.estimatedScaleDelayMs ? ` (${phase.estimatedScaleDelayMs} ms)` : ''}
         </span>
       </div>,
@@ -302,27 +335,60 @@ function getWeightWarnings({ phase, isWeightCol, subTextSize }) {
   return warnings;
 }
 
-function renderTotalCellContent({ isBoolean, booleanContent, mainValue, unit, warning = false }) {
+function getExtendedTotalCellValue(results, col) {
+  if (
+    !results?.extendedTotal ||
+    (!DIRECT_CELL_FIELDS[col.id] && !/^([a-z]+)_(se|mm|avg)$/.test(col.id))
+  )
+    return null;
+  const { mainValue, unit } = resolveCellValue({
+    data: results.extendedTotal,
+    stats: results.extendedTotal,
+    col,
+  });
+  return `${mainValue} ${unit}`;
+}
+
+function renderTotalCellContent({
+  isBoolean,
+  booleanContent,
+  mainValue,
+  unit,
+  warning = false,
+  extendedValue,
+}) {
   if (isBoolean) return <div className='flex justify-end'>{booleanContent}</div>;
   return (
-    <span
-      className='text-base-content/90 font-medium'
-      style={warning ? { color: utilityColors.warningOrange } : undefined}
-    >
-      {mainValue} {unit}
-    </span>
+    <div className='flex flex-col items-end'>
+      <span
+        className='text-base-content/90 font-medium'
+        style={warning ? { color: utilityColors.warningOrange } : undefined}
+      >
+        {mainValue} {unit}
+      </span>
+      {extendedValue && (
+        <div
+          style={{ fontSize: '0.85em' }}
+          className='text-base-content/55 mt-0.5 leading-tight font-medium tracking-normal whitespace-nowrap italic'
+        >
+          <Trans>Extended:</Trans> {extendedValue}
+        </div>
+      )}
+    </div>
   );
 }
 
 function getCellHitState({ phase, col }) {
   if (col.id === 'weight') {
-    return phase.exit?.type === 'weight' || phase.exit?.type === 'volumetric';
+    return isWeightType(phase.exit?.type);
   }
   if (!col.targetType) return false;
   return phase.exit?.type === col.targetType;
 }
 
 function renderBooleanCellContent({ booleanContent, booleanAnomaly, subTextSize }) {
+  const sampleNumber = booleanAnomaly?.sampleInPhase;
+  const sampleValue = String(booleanAnomaly?.value);
   return (
     <div className='flex h-full flex-col items-end justify-center pb-1'>
       <div className='flex items-center'>{booleanContent}</div>
@@ -330,10 +396,10 @@ function renderBooleanCellContent({ booleanContent, booleanAnomaly, subTextSize 
         <div
           style={subTextSize}
           className='text-base-content/55 mt-0.5 flex flex-col items-end leading-tight font-medium tracking-normal'
-          title={`Sample ${booleanAnomaly.sampleInPhase}: ${String(booleanAnomaly.value)}`}
+          title={t`Sample ${sampleNumber}: ${sampleValue}`}
         >
           <span>
-            Sample {booleanAnomaly.sampleInPhase}
+            <Trans>Sample {sampleNumber}</Trans>
             {Number.isFinite(booleanAnomaly.sampleCountInPhase)
               ? ` (${booleanAnomaly.sampleCountInPhase})`
               : ''}
@@ -355,15 +421,23 @@ function renderMetricCellValue({
 }) {
   const isStopValue = mainValueIsCalculated ? calcIsStopReason : isHit && !calcIsStopReason;
   let style = {};
-  if (warning) {
+  if (isStopValue) {
+    style = {
+      '--analysis-stop-label-color': warning
+        ? utilityColors.warningOrange
+        : 'var(--analyzer-stop-label)',
+    };
+  } else if (warning) {
     style = { color: utilityColors.warningOrange };
-  } else if (isStopValue) {
-    style = { color: utilityColors.stopRed };
   }
 
   return (
     <span
-      className={isStopValue ? 'font-normal' : 'text-base-content/90 font-medium'}
+      className={
+        isStopValue
+          ? 'analysis-table-label analysis-table-label--neutral analysis-table-label--reason text-base-content/90 font-normal'
+          : 'text-base-content/90 font-medium'
+      }
       style={style}
     >
       {mainValue} {unit}
@@ -394,6 +468,7 @@ export function CellContent({ phase, col, results, isTotal = false }) {
       mainValue,
       unit,
       warning: safetyStopReason,
+      extendedValue: getExtendedTotalCellValue(results, col),
     });
   }
 

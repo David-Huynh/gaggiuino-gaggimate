@@ -5,7 +5,7 @@
 // scale plugins (BLE / HW), and the role resolver below. Kept free of
 // Arduino/ESP headers so the resolution logic stays a small, self-contained
 // unit that is easy to reason about (and unit-test) in isolation.
-enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH, HARDWARE_SCALE };
+enum class VolumetricMeasurementSource { INACTIVE, FLOW_ESTIMATION, BLUETOOTH, HARDWARE_SCALE, HARDWARE = HARDWARE_SCALE };
 
 enum class ScaleRole { BREW, GRIND };
 

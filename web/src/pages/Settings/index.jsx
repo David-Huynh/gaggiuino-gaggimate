@@ -1,22 +1,27 @@
+import { confirmProfileApply, waitForMachineHardware } from '../../utils/machineProfiles.js';
+import { requestSettings } from '../../utils/settingsRequest.js';
 import { faFileExport } from '@fortawesome/free-solid-svg-icons/faFileExport';
 import { faFileImport } from '@fortawesome/free-solid-svg-icons/faFileImport';
 import { faEllipsisVertical } from '@fortawesome/free-solid-svg-icons/faEllipsisVertical';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { useCallback, useEffect, useRef, useState, useContext } from 'preact/hooks';
-import { useRoute } from 'preact-iso';
+import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
+import { useLocation, useRoute } from 'preact-iso';
+import { Plural, Trans, useLingui } from '@lingui/react/macro';
+import { t } from '@lingui/core/macro';
 import {
-  ApiServiceContext,
   machine,
+  ApiServiceContext,
   prefetchSettings,
   updateSettingsCache,
   getCachedSettings,
 } from '../../services/ApiService.js';
 import {
-  DASHBOARD_LAYOUTS,
+  getDashboardLayout,
   setDashboardLayout,
   setClock24h,
 } from '../../utils/dashboardManager.js';
 import { downloadJson } from '../../utils/download.js';
+import { validateTankCalibration } from '../../utils/waterLevel.js';
 import {
   mergeAutoTuningRuntimeStatus,
   selectAutoTuningProvider,
@@ -29,6 +34,7 @@ import { getStoredTheme, handleThemeChange } from '../../utils/themeManager.js';
 
 import PageLayout from '../../components/PageLayout.jsx';
 import PageHeader from '../../components/PageHeader.jsx';
+import { useProfileList } from '../../services/hooks.js';
 import TabBar from '../../components/TabBar.jsx';
 
 import lazy from 'preact-iso/lazy';
@@ -64,39 +70,53 @@ import { faCrosshairs } from '@fortawesome/free-solid-svg-icons/faCrosshairs';
 import { faPuzzlePiece } from '@fortawesome/free-solid-svg-icons/faPuzzlePiece';
 import { faBluetoothB } from '@fortawesome/free-brands-svg-icons/faBluetoothB';
 import { faRotate } from '@fortawesome/free-solid-svg-icons/faRotate';
+import { isApp } from '../../app/platform.js';
+import {
+  CHECKBOX_KEYS,
+  parseAutoWakeupSchedules,
+  serializeAutoWakeupSchedules,
+  splitPidString,
+} from './settingsForm.js';
 
-function splitPidString(pidString) {
-  if (!pidString) return { pid: pidString, kf: '0.000' };
-  const parts = pidString.split(',');
-  if (parts.length >= 4) {
-    return { pid: parts.slice(0, 3).join(','), kf: parts[3] };
-  }
-  return { pid: pidString, kf: '0.000' };
-}
+// Device facts GET /api/settings reports for display only; never saved, exported or imported.
+const READ_ONLY_KEYS = [
+  'homekitAvailable',
+  'deviceIp',
+  'setupDone',
+  'apMode',
+  'setupStep',
+  'machineHardwareApplyPending',
+  'machineHardwareReady',
+  'machineHardwareError',
+  'steamControlsAvailable',
+  'machineProfileBoard',
+  'machineProfileCapabilities',
+  'machineHardwareConfiguration',
+  'machineProfileSupportedFields',
+];
+
+// Form-only fields that never come back from GET /api/settings.
+const FORM_ONLY_KEYS = [
+  'kf',
+  'button0',
+  'button1',
+  'button2',
+  'standbyDisplayEnabled',
+  'dashboardLayout',
+];
+
+// Owned by the Bluetooth pairing flow; only a settings import may write them (GM-288).
+const IMPORT_ONLY_KEYS = ['savedScale', 'savedScaleName'];
+
+const DEFAULT_SCALE_FACTOR_1 = -2500.0;
+const DEFAULT_SCALE_FACTOR_2 = 2500.0;
+const DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS = 10;
+const DEFAULT_HARDWARE_SCALE_FILTER_ALPHA = 0.8;
 
 function splitButtons(buttonBehavior) {
   if (!buttonBehavior) return {};
   const [button0, button1, button2] = buttonBehavior.split(',');
   return { button0, button1, button2 };
-}
-
-function parseAutoWakeupSchedules(autowakeupSchedules) {
-  const defaultSchedule = [{ time: '07:00', days: [true, true, true, true, true, true, true] }];
-  if (!autowakeupSchedules) {
-    return defaultSchedule;
-  }
-  const schedules = [];
-  if (typeof autowakeupSchedules === 'string' && autowakeupSchedules.trim()) {
-    const scheduleStrings = autowakeupSchedules.split(';');
-    for (const scheduleStr of scheduleStrings) {
-      const [time, daysStr] = scheduleStr.split('|');
-      if (time && daysStr && daysStr.length === 7) {
-        const days = daysStr.split('').map(d => d === '1');
-        schedules.push({ time, days });
-      }
-    }
-  }
-  return schedules.length > 0 ? schedules : defaultSchedule;
 }
 
 function transformFetchedSettings(fetchedSettings) {
@@ -111,8 +131,29 @@ function transformFetchedSettings(fetchedSettings) {
       fetchedSettings.standbyDisplayEnabled !== undefined
         ? fetchedSettings.standbyDisplayEnabled
         : fetchedSettings.standbyBrightness > 0,
-    dashboardLayout: fetchedSettings.dashboardLayout || DASHBOARD_LAYOUTS.ORDER_FIRST,
+    // Stored locally, never returned by the machine.
+    dashboardLayout: getDashboardLayout(),
   };
+
+  const sf1 = Number(fetchedSettings.scaleFactor1);
+  const sf2 = Number(fetchedSettings.scaleFactor2);
+  settingsWithToggle.scaleFactor1 =
+    Number.isFinite(sf1) && Math.abs(sf1) > 0.001 ? sf1 : DEFAULT_SCALE_FACTOR_1;
+  settingsWithToggle.scaleFactor2 =
+    Number.isFinite(sf2) && Math.abs(sf2) > 0.001 ? sf2 : DEFAULT_SCALE_FACTOR_2;
+  const sampleRate = Number(fetchedSettings.hardwareScaleSampleRateSps);
+  settingsWithToggle.hardwareScaleSampleRateSps =
+    sampleRate === 80 ? 80 : DEFAULT_HARDWARE_SCALE_SAMPLE_RATE_SPS;
+  const idleAlpha = Number(fetchedSettings.hardwareScaleIdleAlpha);
+  settingsWithToggle.hardwareScaleIdleAlpha =
+    Number.isFinite(idleAlpha) && idleAlpha > 0 && idleAlpha <= 1
+      ? idleAlpha
+      : DEFAULT_HARDWARE_SCALE_FILTER_ALPHA;
+  const activeAlpha = Number(fetchedSettings.hardwareScaleActiveAlpha);
+  settingsWithToggle.hardwareScaleActiveAlpha =
+    Number.isFinite(activeAlpha) && activeAlpha > 0 && activeAlpha <= 1
+      ? activeAlpha
+      : DEFAULT_HARDWARE_SCALE_FILTER_ALPHA;
 
   if (fetchedSettings.pid) {
     const split = splitPidString(fetchedSettings.pid);
@@ -122,29 +163,52 @@ function transformFetchedSettings(fetchedSettings) {
   return settingsWithToggle;
 }
 
-function buildSubmitFormData(formData, autowakeupSchedules, restart) {
+function isTruthySetting(value) {
+  return value === true || value === 1 || value === '1' || value === 'true' || value === 'on';
+}
+
+// Maps a full or partial settings file onto form fields; keys the file lacks stay untouched.
+function normalizeImportedSettings(data, knownKeys) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(t`The file does not contain a settings object.`);
+  }
+  const fields = {};
+  const ignored = [];
+  for (const [key, value] of Object.entries(data)) {
+    if (!knownKeys.has(key) || value === null || typeof value === 'object') {
+      ignored.push(key);
+    } else {
+      fields[key] = CHECKBOX_KEYS.includes(key) ? isTruthySetting(value) : value;
+    }
+  }
+  const count = Object.keys(fields).length;
+  // API-shaped files carry "p,i,d,kf" and "b0,b1,b2"; the form edits those as separate fields.
+  if (typeof fields.pid === 'string' && fields.pid.split(',').length >= 4) {
+    Object.assign(fields, splitPidString(fields.pid));
+  }
+  if (fields.buttonBehavior && fields.button0 === undefined) {
+    Object.assign(fields, splitButtons(String(fields.buttonBehavior)));
+  }
+  if (fields.standbyBrightness !== undefined && fields.standbyDisplayEnabled === undefined) {
+    fields.standbyDisplayEnabled = Number(fields.standbyBrightness) > 0;
+  }
+  const schedules =
+    fields.autowakeupSchedules !== undefined
+      ? parseAutoWakeupSchedules(fields.autowakeupSchedules)
+      : null;
+  return { fields, schedules, ignored, count };
+}
+
+function buildSubmitFormData(formData, autowakeupSchedules, restart, importedKeys) {
   const formDataToSubmit = new FormData();
-  const checkboxKeys = [
-    'homekit',
-    'boilerFillActive',
-    'smartGrindActive',
-    'homeAssistant',
-    'momentaryButtons',
-    'delayAdjust',
-    'clock24hFormat',
-    'autowakeupEnabled',
-    'smartGrindToggle',
-    'rlAutoTuningEnabled',
-    'rlCommunityUploadEnabled',
-  ];
 
   for (const [key, value] of Object.entries(formData)) {
-    if (value === undefined || value === null) continue;
+    if (value === undefined || value === null || READ_ONLY_KEYS.includes(key)) continue;
+    if (IMPORT_ONLY_KEYS.includes(key) && !importedKeys.has(key)) continue;
 
-    if (checkboxKeys.includes(key)) {
-      if (value) {
-        formDataToSubmit.set(key, '1');
-      }
+    if (CHECKBOX_KEYS.includes(key)) {
+      // Always explicit: the firmware leaves absent booleans untouched (GM-214).
+      formDataToSubmit.set(key, value ? '1' : '0');
     } else {
       formDataToSubmit.set(key, String(value));
     }
@@ -165,10 +229,7 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
     formDataToSubmit.set('pid', combinedPid);
   }
 
-  const schedulesStr = autowakeupSchedules
-    .map(schedule => `${schedule.time}|${schedule.days.map(d => (d ? '1' : '0')).join('')}`)
-    .join(';');
-  formDataToSubmit.set('autowakeupSchedules', schedulesStr);
+  formDataToSubmit.set('autowakeupSchedules', serializeAutoWakeupSchedules(autowakeupSchedules));
   formDataToSubmit.set('rlCommunityUploadPrompted', formData.rlCommunityUploadPrompted ? '1' : '0');
 
   if (!formData.standbyDisplayEnabled) {
@@ -184,12 +245,15 @@ function buildSubmitFormData(formData, autowakeupSchedules, restart) {
 
 export function Settings() {
   const apiService = useContext(ApiServiceContext);
+  const { t } = useLingui();
   const { params } = useRoute();
+  const { route } = useLocation();
   const tab = params.tab || 'general';
   const isFormTab = ['general', 'machine', 'plugins'].includes(tab);
 
-  const [profiles, setProfiles] = useState([]);
+  const { profiles } = useProfileList();
   const [submitting, setSubmitting] = useState(false);
+  const [smartDoseSaving, setSmartDoseSaving] = useState(false);
   const [formData, setFormData] = useState({});
   const [currentTheme, setCurrentTheme] = useState('light');
   const [showWifiPassword, setShowWifiPassword] = useState(false);
@@ -198,6 +262,9 @@ export function Settings() {
   const [autowakeupSchedules, setAutoWakeupSchedules] = useState([
     { time: '07:00', days: [true, true, true, true, true, true, true] },
   ]);
+
+  const [importNotice, setImportNotice] = useState(null);
+  const [importedKeys, setImportedKeys] = useState(() => new Set());
 
   const [fetchedSettings, setFetchedSettings] = useState(() => getCachedSettings());
   const [isLoading, setIsLoading] = useState(!fetchedSettings);
@@ -215,16 +282,6 @@ export function Settings() {
         });
     }
   }, [fetchedSettings]);
-
-  useEffect(() => {
-    const loadProfiles = async () => {
-      if (machine.value.connected) {
-        const response = await apiService.request({ tp: 'req:profiles:list', minimal: true });
-        setProfiles(response.profiles);
-      }
-    };
-    loadProfiles();
-  }, [machine.value.connected, apiService]);
 
   const formRef = useRef();
   const dropdownRef = useRef(null);
@@ -302,19 +359,7 @@ export function Settings() {
         );
         return;
       }
-      if (
-        [
-          'homekit',
-          'boilerFillActive',
-          'smartGrindActive',
-          'smartGrindToggle',
-          'homeAssistant',
-          'momentaryButtons',
-          'delayAdjust',
-          'clock24hFormat',
-          'autowakeupEnabled',
-        ].includes(key)
-      ) {
+      if (CHECKBOX_KEYS.includes(key)) {
         value = !formData[key];
       }
       if (key === 'clock24hFormat') {
@@ -343,6 +388,11 @@ export function Settings() {
   };
 
   const setField = useCallback((key, value) => {
+    setFormData(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const onSmartDoseSaved = useCallback((key, value, settings) => {
+    updateSettingsCache(settings);
     setFormData(prev => ({ ...prev, [key]: value }));
   }, []);
 
@@ -378,16 +428,36 @@ export function Settings() {
   const onSubmit = useCallback(
     async (e, restart = false) => {
       if (e) e.preventDefault();
+      // Save & Restart and imports skip native validation, and the tank fields are only mounted on the Machine tab.
+      const tankErrors = validateTankCalibration(
+        formData.emptyTankDistance,
+        formData.fullTankDistance,
+      );
+      if (
+        !isLoading &&
+        machine.value.capabilities.ledControl &&
+        (tankErrors.empty || tankErrors.full)
+      ) {
+        if (tab === 'machine') formRef.current.reportValidity();
+        else route('/settings/machine');
+        return;
+      }
+      if (smartDoseSaving || submitting) return;
       setSubmitting(true);
-      const form = formRef.current;
-      const formDataToSubmit = buildSubmitFormData(formData, autowakeupSchedules, restart);
+      const formDataToSubmit = buildSubmitFormData(
+        formData,
+        autowakeupSchedules,
+        restart,
+        importedKeys,
+      );
 
       try {
-        const response = await fetch(form.action, {
-          method: 'post',
+        if (!(await confirmProfileApply(formData))) return;
+        let data = await requestSettings({
+          method: 'POST',
           body: formDataToSubmit,
         });
-        const data = await response.json();
+        if (!restart && data.machineHardwareApplyPending) data = await waitForMachineHardware();
 
         const splitPid = data.pid ? splitPidString(data.pid) : null;
         const buttonFields = data.buttonBehavior ? splitButtons(data.buttonBehavior) : {};
@@ -402,44 +472,97 @@ export function Settings() {
 
         updateSettingsCache(data);
         setFormData(updatedData);
+        setImportNotice(null);
+        setImportedKeys(new Set());
       } catch (error) {
         console.error('Failed to save settings:', error);
+        window.alert(error.message);
       } finally {
         setSubmitting(false);
       }
     },
-    [formData, autowakeupSchedules],
+    [
+      formData,
+      autowakeupSchedules,
+      importedKeys,
+      tab,
+      route,
+      isLoading,
+      smartDoseSaving,
+      submitting,
+    ],
   );
 
   const onExport = useCallback(() => {
-    downloadJson(formData, 'settings.json');
-  }, [formData]);
+    const autowakeupSchedulesStr = serializeAutoWakeupSchedules(autowakeupSchedules);
+    const exported = { ...formData, autowakeupSchedules: autowakeupSchedulesStr };
+    READ_ONLY_KEYS.forEach(key => delete exported[key]);
+    downloadJson(exported, 'settings.json');
+  }, [formData, autowakeupSchedules]);
 
-  const onUpload = function (evt) {
-    if (evt.target.files.length) {
-      const file = evt.target.files[0];
-      const reader = new FileReader();
-      reader.onload = async e => {
-        const data = JSON.parse(e.target.result);
-        setFormData(data);
-      };
-      reader.readAsText(file);
+  const onUpload = async evt => {
+    const input = evt.target;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      // Merging onto a form that never loaded would save defaults over the real settings.
+      if (isLoading || !Object.keys(formData).length) {
+        throw new Error(t`Settings have not loaded yet.`);
+      }
+      const knownKeys = new Set([...Object.keys(formData), ...FORM_ONLY_KEYS]);
+      READ_ONLY_KEYS.forEach(key => knownKeys.delete(key));
+      const { fields, schedules, ignored, count } = normalizeImportedSettings(
+        JSON.parse(await file.text()),
+        knownKeys,
+      );
+      if (!count) throw new Error(t`The file contains no known settings.`);
+
+      setFormData(prev => ({ ...prev, ...fields }));
+      setImportedKeys(prev => new Set([...prev, ...Object.keys(fields)]));
+      if (schedules) setAutoWakeupSchedules(schedules);
+      if (fields.clock24hFormat !== undefined) setClock24h(fields.clock24hFormat);
+      if (fields.dashboardLayout !== undefined) setDashboardLayout(fields.dashboardLayout);
+      setImportNotice({ error: false, name: file.name, count, ignored });
+    } catch (error) {
+      setImportNotice({ error: true, name: file.name, message: error.message });
+    } finally {
+      // Lets the same file be picked again.
+      input.value = '';
     }
   };
 
+  const onDiscardImport = useCallback(() => {
+    const current = getCachedSettings() ?? fetchedSettings;
+    setFormData(transformFetchedSettings(current));
+    setAutoWakeupSchedules(parseAutoWakeupSchedules(current?.autowakeupSchedules));
+    setClock24h(!!current?.clock24hFormat);
+    setImportNotice(null);
+    setImportedKeys(new Set());
+  }, [fetchedSettings]);
+
   const settingsTabs = [
-    { id: 'general', label: 'General', icon: faSliders },
-    { id: 'machine', label: 'Machine', icon: faTemperatureHalf, preload: loadMachineTab },
-    { id: 'calibration', label: 'Calibration', icon: faCrosshairs, preload: loadCalibrationTab },
-    { id: 'plugins', label: 'Plugins', icon: faPuzzlePiece, preload: loadPluginsTab },
+    { id: 'general', label: t`General`, icon: faSliders },
+    {
+      id: 'machine',
+      label: t({ message: 'Machine', context: 'settings tab' }),
+      icon: faTemperatureHalf,
+      preload: loadMachineTab,
+    },
+    { id: 'calibration', label: t`Calibration`, icon: faCrosshairs, preload: loadCalibrationTab },
+    { id: 'plugins', label: t`Plugins`, icon: faPuzzlePiece, preload: loadPluginsTab },
     { id: 'bluetooth', label: 'Bluetooth', icon: faBluetoothB, preload: loadBluetoothTab },
-    { id: 'system', label: 'System & Updates', icon: faRotate, preload: loadSystemTab },
+    { id: 'system', label: t`System & Updates`, icon: faRotate, preload: loadSystemTab },
   ];
+
+  const importName = importNotice?.name;
+  const importMessage = importNotice?.message;
+  const importCount = importNotice?.count ?? 0;
+  const ignoredEntries = importNotice?.ignored?.join(', ');
 
   return (
     <PageLayout>
       <PageHeader
-        title='Settings'
+        title={isApp ? t`Device Settings` : t`Settings`}
         noStack={true}
         tabs={<TabBar tabs={settingsTabs} activeTab={tab} basePath='/settings' />}
         actions={
@@ -450,7 +573,7 @@ export function Settings() {
             <button
               onClick={() => setDropdownOpen(open => !open)}
               className='btn btn-ghost btn-circle text-base-content/85 hover:bg-base-content/10'
-              aria-label='More options'
+              aria-label={t`More options`}
               aria-expanded={dropdownOpen}
             >
               <FontAwesomeIcon icon={faEllipsisVertical} size='lg' />
@@ -464,10 +587,12 @@ export function Settings() {
                     setDropdownOpen(false);
                   }}
                   className='justify-start gap-2 font-medium'
-                  aria-label='Export settings'
+                  aria-label={t`Export settings`}
                 >
                   <FontAwesomeIcon icon={faFileExport} />
-                  <span>Export Settings</span>
+                  <span>
+                    <Trans>Export Settings</Trans>
+                  </span>
                 </button>
               </li>
               <li>
@@ -478,10 +603,12 @@ export function Settings() {
                     setDropdownOpen(false);
                   }}
                   className='justify-start gap-2 font-medium'
-                  aria-label='Import settings'
+                  aria-label={t`Import settings`}
                 >
                   <FontAwesomeIcon icon={faFileImport} />
-                  <span>Import Settings</span>
+                  <span>
+                    <Trans>Import Settings</Trans>
+                  </span>
                 </button>
               </li>
             </ul>
@@ -495,6 +622,56 @@ export function Settings() {
           </div>
         }
       />
+
+      {importNotice && (
+        <div
+          role='alert'
+          className={`alert alert-vertical sm:alert-horizontal mb-4 ${importNotice.error ? 'alert-error' : 'alert-info'}`}
+        >
+          <div className='text-sm'>
+            {importNotice.error ? (
+              <span>
+                <Trans>
+                  Could not import {importName}: {importMessage}
+                </Trans>
+              </span>
+            ) : (
+              <>
+                <span>
+                  <Trans>
+                    Loaded <Plural value={importCount} one='# setting' other='# settings' /> from{' '}
+                    {importName}. All other settings are kept. Save to apply.
+                  </Trans>
+                </span>
+                {importNotice.ignored.length > 0 && (
+                  <span className='block text-xs opacity-80'>
+                    <Trans>Ignored unknown entries: {ignoredEntries}</Trans>
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <div className='flex shrink-0 gap-2'>
+            {!importNotice.error && (
+              <button
+                type='button'
+                className='btn btn-sm btn-primary'
+                disabled={submitting}
+                onClick={() => onSubmit()}
+              >
+                <Trans>Save Settings</Trans>
+              </button>
+            )}
+            <button
+              type='button'
+              className='btn btn-sm btn-ghost'
+              onClick={importNotice.error ? () => setImportNotice(null) : onDiscardImport}
+            >
+              {importNotice.error ? t`Dismiss` : t`Discard`}
+            </button>
+          </div>
+        </div>
+      )}
 
       <form
         id='settings-page-form'
@@ -526,13 +703,21 @@ export function Settings() {
           (isLoading ? (
             <MachineTabSkeleton />
           ) : (
-            <LazyMachineTab formData={formData} onChange={onChange} setField={setField} />
+            <LazyMachineTab
+              formData={formData}
+              onChange={onChange}
+              setField={setField}
+              profiles={profiles}
+            />
           ))}
         {tab === 'plugins' &&
           (isLoading ? (
             <PluginsTabSkeleton />
           ) : (
             <LazyPluginsTab
+              onSmartDoseSaved={onSmartDoseSaved}
+              onSmartDoseSaving={setSmartDoseSaving}
+              settingsDisabled={submitting}
               formData={formData}
               onChange={onChange}
               autowakeupSchedules={autowakeupSchedules}
@@ -544,11 +729,16 @@ export function Settings() {
           ))}
 
         {isFormTab && (
-          <StickyFormFooter submitting={submitting} onRestart={e => onSubmit(e, true)} />
+          <StickyFormFooter
+            submitting={submitting || smartDoseSaving}
+            onRestart={e => onSubmit(e, true)}
+          />
         )}
       </form>
 
-      {tab === 'calibration' && <LazyCalibrationTab formData={formData} onChange={onChange} />}
+      {tab === 'calibration' && (
+        <LazyCalibrationTab formData={formData} onChange={onChange} setField={setField} />
+      )}
       {tab === 'bluetooth' && (isLoading ? <BluetoothTabSkeleton /> : <LazyBluetoothTab />)}
       {tab === 'system' && (isLoading ? <SystemTabSkeleton /> : <LazySystemTab />)}
       {communityUploadPromptOpen && (

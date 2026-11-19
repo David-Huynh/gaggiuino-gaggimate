@@ -1,6 +1,7 @@
 #ifndef GAGGIMATE_COMM_H
 #define GAGGIMATE_COMM_H
 
+#include "LedEffect.h"
 #include <cstdint>
 #include <cmath>
 
@@ -17,6 +18,13 @@ enum class PumpControlMode : uint8_t {
 enum class BoilerControlMode : uint8_t {
     Temperature = 0, // setpoint is a target temperature in degC
     Pressure = 1,    // setpoint is a target pressure in bar
+};
+
+// Physical link carrying the controller session.
+enum class LinkType : uint8_t {
+    None = 0,
+    Ble = 1,
+    Uart = 2,
 };
 
 // Per-component commands: drive several components atomically in one frame, comparable so callers send only deltas.
@@ -151,7 +159,13 @@ struct ScaleTareResult {
 struct LedChannelCommand {
     uint8_t channel = 0;
     uint8_t brightness = 0;
-    bool operator==(const LedChannelCommand &o) const { return channel == o.channel && brightness == o.brightness; }
+    LedEffect effect = LedEffect::Off;
+    uint8_t minBrightness = 0;
+    uint16_t cycleTimeMs = 0; // Alba ignores animation fields.
+    bool operator==(const LedChannelCommand &o) const {
+        return channel == o.channel && brightness == o.brightness && effect == o.effect && minBrightness == o.minBrightness &&
+               cycleTimeMs == o.cycleTimeMs;
+    }
     bool operator!=(const LedChannelCommand &o) const { return !(*this == o); }
 };
 

@@ -1,5 +1,6 @@
 import PropTypes from 'prop-types';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { useLingui } from '@lingui/react/macro';
 import { getPrimaryIcon, getPrimaryLabel } from '../utils.js';
 import { WarningIcon } from '../../../components/WarningIcon.jsx';
 import { activeWarnings, WARNING_LEVEL } from '../../../utils/warnings.js';
@@ -16,7 +17,6 @@ export function ActionCard({
   isFinished,
   isBrewing,
   isGrinding,
-  isGrindAvailable,
   isFlushing,
   activate,
   deactivate,
@@ -42,6 +42,7 @@ export function ActionCard({
   warnings = [],
   systemMessage = '',
 }) {
+  const { t } = useLingui();
   const [preheated, setPreheated] = useState(false);
   const showPrimary = mode === 1 || mode === 3 || mode === 4;
   const showStandby = mode === 0;
@@ -95,7 +96,7 @@ export function ActionCard({
             <TargetToggle value={grindTarget ? 1 : 0} onChange={changeTarget} />
           </div>
           <Adjuster
-            label='Grind target'
+            label={t`Grind target`}
             value={grindValue}
             onDecrease={lowerTarget}
             onIncrease={raiseTarget}
@@ -103,7 +104,7 @@ export function ActionCard({
         </div>
       )}
       {!showStandby && (
-        <div className='flex items-center justify-start gap-2' aria-label='Active warnings'>
+        <div className='flex items-center justify-start gap-2' aria-label={t`Active warnings`}>
           {shownWarnings.map(w => (
             <WarningIcon
               key={w.key}
@@ -127,12 +128,12 @@ export function ActionCard({
       )}
       {showStandby && (
         <span className='text-base-content/70 col-span-full py-2 text-center text-sm'>
-          {systemMessage || 'Machine is ready, wake up to use'}
+          {systemMessage || t`Machine is ready, wake up to use`}
         </span>
       )}
       {showSteam && (
         <span className='text-base-content/70 py-2 text-sm'>
-          {!preheated ? 'Preheating...' : 'Ready to steam, open wand'}
+          {!preheated ? t`Preheating...` : t`Ready to steam, open wand`}
         </span>
       )}
       {!showStandby && (

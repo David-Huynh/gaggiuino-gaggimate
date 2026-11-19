@@ -18,6 +18,7 @@
 #include "stm32f4_pindef.h"
 #include <Arduino.h>
 #include <GaggiMateController.h>
+#include "version.h"
 
 // STM32duino HardwareSerial constructor is (RX, TX)
 // Gaggiuino pindef: PA2=TX, PA3=RX, so constructor is (PA3, PA2).
@@ -42,7 +43,7 @@ void setup() {
     // This MUST be initialized before GaggiMateServer starts its UART transport.
     UART_COMM.begin(UART_COMM_BAUD);
 
-    controller = new GaggiMateController(FIRMWARE_VERSION);
+    controller = new GaggiMateController(BUILD_GIT_VERSION);
 
     controller->setup(); // this calls vTaskStartScheduler() and never returns
 }

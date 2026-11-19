@@ -13,6 +13,8 @@ struct SystemCapabilities {
     bool pressure;
     bool ledControl;
     bool tof;
+    bool dualBoiler;
+    bool hwScale = false;
     bool scale;
     std::vector<uint32_t> addons;
 

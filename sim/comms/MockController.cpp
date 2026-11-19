@@ -10,7 +10,7 @@ void MockController::begin() {
 }
 
 void MockController::setBoiler(const BoilerCommand &c) {
-    if (c.mode == BoilerControlMode::Temperature)
+    if (c.mode == BoilerControlMode::Temperature && c.index == 0)
         targetTemp = c.setpoint;
 }
 
@@ -53,8 +53,8 @@ void MockController::update() {
         } else if (pumpMode == PumpControlMode::Flow) {
             fDest = targetFlow;
             pDest = std::min(11.0f, targetFlow * 4.0f);
-        } else { // power
-            pDest = pumpPower / 10.0f;
+        } else {                                                          // power
+            pDest = pumpPower / 100.0f * (brewValveOpen ? 10.0f : 12.0f); // closed valve: deadhead up to the OPV
             fDest = std::max(0.3f, pumpPower / 40.0f);
         }
     }
@@ -69,7 +69,8 @@ void MockController::update() {
         lastSensorMs = now;
         const float puckResistance = flow > 0.05f ? pressure / flow : 0.0f;
         if (onSensor)
-            onSensor(temperature, pressure, flow, flow, puckResistance, pumpPower, constrain(gain * 100.0, 0.0f, 100.0f), 0.0f);
+            onSensor(temperature, temperature + 40.0f, pressure, flow, flow, puckResistance, pumpPower,
+                     constrain(gain * 100.0, 0.0f, 100.0f), 0.0f);
         if (onVolumetric)
             onVolumetric(weight);
     }

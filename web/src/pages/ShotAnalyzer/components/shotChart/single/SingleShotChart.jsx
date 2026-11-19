@@ -1,12 +1,11 @@
-/* global globalThis */
-
 /** Coordinates the single-chart lifecycle, responsive layout, hover, replay, and export. */
 
 import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
-import Chart from 'chart.js/auto';
+import Chart from '../../../../../utils/lineChart.js';
 import annotationPlugin from 'chartjs-plugin-annotation';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { Trans, useLingui } from '@lingui/react/macro';
 import { faMinus } from '@fortawesome/free-solid-svg-icons/faMinus';
 import { faPlus } from '@fortawesome/free-solid-svg-icons/faPlus';
 import {
@@ -25,6 +24,7 @@ import {
   useMeasuredExternalTooltipLayout,
 } from '../ShotChartExternalTooltip';
 import {
+  INITIAL_VISIBILITY,
   REPLAY_FRAME_INTERVAL_MS,
   SINGLE_METRIC_PAGE_KEYS,
   TEMP_CHART_HEIGHT_MIN,
@@ -72,6 +72,7 @@ import {
 import {
   EMPTY_SHOT_SAMPLES,
   getClampedScrubXValue,
+  getSingleMetricPageVisibility,
   getShotChartIdentityKey,
   getShotSampleCapabilities,
   hasFiniteScrubValue,
@@ -82,6 +83,7 @@ import {
 Chart.register(annotationPlugin);
 
 export function SingleShotChart({ shotData, profileData, results, desktopCardHeight = 0 }) {
+  const { t } = useLingui();
   // These refs point to the mounted DOM and Chart.js instances. They stay local
   // to the component because only the top-level orchestrator owns mounting and teardown.
   const hoverAreaRef = useRef(null);
@@ -138,6 +140,8 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
   const shotSamples = Array.isArray(shotData?.samples) ? shotData.samples : EMPTY_SHOT_SAMPLES;
 
   const { hasWeightData, hasWeightFlowData } = getShotSampleCapabilities(shotSamples);
+  const chartSeriesCapabilitiesRef = useRef({ hasWeightData, hasWeightFlowData });
+  chartSeriesCapabilitiesRef.current = { hasWeightData, hasWeightFlowData };
   const scrubberMax = Math.max(0, Number(chartMaxTime) || 0);
   const hasActiveScrubValue = hasFiniteScrubValue(scrubXValue);
   const clampedScrubXValue = getClampedScrubXValue(scrubXValue, scrubberMax);
@@ -283,14 +287,35 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
     if (typeof browserWindow?.matchMedia !== 'function') return undefined;
 
     const mediaQuery = browserWindow.matchMedia('(max-width: 640px)');
-    const handleChange = event => {
-      setUseStaticTooltip(event.matches);
-      if (event.matches) {
+    const applyViewportVisibility = isMobile => {
+      setUseStaticTooltip(isMobile);
+
+      if (isMobile) {
+        const { hasWeightData: hasWeight, hasWeightFlowData: hasWeightFlow } =
+          chartSeriesCapabilitiesRef.current;
+        setSingleMetricPageKey(SINGLE_METRIC_PAGE_KEYS.BASICS);
+        setVisibility(prev =>
+          getSingleMetricPageVisibility({
+            hasWeightData: hasWeight,
+            hasWeightFlowData: hasWeightFlow,
+            pageKey: SINGLE_METRIC_PAGE_KEYS.BASICS,
+            visibility: prev,
+          }),
+        );
         setScrubXValue(null);
         hideExternalTooltip();
+        return;
       }
+
+      setVisibility(prev => ({ ...prev, ...INITIAL_VISIBILITY }));
     };
-    setUseStaticTooltip(mediaQuery.matches);
+    const handleChange = event => applyViewportVisibility(event.matches);
+
+    if (mediaQuery.matches) {
+      applyViewportVisibility(true);
+    } else {
+      setUseStaticTooltip(false);
+    }
     mediaQuery.addEventListener('change', handleChange);
     return () => mediaQuery.removeEventListener('change', handleChange);
   }, [hideExternalTooltip]);
@@ -445,6 +470,23 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
     if (label === 'Weight Flow' && !hasWeightFlowData) return;
     setVisibility(prev => ({ ...prev, [key]: !prev[key] }));
   };
+
+  const handleSingleMetricPageChange = useCallback(
+    nextPageKey => {
+      if (nextPageKey === singleMetricPageKey) return;
+
+      setSingleMetricPageKey(nextPageKey);
+      setVisibility(prev =>
+        getSingleMetricPageVisibility({
+          hasWeightData,
+          hasWeightFlowData,
+          pageKey: nextPageKey,
+          visibility: prev,
+        }),
+      );
+    },
+    [hasWeightData, hasWeightFlowData, singleMetricPageKey],
+  );
 
   useEffect(() => {
     saveToStorage(ANALYZER_DB_KEYS.SINGLE_CHART_VISIBILITY, visibility);
@@ -714,7 +756,7 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
     scrubberMax > 0 ? (
       <MobileChartScrubber
         active={hasActiveScrubValue}
-        ariaLabel='Scrub shot time'
+        ariaLabel={t`Scrub shot time`}
         insets={scrubberInsets}
         max={scrubberMax}
         onInput={updateScrubberFromNativeInput}
@@ -749,7 +791,7 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
             emptyContent={
               <ShotChartStaticMetricPreview
                 activePageKey={singleMetricPageKey}
-                onPageChange={setSingleMetricPageKey}
+                onPageChange={handleSingleMetricPageChange}
                 results={results}
               />
             }
@@ -835,7 +877,9 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
             className='text-xs'
             aria-hidden='true'
           />
-          <span>{isMobileSeriesLegendExpanded ? 'Hide legend' : 'Show legend'}</span>
+          <span>
+            {isMobileSeriesLegendExpanded ? <Trans>Hide legend</Trans> : <Trans>Show legend</Trans>}
+          </span>
         </button>
         {isMobileSeriesLegendExpanded ? (
           <ShotChartLegendToggles
@@ -880,7 +924,7 @@ export function SingleShotChart({ shotData, profileData, results, desktopCardHei
           onClick={() => {
             if (!isControlsLocked) toggleFullDisplay();
           }}
-          aria-label='Close full display'
+          aria-label={t`Close full display`}
         />
         <div className='shot-chart-full-display__panel'>
           {controls}

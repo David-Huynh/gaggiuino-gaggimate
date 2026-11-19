@@ -349,6 +349,10 @@ int main(int argc, char **argv) {
     assert(history.savedNotes.indexOf("history-recovery") >= 0);
     assert(history.ensureProjection(restoredHistory));
     assert(history.index.size() == 1 && historyFile.node->bytes == expectedHistory);
+    historyFile.node->bytes[offsetof(ShotLogHeader, version)] = 7;
+    const auto oldHistory = historyFile.node->bytes;
+    assert(history.ensureProjection(restoredHistory));
+    assert(historyFile.node->bytes == oldHistory);
     historyFile.node->bytes.resize(100); // interrupted/partial old history file
     assert(history.ensureProjection(restoredHistory));
     assert(LittleFS.open("/h/000042.slog").node->bytes == expectedHistory);
@@ -356,8 +360,13 @@ int main(int argc, char **argv) {
     restoredHistory.record.history.phaseTransitionCount = restoredHistory.record.history.phaseTransitions.size() + 1;
     assert(!history.ensureProjection(restoredHistory));
     assert(LittleFS.open("/h/000042.slog").node->bytes == expectedHistory);
+    assert(LittleFS.remove("/h/000042.slog"));
+    history.machine.clearedBefore = 43;
+    restoredHistory.record.history.phaseTransitionCount = 1;
+    assert(history.ensureProjection(restoredHistory));
+    assert(!LittleFS.exists("/h/000042.slog"));
     assert(store.remove("history-recovery"));
-    puts("PASS history projection: persisted-shot recovery, chunk boundary, repeat recovery and invalid metadata");
+    puts("PASS history projection: persisted-shot recovery, old logs retained, invalid metadata, bulk deletion respected");
     recipeArtifact.record = edited;
     recipeArtifact.record.shotId = "confirmed-recipe";
     recipeArtifact.completion.shotId = "confirmed-recipe";

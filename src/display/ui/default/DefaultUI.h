@@ -19,6 +19,21 @@ constexpr int RERENDER_INTERVAL_ACTIVE = 100;
 
 constexpr int TEMP_HISTORY_INTERVAL = 250;
 
+constexpr int SHOT_CHART_POINTS = 120;                    // 30 s live window; older samples slide out to the left
+constexpr unsigned long SHOT_CHART_SAMPLE_INTERVAL = 250; // ms per point
+constexpr int SHOT_HISTORY_POINTS = 480;                  // 2 min of samples, shown whole once the shot ends
+constexpr int PROFILE_CHART_POINTS = 100;                 // pro profile preview chart resolution
+
+enum ShotChartSeries {
+    SHOT_PRESSURE,
+    SHOT_TARGET_PRESSURE,
+    SHOT_FLOW,
+    SHOT_TARGET_FLOW,
+    SHOT_TEMPERATURE,
+    SHOT_WEIGHT,
+    SHOT_SERIES_COUNT
+};
+
 int16_t calculate_angle(int set_temp, int range, int offset);
 
 enum class BrewScreenState { Brew, Settings };
@@ -34,12 +49,15 @@ class DefaultUI {
 
     // Interface methods
     void changeScreen(ScreensEnum screen);
+    void onWelcomeContinue();
+    ScreensEnum getCurrentScreen() const { return currentScreen; }
 
     void changeBrewScreenMode(BrewScreenState state);
     void onProfileSwitch();
     void onNextProfile();
     void onPreviousProfile();
     void onProfileSelect();
+    void onProfileDetailToggle();
     void setBrightness(int brightness) {
         if (panelDriver) {
             panelDriver->setBrightness(brightness);
@@ -73,6 +91,7 @@ class DefaultUI {
         brewConfirmVisible = visible;
         rerender = true;
     }
+    bool isBrewConfirmVisible() const { return brewConfirmVisible; }
 
     void markDirty() { rerender = true; }
     void markProfileDirty() { profileDirty = true; }
@@ -89,23 +108,96 @@ class DefaultUI {
     void setupState();
 
     void handleScreenChange();
+    void updateAccessQrCode(lv_obj_t *qrcode);
+    static ScreensEnum screenForMode(int mode);
 
-    // Animate the dial meters' tick length on screen change (short on profile/new-menu, long elsewhere).
-    void animateGaugeTicks(ScreensEnum from, ScreensEnum to);
+    // Animate the dial meters' tick length (short on profile/menu/info and chart-mode status, long elsewhere).
+    void animateGaugeTicks(bool fromShort, bool toShort);
     void collectMeters(lv_obj_t *obj);
     void setGaugeTickLength(int32_t len);
+    void applyGaugeSetpointStyle(bool inside);
     static void gaugeTickAnimCb(void *var, int32_t v);
     lv_obj_t *gaugeMeters[4] = {nullptr};
+    bool tickChartMode = false; // chart mode the ring ticks currently reflect
     uint8_t gaugeCount = 0;
+    bool gaugeSetpointsInside = false;
     void positionMenuIcon(lv_obj_t *obj, int angle, int radius);
 
     void updateState();
+    bool isChartShot();
     void updateSystemStatus();
     void updateWarnings();
     void updateProfileInfo();
     void updateBoiler();
     void updateBrewProcess();
     void updateMenuScreen();
+
+    // Live shot chart on the status screen (GM-254)
+    void setupShotChart();
+    void applyShotChartTheme();
+    void resetShotChart(float targetTemperature, float targetWeight);
+    void updateShotChart();
+    void addShotChartSample(float weight);
+    void renderShotChart();
+    void zoomOutShotChart();
+    static void shotChartZoomAnimCb(void *var, int32_t value);
+    static void shotChartDrawCb(lv_event_t *e);
+    static void shotChartBackgroundCb(lv_event_t *e);
+    lv_obj_t *shotChart = nullptr;
+    lv_chart_series_t *shotSeries[SHOT_SERIES_COUNT] = {};
+    lv_coord_t shotPoints[SHOT_SERIES_COUNT][SHOT_CHART_POINTS] = {};
+    uint16_t shotPointCount = 0;
+    struct ShotSample {
+        float values[SHOT_SERIES_COUNT]; // raw units, negative = no value
+        bool phaseStart;
+    };
+    ShotSample *shotHistory = nullptr; // PSRAM ring buffer of SHOT_HISTORY_POINTS samples
+    uint16_t shotHistoryStart = 0;
+    uint16_t shotHistoryCount = 0;
+    bool shotChartLive = false;                  // false once the shot ended and the whole shot is shown
+    float shotChartZoom = 0.0f;                  // 0 = live 30 s window, 1 = whole shot
+    bool shotPhaseMarks[SHOT_CHART_POINTS] = {}; // true where a new phase starts
+    size_t shotPhaseIndex = 0;
+    bool shotPhasePending = false;
+    float shotFlowRange = 0.0f; // shared by pressure (bar) and flow (ml/s)
+    float shotWeightRange = 0.0f;
+    float shotTempMin = 0.0f;
+    float shotTempMax = 0.0f;
+    unsigned long lastShotSample = 0;
+    unsigned long shotChartStarted = 0;
+    float shotMaxPressure = 0.0f; // brew-end stats shown in the chart legend
+    float shotFlowSum = 0.0f;
+    uint16_t shotFlowSamples = 0;
+
+    // Profile preview: SD card image and pro profile chart on the new profile screen
+    void updateProfilePreview();
+    void setupProfileChart(lv_obj_t *chart);
+    void renderProfileChart(const Profile &profile);
+    static void profileChartDrawCb(lv_event_t *e);
+    static void profileChartBackgroundCb(lv_event_t *e);
+    lv_obj_t *profileChart = nullptr;
+    lv_chart_series_t *profileSeries[2] = {};
+    lv_coord_t profilePoints[2][PROFILE_CHART_POINTS] = {};
+    bool profilePointIsTarget[2][PROFILE_CHART_POINTS] = {};
+    bool profilePhaseMarks[PROFILE_CHART_POINTS] = {}; // true where a new phase starts
+    String profileChartId;
+    int profileChartGeneration = -1;
+    bool profileDetailsVisible = false;
+
+    // Profile image: the UI task asks for an id, the profile task loads it from SD into PSRAM and hands it over.
+    void loadRequestedImage();
+    std::mutex imageMutex;
+    String imageWantedId;            // UI → loader
+    int imageRequest = 0;            // bumped whenever imageWantedId changes
+    uint8_t *imagePending = nullptr; // loader → UI
+    String imagePendingId;
+    std::atomic<int> imageGeneration{0}; // bumped when an image is uploaded or removed
+    int imageLoadedRequest = -1;         // loader-only
+    int imageLoadedGeneration = -1;
+    lv_img_dsc_t imageDsc[2] = {};
+    uint8_t imageDscIndex = 0;
+    uint8_t *imageShown = nullptr; // UI-only
+    String imageShownId;
     void updateAutoTuningSettingsModal();
     void updateTasteGoalSettingsModal();
     String getErrorMessage();
@@ -127,6 +219,9 @@ class DefaultUI {
     int apActive = false;
     int wifiConnected = false;
     int waitingForController = false;
+    int dualBoiler = false;
+    int initialized = false;
+    bool welcomeActive = false; // first-run welcome screen, shown until setup is done or skipped
     int volumetricAvailable = false;
     int grindVolumetricAvailable = false;
     int bluetoothScales = false;
@@ -142,7 +237,6 @@ class DefaultUI {
     int active = false;
     int smartGrindActive = false;
     int grindAvailable = false;
-    int initialized = false;
 
     // Seasonal flags
     int christmasMode = false;
@@ -156,7 +250,10 @@ class DefaultUI {
     int heatingFlash = 0;
     float pressure = 0.0f;
     float currentTemp = 0.0f;
+    float currentSteamTemp = 0.0f;
     float targetTemp = 0.0f;
+    float targetSteamTemp = 0.0f;
+    double activeWeight = 0.0;
     double bluetoothWeight = 0.0;
     double hardwareWeight = 0.0;
     double estimatedWeight = 0.0;
@@ -212,6 +309,8 @@ class DefaultUI {
     std::mutex profilesMutex;
     std::vector<String> favoritedProfileIds;
     std::vector<Profile> favoritedProfiles;
+    std::vector<bool> favoritedHasImage;
+    int profilesGeneration = 0; // bumped on every reload so previews re-render
     int currentThemeMode = -1; // Force applyTheme on first loop
 
     // Screen change

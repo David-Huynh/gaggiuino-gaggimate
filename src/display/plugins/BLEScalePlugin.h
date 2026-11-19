@@ -1,5 +1,6 @@
 #ifndef BLESCALEPLUGIN_H
 #define BLESCALEPLUGIN_H
+#include <atomic>
 #include "../core/Plugin.h"
 #include "../core/ScaleSourceResolver.h"
 #include "remote_scales.h"
@@ -19,12 +20,12 @@ class BLEScalePlugin : public Plugin {
 
     void setup(Controller *controller, PluginManager *pluginManager) override;
     void loop() override;
-    ;
 
     void connect(const std::string &uuid);
     void connect(const std::string &uuid, ScaleRole role);
     void scan() const;
     void disconnect();
+    void forget();
     void disconnect(ScaleRole role);
     void onMeasurement(float value) const;
     void onMeasurement(ScaleRole role, float value) const;
@@ -79,6 +80,7 @@ class BLEScalePlugin : public Plugin {
     void connectSavedScale(ScaleRole role);
 
     bool active = false;
+    std::atomic<bool> forgetRequested{false};
 
     unsigned long lastUpdate = 0;
     ScaleSlot brewSlot;
