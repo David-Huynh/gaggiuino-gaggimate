@@ -413,6 +413,10 @@ msgstr "Auto Adjust"
 msgid "Auto Range"
 msgstr "Auto Range"
 
+#: src/components/Navigation.jsx
+msgid "Auto Tuning"
+msgstr "Auto Tuning"
+
 #: src/pages/Settings/PluginCard.jsx
 msgid "Auto Wakeup Schedule"
 msgstr "Auto Wakeup Schedule"
