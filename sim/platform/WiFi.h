@@ -1,6 +1,5 @@
-// Host shim for Arduino WiFi.h. STA begin() immediately "connects" and fires the
-// registered events so the firmware's Wi-Fi flow runs; otherwise it stays in AP
-// mode. Just enough surface for Controller::setupWifi and the UI status checks.
+// Host shim for Arduino WiFi.h. STA begin() normally connects immediately.
+// Tests can delay IPv4 assignment to exercise startup recovery.
 #pragma once
 
 #include "IPAddress.h"
@@ -110,10 +109,18 @@ class WiFiClass {
     bool begin(const char *ssid, const char *pass = nullptr) {
         (void)ssid;
         (void)pass;
+        _status = WL_IDLE_STATUS;
+        if (!_deferStationIp) {
+            simulateStationGotIp();
+        }
+        return true;
+    }
+
+    void deferStationIp() { _deferStationIp = true; }
+    void simulateStationGotIp() {
         _status = WL_CONNECTED;
         _ip = IPAddress(192, 168, 1, 123);
         fireConnect();
-        return true;
     }
     bool begin(const String &ssid, const String &pass) { return begin(ssid.c_str(), pass.c_str()); }
     void setScanMethod(wifi_scan_method_t) {}
@@ -178,6 +185,7 @@ class WiFiClass {
     std::vector<ScanResult> _scan;
     std::vector<std::pair<WiFiEvent_t, WiFiEventFuncCb>> _cbs;
     wl_status_t _status = WL_DISCONNECTED;
+    bool _deferStationIp = false;
     wifi_mode_t _mode = WIFI_MODE_NULL;
     IPAddress _ip{0, 0, 0, 0};
 };

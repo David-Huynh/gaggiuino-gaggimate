@@ -120,7 +120,7 @@ class WebUIPlugin : public Plugin {
     std::atomic<const char *> otaError{""};
     std::atomic_bool otaUpdateCheckInProgress{false};
     std::atomic_bool otaUpdateCheckComplete{false};
-    bool apMode = false;
+    std::atomic<bool> apMode{false};
     bool serverRunning = false;
     bool pluginHooksRegistered = false;
 

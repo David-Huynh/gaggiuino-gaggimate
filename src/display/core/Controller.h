@@ -321,6 +321,7 @@ class Controller {
     // the legacy INFO characteristic contents (hardware/version/capabilities).
     void onIncompatibleController(const String &infoJson);
     void setupWifi();
+    void handleWifiEvents();
 
     // Functional methods
     void updateControl(bool urgent = false);
@@ -472,11 +473,12 @@ class Controller {
     std::atomic<bool> updating{false};
     bool autotuning = false;
     bool isApConnection = false;
+    bool wifiTimeConfigured = false;
     // WiFi up/down is signalled (flag only) from the Arduino WiFi event task and
     // acted on in loop(): doing server/socket/mDNS start-stop in that small-stack
     // callback corrupted the heap under load. See setupWifi() + loop().
-    volatile bool wifiConnectedPending = false;
-    volatile bool wifiDisconnectedPending = false;
+    std::atomic<bool> wifiConnectedPending{false};
+    std::atomic<bool> wifiDisconnectedPending{false};
     bool initialized = false;
     bool screenReady = false;
     bool waitingForController = false;

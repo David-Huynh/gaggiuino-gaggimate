@@ -790,7 +790,6 @@ void Controller::setupWifi() {
         WiFi.setHostname(settings.getMdnsName().c_str());
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(true);
-        WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
 
         WiFi.onEvent(
             [this](WiFiEvent_t, WiFiEventInfo_t info) {
@@ -821,7 +820,10 @@ void Controller::setupWifi() {
                 wifiDisconnectedPending = true;
             },
             WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
-        WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) { ESP_LOGW(LOG_TAG, "STA lost IP"); },
+        WiFi.onEvent([this](WiFiEvent_t, WiFiEventInfo_t) {
+                         ESP_LOGW(LOG_TAG, "STA lost IP");
+                         wifiDisconnectedPending = true;
+                     },
                      WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_LOST_IP);
         WiFi.onEvent(
             [](WiFiEvent_t, WiFiEventInfo_t info) {
@@ -833,72 +835,74 @@ void Controller::setupWifi() {
         WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
         WiFi.begin(settings.getWifiSsid(), settings.getWifiPassword());
         WiFi.setTxPower(WIFI_POWER_19_5dBm);
-        for (int attempts = 0; attempts < WIFI_CONNECT_ATTEMPTS; attempts++) {
-            if (WiFi.status() == WL_CONNECTED) {
-                break;
-            }
-            delay(500);
-            Serial.print(".");
+        const unsigned long attemptedAt = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - attemptedAt < WIFI_STARTUP_WAIT_MS) {
+            delay(100);
         }
-        Serial.println("");
         if (WiFi.status() == WL_CONNECTED) {
-            ESP_LOGI(LOG_TAG, "Connected to %s with IP address %s", settings.getWifiSsid().c_str(),
-                     WiFi.localIP().toString().c_str());
-            configTzTime(resolve_timezone(settings.getTimezone()), NTP_SERVER);
-            setenv("TZ", resolve_timezone(settings.getTimezone()), 1);
-            tzset();
-            sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
-            sntp_setservername(0, NTP_SERVER);
-            sntp_init();
-        } else {
-            WiFi.disconnect(true, true);
-            ESP_LOGI(LOG_TAG, "Timed out while connecting to WiFi");
-            Serial.println("Timed out while connecting to WiFi");
+            return;
         }
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-        isApConnection = true;
-        const String apPassword = settings.getWifiApPassword();
-        // WPA2 requires >= 8 chars; fall back to an open AP if somehow shorter.
-        const bool secured = apPassword.length() >= WIFI_AP_PASSWORD_MIN_LENGTH;
-        // APSTA keeps an idle station for setup-wizard network scans; it never connects until the next boot
-        WiFi.setAutoReconnect(false);
-        WiFi.mode(WIFI_AP_STA);
-        WiFi.softAPConfig(WIFI_AP_IP, WIFI_AP_IP, WIFI_SUBNET_MASK);
-        WiFi.softAP(WIFI_AP_SSID, secured ? apPassword.c_str() : nullptr);
-        WiFi.setTxPower(WIFI_POWER_19_5dBm);
-        // Credentials block so headless users can read the AP login from serial.
-        ESP_LOGI(LOG_TAG, "========================================");
-        ESP_LOGI(LOG_TAG, "  WiFi Access Point started");
-        ESP_LOGI(LOG_TAG, "  SSID:     %s", WIFI_AP_SSID);
-        if (secured) {
-            ESP_LOGI(LOG_TAG, "  Password: %s", apPassword.c_str());
-        } else {
-            ESP_LOGI(LOG_TAG, "  Password: <open network>");
-        }
-        ESP_LOGI(LOG_TAG, "  Web UI:   http://%s/", WIFI_AP_IP.toString().c_str());
-        ESP_LOGI(LOG_TAG, "========================================");
+        ESP_LOGW(LOG_TAG, "No Wi-Fi address after %lu ms, starting setup hotspot while STA can retry", WIFI_STARTUP_WAIT_MS);
     }
 
-    // STA path: STA_GOT_IP handler already set wifiConnectedPending; loop()
-    // dispatches controller:wifi:connect from there. AP path has no STA_GOT_IP,
-    // so it needs the explicit trigger here.
-    if (isApConnection) {
-        pluginManager->trigger("controller:wifi:connect", "AP", 1);
+    const String apPassword = settings.getWifiApPassword();
+    // WPA2 requires >= 8 chars; fall back to an open AP if somehow shorter.
+    const bool secured = apPassword.length() >= WIFI_AP_PASSWORD_MIN_LENGTH;
+    // Keep the pending association or DHCP exchange. Let the STA watchdog
+    // pace any further attempts so the radio can also serve the setup UI.
+    WiFi.setAutoReconnect(false);
+    if (!WiFi.mode(WIFI_AP_STA) || !WiFi.softAPConfig(WIFI_AP_IP, WIFI_AP_IP, WIFI_SUBNET_MASK) ||
+        !WiFi.softAP(WIFI_AP_SSID, secured ? apPassword.c_str() : nullptr)) {
+        ESP_LOGE(LOG_TAG, "Unable to start the Wi-Fi setup hotspot");
+        return;
     }
+    isApConnection = true;
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    // Credentials block so headless users can read the AP login from serial.
+    ESP_LOGI(LOG_TAG, "========================================");
+    ESP_LOGI(LOG_TAG, "  WiFi Access Point started");
+    ESP_LOGI(LOG_TAG, "  SSID:     %s", WIFI_AP_SSID);
+    if (secured) {
+        ESP_LOGI(LOG_TAG, "  Password: %s", apPassword.c_str());
+    } else {
+        ESP_LOGI(LOG_TAG, "  Password: <open network>");
+    }
+    ESP_LOGI(LOG_TAG, "  Web UI:   http://%s/", WIFI_AP_IP.toString().c_str());
+    ESP_LOGI(LOG_TAG, "========================================");
+    pluginManager->trigger("controller:wifi:connect", "AP", 1);
+}
+
+void Controller::handleWifiEvents() {
+    // STA retries can disconnect while the setup hotspot remains available.
+    if (wifiDisconnectedPending.exchange(false) && !isApConnection) {
+        pluginManager->trigger("controller:wifi:disconnect");
+    }
+    if (!wifiConnectedPending.exchange(false) || WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    if (isApConnection) {
+        if (!WiFi.mode(WIFI_STA)) {
+            ESP_LOGE(LOG_TAG, "Unable to stop the setup hotspot after acquiring a Wi-Fi address");
+            return;
+        }
+        isApConnection = false;
+        WiFi.setAutoReconnect(true);
+        ESP_LOGI(LOG_TAG, "Setup hotspot stopped after Wi-Fi recovered");
+    }
+    if (!wifiTimeConfigured) {
+        configTzTime(resolve_timezone(settings.getTimezone()), NTP_SERVER);
+        setenv("TZ", resolve_timezone(settings.getTimezone()), 1);
+        tzset();
+        sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
+        sntp_setservername(0, NTP_SERVER);
+        sntp_init();
+        wifiTimeConfigured = true;
+    }
+    pluginManager->trigger("controller:wifi:connect", "AP", 0);
 }
 
 void Controller::loop() {
-    // Act on WiFi link-state changes flagged by the (small-stack) event task here
-    // on the main loop. Disconnect before connect so a flap is ordered correctly.
-    if (wifiDisconnectedPending) {
-        wifiDisconnectedPending = false;
-        pluginManager->trigger("controller:wifi:disconnect");
-    }
-    if (wifiConnectedPending) {
-        wifiConnectedPending = false;
-        pluginManager->trigger("controller:wifi:connect", "AP", isApConnection ? 1 : 0);
-    }
+    handleWifiEvents();
 
     warnings.loop();
     buttons.loop(millis());

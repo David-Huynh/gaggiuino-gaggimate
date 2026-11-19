@@ -680,7 +680,12 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         otaDisplayFirmwareName(), "board-firmware.bin");
     ota->init();
     pluginManager->on("controller:wifi:connect", [this](Event const &event) {
-        apMode = event.getInt("AP");
+        const bool setupHotspot = event.getInt("AP");
+        if (!setupHotspot && dnsServer) {
+            dnsServer->stop();
+            dnsServer.reset();
+        }
+        apMode = setupHotspot;
         start();
     });
     // Intentionally do NOT stop the server on a WiFi disconnect: the listen
@@ -3662,7 +3667,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["smartGrindMode"] = settings.getSmartGrindMode();
     doc["mahlkonigActive"] = settings.isMahlkonigActive();
     doc["mahlkonigRecipeProfiles"] = settings.getMahlkonigRecipeProfiles();
-    doc["apMode"] = apMode; // read-only, the setup wizard offers Wi-Fi setup in AP mode
+    doc["apMode"] = apMode.load(); // read-only, the setup wizard offers Wi-Fi setup in AP mode
     doc["deviceIp"] = apMode ? WIFI_AP_IP.toString() : WiFi.localIP().toString(); // read-only, for plugin setup hints
     doc["momentaryButtons"] = settings.isMomentaryButtons();
     doc["pressureOffset"] = String(settings.getPressureOffset());

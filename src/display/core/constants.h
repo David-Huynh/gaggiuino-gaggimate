@@ -33,7 +33,7 @@ constexpr char DEFAULT_TIMEZONE[] = "Europe/Rome";
 constexpr char DEFAULT_HOME_ASSISTANT_TOPIC[] = "homeassistant";
 constexpr float DEFAULT_STEAM_PUMP_PERCENTAGE = 4.f;
 constexpr float DEFAULT_STEAM_PUMP_CUTOFF = 2.f;
-constexpr int WIFI_CONNECT_ATTEMPTS = 20;
+constexpr unsigned long WIFI_STARTUP_WAIT_MS = 15000;
 
 constexpr float DEFAULT_COMMUTATION_GAIN = 0.7f;
 constexpr float DEFAULT_CONVERGENCE_GAIN = 1.0f;

@@ -19,6 +19,7 @@ void WifiStaWatchdogPlugin::setup(Controller *c, PluginManager *pluginManager) {
     // pull.  NetworkWatchdog already gates its WiFi.reconnect() the same way.
     pluginManager->on("ota:update:start", [this](Event const &) { updating = true; });
     pluginManager->on("ota:update:end", [this](Event const &) { updating = false; });
+    pluginManager->on("controller:startup", [this](Event const &) { lastConnectedMs = millis(); });
 
     ESP_LOGI(LOG_TAG, "armed=%d grace=%lums backoff=%lums", armed, STA_DOWN_GRACE_MS, STA_REASSOC_BACKOFF_MS);
 }
@@ -27,9 +28,9 @@ void WifiStaWatchdogPlugin::loop() {
     if (!armed || updating)
         return;
 
-    // AP-fallback mode (AP or APSTA, whose station only scans) is its own world; skip rather than thrash WiFi.begin().
+    // The setup hotspot can coexist with a retry of the saved station network.
     const wifi_mode_t mode = WiFi.getMode();
-    if (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA || mode == WIFI_MODE_NULL)
+    if (mode != WIFI_MODE_STA && mode != WIFI_MODE_APSTA)
         return;
 
     const unsigned long now = millis();
@@ -41,6 +42,9 @@ void WifiStaWatchdogPlugin::loop() {
     if (now - lastConnectedMs < STA_DOWN_GRACE_MS)
         return;
     if (lastReassocMs != 0 && now - lastReassocMs < STA_REASSOC_BACKOFF_MS)
+        return;
+    // Let an explicit setup-wizard scan finish before requesting reassociation.
+    if (WiFi.scanComplete() == WIFI_SCAN_RUNNING)
         return;
 
     forceReassoc();
