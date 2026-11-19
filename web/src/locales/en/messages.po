@@ -339,6 +339,10 @@ msgstr "All Shots"
 msgid "Alt Relay / SSR2 Function"
 msgstr "Alt Relay / SSR2 Function"
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "An update is already running."
+msgstr "An update is already running."
+
 #: src/components/PumpFlowCalibration/usePumpFlowCalibration.js
 msgid "Analysis complete."
 msgstr "Analysis complete."
@@ -550,20 +554,17 @@ msgstr "Avg. Temperature"
 msgid "Avg. Weight Flow"
 msgstr "Avg. Weight Flow"
 
-#: src/app/MachineSetup.jsx
-#: src/components/PumpFlowCalibration/Footer.jsx
-#: src/pages/DashboardSettings/index.jsx
-#: src/pages/Home/BrewConfirmModal.jsx
-#: src/pages/ProfileEdit/ExtendedProfileForm.jsx
-#: src/pages/ProfileEdit/StandardProfileForm.jsx
 #: src/pages/Settings/tabs/SystemTab.jsx
-#: src/pages/SetupWizard/index.jsx
 msgid "Back"
 msgstr "Back"
 
 #: src/pages/ShotAnalyzer/shotAnalyzer/ActiveAnalysisView.jsx
 msgid "Back to analyzer"
 msgstr "Back to analyzer"
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Back to updates"
+msgstr "Back to updates"
 
 #: src/pages/Settings/tabs/CleaningSection.jsx
 msgid "Backflush"
@@ -825,6 +826,10 @@ msgstr "Chart First"
 msgid "Check the connection to your machine and try again."
 msgstr "Check the connection to your machine and try again."
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Checking for updates…"
+msgstr "Checking for updates…"
+
 #: src/app/ConnectionGate.jsx
 msgid "Choose another machine"
 msgstr "Choose another machine"
@@ -1074,6 +1079,10 @@ msgstr "Controller Connection"
 #: src/app/appSettings.js
 msgid "Controller errors and error-level warnings."
 msgstr "Controller errors and error-level warnings."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Controller updates use ST-Link."
+msgstr "Controller updates use ST-Link."
 
 #: src/pages/Settings/tabs/SystemTab.jsx
 msgid "Controller Version"
@@ -2025,7 +2034,10 @@ msgstr "Finish"
 msgid "Finish and restart"
 msgstr "Finish and restart"
 
-#: src/pages/Home/cards/ProfileCard.jsx
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Finish the current machine operation before updating."
+msgstr "Finish the current machine operation before updating."
+
 #: src/pages/Settings/tabs/SystemTab.jsx
 msgid "Finished"
 msgstr "Finished"
@@ -2037,6 +2049,10 @@ msgstr "Finished Color"
 #: src/app/FirmwareWarning.jsx
 msgid "Firmware {version} – not all features may be available."
 msgstr "Firmware {version} – not all features may be available."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Firmware verification failed. The current ESP32 firmware is still installed."
+msgstr "Firmware verification failed. The current ESP32 firmware is still installed."
 
 #: src/utils/panelDefinitions.js
 msgid "Flexible Space"
@@ -3124,7 +3140,6 @@ msgstr "Next"
 msgid "Next shot"
 msgstr "Next shot"
 
-#: src/app/AppSettings.jsx
 #: src/pages/Settings/tabs/SystemTab.jsx
 msgctxt "update channel"
 msgid "Nightly"
@@ -4213,6 +4228,10 @@ msgstr "Recent Shots"
 msgid "Recipe {recipe}"
 msgstr "Recipe {recipe}"
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Reconnecting to resume the firmware download"
+msgstr "Reconnecting to resume the firmware download"
+
 #: src/pages/ShotAnalyzer/utils/columns.js
 msgid "Recorded Stop Reason"
 msgstr "Recorded Stop Reason"
@@ -5009,6 +5028,7 @@ msgstr "Show the control column panels as separate cards, or group them into a s
 #: src/pages/Settings/PatchNotes.jsx
 msgid "showing the newest {0}"
 msgstr "showing the newest {0}"
+
 #: src/pages/Statistics/components/StatisticsShotCompareSection.jsx
 msgid "Showing up to 100 latest shots. Refine with filters."
 msgstr "Showing up to 100 latest shots. Refine with filters."
@@ -5120,8 +5140,6 @@ msgstr "Sour"
 msgid "Space evenly"
 msgstr "Space evenly"
 
-#: src/app/AppSettings.jsx
-#: src/pages/Settings/PatchNotes.jsx
 #: src/pages/Settings/tabs/SystemTab.jsx
 msgctxt "update channel"
 msgid "Stable"
@@ -5730,6 +5748,10 @@ msgstr "The controller is not connected yet."
 msgid "The controller reported an error."
 msgstr "The controller reported an error."
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "The controller update failed. Check the controller connection and retry."
+msgstr "The controller update failed. Check the controller connection and retry."
+
 #: src/pages/Settings/index.jsx
 msgid "The file contains no known settings."
 msgstr "The file contains no known settings."
@@ -5737,6 +5759,10 @@ msgstr "The file contains no known settings."
 #: src/pages/Settings/index.jsx
 msgid "The file does not contain a settings object."
 msgstr "The file does not contain a settings object."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "The firmware download could not be completed. Check the connection and retry."
+msgstr "The firmware download could not be completed. Check the connection and retry."
 
 #: src/pages/Settings/PatchNotes.jsx
 msgid "The firmware version is not known yet"
@@ -5790,6 +5816,10 @@ msgstr "The profile's dose is saved to the shot history."
 msgid "The pump runs with the 3-way valve closed until pressure stops rising. Then the pump stops and the valve opens, which should release the pressure to about 0 bar."
 msgstr "The pump runs with the 3-way valve closed until pressure stops rising. Then the pump stops and the valve opens, which should release the pressure to about 0 bar."
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "The release version could not be checked. Refresh when the machine is online."
+msgstr "The release version could not be checked. Refresh when the machine is online."
+
 #: src/pages/Settings/tabs/BluetoothTab.jsx
 msgid "The scale was found, but the Bluetooth connection failed. Try again or restart the scale."
 msgstr "The scale was found, but the Bluetooth connection failed. Try again or restart the scale."
@@ -5801,6 +5831,10 @@ msgstr "The scale wasn't found. Make sure it's switched on and nearby, then scan
 #: src/pages/ProfileList/index.jsx
 msgid "The selected profile can't be deleted"
 msgstr "The selected profile can't be deleted"
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "The selected release does not contain firmware for this board."
+msgstr "The selected release does not contain firmware for this board."
 
 #: src/pages/SetupWizard/TestStep.jsx
 msgid "The temperature did not rise. Check the heater wiring, the SSR and the thermal fuses."
@@ -5827,6 +5861,10 @@ msgstr "Theme"
 msgid "Theme & Notifications"
 msgstr "Theme & Notifications"
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "There is no newer firmware in the selected channel."
+msgstr "There is no newer firmware in the selected channel."
+
 #: src/pages/Settings/tabs/MachineTab.jsx
 msgid "Thermal Feedforward Gain"
 msgstr "Thermal Feedforward Gain"
@@ -5834,6 +5872,10 @@ msgstr "Thermal Feedforward Gain"
 #: src/app/machines.js
 msgid "this address is not a GaggiMate"
 msgstr "this address is not a GaggiMate"
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "This board cannot be updated over Wi-Fi."
+msgstr "This board cannot be updated over Wi-Fi."
 
 #: src/pages/ShotAnalyzer/services/ReplayVideoExportService.js
 msgid "This browser cannot record MP4 video. Please use WebM export instead."
@@ -5850,6 +5892,18 @@ msgstr "This feature allows connection to a Home Assistant or MQTT installation 
 #: src/pages/Settings/PluginCard.jsx
 msgid "This feature controls a Tasmota Plug to turn off your grinder after the target has been reached."
 msgstr "This feature controls a Tasmota Plug to turn off your grinder after the target has been reached."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "This firmware is too large for the update slot."
+msgstr "This firmware is too large for the update slot."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "This flash layout requires a USB firmware update."
+msgstr "This flash layout requires a USB firmware update."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "This fork has no Stable release. Select Nightly to check its published builds."
+msgstr "This fork has no Stable release. Select Nightly to check its published builds."
 
 #: src/utils/machineProfiles.js
 msgid "This profile includes settings outside machine configuration. Remove them from the profile before importing it."
@@ -6370,6 +6424,10 @@ msgstr "W"
 msgid "Wait for the controller to confirm the applied configuration before exporting."
 msgstr "Wait for the controller to confirm the applied configuration before exporting."
 
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Wait for the update check and confirm the machine is connected to Wi-Fi."
+msgstr "Wait for the update check and confirm the machine is connected to Wi-Fi."
+
 #: src/pages/SetupWizard/MachineStep.jsx
 msgid "Waiting for controller configuration…"
 msgstr "Waiting for controller configuration…"
@@ -6581,6 +6639,10 @@ msgstr "Wi-Fi SSID"
 #: src/app/appSettings.js
 msgid "With shot time and weight."
 msgstr "With shot time and weight."
+
+#: src/pages/Settings/tabs/SystemTab.jsx
+msgid "Writing the firmware failed. The current ESP32 firmware is still installed."
+msgstr "Writing the firmware failed. The current ESP32 firmware is still installed."
 
 #: src/pages/Statistics/components/TrendChart.jsx
 msgctxt "time bucket"

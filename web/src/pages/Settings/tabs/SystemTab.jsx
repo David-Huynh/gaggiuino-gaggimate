@@ -1,4 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'preact/hooks';
+import { msg } from '@lingui/core/macro';
 import { Trans, useLingui } from '@lingui/react/macro';
 import { ApiServiceContext, machine } from '../../../services/ApiService.js';
 import { downloadJson } from '../../../utils/download.js';
@@ -45,7 +46,7 @@ const getLinkStatusClass = (link, rssi) => {
 };
 
 function OtaProgressView({ phase, progress, error, headless, onBack }) {
-  const { t } = useLingui();
+  const { t, i18n } = useLingui();
   const finished = phase === 4;
   const failed = phase === 5;
   const getOtaPhaseText = p => {
@@ -71,7 +72,7 @@ function OtaProgressView({ phase, progress, error, headless, onBack }) {
       <span className='text-base-content text-xl font-medium'>{getOtaPhaseText(phase)}</span>
       {failed ? (
         <span role='alert' className='text-base-content/70 max-w-md text-center'>
-          {otaErrorMessage(t, error)}
+          {i18n._(otaErrorMessage(error))}
         </span>
       ) : (
         <span className='text-base-content text-lg font-medium'>{finished ? 100 : progress}%</span>
@@ -101,32 +102,32 @@ function OtaProgressView({ phase, progress, error, headless, onBack }) {
   );
 }
 
-function otaErrorMessage(t, error) {
+function otaErrorMessage(error) {
   switch (error) {
     case 'no_ota_partition':
-      return t`This flash layout requires a USB firmware update.`;
+      return msg`This flash layout requires a USB firmware update.`;
     case 'image_too_large':
-      return t`This firmware is too large for the update slot.`;
+      return msg`This firmware is too large for the update slot.`;
     case 'image_missing':
-      return t`The selected release does not contain firmware for this board.`;
+      return msg`The selected release does not contain firmware for this board.`;
     case 'image_invalid':
-      return t`Firmware verification failed. The current ESP32 firmware is still installed.`;
+      return msg`Firmware verification failed. The current ESP32 firmware is still installed.`;
     case 'flash_failed':
-      return t`Writing the firmware failed. The current ESP32 firmware is still installed.`;
+      return msg`Writing the firmware failed. The current ESP32 firmware is still installed.`;
     case 'machine_busy':
-      return t`Finish the current machine operation before updating.`;
+      return msg`Finish the current machine operation before updating.`;
     case 'no_update':
-      return t`There is no newer firmware in the selected channel.`;
+      return msg`There is no newer firmware in the selected channel.`;
     case 'check_unavailable':
-      return t`Wait for the update check and confirm the machine is connected to Wi-Fi.`;
+      return msg`Wait for the update check and confirm the machine is connected to Wi-Fi.`;
     case 'ota_unavailable':
-      return t`This board cannot be updated over Wi-Fi.`;
+      return msg`This board cannot be updated over Wi-Fi.`;
     case 'already_updating':
-      return t`An update is already running.`;
+      return msg`An update is already running.`;
     case 'controller_update_failed':
-      return t`The controller update failed. Check the controller connection and retry.`;
+      return msg`The controller update failed. Check the controller connection and retry.`;
     default:
-      return t`The firmware download could not be completed. Check the connection and retry.`;
+      return msg`The firmware download could not be completed. Check the connection and retry.`;
   }
 }
 
@@ -298,7 +299,7 @@ function MaintenanceSection({
 }
 
 export function SystemTab() {
-  const { t } = useLingui();
+  const { t, i18n } = useLingui();
   const apiService = useContext(ApiServiceContext);
   const [isLoading, setIsLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -481,7 +482,7 @@ export function SystemTab() {
         {!formData.checking && formData.checkError && formData.checkError !== 'no_stable_release' && (
           <p role='status'><Trans>The release version could not be checked. Refresh when the machine is online.</Trans></p>
         )}
-        {updateError && <p role='alert'>{otaErrorMessage(t, updateError)}</p>}
+        {updateError && <p role='alert'>{i18n._(otaErrorMessage(updateError))}</p>}
 
         <div className='border-base-content/5 mt-6 grid grid-cols-1 gap-6 border-t pt-6 md:grid-cols-2'>
           <div className='flex flex-col space-y-1'>

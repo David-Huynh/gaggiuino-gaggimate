@@ -40,8 +40,11 @@ function resolveLocale(preference) {
 // Catalogs are separate chunks, so a browser only downloads its own language.
 export async function activateLocale(preference = getStoredLocale()) {
   const locale = resolveLocale(preference);
-  const { messages } = await import(`./locales/${locale}/messages.po`);
-  i18n.loadAndActivate({ locale, messages });
+  const [{ messages: english }, localized] = await Promise.all([
+    import('./locales/en/messages.po'),
+    locale === 'en' ? null : import(`./locales/${locale}/messages.po`),
+  ]);
+  i18n.loadAndActivate({ locale, messages: localized ? { ...english, ...localized.messages } : english });
   document.documentElement.lang = locale;
 }
 
