@@ -1,6 +1,7 @@
 #include "Controller.h"
 #include "ArduinoJson.h"
 #include "esp_coexist.h"
+#include "esp_heap_caps.h"
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
 #include <LittleFS.h>
@@ -302,6 +303,14 @@ void Controller::connect() {
 
     setupWifi();
     setupBluetooth();
+#if defined(GAGGIMATE_N16R8)
+    // Keep the SDK's heap preference during radio startup. A cold WebUI load
+    // then gets PSRAM for ordinary buffers and leaves internal RAM for Wi-Fi.
+    if (psramFound()) {
+        constexpr size_t internalHeapPreferenceBytes = 512;
+        heap_caps_malloc_extmem_enable(internalHeapPreferenceBytes);
+    }
+#endif
     pluginManager->on("ota:update:start", [this](Event const &) {
         updating = true;
         activateStandby();
