@@ -17,7 +17,6 @@ class NetworkWatchdogPlugin : public Plugin {
 
   private:
     static constexpr unsigned long PROBE_PERIOD = 2000;
-    static constexpr unsigned long STATS_PERIOD = 5000;
     static constexpr unsigned long DEAD_AFTER = 15000;
     static constexpr unsigned long REBOOT_AFTER = 30000;
     static constexpr uint16_t PROBE_PORT = 9;
@@ -29,7 +28,6 @@ class NetworkWatchdogPlugin : public Plugin {
     WiFiUDP _probe;
     bool _socketReady = false;
     unsigned long _lastProbe = 0;
-    unsigned long _lastStats = 0;
     unsigned long _lastAlive = 0;
     unsigned long _standbySince = 0;
     uint8_t _stage = 0;

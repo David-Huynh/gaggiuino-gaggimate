@@ -16,9 +16,9 @@ void NetworkWatchdogPlugin::setup(Controller *c, PluginManager *pluginManager) {
         const unsigned long now = millis();
         _lastAlive = now;
         _lastProbe = now;
-        _lastStats = now;
         _stage = 0;
         ESP_LOGI(LOG_TAG, "Watchdog started (wifi connected)");
+        logStats("connected");
     });
     pluginManager->on("controller:wifi:disconnect", [this](Event const &) {
         ESP_LOGI(LOG_TAG, "Watchdog stopped (wifi disconnected)");
@@ -51,7 +51,7 @@ void NetworkWatchdogPlugin::logStats(const char *reason) {
     const unsigned minInt = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
     const unsigned largestInt = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     const unsigned long sinceOk = millis() - _lastAlive;
-    ESP_LOGV(LOG_TAG, "[%s] internal heap: free=%u min=%u largest=%u | egress ok %lus ago (stage %u)", reason, freeInt, minInt,
+    ESP_LOGI(LOG_TAG, "[%s] internal heap: free=%u min=%u largest=%u | egress ok %lus ago (stage %u)", reason, freeInt, minInt,
              largestInt, sinceOk / 1000, _stage);
 }
 
@@ -108,11 +108,6 @@ void NetworkWatchdogPlugin::loop() {
         _stage = 0;
         _rebootHeld = false;
         return;
-    }
-
-    if (now - _lastStats >= STATS_PERIOD) {
-        _lastStats = now;
-        logStats("periodic");
     }
 
     if (now - _lastProbe >= PROBE_PERIOD) {
