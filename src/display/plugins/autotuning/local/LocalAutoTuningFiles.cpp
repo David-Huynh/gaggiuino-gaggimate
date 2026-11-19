@@ -16,7 +16,7 @@ namespace {
 static String safeIdentifier(String value, size_t maxLength = 120) {
     value.trim();
     String output;
-    output.reserve(std::min(value.length(), maxLength));
+    output.reserve(std::min<size_t>(value.length(), maxLength));
     for (size_t index = 0; index < value.length() && output.length() < maxLength; ++index) {
         const char character = value.charAt(index);
         const bool valid = (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z') ||

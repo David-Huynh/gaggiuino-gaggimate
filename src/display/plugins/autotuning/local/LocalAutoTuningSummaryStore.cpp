@@ -9,7 +9,9 @@
 #include <display/core/EpochTime.h>
 #include <display/util/LittleFSUtil.h>
 #include <display/util/PsramAllocator.h>
+#include <display/util/PsramStlAllocator.h>
 #include <limits>
+#include <string>
 
 namespace {
 
@@ -125,11 +127,9 @@ bool LocalAutoTuningSummaryStore::removeShot(const String &shotId) const {
 
 bool LocalAutoTuningSummaryStore::upsertShot(JsonObjectConst raw) {
     auto flashLease = StorageCoordinator::instance().acquireFlash();
-    if (!begin() || raw.isNull()) {
-        return false;
-    }
     const String shotId = raw["shot_id"].as<String>();
-    if (shotId.isEmpty()) {
+    if (shotId.isEmpty() || !LocalAutoTuningFiles::ensureDirectory(STORE_DIR) ||
+        !LocalAutoTuningFiles::ensureDirectory(SHOT_DIR)) {
         return false;
     }
 
@@ -138,7 +138,6 @@ bool LocalAutoTuningSummaryStore::upsertShot(JsonObjectConst raw) {
     out["event_type"] = "local_shot_summary";
     out["schema_version"] = 1;
     out["shot_id"] = shotId;
-    out["updated_at"] = nowEpoch();
 
     static constexpr const char *KEYS[] = {
         "timestamp",
@@ -206,8 +205,25 @@ bool LocalAutoTuningSummaryStore::upsertShot(JsonObjectConst raw) {
     observed["dose"] = (raw["dose_observed"] | false) || (raw["dose_target_confirmed"] | false);
     observed["target_yield"] = jsonNumber(raw["target_yield_g"]);
     addFixedCadenceMetadata(raw, out);
+    if (outDoc.overflowed()) {
+        return false;
+    }
 
-    return LocalAutoTuningFiles::writeJson(LocalAutoTuningFiles::recordPath(SHOT_DIR, shotId), outDoc);
+    const String path = LocalAutoTuningFiles::recordPath(SHOT_DIR, shotId);
+    JsonDocument existing(&psramAllocator);
+    if (LocalAutoTuningFiles::readJson(path, existing) && existing["updated_at"].is<EpochSeconds>()) {
+        existing.remove("updated_at");
+        // Compare at JSON's stored precision so rounded floating-point fields
+        // match on the next recovery pass.
+        std::basic_string<char, std::char_traits<char>, PsramStlAllocator<char>> serialized;
+        serializeJson(outDoc, serialized);
+        JsonDocument expected(&psramAllocator);
+        if (!deserializeJson(expected, serialized) && expected.as<JsonObjectConst>() == existing.as<JsonObjectConst>()) {
+            return true;
+        }
+    }
+    out["updated_at"] = nowEpoch();
+    return !outDoc.overflowed() && LocalAutoTuningFiles::writeJson(path, outDoc);
 }
 
 bool LocalAutoTuningSummaryStore::upsertRecommendation(JsonObjectConst raw) {

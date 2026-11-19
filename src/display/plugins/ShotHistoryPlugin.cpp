@@ -4,6 +4,7 @@
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <cmath>
+#include <cstring>
 #include <display/core/Controller.h>
 #include <display/core/ProfileManager.h>
 #include <display/core/StorageCoordinator.h>
@@ -361,19 +362,36 @@ bool ShotHistoryPlugin::ensureProjection(AutoTuning::CompletedShotArtifact const
     if (wasDeleted()) {
         return true;
     }
-    if (!appendToIndex(indexEntry)) {
+    const String notesId(history.id);
+    JsonDocument notes(&psramAllocator);
+    const bool validNotes = loadNotes(notesId, notes);
+    indexEntry.rating = notes["rating"].as<uint8_t>();
+    const float notesYield = notes["doseOut"].as<String>().toFloat();
+    const bool hasYieldOverride = std::isfinite(notesYield) && notesYield > 0.0f;
+    if (hasYieldOverride) {
+        indexEntry.volume = encodeUnsigned(std::min(notesYield, WEIGHT_MAX_VALUE / WEIGHT_SCALE), WEIGHT_SCALE, WEIGHT_MAX_VALUE);
+    }
+    if (indexEntry.rating > 0 || hasYieldOverride) {
+        indexEntry.flags |= SHOT_FLAG_HAS_NOTES;
+    }
+    if (!appendToIndex(indexEntry, true)) {
         return false;
     }
 
-    JsonDocument notes(&psramAllocator);
-    loadNotes(String(history.id), notes);
-    notes["id"] = String(history.id);
-    notes["rlShotId"] = artifact.record.shotId.c_str();
-    if (artifact.record.recommendation.present()) {
-        notes["rlRecommendationId"] = artifact.record.recommendation.recommendationId.c_str();
+    const auto &recommendation = artifact.record.recommendation;
+    if (validNotes && notes["id"].as<String>() == notesId && notes["rlShotId"] == artifact.record.shotId.c_str() &&
+        (!recommendation.present() || notes["rlRecommendationId"] == recommendation.recommendationId.c_str())) {
+        return true;
     }
-    saveNotes(String(history.id), notes);
-    return true;
+    if (!notes.is<JsonObject>()) {
+        notes.to<JsonObject>();
+    }
+    notes["id"] = notesId;
+    notes["rlShotId"] = artifact.record.shotId.c_str();
+    if (recommendation.present()) {
+        notes["rlRecommendationId"] = recommendation.recommendationId.c_str();
+    }
+    return saveNotes(notesId, notes);
 }
 
 bool ShotHistoryPlugin::removeProjection(const std::uint32_t historyId) {
@@ -1154,25 +1172,35 @@ void ShotHistoryPlugin::handleRequest(JsonDocument &request, JsonDocument &respo
     }
 }
 
-void ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
+bool ShotHistoryPlugin::saveNotes(const String &id, const JsonDocument &notes) {
+    String notesStr;
+    const size_t expected = measureJson(notes);
+    if (notes.overflowed() || serializeJson(notes, notesStr) != expected) {
+        return false;
+    }
     auto flashLease = StorageCoordinator::instance().acquireFlash();
     File file = fs->open(resolveNotesPath(id.toInt()), FILE_WRITE);
-    if (file) {
-        String notesStr;
-        serializeJson(notes, notesStr);
-        file.print(notesStr);
-        file.close();
+    if (!file) {
+        return false;
     }
+    const bool saved = file.print(notesStr) == expected;
+    file.close();
+    return saved;
 }
 
-void ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
+bool ShotHistoryPlugin::loadNotes(const String &id, JsonDocument &notes) {
     auto flashLease = StorageCoordinator::instance().acquireFlash();
-    File file = fs->open(resolveNotesPath(id.toInt()), "r");
-    if (file) {
-        String notesStr = file.readString();
-        file.close();
-        deserializeJson(notes, notesStr);
+    const String path = resolveNotesPath(id.toInt());
+    if (!(fs == &LittleFS ? LittleFSUtil::existsQuietly(path) : fs->exists(path))) {
+        return false;
     }
+    File file = fs->open(path, FILE_READ);
+    if (!file) {
+        return false;
+    }
+    const auto error = deserializeJson(notes, file);
+    file.close();
+    return !error && notes.is<JsonObject>();
 }
 
 // Returns the canonical notes path, moving a legacy unpadded-id file onto it (the UI has shown that one since #449)
@@ -1307,7 +1335,7 @@ bool ShotHistoryPlugin::ensureIndexExists() {
     return true;
 }
 
-bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
+bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry, bool preserveCompleted) {
     auto flashLease = StorageCoordinator::instance().acquireFlash();
     if (!ensureIndexExists()) {
         return false;
@@ -1328,6 +1356,18 @@ bool ShotHistoryPlugin::appendToIndex(const ShotIndexEntry &entry) {
     // Check for existing entry with same ID - update in place (upsert)
     int existingPos = findEntryPosition(indexFile, header, entry.id);
     if (existingPos >= 0) {
+        ShotIndexEntry existing{};
+        if (!readEntryAtPosition(indexFile, existingPos, existing)) {
+            indexFile.close();
+            return false;
+        }
+        // Recovery keeps recorded history, including ratings and yield
+        // overrides, and respects an existing deletion marker.
+        if ((preserveCompleted && (existing.flags & (SHOT_FLAG_COMPLETED | SHOT_FLAG_DELETED))) ||
+            std::memcmp(&existing, &entry, sizeof(entry)) == 0) {
+            indexFile.close();
+            return true;
+        }
         if (writeEntryAtPosition(indexFile, existingPos, entry)) {
             ESP_LOGD("ShotHistoryPlugin", "Updated existing index entry for shot %u", entry.id);
             indexFile.close();

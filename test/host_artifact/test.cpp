@@ -1,11 +1,14 @@
 #include "RecipeStateHarness.h"
 #include <display/core/RecipeConfirmation.h>
 #include "ProjectionHarness.h"
+#include "RecoveryHarness.h"
 #include <display/plugins/autotuning/local/RecipePrompt.h>
 #include <display/plugins/autotuning/LifecycleReceipt.h>
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <cassert>
+#include <chrono>
+#include <cmath>
 #include <limits>
 #include <fstream>
 #include <iterator>
@@ -15,7 +18,11 @@
 #include <display/util/AtomicFile.h>
 #include <display/core/RecommendationContext.h>
 
-extern "C" unsigned long millis() { return 1000; }
+extern "C" unsigned long millis() {
+    using namespace std::chrono;
+    static const auto start = steady_clock::now();
+    return 1000 + static_cast<unsigned long>(duration_cast<milliseconds>(steady_clock::now() - start).count());
+}
 extern "C" void delay(uint32_t) {}
 extern "C" void yield() {}
 
@@ -49,6 +56,114 @@ static AutoTuning::CompletedShotArtifact fixture() {
     }
     artifact.bindSamples();
     return artifact;
+}
+
+static ShotIndexEntry readOnlyIndexEntry() {
+    File index = LittleFS.open("/h/index.bin", FILE_READ);
+    ShotIndexHeader header{};
+    ShotIndexEntry entry{};
+    assert(index.read(reinterpret_cast<uint8_t *>(&header), sizeof(header)) == sizeof(header));
+    assert(header.entryCount == 1);
+    assert(index.read(reinterpret_cast<uint8_t *>(&entry), sizeof(entry)) == sizeof(entry));
+    return entry;
+}
+
+static void testBootRecovery() {
+    constexpr const char *replayPath = "/rll/p/recovery-fixture.json";
+    constexpr const char *summaryPath = "/rll/s/recovery-fixture.json";
+    constexpr const char *notesPath = "/h/000042.json";
+    constexpr auto savedTime = 1720001000;
+
+    auto artifact = fixture();
+    artifact.record.beverageOutG = 36.102347f;
+    artifact.completion.doseTargetG = 18.54321f;
+    CompletedShotArtifactStore artifacts;
+    assert(artifacts.begin());
+    assert(artifacts.write(artifact));
+
+    ShotHistoryPlugin history;
+    LocalAutoTuningStorePlugin firstBoot;
+    firstBoot.machine.projection = &history;
+    assert(firstBoot.recoverCommittedArtifacts());
+
+    // Add edits a user could have made after this shot completed.
+    JsonDocument notes;
+    assert(LocalAutoTuningFiles::readJson(notesPath, notes));
+    notes["rating"] = 4;
+    notes["doseOut"] = "37.5";
+    notes["notes"] = "Keep this tasting note";
+    assert(history.saveNotes("42", notes));
+    auto entry = readOnlyIndexEntry();
+    entry.rating = 4;
+    entry.volume = 375;
+    entry.flags |= SHOT_FLAG_HAS_NOTES;
+    assert(history.appendToIndex(entry));
+
+    JsonDocument replay;
+    assert(LocalAutoTuningFiles::readJson(replayPath, replay));
+    replay["updated_at"] = savedTime;
+    replay["local_delivery_state"] = "accepted";
+    replay["prompt_state"] = AutoTuning::promptStatusKey(AutoTuning::PromptStatus::Resolved);
+    replay["prompt_revision"] = 5;
+    assert(LocalAutoTuningFiles::writeJson(replayPath, replay));
+    JsonDocument summary;
+    assert(LocalAutoTuningFiles::readJson(summaryPath, summary));
+    summary["updated_at"] = savedTime;
+    assert(LocalAutoTuningFiles::writeJson(summaryPath, summary));
+
+    const size_t beforeReboot = LittleFS.mutations;
+    LocalAutoTuningStorePlugin secondBoot;
+    secondBoot.machine.projection = &history;
+    assert(secondBoot.recoverCommittedArtifacts());
+    assert(LittleFS.mutations == beforeReboot);
+    assert(readOnlyIndexEntry().rating == 4 && readOnlyIndexEntry().volume == 375);
+    assert(LocalAutoTuningFiles::readJson(summaryPath, summary));
+    assert(summary["updated_at"] == savedTime);
+
+    // Repair a legacy envelope even when its artifact identity already matches.
+    replay["schema_version"] = 2;
+    replay["artifact_encoding_version"] = 0;
+    replay["completion"] = nullptr;
+    replay["payload"]["legacy"] = true;
+    replay.remove("dose_target_g");
+    assert(LocalAutoTuningFiles::writeJson(replayPath, replay));
+    assert(secondBoot.recoverCommittedArtifacts());
+    assert(LocalAutoTuningFiles::readJson(replayPath, replay));
+    assert(replay["schema_version"] == 3 && replay["artifact_encoding_version"] == 1);
+    assert(replay["payload"].isUnbound() && replay["completion"].isUnbound());
+    assert(std::fabs(replay["dose_target_g"].as<float>() - artifact.completion.doseTargetG) < 0.0001f);
+    assert(replay["local_delivery_state"] == "accepted" && replay["prompt_revision"] == 5);
+    assert(replay["updated_at"] == savedTime);
+
+    // A canonical revision can change projected values without resetting feedback.
+    artifact.record.beverageOutG = 38.5f;
+    artifact.revision++;
+    assert(artifacts.write(artifact));
+    assert(secondBoot.recoverCommittedArtifacts());
+    assert(LocalAutoTuningFiles::readJson(replayPath, replay));
+    assert(replay["artifact_revision"] == artifact.revision && replay["artifact_payload_hash"] == artifact.payloadHash.c_str());
+    assert(replay["local_delivery_state"] == "accepted" && replay["prompt_revision"] == 5);
+    assert(LocalAutoTuningFiles::readJson(summaryPath, summary));
+    assert(summary["beverage_out_g"].as<float>() == 38.5f);
+    assert(readOnlyIndexEntry().rating == 4 && readOnlyIndexEntry().volume == 375);
+
+    // Repair missing and unreadable projections while keeping the notes.
+    assert(LittleFS.remove("/h/index.bin"));
+    File corruptSummary = LittleFS.open(summaryPath, FILE_WRITE);
+    corruptSummary.print("{\"schema_version\":");
+    corruptSummary.close();
+    notes["rlShotId"] = "old-link";
+    assert(history.saveNotes("42", notes));
+    assert(secondBoot.recoverCommittedArtifacts());
+    assert(LocalAutoTuningFiles::readJson(summaryPath, summary));
+    assert(LocalAutoTuningFiles::readJson(notesPath, notes));
+    assert(notes["rlShotId"] == "recovery-fixture" && notes["notes"] == "Keep this tasting note");
+    assert(readOnlyIndexEntry().rating == 4 && readOnlyIndexEntry().volume == 375);
+    const size_t afterRepair = LittleFS.mutations;
+    assert(secondBoot.recoverCommittedArtifacts());
+    assert(LittleFS.mutations == afterRepair);
+    LittleFS = MemoryFS{};
+    puts("PASS boot recovery: unchanged records perform zero writes; legacy and missing projections repaired");
 }
 
 void testRememberedRecipe() {
@@ -315,6 +430,7 @@ int main(int argc, char **argv) {
         puts("PASS Python receipt parsed by firmware; invalid envelopes rejected");
         return 0;
     }
+    testBootRecovery();
     CompletedShotArtifactStore store;
     assert(store.begin());
     // Reproduce boot recovery with a persisted shot spanning multiple 4 KB
@@ -345,10 +461,12 @@ int main(int argc, char **argv) {
         assert(sample.t == (i == 1 ? 380 : i * 250) && sample.ct == 930 && sample.cp == 90);
         assert(sample.wp == (i == 1 ? 13 : SHOT_LOG_WATER_PUMPED_UNKNOWN));
     }
-    assert(history.index.size() == 1 && history.index.at(42).avgTemp == 930);
-    assert(history.savedNotes.indexOf("history-recovery") >= 0);
+    assert(readOnlyIndexEntry().id == 42 && readOnlyIndexEntry().avgTemp == 930);
+    JsonDocument historyNotes;
+    history.loadNotes("42", historyNotes);
+    assert(historyNotes["rlShotId"] == "history-recovery");
     assert(history.ensureProjection(restoredHistory));
-    assert(history.index.size() == 1 && historyFile.node->bytes == expectedHistory);
+    assert(readOnlyIndexEntry().id == 42 && historyFile.node->bytes == expectedHistory);
     historyFile.node->bytes[offsetof(ShotLogHeader, version)] = 7;
     const auto oldHistory = historyFile.node->bytes;
     assert(history.ensureProjection(restoredHistory));

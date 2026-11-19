@@ -191,10 +191,6 @@ void LocalAutoTuningStorePlugin::setup(Controller *ctrl, PluginManager *pm) {
     controller = ctrl;
     pluginManager = pm;
     ctrl->setAutoTuningRecordStore(this);
-    {
-        LocalStoreLock lock(storeMutex);
-        ensureDirectories();
-    }
     recoverCommittedArtifacts();
     refreshCachedStatus();
     snapshotContexts();
@@ -995,7 +991,7 @@ bool LocalAutoTuningStorePlugin::upsertArtifactSummary(
 bool LocalAutoTuningStorePlugin::saveReplaySnapshot(
     AutoTuning::CompletedShotArtifact const &artifact) {
     const String shotId(artifact.record.shotId.c_str());
-    if (!ensureDirectories() || shotId.isEmpty() || artifact.payloadHash.size() != 64) {
+    if (shotId.isEmpty() || artifact.payloadHash.size() != 64) {
         return false;
     }
     const bool doseConfirmationRequired = artifact.disposition.doseConfirmationRequired;
@@ -1256,26 +1252,31 @@ bool LocalAutoTuningStorePlugin::recoverCommittedArtifacts() {
             const bool identityChanged =
                 jsonStringOrEmpty(root["artifact_payload_hash"]) != artifact.payloadHash.c_str() ||
                 (root["artifact_revision"] | 0U) != artifact.revision;
-            root["schema_version"] = 3;
-            root.remove("payload");
-            root.remove("completion");
-            updateReplayArtifactIdentity(root, artifact);
-            if (root["dose_target_g"].isNull()) {
-                root["dose_target_g"] = artifact.completion.doseTargetG;
+            const bool needsUpgrade = (root["schema_version"] | 0) != 3 ||
+                                      (root["artifact_encoding_version"] | 0) != 1 ||
+                                      !root["payload"].isUnbound() || !root["completion"].isUnbound() ||
+                                      root["dose_target_g"].isNull() || root["prompt_state"].isNull();
+            if (identityChanged || needsUpgrade) {
+                root["schema_version"] = 3;
+                root.remove("payload");
+                root.remove("completion");
+                updateReplayArtifactIdentity(root, artifact);
+                if (root["dose_target_g"].isNull()) {
+                    root["dose_target_g"] = artifact.completion.doseTargetG;
+                }
+                if (root["prompt_state"].isNull()) {
+                    root["prompt_state"] =
+                        AutoTuning::promptStatusKey(AutoTuning::PromptStatus::Processing);
+                    root["prompt_revision"] = 1;
+                    root["prompt_updated_at"] = nowEpoch();
+                }
+                if (identityChanged) {
+                    root["updated_at"] = nowEpoch();
+                }
+                recovered = LocalAutoTuningFiles::writeJson(
+                                LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), replay) &&
+                            recovered;
             }
-            if (root["prompt_state"].isNull()) {
-                root["prompt_state"] =
-                    AutoTuning::promptStatusKey(AutoTuning::PromptStatus::Processing);
-                root["prompt_revision"] = 1;
-                root["prompt_updated_at"] = nowEpoch();
-            }
-            if (identityChanged) {
-                root["updated_at"] = nowEpoch();
-            }
-            recovered =
-                LocalAutoTuningFiles::writeJson(
-                    LocalAutoTuningFiles::recordPath(REPLAY_DIR, shotId), replay) &&
-                recovered;
         }
         recovered = upsertArtifactSummary(artifact) && recovered;
         AutoTuning::CompletedShotProjectionPort *projection =

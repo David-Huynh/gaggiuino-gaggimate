@@ -33,7 +33,7 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
     void handleRequest(JsonDocument &request, JsonDocument &response);
 
     // Index management methods
-    bool appendToIndex(const ShotIndexEntry &entry);
+    bool appendToIndex(const ShotIndexEntry &entry, bool preserveCompleted = false);
     void updateIndexMetadata(uint32_t shotId, uint8_t rating, uint16_t volume);
     void markIndexDeleted(uint32_t shotId);
     // Removes every shot log and notes file under /h and resets the index; false when anything could not be removed
@@ -61,8 +61,8 @@ class ShotHistoryPlugin : public Plugin, public AutoTuning::CompletedShotProject
     bool writeEntryAtPosition(File &indexFile, size_t position, const ShotIndexEntry &entry);
     bool persistBufferedShot();
 
-    void saveNotes(const String &id, const JsonDocument &notes);
-    void loadNotes(const String &id, JsonDocument &notes);
+    bool saveNotes(const String &id, const JsonDocument &notes);
+    bool loadNotes(const String &id, JsonDocument &notes);
     String resolveNotesPath(uint32_t id);
     void startRecording(Event const &event);
 

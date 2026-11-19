@@ -9,6 +9,14 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def extract_methods(source, signatures):
+    methods = []
+    for signature in signatures:
+        start = source.index(signature)
+        methods.append(source[start:source.index("\n}", start) + 2])
+    return "\n\n".join(methods)
+
+
 def main():
     build = ROOT / ".pio/host-artifact"
     build.mkdir(parents=True, exist_ok=True)
@@ -32,10 +40,31 @@ def main():
                          "\n".join(methods) + "\n}\n")
     history = (ROOT / "src/display/plugins/ShotHistoryPlugin.cpp").read_text(encoding="utf-8")
     helpers = history[history.index("namespace {"):history.index("bool readOptionalCorrectionFloat(")]
-    start = history.index("bool ShotHistoryPlugin::ensureProjection(")
+    history_methods = extract_methods(history, (
+        "bool ShotHistoryPlugin::ensureProjection(", "bool ShotHistoryPlugin::appendToIndex(",
+        "bool ShotHistoryPlugin::ensureIndexExists(", "bool ShotHistoryPlugin::readIndexHeader(",
+        "int ShotHistoryPlugin::findEntryPosition(", "bool ShotHistoryPlugin::readEntryAtPosition(",
+        "bool ShotHistoryPlugin::writeEntryAtPosition(", "bool ShotHistoryPlugin::saveNotes(",
+        "bool ShotHistoryPlugin::loadNotes(", "String ShotHistoryPlugin::resolveNotesPath(",
+    ))
     projection = build / "projection.cpp"
-    projection.write_text('#include "ProjectionHarness.h"\n#include <cmath>\n' + helpers + "\n}\n" +
-                          history[start:history.index("\n}\n", start) + 3], encoding="utf-8")
+    projection.write_text('#include "ProjectionHarness.h"\n#include <cmath>\n#include <cstring>\n#include <esp_log.h>\n' +
+                          helpers + "\n}\n" + history_methods, encoding="utf-8")
+    store = (ROOT / "src/display/plugins/LocalAutoTuningStorePlugin.cpp").read_text(encoding="utf-8")
+    store_helpers = "\n".join(next(line for line in store.splitlines() if line.startswith(prefix)) for prefix in (
+        "constexpr const char *STORE_DIR", "constexpr const char *REPLAY_DIR", "using EpochSeconds", "using LocalStoreLock",
+        "static EpochSeconds nowEpoch(",
+    )) + "\n" + extract_methods(store, ("static String jsonStringOrEmpty(",))
+    recovery = build / "recovery.cpp"
+    recovery.write_text('#include "RecoveryHarness.h"\nnamespace {\n' + store_helpers + "\n}\n" +
+                        extract_methods(store, (
+                            "bool LocalAutoTuningStorePlugin::ensureDirectories(",
+                            "bool LocalAutoTuningStorePlugin::loadReplaySnapshot(",
+                            "bool LocalAutoTuningStorePlugin::saveReplaySnapshot(",
+                            "bool LocalAutoTuningStorePlugin::updateReplayArtifactIdentity(",
+                            "bool LocalAutoTuningStorePlugin::upsertArtifactSummary(",
+                            "bool LocalAutoTuningStorePlugin::recoverCommittedArtifacts(",
+                        )), encoding="utf-8")
     mqtt = (ROOT / "src/display/plugins/MQTTPlugin.cpp").read_text(encoding="utf-8")
     recipe_methods = []
     for signature in ("void MQTTPlugin::rememberConfirmedRecipe(", "void MQTTPlugin::persistRecommendationView("):
@@ -54,9 +83,12 @@ def main():
                "sim/platform/arduino/stdlib_noniso.c", "sim/platform/noniso_extra.c", "src/display/core/StorageCoordinator.cpp",
                "src/display/core/AutoTuningModels.cpp", "src/display/plugins/autotuning/AutoTuningJsonCodec.cpp",
                "src/display/plugins/autotuning/local/CompletedShotArtifactStore.cpp",
+               "src/display/plugins/autotuning/local/LocalAutoTuningFiles.cpp",
+               "src/display/plugins/autotuning/local/LocalAutoTuningSummaryStore.cpp",
                "src/display/util/AtomicFile.cpp", "src/display/util/LittleFSUtil.cpp"]
     binary = build / ("test.exe" if os.name == "nt" else "test")
-    command += [str(ROOT / source) for source in sources] + [str(generated), str(projection), str(recipe_source), "-o", str(binary)]
+    command += [str(ROOT / source) for source in sources]
+    command += [str(generated), str(projection), str(recovery), str(recipe_source), "-o", str(binary)]
     subprocess.run(command, check=True, cwd=ROOT)
     subprocess.run([str(binary)], check=True, timeout=30, cwd=ROOT)
 
