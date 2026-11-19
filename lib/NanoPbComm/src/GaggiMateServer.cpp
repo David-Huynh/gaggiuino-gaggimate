@@ -155,6 +155,7 @@ void GaggiMateServer::setSystemInfo(const String &hardware, const String &versio
     _systemInfo.has_capabilities = true;
     _systemInfo.capabilities = capabilities;
 
+#if !defined(ARDUINO_ARCH_STM32)
     // Mirror system info onto the legacy read-only characteristic in the old
     // JSON shape (plus "pv"), so pre-framing tools can still read it.
     char json[224];
@@ -162,8 +163,8 @@ void GaggiMateServer::setSystemInfo(const String &hardware, const String &versio
              "{\"hw\":\"%s\",\"v\":\"%s\",\"pv\":%u,\"cp\":{\"ps\":%s,\"dm\":%s,\"led\":%s,\"tof\":%s,\"sc\":%s}}",
              hardware.c_str(), version.c_str(), static_cast<unsigned>(gm_proto::PROTOCOL_VERSION),
              capabilities.pressure ? "true" : "false", capabilities.dimming ? "true" : "false",
-             capabilities.led_control ? "true" : "false", capabilities.tof ? "true" : "false");
-#if !defined(ARDUINO_ARCH_STM32)
+             capabilities.led_control ? "true" : "false", capabilities.tof ? "true" : "false",
+             capabilities.scale ? "true" : "false");
     _ble.setInfo(json);
 #endif
 }
