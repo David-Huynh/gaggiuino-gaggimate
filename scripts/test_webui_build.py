@@ -7,26 +7,37 @@ import runpy
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from build_webui import ensure_bundle
 
 
 class WebUiBuildTests(unittest.TestCase):
     def test_firmware_hook_sanitizes_unicode_output_and_propagates_build_failure(self):
-        hook = Path(__file__).with_name("embed_webui_pre.py")
+        hook = Path(__file__).resolve().with_name("embed_webui_pre.py")
+        root = hook.parent.parent
+        build_dir = root / ".pio/build/display"
         for code in (0, 1):
+            env = MagicMock()
+            env.__getitem__.side_effect = {"PROJECT_DIR": str(root)}.__getitem__
+            env.subst.return_value = str(build_dir)
             result = subprocess.CompletedProcess([], code, stdout="Build \U0001f33c\n")
             with patch("subprocess.run", return_value=result) as run, contextlib.redirect_stdout(io.StringIO()) as output:
                 def invoke():
                     runpy.run_path(str(hook), init_globals={
-                        "Import": lambda _: None, "env": {"PROJECT_DIR": str(hook.parent.parent)},
+                        "Import": lambda _: None, "env": env,
                     })
                 if code:
                     with self.assertRaises(subprocess.CalledProcessError):
                         invoke()
+                    env.Depends.assert_not_called()
                 else:
                     invoke()
+                    env.subst.assert_called_once_with("$BUILD_DIR")
+                    env.Depends.assert_called_once_with(
+                        str(build_dir / "src/display/webassets/web_ui_blob.S.o"),
+                        str(root / "src/display/webassets/web_ui.bin"),
+                    )
                 output.getvalue().encode("ascii")
                 self.assertIn("--if-needed", run.call_args.args[0])
 
