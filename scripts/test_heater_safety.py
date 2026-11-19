@@ -1,5 +1,6 @@
 """Real session, heater/PID and thermocouple code with fake RTOS, link and sensors."""
 import importlib.util
+from configparser import ConfigParser
 import os
 from pathlib import Path
 import shutil
@@ -26,6 +27,11 @@ def main():
     folders = [ROOT/"test/host_heater/stubs", ROOT/"lib/NanoPbComm/src", generated, nanopb,
                ROOT/"lib/GaggiMateController/src/peripherals", ROOT/"lib/NayrodPID/src"]
     command = compiler + ["-x", "c++", "-std=c++17", "-pthread", "-fno-access-control", "-DARDUINO_ARCH_STM32"]
+    config = ConfigParser(interpolation=None)
+    config.read(ROOT / "platformio.ini", encoding="utf-8")
+    rx_size = next(flag for flag in config["env:stm32f4"]["build_flags"].split()
+                   if flag.startswith("-DSERIAL_RX_BUFFER_SIZE="))
+    command.append(rx_size)
     for folder in folders:
         command += ["-I", str(folder)]
     sources = [ROOT/"test/host_heater/test.cpp", ROOT/"lib/NanoPbComm/src/Endpoint.cpp",

@@ -18,7 +18,11 @@
 #include "stm32f4_pindef.h"
 #include <Arduino.h>
 #include <GaggiMateController.h>
+#include <uart/UartTransport.h>
 #include "version.h"
+
+static_assert(SERIAL_RX_BUFFER_SIZE > gm_uart::cobsMaxEncodedLen(UartTransport::MAX_PROTOCOL_DATAGRAM + 3) + 1,
+              "STM32 UART RX must hold a complete protocol frame plus the ring buffer sentinel");
 
 // STM32duino HardwareSerial constructor is (RX, TX)
 // Gaggiuino pindef: PA2=TX, PA3=RX, so constructor is (PA3, PA2).

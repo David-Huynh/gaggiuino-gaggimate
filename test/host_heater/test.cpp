@@ -287,6 +287,7 @@ class MemorySerial : public Stream {
   public:
     MemorySerial *peer = nullptr;
     std::deque<uint8_t> input;
+    size_t receiveCapacity = std::numeric_limits<size_t>::max();
 
     int available() override { return input.size(); }
     int read() override {
@@ -297,8 +298,10 @@ class MemorySerial : public Stream {
         return next;
     }
     size_t write(const uint8_t *data, size_t length) override {
-        if (peer)
-            peer->input.insert(peer->input.end(), data, data + length);
+        if (peer) {
+            const size_t received = std::min(length, peer->receiveCapacity - peer->input.size());
+            peer->input.insert(peer->input.end(), data, data + received);
+        }
         return length;
     }
 };
@@ -337,10 +340,58 @@ static void testUart() {
     puts("PASS UART: bidirectional handshake, CRC rejection, embedded zeros, independent restart");
 }
 
+static void testUartConfigurationBurst() {
+    gm::Frame frame = gaggimate_Frame_init_zero;
+    frame.id = 17;
+    frame.session_id = 0xa49b19c1;
+    frame.peer_session_id = 0xc9db71fe;
+    frame.payloads_count = 4;
+    auto &pressure = frame.payloads[0];
+    pressure.which_content = gaggimate_Payload_pressure_scale_tag;
+    pressure.content.pressure_scale.scale = 1.05f;
+    auto &heater = frame.payloads[1];
+    heater.which_content = gaggimate_Payload_heater_tag;
+    heater.content.heater.kp = 30;
+    heater.content.heater.ki = 0.3f;
+    heater.content.heater.kd = 100;
+    auto &pump = frame.payloads[2];
+    pump.which_content = gaggimate_Payload_pump_model_tag;
+    pump.content.pump_model.a = 7;
+    pump.content.pump_model.b = 2;
+    pump.content.pump_model.c = std::numeric_limits<float>::quiet_NaN();
+    pump.content.pump_model.d = pump.content.pump_model.c;
+    auto &scale = frame.payloads[3];
+    scale.which_content = gaggimate_Payload_scale_calibration_tag;
+    scale.content.scale_calibration.calibration1 = 1285;
+    scale.content.scale_calibration.calibration2 = 1341;
+    scale.content.scale_calibration.offset1 = -240450;
+    scale.content.scale_calibration.offset2 = 210249;
+    const auto configuration = encode(frame);
+
+    const auto receiveBurst = [&](size_t capacity) {
+        MemorySerial display, controller;
+        display.peer = &controller;
+        controller.receiveCapacity = capacity;
+        UartTransport sender(display), receiver(controller);
+        sender.begin();
+        receiver.begin();
+        std::vector<uint8_t> delivered;
+        receiver.onData([&](const uint8_t *data, size_t length) { delivered.assign(data, data + length); });
+        // One UART polling interval can contain the entire configuration frame.
+        assert(sender.send(configuration.data(), configuration.size()));
+        receiver.loop();
+        return delivered;
+    };
+    assert(receiveBurst(64 - 1).empty());
+    assert(receiveBurst(SERIAL_RX_BUFFER_SIZE - 1) == configuration);
+    puts("PASS UART: STM32 RX buffer preserves the startup configuration batch");
+}
+
 int main() {
     testHeater();
     testSensor();
     testSessions();
     testHeatingAcrossSessions();
     testUart();
+    testUartConfigurationBurst();
 }
