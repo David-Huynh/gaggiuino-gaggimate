@@ -39,6 +39,7 @@
 #include <esp_system.h>
 #include <mbedtls/platform.h>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 #include <version.h>
@@ -53,6 +54,14 @@ static constexpr unsigned long RXBUFFER_IDLE_EVICT_MS = 5UL * 60UL * 1000UL;
 
 namespace {
 constexpr size_t MAX_HISTORY_HTTP_FILE_BYTES = 512 * 1024;
+#if !defined(GAGGIMATE_SIM)
+constexpr size_t PROFILE_REQUEST_QUEUE_DEPTH = DEFAULT_MAX_WS_CLIENTS * 2;
+
+struct ProfileRequest {
+    uint32_t clientId;
+    JsonDocument request;
+};
+#endif
 
 void sendStorageSnapshot(AsyncWebServerRequest *request, FS &fs, const String &path, const char *contentType) {
     auto flashLease = StorageCoordinator::instance().tryAcquireFlash();
@@ -1888,6 +1897,18 @@ void WebUIPlugin::start() {
         // STA reconnect needs nothing done here.
         return;
     }
+#if !defined(GAGGIMATE_SIM)
+    if (!profileRequests) {
+        profileRequests = xQueueCreate(PROFILE_REQUEST_QUEUE_DEPTH, sizeof(ProfileRequest *));
+        if (profileRequests && xTaskCreatePinnedToCore(profileRequestTask, "WebUI profiles", 8192, this, 1, nullptr, 1) != pdPASS) {
+            vQueueDelete(profileRequests);
+            profileRequests = nullptr;
+        }
+        if (!profileRequests) {
+            ESP_LOGE("WebUIPlugin", "Unable to start profile request worker");
+        }
+    }
+#endif
     if (!pluginHooksRegistered) {
         // Fired here, not in setup(), so plugins set up after this one still get to register before the server listens
         Event serverEvent;
@@ -2090,7 +2111,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
     if (!err) {
         String msgType = doc["tp"].as<String>();
         if (msgType.startsWith("req:profiles:")) {
-            handleProfileRequest(client->id(), doc);
+            queueProfileRequest(cid, doc);
         } else if (msgType == "req:ota-settings") {
             handleOTASettings(client->id(), doc);
         } else if (msgType == "req:ota-start") {
@@ -2401,6 +2422,43 @@ void WebUIPlugin::handleAutotuneStart(uint32_t clientId, JsonDocument &request) 
     int heaterWattage = request["wattage"] | 0;
     controller->autotune(testTime, samples, heaterWattage);
 }
+
+void WebUIPlugin::queueProfileRequest(uint32_t clientId, JsonDocument &request) {
+#if defined(GAGGIMATE_SIM)
+    handleProfileRequest(clientId, request);
+#else
+    // Keep filesystem access off the AsyncTCP task. Each queued request owns
+    // its parsed payload; a disconnected WebSocket client can be freed safely.
+    if (profileRequests) {
+        auto *job = new (std::nothrow) ProfileRequest{clientId, std::move(request)};
+        if (job) {
+            if (xQueueSend(profileRequests, &job, 0) == pdPASS) {
+                return;
+            }
+            request = std::move(job->request);
+            delete job;
+        }
+    }
+    JsonDocument response(&psramAllocator);
+    response["tp"] = String("res:") + request["tp"].as<String>().substring(4);
+    response["rid"] = request["rid"];
+    response["error"] = profileRequests ? "Profile requests are busy. Try again." : "Profile requests are unavailable.";
+    ws.text(clientId, toWsBuffer(response));
+#endif
+}
+
+#if !defined(GAGGIMATE_SIM)
+void WebUIPlugin::profileRequestTask(void *arg) {
+    auto *self = static_cast<WebUIPlugin *>(arg);
+    for (;;) {
+        ProfileRequest *job = nullptr;
+        if (xQueueReceive(self->profileRequests, &job, portMAX_DELAY) == pdPASS) {
+            const std::unique_ptr<ProfileRequest> request(job);
+            self->handleProfileRequest(request->clientId, request->request);
+        }
+    }
+}
+#endif
 
 void WebUIPlugin::handleProfileRequest(uint32_t clientId, JsonDocument &request) {
     // Allocate the response node pool from PSRAM â€” list responses can be tens

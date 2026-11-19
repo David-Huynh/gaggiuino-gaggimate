@@ -17,6 +17,10 @@
 #include <display/core/Event.h>
 #include <display/core/Plugin.h>
 #include <display/util/PsramAllocator.h>
+#if !defined(GAGGIMATE_SIM)
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#endif
 
 constexpr size_t UPDATE_CHECK_INTERVAL = 30 * 60 * 1000;
 constexpr size_t CLEANUP_PERIOD = 1000;
@@ -46,7 +50,12 @@ class WebUIPlugin : public Plugin {
     void handleOTASettings(uint32_t clientId, JsonDocument &request);
     void handleOTAStart(uint32_t clientId, JsonDocument &request);
     void handleAutotuneStart(uint32_t clientId, JsonDocument &request);
+    void queueProfileRequest(uint32_t clientId, JsonDocument &request);
     void handleProfileRequest(uint32_t clientId, JsonDocument &request);
+#if !defined(GAGGIMATE_SIM)
+    static void profileRequestTask(void *arg);
+    QueueHandle_t profileRequests = nullptr;
+#endif
     void handleRLRequest(uint32_t clientId, JsonDocument &request);
     void handleFlushStart(uint32_t clientId, JsonDocument &request);
     // Send/re-send the pending shot comparison prompt. No-op when nothing is pending.
