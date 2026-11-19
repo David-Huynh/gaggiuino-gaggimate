@@ -23,9 +23,20 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, help="also transfer a real relocated STM32 firmware binary")
     parser.add_argument("--package", type=Path, help="also transfer a package signed with the RFC 8032 fixture key")
+    parser.add_argument("--factory", type=Path, help="also boot an initial ST-Link image in simulated flash")
+    parser.add_argument("--public-key", help="32-byte public key in hex for the ST-Link image")
     args = parser.parse_args()
     if args.package and not args.image:
         parser.error("--package requires --image")
+    if bool(args.factory) != bool(args.public_key):
+        parser.error("--factory and --public-key must be used together")
+    if args.factory:
+        try:
+            factory_key = bytes.fromhex(args.public_key)
+            if len(factory_key) != 32:
+                raise ValueError
+        except ValueError:
+            parser.error("--public-key must be a 32-byte hex key")
     cc = compiler("CC", ("gcc", "clang"), "cc")
     cxx = compiler("CXX", ("g++", "clang++"), "c++")
     crypto = monocypher_sources()
@@ -53,6 +64,13 @@ def main():
     if args.package:
         command.append(str(args.package.resolve(strict=True)))
     subprocess.run(command, check=True, cwd=ROOT, timeout=120)
+    if args.factory:
+        key_file = build / "factory-public-key.bin"
+        key_file.write_bytes(factory_key)
+        subprocess.run(
+            [str(binary), "--factory", str(args.factory.resolve(strict=True)), str(key_file)],
+            check=True, cwd=ROOT, timeout=30,
+        )
 
 
 if __name__ == "__main__":

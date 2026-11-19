@@ -337,9 +337,31 @@ void testFailedActivation(const TestKey &key, const Image &current, const Image 
     assert(recoveredBoot.prepareApplication() && update.isActive(flash));
 }
 
+void testFactoryImage(const char *imagePath, const char *keyPath) {
+    uint8_t publicKey[32];
+    std::ifstream keyFile(keyPath, std::ios::binary);
+    assert(keyFile.read(reinterpret_cast<char *>(publicKey), sizeof(publicKey)));
+    std::ifstream imageFile(imagePath, std::ios::binary);
+    const std::vector<uint8_t> image(std::istreambuf_iterator<char>(imageFile), {});
+    assert(image.size() > APPLICATION - FLASH_BASE && image.size() <= STAGED_MANIFEST - FLASH_BASE);
+
+    SimFlash flash;
+    std::copy(image.begin(), image.end(), flash.bytes.begin());
+    Installer coldBoot(flash, publicKey);
+    assert(coldBoot.prepareApplication() && flash.operations == 0);
+    flash.bytes[APPLICATION - FLASH_BASE + 8] ^= 1;
+    Installer damagedBoot(flash, publicKey);
+    assert(!damagedBoot.prepareApplication() && flash.operations == 0);
+    std::puts("Verified first boot from the ST-Link image and rejection of a damaged image.");
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
+    if (argc == 4 && std::strcmp(argv[1], "--factory") == 0) {
+        testFactoryImage(argv[2], argv[3]);
+        return 0;
+    }
     const TestKey key;
     const Image current(0x59), update(0xb2);
     testTransportAndValidation(key, current, update);

@@ -39,6 +39,21 @@ The loader verifies the active image and vector table before booting. It install
 
 With the signing dependency used by `scripts/sign_release.py`, `scripts/pack_stm32_ota.py` packages a relocated application ELF as a signed manifest followed by the image. Pass `--toolchain` if the ARM tools are outside PATH. The loader and OTA app must be built with the matching public key.
 
+## First installation for a bench test
+
+Use an STM32F411CE with 512 KiB of flash. Unplug the machine from mains and bench-power the controller with the heater and pump loads disconnected. Build both OTA targets with a local signing key for this board.
+
+Pass the bootloader ELF to the existing packer to combine the loader, signed active manifest and relocated app into one ST-Link image.
+
+```sh
+python scripts/pack_stm32_ota.py .pio/build/stm32f4-ota-app/firmware.elf stm32-ota-bench.bin \
+  --bootloader .pio/build/stm32f4-bootloader/firmware.elf --private-key path/to/your-signing-key.pem
+```
+
+Use STM32CubeProgrammer over ST-Link/SWD to read and save 524,288 bytes from `0x08000000`. When the backup is complete, program the combined `.bin` at `0x08000000` with verification enabled and reset the controller. Program the saved backup at the same address to restore the original controller.
+
+Confirm the heater and pump control lines stay off through reset. To check the UART connection, use an ESP32 build that speaks controller protocol `10016`. [STM32CubeProgrammer SWD command reference](https://dev.st.com/stm32cube-docs/prog/2.23.0/en/docs/markup/CubeProg_Command_Lines.html)
+
 ## Integration status
 
-These builds are for software testing. Connecting the shared sender to the ESP32 updater and verifying the controller's version after reboot are the next integration steps. First installation of the loader on a stock controller requires ST-Link. The simulation covers the flash protocol and recovery decisions. GPIO levels during reset, voltage drop behavior and actual flash timing need a hardware check before enabling deployment.
+Connecting the shared sender to the ESP32 updater and verifying the controller's version after reboot are the next integration steps. The simulation covers the flash protocol and recovery decisions. GPIO levels during reset, voltage drop behavior and actual flash timing need a hardware check before enabling deployment.
