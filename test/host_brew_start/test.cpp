@@ -39,6 +39,7 @@ using String = std::string;
 constexpr int MODE_STANDBY = 0, MODE_BREW = 1, MODE_STEAM = 2, MODE_WATER = 3, MODE_GRIND = 4;
 constexpr int STEAM_SAFETY_DURATION_MS = 120000;
 enum class ProcessTarget { TIME, VOLUMETRIC };
+enum class ProcessPhase { RUNNING, FINISHED, INTERRUPTED };
 struct Event { String id; void setString(const char *, const String &) {} };
 struct Plugins { void trigger(const char *) {} void trigger(const Event &) {} };
 struct Settings {
@@ -53,13 +54,16 @@ struct Settings {
 struct Process {
     virtual ~Process() = default;
     virtual int getType() const { return MODE_BREW; }
-    bool active = true;
+    ProcessPhase processPhase = ProcessPhase::RUNNING;
     bool isUtility() const { return false; }
-    bool isComplete() const { return true; }
-    void progress() { active = false; }
+    bool isActive() const { return processPhase == ProcessPhase::RUNNING; }
+    bool isComplete() const { return !isActive(); }
+    void progress() { processPhase = ProcessPhase::FINISHED; }
 };
 struct BrewProcess : Process {
     ProcessTarget target = ProcessTarget::TIME;
+    unsigned long finished = 0;
+    #include "brew_interrupt.inc"
     void updatePressure(float) {} void updateFlow(float) {} void updateWaterPumped(float) {}
     double getNewDelayTime() const { return -1; }
 };
@@ -110,7 +114,7 @@ struct Controller {
     std::atomic<float> currentTemp{0}, pressure{0}, currentPumpFlow{0}, currentWaterPumped{0};
     bool isReady() const { return ready; }
     bool isErrorState() const { return false; }
-    bool isActiveLocked() const { return currentProcess && currentProcess->active; }
+    bool isActiveLocked() const { return currentProcess && currentProcess->isActive(); }
     bool isActive() const { return isActiveLocked(); }
     float getTargetTemp() const { return 93; }
     void updateLastAction() {} void deactivateGrind() {} void activateStandby() {}
@@ -329,12 +333,25 @@ static void testController() {
         c.brewTare.complete(c.comms.lastRequest, true, clockMs);
         c.pollHardwareScaleBrewTare();
         assert(c.started && c.currentProcess && storage.processActive());
-        if (shot % 4 == 0)
+        if (shot % 4 == 0) {
+            clockMs += 1800;
             c.deactivate(); // web Stop
-        else if (shot % 4 == 1)
+            auto *stopped = static_cast<BrewProcess *>(c.lastProcess);
+            assert(stopped && stopped->processPhase == ProcessPhase::INTERRUPTED && stopped->finished == clockMs);
+            assert(c.processCompleted); // interrupted shots don't adjust brew delay
+            clockMs += 5000;
+            c.loopLogic();
+            assert(c.lastProcess == stopped && stopped->finished == clockMs - 5000);
+            assert(stopped->processPhase == ProcessPhase::INTERRUPTED);
+            c.clear(); // web Finish (dismiss)
+            assert(!c.lastProcess);
+        } else if (shot % 4 == 1) {
             c.handleBrewButton(0); // physical Stop
-        else
+        } else {
             c.loopLogic(); // automatic completion
+            assert(c.lastProcess && c.lastProcess->processPhase == ProcessPhase::FINISHED);
+            assert(!c.processCompleted);
+        }
         assert(!storage.processActive() && !c.currentProcess && !c.brewTare.pending());
         assert(!c.pendingProcessStorageLease && !c.processStorageLease);
         auto flash = storage.tryAcquireFlash();

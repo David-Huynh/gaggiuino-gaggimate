@@ -1501,7 +1501,9 @@ void WebUIPlugin::loop() {
         if (process == nullptr) {
             process = controller->getLastProcess();
         }
-        if (process != nullptr) {
+        if (process == nullptr) {
+            statusDoc["process"] = nullptr;
+        } else {
             auto pObj = statusDoc["process"].to<JsonObject>();
             pObj["u"] = process->isUtility() ? 1 : 0;
             pObj["a"] = controller->isActive() ? 1 : 0;
@@ -2310,7 +2312,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
         } else if (msgType == "req:flush:stop") {
             controller->postCommand(CtrlCmd::STOP_FLUSH);
         } else if (msgType == "req:process:deactivate") {
-            controller->postCommand(CtrlCmd::DEACTIVATE_CLEAR);
+            controller->postCommand(CtrlCmd::DEACTIVATE);
         } else if (msgType == "req:process:clear") {
             controller->postCommand(CtrlCmd::CLEAR);
         } else if (msgType == "req:grind:activate") {

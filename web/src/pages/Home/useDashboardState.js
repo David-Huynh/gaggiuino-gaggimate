@@ -1,7 +1,7 @@
 import { grindAvailable } from '../../utils/grind.js';
 import { displayedTemperatureTarget } from '../../utils/temperatureTarget.js';
 import { computed } from '@preact/signals';
-import { useContext, useEffect, useState } from 'preact/hooks';
+import { useCallback, useContext, useEffect, useState } from 'preact/hooks';
 import { useQuery } from 'preact-fetching';
 import { ApiServiceContext, machine } from '../../services/ApiService.js';
 import { MODES } from './utils.js';
@@ -48,7 +48,7 @@ export function useDashboardState() {
   // ── derived ──────────────────────────────────────────────
   const isActive = !!p?.a;
   const isStarting = !!s.brewStartPending;
-  const isFinished = !!p?.e && !isActive;
+  const isFinished = p?.e != null && !isActive;
   const isBrewing = mode === 1;
   const isGrinding = mode === 4;
   // The firmware flags a flush (utility process) so this state survives re-renders and reloads.
@@ -82,14 +82,14 @@ export function useDashboardState() {
       : null;
 
   // ── handlers ─────────────────────────────────────────────
-  const send = tp => {
+  const send = useCallback(tp => {
     setSendError('');
     try {
       apiService.send({ tp });
     } catch {
       setSendError('Connection lost. Wait for reconnection, then try again.');
     }
-  };
+  }, [apiService]);
 
   const toggleSteam = () => {
     if (systemReady && caps.dualBoiler && mode !== 0 && s.steamControlsAvailable !== false)
@@ -106,13 +106,7 @@ export function useDashboardState() {
   };
 
   const activate = () => send(isGrinding ? 'req:grind:activate' : 'req:process:activate');
-  const deactivate = () => {
-    send(isGrinding ? 'req:grind:deactivate' : 'req:process:deactivate');
-    if (isFlushing) {
-      send('req:process:clear');
-      setFlushPending(false);
-    }
-  };
+  const deactivate = () => send(isGrinding ? 'req:grind:deactivate' : 'req:process:deactivate');
   const clear = () => {
     send('req:process:clear');
     setFlushPending(false);
@@ -129,13 +123,11 @@ export function useDashboardState() {
     send('req:flush:stop');
   };
 
+  // Let the firmware confirm the flush end before clearing its summary.
   useEffect(() => {
-    if (flushRunning) setFlushPending(false);
-  }, [flushRunning]);
-  // A finished flush clears itself; nobody wants to confirm a flush like a shot.
-  useEffect(() => {
-    if (flushFinished) apiService.send({ tp: 'req:process:clear' });
-  }, [flushFinished, apiService]);
+    if (flushRunning || flushFinished) setFlushPending(false);
+    if (flushFinished) send('req:process:clear');
+  }, [flushRunning, flushFinished, send]);
 
   const raiseTemp = () => send('req:raise-temp');
   const lowerTemp = () => send('req:lower-temp');

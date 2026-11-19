@@ -44,6 +44,21 @@ assert.equal(machine.value.status.brewStartPending, false);
 assert.equal(machine.value.history.length, count + 1);
 console.log('PASS sparse status: preserves hardware scales, profile, updates and pending brew state');
 
+const running = { a: 1, u: 0, e: 1200 };
+api._onStatus({ tp: 'evt:status', ct: 93, process: running });
+api._onStatus({ tp: 'evt:status', tw: 36 });
+assert.equal(machine.value.status.process, running);
+assert.equal(machine.value.status.activeTargetWeight, 36);
+api._onStatus({ tp: 'evt:status', ct: 93, process: { ...running, a: 0 } });
+assert.equal(machine.value.status.process.a, 0);
+api._onStatus({ tp: 'evt:status', ct: 93, process: null });
+assert.equal(machine.value.status.process, null);
+assert.equal(machine.value.status.activeTargetWeight, 0);
+api._onStatus({ tp: 'evt:status', ct: 93, process: { ...running, u: 1 } });
+api._onStatus({ tp: 'evt:status', ct: 93 });
+assert.equal(machine.value.status.process, null);
+console.log('PASS process telemetry: preserves sparse updates and clears stopped brews and flushes');
+
 api._onStatus({ tp: 'evt:status', tt: 85, cht: 145, chc: true });
 assert.equal(machine.value.status.targetTemperature, 85);
 assert.equal(machine.value.status.controllerTargetTemperature, 145);

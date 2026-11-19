@@ -271,7 +271,8 @@ export default class ApiService {
     map('bc', 'bluetoothConnected', v => v || false);
     map('scaleSource', 'activeScaleSource', v => v || 'inactive');
     map('sbat', 'scaleBattery', v => v ?? null);
-    map('process', 'process', v => v || null);
+    // Telemetry always describes the process. Older firmware omitted it after clearing.
+    if (has('ct') || has('process')) status.process = message.process ?? null;
     map('rssi', 'rssi', v => v || 0);
     map('lnk', 'controllerLink', v => v || 'none');
     map('lat', 'lat', v => v || 0);

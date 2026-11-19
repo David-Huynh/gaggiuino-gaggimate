@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / ".pio" / "host-brew-start"
 
 
-def method(source, signature):
+def method(source, signature, closing="\n}"):
     start = source.index(signature)
-    end = source.index("\n}", start) + 2
+    end = source.index(closing, start) + len(closing)
     return source[start:end]
 
 
@@ -40,6 +40,9 @@ def main():
         "void Controller::deactivateStandby()",
     ]
     (BUILD / "controller_methods.inc").write_text("\n\n".join(method(source, s) for s in signatures), encoding="utf-8")
+    brew_process = (ROOT / "src/display/core/process/BrewProcess.h").read_text(encoding="utf-8")
+    (BUILD / "brew_interrupt.inc").write_text(
+        method(brew_process, "    bool interrupt()", "\n    }"), encoding="utf-8")
     cxx = os.environ.get("CXX") or shutil.which("g++") or shutil.which("clang++")
     if cxx:
         command = [cxx]

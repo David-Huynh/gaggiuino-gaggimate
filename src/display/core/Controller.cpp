@@ -1861,6 +1861,10 @@ bool Controller::deactivateLocked(DeferredProcessEvents &events) {
     const bool brewWasUtility = lastProcess->isUtility();
     currentVolumetricSource = VolumetricMeasurementSource::INACTIVE;
     if (swappedType == MODE_BREW) {
+        if (static_cast<BrewProcess *>(lastProcess)->interrupt()) {
+            // Keep the stopped brew visible until dismissed, without learning a delay from it.
+            processCompleted = true;
+        }
         if (!brewWasUtility)
             flushPending = true;
         events.push_back({"controller:brew:end", brewWasUtility ? 1 : 0});

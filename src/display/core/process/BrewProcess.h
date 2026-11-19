@@ -54,7 +54,7 @@ class BrewProcess : public Process {
 
     void updateVolume(double volume) override { // called even after the Process is no longer active
         currentVolume = volume;
-        if (processPhase != ProcessPhase::FINISHED) { // only store measurements while active
+        if (isActive()) { // only store measurements while active
             volumetricRateCalculator.addMeasurement(volume);
         }
     }
@@ -137,7 +137,7 @@ class BrewProcess : public Process {
     }
 
     bool isRelayActive() override {
-        if (processPhase == ProcessPhase::FINISHED) {
+        if (!isActive()) {
             return false;
         }
         return currentPhase.valve;
@@ -146,13 +146,13 @@ class BrewProcess : public Process {
     bool isAltRelayActive() override { return false; }
 
     float getPumpValue() override {
-        if (processPhase == ProcessPhase::FINISHED) {
+        if (!isActive()) {
             return 0.0f;
         }
         return currentPhase.pumpIsSimple ? currentPhase.pumpSimple : 100.0f;
     }
 
-    bool isAdvancedPump() const { return processPhase != ProcessPhase::FINISHED && !currentPhase.pumpIsSimple; }
+    bool isAdvancedPump() const { return processPhase == ProcessPhase::RUNNING && !currentPhase.pumpIsSimple; }
 
     [[nodiscard]] PumpTarget getPumpTarget() const { return currentPhase.pumpAdvanced.target; }
 
@@ -184,7 +184,7 @@ class BrewProcess : public Process {
     void progress() override {
         // Progress should be called around every 100ms, as defined in PROGRESS_INTERVAL, while the Process is active
         PhaseExitReason reason;
-        while ((reason = currentPhaseExitReason()) != PhaseExitReason::NONE && processPhase == ProcessPhase::RUNNING) {
+        while (isActive() && (reason = currentPhaseExitReason()) != PhaseExitReason::NONE) {
             previousPhaseFinished = millis();
             lastExitReason = reason; // record why this phase ended for the shot history transition
             releaseRequested = false;
@@ -212,8 +212,17 @@ class BrewProcess : public Process {
 
     bool isActive() override { return processPhase == ProcessPhase::RUNNING; }
 
+    bool interrupt() {
+        if (!isActive()) {
+            return false;
+        }
+        processPhase = ProcessPhase::INTERRUPTED;
+        finished = millis();
+        return true;
+    }
+
     void applyLiveTargetUpdate(const LiveBrewTargetUpdate &update) {
-        if (processPhase == ProcessPhase::FINISHED) {
+        if (!isActive()) {
             return;
         }
 
@@ -259,7 +268,7 @@ class BrewProcess : public Process {
     }
 
     bool isComplete() override {
-        if (target == ProcessTarget::TIME) {
+        if (target == ProcessTarget::TIME || processPhase == ProcessPhase::INTERRUPTED) {
             return !isActive();
         }
         return processPhase == ProcessPhase::FINISHED && millis() - finished > PREDICTIVE_TIME;

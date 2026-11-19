@@ -69,6 +69,72 @@ def check_uart_update(page):
     assert update.is_enabled()
 
 
+def check_process_controls(page):
+    start = page.get_by_role('button', name='Start', exact=True)
+    pause = page.get_by_role('button', name='Pause', exact=True)
+    finish = page.get_by_role('button', name='Finish', exact=True)
+    flush = page.get_by_role('button', name='Flush water')
+    brewing = page.get_by_text('Now Brewing', exact=False)
+    finished = page.get_by_text('Finished · Test espresso', exact=True)
+    brew_process = dict(a=1, u=0, s='brew', e=1200, tt='time', pp=1200, pt=30000)
+
+    def process_status(process):
+        page.evaluate('process => window.__emit({tp:"evt:status", ct:93, process})', process)
+
+    def count_commands(topic):
+        return page.evaluate('tp => window.__sent.filter(msg => msg.tp === tp).length', topic)
+
+    for manual_stop in (True, False):
+        prior_starts = count_commands('req:process:activate')
+        start.click()
+        assert count_commands('req:process:activate') == prior_starts + 1
+        process_status(brew_process)
+        brewing.wait_for()
+        page.evaluate('window.__emit({tp:"evt:status", p:"Test espresso"})')
+        assert pause.is_visible()
+        if manual_stop:
+            prior_stops = count_commands('req:process:deactivate')
+            pause.click()
+            assert count_commands('req:process:deactivate') == prior_stops + 1
+        # A brew stopped immediately may report zero elapsed milliseconds.
+        process_status(dict(brew_process, a=0, e=0 if manual_stop else 30000))
+        finished.wait_for()
+        prior_clears = count_commands('req:process:clear')
+        finish.click()
+        assert count_commands('req:process:clear') == prior_clears + 1
+        process_status(None)
+        start.wait_for()
+        finished.wait_for(state='hidden')
+        brewing.wait_for(state='hidden')
+
+    for manual_stop in (True, False):
+        prior_flushes = count_commands('req:flush:start')
+        flush.click()
+        assert count_commands('req:flush:start') == prior_flushes + 1
+        page.evaluate('window.__reply(window.__sent.filter(m => m.tp === "req:flush:start").at(-1))')
+        prior_clears = count_commands('req:process:clear')
+        if manual_stop:
+            process_status(dict(brew_process, u=1))
+            prior_stops = count_commands('req:process:deactivate')
+            pause.click()
+            assert count_commands('req:process:deactivate') == prior_stops + 1
+            assert count_commands('req:process:clear') == prior_clears
+        # The next flush can finish while the browser has only seen the start request.
+        process_status(dict(brew_process, a=0, u=1))
+        page.wait_for_function(
+            'count => window.__sent.filter(m => m.tp === "req:process:clear").length === count + 1',
+            arg=prior_clears,
+        )
+        if manual_stop:
+            process_status(None)
+        else:
+            page.evaluate('window.__emit({tp:"evt:status", ct:93})')  # Older firmware leaves out process.
+        start.wait_for()
+        assert flush.get_attribute('aria-pressed') == 'false'
+        finished.wait_for(state='hidden')
+        brewing.wait_for(state='hidden')
+
+
 def main():
     server = ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(Handler, directory=str(ROOT / 'web/dist')))
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -122,6 +188,8 @@ def main():
                 page.evaluate("window.__emit({tp:'evt:status',tt:85,cht:null,chc:false})")
                 assert page.get_by_label('Temperature target differs from selected target').count() == 0
 
+                check_process_controls(page)
+
                 # An orientation timer queued just before leaving must not use a
                 # destroyed Chart.js instance 100 ms later.
                 page.evaluate("window.dispatchEvent(new Event('orientationchange')); window.__navigate('/not-found')")
@@ -130,7 +198,7 @@ def main():
                 page.wait_for_timeout(200)
                 assert not errors, errors
                 assert not page.evaluate('window.__errors'), page.evaluate('window.__errors')
-                print(f'PASS {viewport}: delayed startup, navigation, reconnect, chart disposal and UART OTA retry/failure')
+                print(f'PASS {viewport}: navigation, reconnect, brew/flush controls and UART OTA retry/failure')
                 page.close()
             browser.close()
     finally:
