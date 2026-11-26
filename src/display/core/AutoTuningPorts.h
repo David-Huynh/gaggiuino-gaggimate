@@ -59,6 +59,44 @@ class LocalOptimizationStorePort {
     virtual LocalStoreStats stats() const = 0;
 };
 
+struct OnBoardRuntimeTelemetry {
+    bool ready = false;
+    bool shadowModeOnly = true;
+    bool persistedStateLoaded = false;
+    bool persistenceAvailable = false;
+    std::size_t vfeSampleCount = 0;
+    std::size_t cpboPointCount = 0;
+    std::size_t cpboComparisonCount = 0;
+    std::uint32_t lastMpcFitUs = 0;
+    std::uint32_t lastCpboFitMs = 0;
+    bool lastLiveActive = false;
+    std::uint8_t lastLiveMode = 0;
+    float lastBasePressureBar = 0.0f;
+    float lastMpcPressureBar = 0.0f;
+    float lastBaseFlowMlS = 0.0f;
+    float lastMpcFlowMlS = 0.0f;
+    float lastKfOffset = 0.0f;
+    std::uint32_t leaseEvaluatedCount = 0;
+    std::uint32_t leaseShadowCount = 0;
+    std::uint32_t leaseAppliedCount = 0;
+    std::uint32_t leaseRejectedCount = 0;
+    std::uint32_t leaseExpiredCount = 0;
+};
+
+class OnBoardOptimizerPort {
+  public:
+    virtual ~OnBoardOptimizerPort() = default;
+
+    virtual bool ready() const = 0;
+    virtual bool shadowModeOnly() const = 0;
+    virtual void setShadowModeOnly(bool shadowOnly) = 0;
+    virtual OnBoardRuntimeTelemetry runtimeTelemetry() const { return OnBoardRuntimeTelemetry{}; }
+    virtual ShotSubmissionResult submitShot(ShotRecord const &shot, ShotDeliveryAttempt const &attempt) = 0;
+    virtual bool onLiveShotStarted(LiveShotStarted const &event) = 0;
+    virtual bool onLiveShotSample(LiveShotSample const &event) = 0;
+    virtual bool onLiveShotEnded(LiveShotEnded const &event) = 0;
+};
+
 } // namespace AutoTuning
 
 #endif // AUTOTUNINGPORTS_H

@@ -179,6 +179,15 @@ class WebUIPlugin : public Plugin {
     int rlCPBOTrustRegionFailureCount = 0;
     String rlCPBOLastTransitionAction = "";
     int rlLocalShotCount = 0;
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    bool rlOnBoardShadowOnly = true;
+    int rlOnBoardVfeSamples = 0;
+    int rlOnBoardCpboPoints = 0;
+    int rlOnBoardCpboComparisons = 0;
+    int rlOnBoardLastMpcUs = 0;
+    int rlOnBoardLastCpboMs = 0;
+    bool rlOnBoardPersisted = false;
+#endif
     String rlRuntimeHealthStatus = "";
     String rlRuntimeHealthSummary = "";
     String rlRuntimeHealthWarningsJson = "[]";

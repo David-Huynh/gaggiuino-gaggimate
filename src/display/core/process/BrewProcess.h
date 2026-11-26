@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <cmath>
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+#include <display/core/LiveBrewLease.h>
+#endif
 #include <display/core/LiveBrewTargetUpdate.h>
 #include <display/core/constants.h>
 #include <display/core/predictive.h>
@@ -154,9 +157,9 @@ class BrewProcess : public Process {
 
     bool isAdvancedPump() const { return processPhase == ProcessPhase::RUNNING && !currentPhase.pumpIsSimple; }
 
-    [[nodiscard]] PumpTarget getPumpTarget() const { return currentPhase.pumpAdvanced.target; }
+    [[nodiscard]] PumpTarget getBasePumpTarget() const { return currentPhase.pumpAdvanced.target; }
 
-    float getPumpPressure() const {
+    float getBasePumpPressure() const {
         if (!isAdvancedPump())
             return 0.0f;
         const float startVal = phaseStartPressure;
@@ -165,7 +168,7 @@ class BrewProcess : public Process {
         return startVal + (endVal - startVal) * a;
     }
 
-    float getPumpFlow() const {
+    float getBasePumpFlow() const {
         if (!isAdvancedPump())
             return 0.0f;
         const float startVal = phaseStartFlow;
@@ -173,6 +176,82 @@ class BrewProcess : public Process {
         const float a = transitionAlpha();
         return startVal + (endVal - startVal) * a;
     }
+
+    [[nodiscard]] PumpTarget getPumpTarget() const {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        if (!isAdvancedPump()) {
+            return currentPhase.pumpAdvanced.target;
+        }
+        const LiveLeasePumpMode baseMode = (currentPhase.pumpAdvanced.target == PumpTarget::PUMP_TARGET_PRESSURE)
+                                               ? LiveLeasePumpMode::PRESSURE
+                                               : LiveLeasePumpMode::FLOW;
+        LiveLeasePumpMode outMode = baseMode;
+        float outP = 0.0f;
+        float outQ = 0.0f;
+        liveLease.resolve(millis(), baseMode, getBasePumpPressure(), getBasePumpFlow(), outMode, outP, outQ);
+        return (outMode == LiveLeasePumpMode::FLOW) ? PumpTarget::PUMP_TARGET_FLOW : PumpTarget::PUMP_TARGET_PRESSURE;
+#else
+        return currentPhase.pumpAdvanced.target;
+#endif
+    }
+
+    float getPumpPressure() const {
+        if (!isAdvancedPump())
+            return 0.0f;
+        const float baseP = getBasePumpPressure();
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        const float baseQ = getBasePumpFlow();
+        const LiveLeasePumpMode baseMode = (currentPhase.pumpAdvanced.target == PumpTarget::PUMP_TARGET_PRESSURE)
+                                               ? LiveLeasePumpMode::PRESSURE
+                                               : LiveLeasePumpMode::FLOW;
+        LiveLeasePumpMode outMode = baseMode;
+        float outP = baseP;
+        float outQ = baseQ;
+        liveLease.resolve(millis(), baseMode, baseP, baseQ, outMode, outP, outQ);
+        return outP;
+#else
+        return baseP;
+#endif
+    }
+
+    float getPumpFlow() const {
+        if (!isAdvancedPump())
+            return 0.0f;
+        const float baseQ = getBasePumpFlow();
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        const float baseP = getBasePumpPressure();
+        const LiveLeasePumpMode baseMode = (currentPhase.pumpAdvanced.target == PumpTarget::PUMP_TARGET_PRESSURE)
+                                               ? LiveLeasePumpMode::PRESSURE
+                                               : LiveLeasePumpMode::FLOW;
+        LiveLeasePumpMode outMode = baseMode;
+        float outP = baseP;
+        float outQ = baseQ;
+        liveLease.resolve(millis(), baseMode, baseP, baseQ, outMode, outP, outQ);
+        return outQ;
+#else
+        return baseQ;
+#endif
+    }
+
+    float getPhaseStartPressure() const { return phaseStartPressure; }
+    float getPhaseStartFlow() const { return phaseStartFlow; }
+    float getEffectivePressure() const { return effectivePressure; }
+    float getEffectiveFlow() const { return effectiveFlow; }
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    const LiveBrewLeaseDiagnostics &getLiveLeaseDiagnostics() const { return liveLease.diagnostics(); }
+
+    bool applyLeasedLiveTarget(const LiveBrewLeaseCommand &cmd, uint32_t nowMs, bool forceShadowMode = false) {
+        if (!isActive() || !isAdvancedPump()) {
+            return false;
+        }
+        const LiveLeasePumpMode baseMode = (currentPhase.pumpAdvanced.target == PumpTarget::PUMP_TARGET_PRESSURE)
+                                               ? LiveLeasePumpMode::PRESSURE
+                                               : LiveLeasePumpMode::FLOW;
+        return liveLease.submit(cmd, baseMode, getBasePumpPressure(), getBasePumpFlow(), nowMs, forceShadowMode);
+    }
+
+    void clearLiveControlLease() { liveLease.clear(); }
+#endif
 
     float getTemperature() const {
         if (currentPhase.temperature > 0.0f) {
@@ -193,12 +272,18 @@ class BrewProcess : public Process {
                 phaseIndex++;
                 Phase nextPhase = profile.phases.at(phaseIndex);
                 phaseStartVolume = currentVolume;
-                phaseStartPressure = nextPhase.transition.adaptive ? currentPressure : getPumpPressure();
-                phaseStartFlow = nextPhase.transition.adaptive ? currentFlow : getPumpFlow();
+                phaseStartPressure = nextPhase.transition.adaptive ? currentPressure : getBasePumpPressure();
+                phaseStartFlow = nextPhase.transition.adaptive ? currentFlow : getBasePumpFlow();
                 currentPhase = nextPhase;
                 currentPhaseStarted = millis();
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+                liveLease.clear();
+#endif
                 computeEffectiveTargetsForCurrentPhase();
             } else {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+                liveLease.clear();
+#endif
                 stopMeasuredVolume = currentVolume;
                 stopPredictedAddedVolume = currentPredictedAddedVolume;
                 stopPredictedVolume = currentPredictedVolume;
@@ -216,6 +301,9 @@ class BrewProcess : public Process {
         if (!isActive()) {
             return false;
         }
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        liveLease.clear();
+#endif
         processPhase = ProcessPhase::INTERRUPTED;
         finished = millis();
         return true;
@@ -227,6 +315,9 @@ class BrewProcess : public Process {
         }
 
         if (update.stopRequested) {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+            liveLease.clear();
+#endif
             manuallyFinished = true; // Explicit live-control finish, not an interruption.
             processPhase = ProcessPhase::FINISHED;
             finished = millis();
@@ -277,6 +368,9 @@ class BrewProcess : public Process {
     int getType() override { return MODE_BREW; }
 
   private:
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    mutable LiveBrewLease liveLease;
+#endif
     float phaseStartPressure = 0.0f;
     float phaseStartFlow = 0.0f;
 

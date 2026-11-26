@@ -1128,6 +1128,30 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
     AutoTuning::ShotSubmissionResult submission{
         AutoTuning::ShotSubmissionOutcome::Submitted, "not_required"};
     if (localDeliveryRequired) {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        const AutoTuning::Router router =
+            controller ? AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
+                                            controller->getOptimizerTransport())
+                       : AutoTuning::Router(AutoTuning::OptimizerConfiguration{});
+        if (router.useOnBoardOptimizer()) {
+            AutoTuning::OnBoardOptimizerPort *onBoard =
+                controller ? controller->getOnBoardOptimizer() : nullptr;
+            submission =
+                onBoard ? onBoard->submitShot(artifact.record, attempt)
+                        : AutoTuning::ShotSubmissionResult{
+                              AutoTuning::ShotSubmissionOutcome::NotConnected,
+                              "on_board_optimizer_unavailable"};
+        } else {
+            AutoTuning::OptimizerTransportPort *transport =
+                controller ? controller->getOptimizerTransport() : nullptr;
+            submission =
+                transport
+                    ? transport->publishShot(artifact.record, attempt)
+                    : AutoTuning::ShotSubmissionResult{
+                          AutoTuning::ShotSubmissionOutcome::NotConnected,
+                          "optimizer_transport_unavailable"};
+        }
+#else
         AutoTuning::OptimizerTransportPort *transport =
             controller ? controller->getOptimizerTransport() : nullptr;
         submission =
@@ -1136,6 +1160,7 @@ bool LocalAutoTuningStorePlugin::dispatchStoredShot(const String &shotId, bool r
                 : AutoTuning::ShotSubmissionResult{
                       AutoTuning::ShotSubmissionOutcome::NotConnected,
                       "optimizer_transport_unavailable"};
+#endif
     }
 
 
@@ -1915,9 +1940,9 @@ void LocalAutoTuningStorePlugin::processDueDelivery() {
         }
         return;
     }
-    if (!AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(),
-                            controller->getOptimizerTransport())
-             .routeOffBoardTransport()) {
+    const AutoTuning::Router deliveryRouter(controller->getSettings().getRLOptimizerConfiguration(),
+                                            controller->getOptimizerTransport());
+    if (!deliveryRouter.routeOffBoardTransport() && !deliveryRouter.useOnBoardOptimizer()) {
         return;
     }
     dispatchStoredShot(dueShotId, true, true);

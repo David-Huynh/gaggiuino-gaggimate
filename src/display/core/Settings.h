@@ -421,6 +421,9 @@ class Settings {
         return !getRLUploadInstallId().isEmpty() && !getRLUploadTokenId().isEmpty() && getRLUploadSecret().length() >= 32;
     }
     String getRLAutoTuningProviderMode() const { return rlAutoTuningProviderMode.get(); }
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    bool isRLOnBoardShadowOnly() const { return rlOnBoardShadowOnly.get(); }
+#endif
     String getRLBeanContextId() const { return rlBeanContextId.get(); }
     String getRLBeanContextName() const { return rlBeanContextName.get(); }
     String getRLBeanContextsJson() const { return rlBeanContextsJson.get(); }
@@ -549,6 +552,9 @@ class Settings {
     void setRLUploadCredentials(const String &installId, const String &tokenId, const String &secret);
     void clearRLUploadCredentials();
     void setRLAutoTuningProviderMode(const String &providerMode);
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    void setRLOnBoardShadowOnly(bool shadowOnly);
+#endif
     void setRLBeanContextId(const String &contextId);
     void setRLBeanContextName(const String &contextName);
     void setRLBeanContextsJson(const String &contextsJson);
@@ -746,6 +752,9 @@ class Settings {
     Property<String> rlUploadTokenId{registry, "rl_up_tid", ""};
     Property<String> rlUploadSecret{registry, "rl_up_sec", ""};
     Property<String> rlAutoTuningProviderMode{registry, "rl_provider", "disabled"};
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    Property<bool> rlOnBoardShadowOnly{registry, "rl_ob_shad", true};
+#endif
     Property<String> rlBeanContextId{registry, "rl_ctx_id", ""};
     Property<String> rlBeanContextName{registry, "rl_ctx_nm", ""};
     Property<String> rlBeanContextsJson{registry, "rl_ctxs", "[]"};

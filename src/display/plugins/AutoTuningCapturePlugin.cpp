@@ -248,6 +248,24 @@ void AutoTuningCapturePlugin::recordShotSample() {
     captureHistoryPhaseTransition();
     shotSamples.push_back(sample);
 
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    if (controller) {
+        const AutoTuning::Router router(controller->getSettings().getRLOptimizerConfiguration(),
+                                        controller->getOptimizerTransport());
+        AutoTuning::OnBoardOptimizerPort *onBoard =
+            router.useOnBoardOptimizer() ? controller->getOnBoardOptimizer() : nullptr;
+        if (onBoard != nullptr && onBoard->ready()) {
+            AutoTuning::LiveShotSample event;
+            event.shotId = currentShotId.c_str();
+            event.machineId = machineId().c_str();
+            event.timestampMs = liveShotStartedAtMs + elapsedMs;
+            event.sequence = static_cast<std::uint16_t>(shotSamples.size() - 1);
+            event.sample = sample;
+            onBoard->onLiveShotSample(event);
+        }
+    }
+#endif
+
     if (liveShotActive && controller) {
         AutoTuning::OptimizerTransportPort *transport = controller->getOptimizerTransport();
         if (transport) {
@@ -264,6 +282,24 @@ void AutoTuningCapturePlugin::recordShotSample() {
 
 void AutoTuningCapturePlugin::publishLiveShotStarted() {
     liveShotStartedAtMs = shotStartedAt * 1000;
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    if (controller) {
+        const AutoTuning::Router router(controller->getSettings().getRLOptimizerConfiguration(),
+                                        controller->getOptimizerTransport());
+        AutoTuning::OnBoardOptimizerPort *onBoard =
+            router.useOnBoardOptimizer() ? controller->getOnBoardOptimizer() : nullptr;
+        if (onBoard != nullptr && onBoard->ready()) {
+            AutoTuning::LiveShotStarted event;
+            event.shotId = currentShotId.c_str();
+            event.machineId = machineId().c_str();
+            event.startedAtMs = liveShotStartedAtMs;
+            event.sampleIntervalMs = SHOT_SAMPLE_INTERVAL_MS;
+            event.weightSource = weightSourceName();
+            event.flowSource = flowSourceName();
+            onBoard->onLiveShotStarted(event);
+        }
+    }
+#endif
     liveShotActive = shotOptimizerDeliveryRequired && liveShotStartedAtMs >= EpochTime::MIN_VALID * 1000;
     if (!liveShotActive || !controller)
         return;
@@ -283,6 +319,24 @@ void AutoTuningCapturePlugin::publishLiveShotStarted() {
 }
 
 void AutoTuningCapturePlugin::publishLiveShotEnded(const char *endState) {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    if (controller) {
+        const AutoTuning::Router router(controller->getSettings().getRLOptimizerConfiguration(),
+                                        controller->getOptimizerTransport());
+        AutoTuning::OnBoardOptimizerPort *onBoard =
+            router.useOnBoardOptimizer() ? controller->getOnBoardOptimizer() : nullptr;
+        if (onBoard != nullptr && onBoard->ready()) {
+            AutoTuning::LiveShotEnded event;
+            event.shotId = currentShotId.c_str();
+            event.machineId = machineId().c_str();
+            event.endedAtMs = liveShotStartedAtMs + shotStopElapsedMs;
+            event.finalSequence = shotSamples.empty() ? 0 : static_cast<std::uint16_t>(shotSamples.size() - 1);
+            event.elapsedMs = shotStopElapsedMs;
+            event.endState = endState ? endState : "manual_or_interrupted";
+            onBoard->onLiveShotEnded(event);
+        }
+    }
+#endif
     if (!liveShotActive || !controller)
         return;
 

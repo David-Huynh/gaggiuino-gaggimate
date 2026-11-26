@@ -83,10 +83,28 @@ class DisabledProvider final : public OptimizerProvider {
 
 class OnBoardProvider final : public OptimizerProvider {
   public:
-    bool available(OptimizerTransportPort const *) const override { return false; }
+    bool available(OptimizerTransportPort const *) const override {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        return true;
+#else
+        return false;
+#endif
+    }
     bool usesOffBoardTransport(OptimizerTransportPort const *) const override { return false; }
-    const char *status(OptimizerTransportPort const *) const override { return "unavailable"; }
-    const char *summary(OptimizerTransportPort const *) const override { return "On-board optimizer is not implemented yet"; }
+    const char *status(OptimizerTransportPort const *) const override {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        return "ready";
+#else
+        return "unavailable";
+#endif
+    }
+    const char *summary(OptimizerTransportPort const *) const override {
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        return "Using on-board EspressoRL (ESP32-S3)";
+#else
+        return "On-board optimizer is not implemented yet";
+#endif
+    }
 };
 
 class OffBoardProvider final : public OptimizerProvider {
@@ -176,7 +194,13 @@ bool Router::optimizationActive() const {
 
 bool Router::routeOffBoardTransport() const { return enabled() && provider().usesOffBoardTransport(transport); }
 
+bool Router::useOnBoardOptimizer() const {
+    return enabled() && configuration.providerMode == ProviderMode::OnBoard && providerAvailable();
+}
+
 bool Router::acceptOffBoardStatus() const { return routeOffBoardTransport(); }
+
+bool Router::acceptOptimizerStatus() const { return routeOffBoardTransport() || useOnBoardOptimizer(); }
 
 bool Router::acceptActionableRecommendations() const { return optimizationActive(); }
 

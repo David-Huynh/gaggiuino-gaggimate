@@ -64,7 +64,9 @@ class Router {
     bool providerAvailable() const;
     bool optimizationActive() const;
     bool routeOffBoardTransport() const;
+    bool useOnBoardOptimizer() const;
     bool acceptOffBoardStatus() const;
+    bool acceptOptimizerStatus() const;
     bool acceptActionableRecommendations() const;
     bool acceptUserCommands() const;
     const char *providerStatus() const;

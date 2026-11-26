@@ -23,6 +23,9 @@
 #ifndef GAGGIMATE_SIM
 #include <display/plugins/AutoTuningCapturePlugin.h>
 #include <display/plugins/CommunityUploadPlugin.h>
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+#include <display/plugins/OnBoardEspressoRLPlugin.h>
+#endif
 #endif
 #include <display/plugins/BoilerFillPlugin.h>
 #include <display/plugins/CleaningSchedulePlugin.h>
@@ -235,6 +238,9 @@ void Controller::setup() {
     }
 #ifndef GAGGIMATE_SIM
     pluginManager->registerPlugin(&AutoTuningCapture);
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    pluginManager->registerPlugin(&OnBoardEspressoRL);
+#endif
 #endif
     pluginManager->registerPlugin(&ShotHistory);
     pluginManager->registerPlugin(&LocalAutoTuningStore);
@@ -1561,6 +1567,19 @@ LiveBrewTargetApplyStatus Controller::applyLiveBrewTargetUpdate(const LiveBrewTa
     brewProcess->applyLiveTargetUpdate(update);
     return LiveBrewTargetApplyStatus::APPLIED;
 }
+
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+LiveBrewTargetApplyStatus Controller::applyLeasedLiveBrewTarget(const LiveBrewLeaseCommand &cmd, bool forceShadowMode) {
+    std::lock_guard<std::recursive_mutex> guard(processMutex);
+    Process *proc = currentProcess;
+    if (proc == nullptr || proc->getType() != MODE_BREW || !proc->isActive()) {
+        return LiveBrewTargetApplyStatus::NOT_ACTIVE_BREW;
+    }
+    auto *brewProcess = static_cast<BrewProcess *>(proc);
+    brewProcess->applyLeasedLiveTarget(cmd, millis(), forceShadowMode);
+    return LiveBrewTargetApplyStatus::APPLIED;
+}
+#endif
 
 void Controller::updateControl(bool urgent) {
     // Never drive a controller whose protocol version we don't match -- the

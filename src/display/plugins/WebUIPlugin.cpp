@@ -958,7 +958,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
 
     pluginManager->on("rl:status:received", [this](Event const &event) {
         if (!AutoTuning::Router(controller->getSettings().getRLOptimizerConfiguration(), controller->getOptimizerTransport())
-                 .acceptOffBoardStatus()) {
+                 .acceptOptimizerStatus()) {
             return;
         }
 
@@ -994,6 +994,17 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         rlCPBOTrustRegionFailureCount = event.getInt("cpbo_trust_region_failure_count");
         rlCPBOLastTransitionAction = event.getString("cpbo_last_transition_action");
         rlLocalShotCount = event.getInt("local_shot_count");
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        if (event.getInt("onboard_present") > 0) {
+            rlOnBoardShadowOnly = event.getInt("onboard_shadow_only") > 0;
+            rlOnBoardVfeSamples = event.getInt("onboard_vfe_samples");
+            rlOnBoardCpboPoints = event.getInt("onboard_cpbo_points");
+            rlOnBoardCpboComparisons = event.getInt("onboard_cpbo_comparisons");
+            rlOnBoardLastMpcUs = event.getInt("onboard_last_mpc_us");
+            rlOnBoardLastCpboMs = event.getInt("onboard_last_cpbo_ms");
+            rlOnBoardPersisted = event.getInt("onboard_persisted") > 0;
+        }
+#endif
         rlRuntimeHealthStatus = event.getString("runtime_health_status");
         rlRuntimeHealthSummary = event.getString("runtime_health_summary");
         rlRuntimeHealthWarningsJson =
@@ -1087,6 +1098,15 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
         doc["rlOptimizerFallbackReason"] = rlOptimizerFallbackReason;
         doc["rlLocalShotCount"] = rlLocalShotCount;
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        doc["rlOnBoardShadowOnly"] = settings.isRLOnBoardShadowOnly();
+        doc["rlOnBoardVfeSamples"] = rlOnBoardVfeSamples;
+        doc["rlOnBoardCpboPoints"] = rlOnBoardCpboPoints;
+        doc["rlOnBoardCpboComparisons"] = rlOnBoardCpboComparisons;
+        doc["rlOnBoardLastMpcUs"] = rlOnBoardLastMpcUs;
+        doc["rlOnBoardLastCpboMs"] = rlOnBoardLastCpboMs;
+        doc["rlOnBoardPersisted"] = rlOnBoardPersisted;
+#endif
         doc["rlRuntimeHealthStatus"] = rlRuntimeHealthStatus;
         doc["rlRuntimeHealthSummary"] = rlRuntimeHealthSummary;
         copyRLStringArray(doc, "rlRuntimeHealthWarnings", rlRuntimeHealthWarningsJson);
@@ -1101,6 +1121,28 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         copyRLRecentShots(doc, rlRecentShotsJson);
         ws.textAll(doc.as<String>());
     });
+
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    pluginManager->on("rl:onboard:live", [this](Event const &event) {
+        JsonDocument doc;
+        doc["tp"] = "evt:rl:onboard-live";
+        doc["shadowOnly"] = event.getInt("shadow_only") > 0;
+        doc["active"] = event.getInt("active") > 0;
+        doc["mode"] = event.getInt("mode");
+        doc["baseP"] = event.getFloat("base_p");
+        doc["mpcP"] = event.getFloat("mpc_p");
+        doc["baseQ"] = event.getFloat("base_q");
+        doc["mpcQ"] = event.getFloat("mpc_q");
+        doc["kfOffset"] = event.getFloat("kf_offset");
+        doc["mpcUs"] = event.getInt("mpc_us");
+        doc["evalCount"] = event.getInt("eval_count");
+        doc["shadowCount"] = event.getInt("shadow_count");
+        doc["appliedCount"] = event.getInt("applied_count");
+        doc["rejectedCount"] = event.getInt("rejected_count");
+        doc["expiredCount"] = event.getInt("expired_count");
+        broadcastJson(doc);
+    });
+#endif
 
     pluginManager->on("rl:community-upload:status", [this](Event const &event) {
         communityUploadRequested = event.getInt("requested") > 0;
@@ -2133,7 +2175,7 @@ void WebUIPlugin::handleWebSocketData(AsyncWebSocket *server, AsyncWebSocketClie
                    msgType.startsWith("req:rl:optimization:") ||
                    msgType == "req:rl:taste-goal:set" || msgType == "req:rl:dose-target:set" ||
                    msgType == "req:rl:recipe-domain:set" || msgType == "req:rl:cpbo-config:set" ||
-                   msgType == "req:rl:local-reset") {
+                   msgType == "req:rl:onboard:mode" || msgType == "req:rl:local-reset") {
             handleRLRequest(client->id(), doc);
         } else if (msgType == "req:rl:recommendation:use") {
             JsonDocument response;
@@ -2912,6 +2954,27 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             pluginManager->trigger(event);
             if (event.getInt("control_persisted") <= 0) response["error"] = event.getString("error");
             else changed = true;
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+        } else if (type == "req:rl:onboard:mode") {
+            if (!request["shadow_only"].is<bool>()) {
+                response["error"] = F("shadow_only boolean is required");
+            } else {
+                const bool shadowOnly = request["shadow_only"].as<bool>();
+                AutoTuning::OnBoardOptimizerPort *onBoard = controller->getOnBoardOptimizer();
+                if (onBoard == nullptr || !onBoard->ready()) {
+                    response["error"] = F("On-board EspressoRL optimizer is not available in this build");
+                } else if (!shadowOnly && controller->isActive()) {
+                    response["error"] = F("Stop brewing before arming live on-board actuation");
+                } else {
+                    settings.setRLOnBoardShadowOnly(shadowOnly);
+                    settings.save(true);
+                    onBoard->setShadowModeOnly(shadowOnly);
+                    rlOnBoardShadowOnly = shadowOnly;
+                    response["onboard_shadow_only"] = shadowOnly;
+                    changed = true;
+                }
+            }
+#endif
         } else if (type == "req:rl:local-reset") {
             settings.setRLSavedRecommendationJson("");
             settings.setRLRecipeChangedAt(0);
@@ -3505,6 +3568,8 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
 #endif
     AutoTuning::Router router(settings.getRLOptimizerConfiguration(), controller->getOptimizerTransport());
     const bool rlOffBoardProvider = router.routeOffBoardTransport();
+    const bool rlOnBoardProvider = router.useOnBoardOptimizer();
+    const bool rlActiveProvider = rlOffBoardProvider || rlOnBoardProvider;
     const bool rlEnabled = router.enabled();
     doc["rlAutoTuningEnabled"] = rlEnabled;
     doc["rlProviderMode"] = settings.getRLAutoTuningProviderMode();
@@ -3552,7 +3617,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         JsonObject calibration = doc["rlActiveGrinderCalibration"].to<JsonObject>();
         copyRLGrinderCalibration(calibration, activeGrinderContext);
     }
-    doc["rlStatusSeen"] = rlOffBoardProvider ? rlStatusSeen : rlEnabled;
+    doc["rlStatusSeen"] = rlOffBoardProvider ? rlStatusSeen : (rlOnBoardProvider ? true : rlEnabled);
     doc["rlAddonOnline"] = rlOffBoardProvider ? rlAddonOnline : router.providerAvailable();
     doc["rlLastStatusAt"] = rlLastStatusAt;
     doc["rlLastShotId"] = rlLastShotId;
@@ -3600,6 +3665,29 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["rlOptimizerEffectiveMode"] = rlOptimizerEffectiveMode;
     doc["rlOptimizerFallbackReason"] = rlOptimizerFallbackReason;
     doc["rlLocalShotCount"] = rlLocalShotCount;
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    {
+        AutoTuning::OnBoardRuntimeTelemetry obTele;
+        if (auto *onBoard = controller->getOnBoardOptimizer()) {
+            obTele = onBoard->runtimeTelemetry();
+        } else {
+            obTele.shadowModeOnly = settings.isRLOnBoardShadowOnly();
+            obTele.vfeSampleCount = static_cast<std::size_t>(std::max(rlOnBoardVfeSamples, 0));
+            obTele.cpboPointCount = static_cast<std::size_t>(std::max(rlOnBoardCpboPoints, 0));
+            obTele.cpboComparisonCount = static_cast<std::size_t>(std::max(rlOnBoardCpboComparisons, 0));
+            obTele.lastMpcFitUs = static_cast<std::uint32_t>(std::max(rlOnBoardLastMpcUs, 0));
+            obTele.lastCpboFitMs = static_cast<std::uint32_t>(std::max(rlOnBoardLastCpboMs, 0));
+            obTele.persistedStateLoaded = rlOnBoardPersisted;
+        }
+        doc["rlOnBoardShadowOnly"] = obTele.shadowModeOnly;
+        doc["rlOnBoardVfeSamples"] = static_cast<int>(obTele.vfeSampleCount);
+        doc["rlOnBoardCpboPoints"] = static_cast<int>(obTele.cpboPointCount);
+        doc["rlOnBoardCpboComparisons"] = static_cast<int>(obTele.cpboComparisonCount);
+        doc["rlOnBoardLastMpcUs"] = static_cast<int>(obTele.lastMpcFitUs);
+        doc["rlOnBoardLastCpboMs"] = static_cast<int>(obTele.lastCpboFitMs);
+        doc["rlOnBoardPersisted"] = obTele.persistedStateLoaded;
+    }
+#endif
     doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();
     doc["rlCommunityUploadPrompted"] = settings.isRLCommunityUploadPrompted();
     doc["rlUploadBaseUrl"] = settings.getRLUploadBaseUrl();
@@ -3614,9 +3702,11 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
     doc["communityUploadPendingCount"] = communityUploadPendingCount;
     doc["communityUploadRetryCount"] = communityUploadRetryCount;
     doc["communityUploadRejectedCount"] = communityUploadRejectedCount;
-    doc["rlRuntimeHealthStatus"] = rlOffBoardProvider ? rlRuntimeHealthStatus : (rlEnabled ? "attention" : "waiting");
+    doc["rlRuntimeHealthStatus"] =
+        rlActiveProvider ? (!rlRuntimeHealthStatus.isEmpty() ? rlRuntimeHealthStatus : (rlOnBoardProvider ? "healthy" : "waiting"))
+                         : (rlEnabled ? "attention" : "waiting");
     doc["rlRuntimeHealthSummary"] =
-        rlOffBoardProvider && !rlRuntimeHealthSummary.isEmpty() ? rlRuntimeHealthSummary : router.providerSummary();
+        rlActiveProvider && !rlRuntimeHealthSummary.isEmpty() ? rlRuntimeHealthSummary : router.providerSummary();
     copyRLStringArray(doc, "rlRuntimeHealthWarnings", rlRuntimeHealthWarningsJson);
     copyRLStringArray(doc, "rlRuntimeHealthWaitingReasons", rlRuntimeHealthWaitingReasonsJson);
     copyRLDiagnosticSteps(doc, rlAutoTuningDiagnosticStepsJson);

@@ -532,6 +532,10 @@ void Settings::setRLAutoTuningProviderMode(const String &providerMode) {
     rlAutoTuningProviderMode.set(normalized.c_str());
 }
 
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+void Settings::setRLOnBoardShadowOnly(const bool shadowOnly) { rlOnBoardShadowOnly.set(shadowOnly); }
+#endif
+
 void Settings::setRLBeanContextId(const String &contextId) { rlBeanContextId.set(contextId); }
 
 void Settings::setRLBeanContextName(const String &contextName) { rlBeanContextName.set(contextName); }

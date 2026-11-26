@@ -7,6 +7,9 @@
 
 #include <atomic>
 #include <cstdint>
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+#include "LiveBrewLease.h"
+#endif
 #include "LiveBrewTargetUpdate.h"
 #include "PluginManager.h"
 #include "ScaleSourceResolver.h"
@@ -158,6 +161,10 @@ class Controller {
     void startProcess(Process *process);
     // Thread-safe live brew target mutation for adapter-driven adaptive profiles.
     LiveBrewTargetApplyStatus applyLiveBrewTargetUpdate(const LiveBrewTargetUpdate &update);
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    // Thread-safe leased live brew target override with deadman timeout and Shadow Mode support.
+    LiveBrewTargetApplyStatus applyLeasedLiveBrewTarget(const LiveBrewLeaseCommand &cmd, bool forceShadowMode = false);
+#endif
     // Dereferencing the returned pointers requires holding getProcessLock(); the
     // logic task and control entry points can delete them at any time (GM-147).
     Process *getProcess() const { return currentProcess; }
@@ -167,6 +174,11 @@ class Controller {
     void setOptimizerTransport(AutoTuning::OptimizerTransportPort *transport) { optimizerTransport = transport; }
     AutoTuning::OptimizerTransportPort *getOptimizerTransport() { return optimizerTransport; }
     AutoTuning::OptimizerTransportPort const *getOptimizerTransport() const { return optimizerTransport; }
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    void setOnBoardOptimizer(AutoTuning::OnBoardOptimizerPort *optimizer) { onBoardOptimizer = optimizer; }
+    AutoTuning::OnBoardOptimizerPort *getOnBoardOptimizer() { return onBoardOptimizer; }
+    AutoTuning::OnBoardOptimizerPort const *getOnBoardOptimizer() const { return onBoardOptimizer; }
+#endif
     void setAutoTuningRecordStore(AutoTuning::AutoTuningRecordStorePort *store) { autoTuningRecordStore = store; }
     AutoTuning::AutoTuningRecordStorePort *getAutoTuningRecordStore() const { return autoTuningRecordStore; }
     void setCompletedShotProjection(AutoTuning::CompletedShotProjectionPort *projection) {
@@ -385,6 +397,9 @@ class Controller {
     PluginManager *pluginManager{};
     ProfileManager *profileManager{};
     AutoTuning::OptimizerTransportPort *optimizerTransport{};
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+    AutoTuning::OnBoardOptimizerPort *onBoardOptimizer{};
+#endif
     AutoTuning::AutoTuningRecordStorePort *autoTuningRecordStore{};
     AutoTuning::CompletedShotProjectionPort *completedShotProjection{};
     std::optional<StorageCoordinator::ProcessLease> processStorageLease;

@@ -63,6 +63,7 @@ struct Process {
 struct BrewProcess : Process {
     ProcessTarget target = ProcessTarget::TIME;
     unsigned long finished = 0;
+    struct { void clear() {} } liveLease;
     #include "brew_interrupt.inc"
     void updatePressure(float) {} void updateFlow(float) {} void updateWaterPumped(float) {}
     double getNewDelayTime() const { return -1; }
