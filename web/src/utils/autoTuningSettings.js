@@ -26,6 +26,13 @@ const AUTO_TUNING_RUNTIME_FIELDS = [
   'rlCPBOEffectiveProfileName',
   'rlCPBOEffectiveComparisonMode',
   'rlLocalShotCount',
+  'rlOnBoardShadowOnly',
+  'rlOnBoardVfeSamples',
+  'rlOnBoardCpboPoints',
+  'rlOnBoardCpboComparisons',
+  'rlOnBoardLastMpcUs',
+  'rlOnBoardLastCpboMs',
+  'rlOnBoardPersisted',
 ];
 
 export function mergeAutoTuningRuntimeStatus(formData, status) {

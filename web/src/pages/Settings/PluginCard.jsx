@@ -116,6 +116,9 @@ function statusText(formData) {
     return 'Disabled';
   }
   if (formData.rlProviderMode === 'on_board') {
+    if (formData.rlProviderStatus === 'ready') {
+      return formData.rlOnBoardShadowOnly === false ? 'On-board (Live)' : 'On-board (Shadow)';
+    }
     return 'Not implemented';
   }
   if (formData.rlProviderMode === 'off_board' && !mqttConfigured(formData)) {
@@ -134,6 +137,9 @@ function providerLabel(value) {
 function providerStatusTone(formData) {
   if (!formData.rlAutoTuningEnabled) {
     return 'badge-neutral';
+  }
+  if (formData.rlProviderMode === 'on_board' && formData.rlProviderStatus === 'ready') {
+    return formData.rlOnBoardShadowOnly === false ? 'badge-warning' : 'badge-success';
   }
   if (formData.rlProviderMode === 'off_board' && formData.rlAddonOnline) {
     return 'badge-success';

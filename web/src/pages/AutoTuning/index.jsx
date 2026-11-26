@@ -537,7 +537,18 @@ function runtimeHealth(settings) {
   }
   const providerMode = settings?.rlProviderMode || 'disabled';
   if (providerMode === 'on_board') {
-    return { tone: 'warning', summary: 'On-board optimization is not implemented yet.' };
+    if (settings?.rlProviderStatus === 'ready') {
+      const liveArmed = settings?.rlOnBoardShadowOnly === false;
+      return {
+        tone: liveArmed ? 'warning' : 'success',
+        summary:
+          settings?.rlRuntimeHealthSummary ||
+          (liveArmed
+            ? 'On-board ESP32-S3 CPBO + Level 1 MPC active (Live Actuation Armed).'
+            : 'On-board ESP32-S3 CPBO + Level 1 MPC active (Shadow Mode).'),
+      };
+    }
+    return { tone: 'warning', summary: 'On-board optimization is not enabled in this firmware build.' };
   }
   if (providerMode === 'off_board' && !settings?.rlMqttConfigured) {
     return { tone: 'warning', summary: 'Configure the MQTT broker to reach EspressoRL.' };
@@ -707,6 +718,7 @@ export function AutoTuning() {
   const [cpboProfileDraft, setCpboProfileDraft] = useState('application');
   const [cpboComparisonDraft, setCpboComparisonDraft] = useState('best_incumbent');
   const [doseTargetDraft, setDoseTargetDraft] = useState('18');
+  const [onBoardLive, setOnBoardLive] = useState(null);
 
   const mergeLiveSettings = useCallback(update => {
     if (snapshotRef.current) Object.assign(snapshotRef.current.patch, update);
@@ -783,11 +795,15 @@ export function AutoTuning() {
         rlRecommendationApplyStatus: '',
       });
     });
+    const onBoardLiveListener = apiService.on('evt:rl:onboard-live', message => {
+      setOnBoardLive(message);
+    });
     return () => {
       apiService.off('evt:rl:status', statusListener);
       apiService.off('evt:rl:recipe', recipeListener);
       apiService.off('evt:rl:recommendation', recommendationListener);
       apiService.off('evt:rl:recommendation-clear', recommendationClearListener);
+      apiService.off('evt:rl:onboard-live', onBoardLiveListener);
     };
   }, [apiService, mergeLiveSettings]);
 
@@ -1310,6 +1326,102 @@ export function AutoTuning() {
           <StatCard label='Provider' value={providerLabel(settings.rlProviderMode)} />
         </div>
       </Panel>
+
+      {settings.rlProviderMode === 'on_board' && settings.rlProviderStatus === 'ready' && (
+        <Panel
+          title='On-Board Controller (ESP32-S3)'
+          subtitle='Level 1 GP-MPC live safety lease & LittleFS persistence'
+          action={
+            <StatusPill tone={settings.rlOnBoardShadowOnly === false ? 'warning' : 'success'}>
+              {settings.rlOnBoardShadowOnly === false ? 'Live Armed' : 'Shadow Mode (Safe)'}
+            </StatusPill>
+          }
+        >
+          <div className='space-y-4'>
+            <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+              <p className='max-w-xl text-sm opacity-80'>
+                {settings.rlOnBoardShadowOnly === false
+                  ? 'Live Actuation is ARMED: CEM GP-MPC may adjust pump targets inside the ±2.5 bar / ±1.2 ml/s corridor with a 500 ms deadman lease.'
+                  : 'Shadow Mode evaluates and logs GP-MPC proposals at 4 Hz without actuating pump setpoints. Run 3–5 shots in Shadow Mode before arming Live.'}
+              </p>
+              <button
+                type='button'
+                className={
+                  settings.rlOnBoardShadowOnly === false
+                    ? 'btn btn-outline btn-sm'
+                    : 'btn btn-warning btn-sm'
+                }
+                disabled={busy}
+                onClick={() => {
+                  const armingLive = settings.rlOnBoardShadowOnly !== false;
+                  if (
+                    armingLive &&
+                    !window.confirm(
+                      'Arm Live On-Board GP-MPC actuation? The controller will dynamically adjust pump pressure/flow within the ±2.5 bar / ±1.2 ml/s safety corridor during extraction.',
+                    )
+                  ) {
+                    return;
+                  }
+                  run('req:rl:onboard:mode', { shadow_only: !armingLive });
+                }}
+              >
+                {settings.rlOnBoardShadowOnly === false ? 'Disarm to Shadow' : 'Arm Live Mode'}
+              </button>
+            </div>
+
+            <div className='grid grid-cols-2 gap-3 sm:grid-cols-4'>
+              <StatCard
+                label='VFE samples'
+                value={String(settings.rlOnBoardVfeSamples ?? 0)}
+              />
+              <StatCard
+                label='CPBO pairs'
+                value={`${settings.rlOnBoardCpboComparisons ?? 0} (${settings.rlOnBoardCpboPoints ?? 0} pts)`}
+              />
+              <StatCard
+                label='Last MPC / CPBO'
+                value={`${settings.rlOnBoardLastMpcUs ?? 0} µs / ${settings.rlOnBoardLastCpboMs ?? 0} ms`}
+              />
+              <StatCard
+                label='Persistence'
+                value={settings.rlOnBoardPersisted ? 'LittleFS Saved' : 'Ready (Empty)'}
+                tone={settings.rlOnBoardPersisted ? 'success' : 'neutral'}
+              />
+            </div>
+
+            {onBoardLive && (
+              <div className='bg-base-200/60 space-y-2 rounded-md p-3 text-sm'>
+                <div className='flex items-center justify-between'>
+                  <span className='font-medium'>
+                    {onBoardLive.active ? 'Live Shot Telemetry' : 'Last Shot Lease Summary'}
+                  </span>
+                  <StatusPill tone={onBoardLive.shadowOnly ? 'success' : 'warning'}>
+                    {onBoardLive.shadowOnly ? 'SHADOW' : 'LIVE'}
+                  </StatusPill>
+                </div>
+                <div className='grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-2'>
+                  <InfoRow
+                    label='Pressure (base → MPC)'
+                    value={`${Number(onBoardLive.baseP || 0).toFixed(2)} → ${Number(onBoardLive.mpcP || 0).toFixed(2)} bar`}
+                  />
+                  <InfoRow
+                    label='Flow (base → MPC)'
+                    value={`${Number(onBoardLive.baseQ || 0).toFixed(2)} → ${Number(onBoardLive.mpcQ || 0).toFixed(2)} ml/s`}
+                  />
+                  <InfoRow
+                    label='KF offset / latency'
+                    value={`${Number(onBoardLive.kfOffset || 0).toFixed(2)} / ${onBoardLive.mpcUs ?? 0} µs`}
+                  />
+                  <InfoRow
+                    label='Lease (shad / app / rej / exp)'
+                    value={`${onBoardLive.shadowCount ?? 0} / ${onBoardLive.appliedCount ?? 0} / ${onBoardLive.rejectedCount ?? 0} / ${onBoardLive.expiredCount ?? 0}`}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        </Panel>
+      )}
 
       {drawer === 'advanced' && (
         <Drawer
