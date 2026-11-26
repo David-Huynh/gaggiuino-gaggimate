@@ -1,0 +1,8 @@
+{
+  "name": "EspressoRLCore",
+  "version": "0.1.0",
+  "description": "Portable STL-only C++17 hydraulic GP-MPC and Gauss-Hermite VI CPBO library for EspressoRL on ESP32-S3 and native host.",
+  "keywords": "espresso, gp-mpc, cpbo, gaussian-process, control",
+  "frameworks": "*",
+  "platforms": "*"
+}
