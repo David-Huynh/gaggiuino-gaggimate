@@ -1,6 +1,6 @@
 {
-  "version": "v1.9.0-nightly.39+gca2c12d7",
+  "version": "v1.9.0-nightly.40+gc6258e90",
   "url": "https://github.com/David-Huynh/gaggiuino-gaggimate/releases/download/nightly/app-web.zip",
-  "checksum": "dff9d41cb5507b5cf6c56ab35f48d09cca3bdf09aac99fdce096f08bcd09be38",
+  "checksum": "a9c04b6f211172cedce57c00f9c6d0cc4a7d11fe37e9aea8ffac691dabbb5841",
   "minAppVersion": "1.0.0"
 }
