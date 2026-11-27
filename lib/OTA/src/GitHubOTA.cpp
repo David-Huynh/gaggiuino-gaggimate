@@ -87,6 +87,11 @@ const char *GitHubOTA::getCheckError() const {
     return _checkError;
 }
 
+void GitHubOTA::setCheckError(const char *error) {
+    std::lock_guard<std::mutex> lock(_stateMutex);
+    _checkError = (error != nullptr) ? error : "";
+}
+
 bool GitHubOTA::isUpdateAvailable(bool controller) const {
     std::lock_guard<std::mutex> lock(_stateMutex);
     return !_latest_url.isEmpty() && semver_gt(_latest_version, controller ? _controller_version : _version);

@@ -436,7 +436,7 @@ void OnBoardEspressoRLPlugin::setup(Controller *ctrl, PluginManager *pm) {
     }
 
     // Spawn dedicated Core-1 background worker for between-shot GP/CPBO optimization & flash persistence.
-    if (xTaskCreatePinnedToCore(workerTaskEntry, "OnBoardEspressoRL", 16384, this, 1, &workerTaskHandle_, 1) !=
+    if (xTaskCreatePinnedToCore(workerTaskEntry, "OnBoardEspressoRL", 10240, this, 1, &workerTaskHandle_, 1) !=
         pdPASS) {
         workerTaskHandle_ = nullptr;
         workspaceReady_.store(false, std::memory_order_release);

@@ -1725,12 +1725,18 @@ void WebUIPlugin::startOTAUpdateCheck(const unsigned long now) {
         return;
     }
     otaUpdateCheckComplete.store(false, std::memory_order_release);
-    if (xTaskCreatePinnedToCore(otaUpdateCheckTask, "OTA update check", 12288, this, 1, nullptr, 0) != pdPASS) {
+    // mbedTLS handshake buffers are routed to PSRAM via mbedtlsPsramCalloc, so 8 KB
+    // internal DRAM stack provides ample margin without failing under heap fragmentation.
+    if (xTaskCreatePinnedToCore(otaUpdateCheckTask, "OTA update check", 8192, this, 1, nullptr, 0) != pdPASS) {
         otaUpdateCheckInProgress.store(false, std::memory_order_release);
-        ESP_LOGE("WebUIPlugin", "Unable to start OTA update check task");
+        ota->setCheckError("low_memory");
+        lastUpdateCheck = now != 0 ? now : 1;
+        ESP_LOGE("WebUIPlugin", "Unable to start OTA update check task (largest internal block=%u B)",
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT | MALLOC_CAP_INTERNAL)));
+        updateOTAStatus();
         return;
     }
-    lastUpdateCheck = now;
+    lastUpdateCheck = now != 0 ? now : 1;
 }
 
 void WebUIPlugin::otaUpdateCheckTask(void *arg) {
@@ -2451,6 +2457,7 @@ void WebUIPlugin::handleOTASettings(uint32_t clientId, JsonDocument &request) {
     if (!updating && request["update"].as<bool>() && (channel == "latest" || channel == "nightly")) {
         controller->getSettings().setOTAChannel(channel);
         ota->setReleaseUrl(otaReleaseUrlForChannel(channel));
+        ota->setCheckError("");
         lastUpdateCheck = 0;
     } else if (!updating && !otaUpdateCheckInProgress && ota->getCurrentVersion().isEmpty() && !ota->getCheckError()[0]) {
         lastUpdateCheck = 0;

@@ -286,7 +286,7 @@ bool MQTTPlugin::connect(Controller *controller) {
 }
 
 void MQTTPlugin::requestReconnect() {
-    if (!controller || connectionTaskHandle == nullptr) {
+    if (!controller) {
         return;
     }
     Settings const &settings = controller->getSettings();
@@ -303,6 +303,7 @@ void MQTTPlugin::requestReconnect() {
     const bool connectionShouldBeEnabled = next.enabled;
 
     bool changed = false;
+    TaskHandle_t taskToNotify = nullptr;
     {
         std::lock_guard<std::mutex> guard(connectionConfigMutex);
         changed = connectionConfiguration.enabled != next.enabled ||
@@ -313,12 +314,23 @@ void MQTTPlugin::requestReconnect() {
         if (changed) {
             connectionConfiguration = std::move(next);
         }
+        // Lazily spawn the 10 KB MQTT worker only when an MQTT endpoint is actually enabled,
+        // preserving 10 KB of internal DRAM when running purely with the on-board optimizer.
+        if (connectionShouldBeEnabled && connectionTaskHandle == nullptr) {
+            if (xTaskCreate(connectionWorkerTask, "MQTT worker", 10240, this, 1, &connectionTaskHandle) != pdPASS) {
+                connectionTaskHandle = nullptr;
+                ESP_LOGE(LOG_TAG.c_str(), "Unable to start MQTT worker task");
+            }
+        }
+        taskToNotify = connectionTaskHandle;
     }
     if (changed) {
         connectionConfigRevision.fetch_add(1, std::memory_order_release);
     }
     connectionEnabled.store(connectionShouldBeEnabled, std::memory_order_release);
-    xTaskNotifyGive(connectionTaskHandle);
+    if (taskToNotify != nullptr) {
+        xTaskNotifyGive(taskToNotify);
+    }
 }
 
 void MQTTPlugin::connectionWorkerTask(void *arg) {
@@ -2107,10 +2119,7 @@ void MQTTPlugin::setup(Controller *ctrl, PluginManager *pm) {
     client.onMessage([this](String &topic, String &payload) {
         enqueueInbound(topic, payload);
     });
-    if (xTaskCreate(connectionWorkerTask, "MQTT worker", 10240, this, 1, &connectionTaskHandle) != pdPASS) {
-        connectionTaskHandle = nullptr;
-        ESP_LOGE(LOG_TAG.c_str(), "Unable to start MQTT worker task");
-    }
+    // Worker task is started lazily in requestReconnect() once an MQTT broker is enabled.
 
     pm->on("settings:changed", [this](Event const &) { requestReconnect(); });
 

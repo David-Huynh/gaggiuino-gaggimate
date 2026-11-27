@@ -191,6 +191,15 @@ void Controller::setup() {
         Serial.println(F("An Error has occurred while mounting LittleFS"));
     }
 
+#if defined(GAGGIMATE_N16R8)
+    // Route plugin/profile/webserver heap objects into PSRAM during setup so scarce
+    // internal DRAM stays unfragmented for Wi-Fi, BLE, and FreeRTOS task stacks (OTA).
+    if (psramFound()) {
+        constexpr size_t internalHeapPreferenceBytes = 128;
+        heap_caps_malloc_extmem_enable(internalHeapPreferenceBytes);
+    }
+#endif
+
     setupPanel();
 
     pluginManager = new PluginManager();
@@ -292,7 +301,7 @@ void Controller::setup() {
     this->onScreenReady();
 
     updateLastAction();
-    xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", 8192, this, 3, &logicTaskHandle, 0);
+    xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", 6144, this, 3, &logicTaskHandle, 0);
     esp_task_wdt_add(logicTaskHandle);
 }
 
@@ -307,11 +316,16 @@ void Controller::connect() {
     connectStartTime = millis();
     pluginManager->trigger("controller:startup");
 
+#if defined(GAGGIMATE_N16R8)
+    // Keep the SDK's default internal-heap preference during radio startup, then
+    // return ordinary buffers to PSRAM so internal DRAM stays roomy for task stacks.
+    if (psramFound()) {
+        heap_caps_malloc_extmem_enable(4096);
+    }
+#endif
     setupWifi();
     setupBluetooth();
 #if defined(GAGGIMATE_N16R8)
-    // Keep the SDK's heap preference during radio startup. A cold WebUI load
-    // then gets PSRAM for ordinary buffers and leaves internal RAM for Wi-Fi.
     if (psramFound()) {
         constexpr size_t internalHeapPreferenceBytes = 128;
         heap_caps_malloc_extmem_enable(internalHeapPreferenceBytes);

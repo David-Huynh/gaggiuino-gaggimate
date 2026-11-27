@@ -30,6 +30,7 @@ class GitHubOTA {
     bool isUpdateAvailable(bool controller = false) const;
     String getCurrentVersion() const;
     const char *getCheckError() const;
+    void setCheckError(const char *error);
     const char *getUpdateError() const { return _updateError; }
     void update(bool controller = true, bool display = true, OtaSender *controllerLink = nullptr);
     void setReleaseUrl(const String &release_url);

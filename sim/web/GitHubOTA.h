@@ -22,6 +22,7 @@ class GitHubOTA {
     bool isUpdateAvailable(bool = false) const { return false; }
     String getCurrentVersion() const { return _version; }
     const char *getCheckError() const { return ""; }
+    void setCheckError(const char *) {}
     const char *getUpdateError() const { return ""; }
     void update(bool = true, bool = true, OtaSender * = nullptr) {}
     void setReleaseUrl(const String &) {}

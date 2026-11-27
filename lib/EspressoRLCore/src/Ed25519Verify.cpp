@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 
 namespace EspressoRL {
 namespace {
@@ -337,19 +338,16 @@ void pointAdd(Point &r, const Point &p, const Point &q) {
     M(r.t, e, h);
 }
 
-void scalarMult(Point &out, const Point &base, const std::uint8_t s[32]) {
-    Point acc;
+void scalarMult(Point &out, const Point &base, const std::uint8_t s[32], Point &acc, Point &cur, Point &tmp) {
     pointIdentity(acc);
-    Point cur = base;
+    cur = base;
     for (int bit = 0; bit < 256; ++bit) {
         if (((s[bit >> 3] >> (bit & 7)) & 1u) != 0u) {
-            Point next;
-            pointAdd(next, acc, cur);
-            acc = next;
+            pointAdd(tmp, acc, cur);
+            acc = tmp;
         }
-        Point doubled;
-        pointAdd(doubled, cur, cur);
-        cur = doubled;
+        pointAdd(tmp, cur, cur);
+        cur = tmp;
     }
     out = acc;
 }
@@ -473,37 +471,48 @@ bool ed25519Verify(const std::uint8_t publicKey[ED25519_PUBLIC_KEY_BYTES], const
         return false;
     }
 
-    Point A_pt, R_pt;
-    if (!decodePoint(A_pt, publicKey) || !decodePoint(R_pt, signature)) {
+    // Keep the ~5 KB working points & SHA-512 state off small embedded task stacks.
+    struct VerifyWorkspace {
+        Point aPt;
+        Point rPt;
+        Point baseB;
+        Point lhs;
+        Point kA;
+        Point rhs;
+        Point acc;
+        Point cur;
+        Point tmp;
+        Sha512 hasher;
+    };
+    auto ws = std::make_unique<VerifyWorkspace>();
+
+    if (!decodePoint(ws->aPt, publicKey) || !decodePoint(ws->rPt, signature)) {
         return false;
     }
 
-    Sha512 hasher;
-    hasher.update(signature, 32);
-    hasher.update(publicKey, 32);
+    ws->hasher.update(signature, 32);
+    ws->hasher.update(publicKey, 32);
     if (messageLen > 0) {
-        hasher.update(message, messageLen);
+        ws->hasher.update(message, messageLen);
     }
     std::uint8_t hDigest[64];
-    hasher.finalize(hDigest);
+    ws->hasher.finalize(hDigest);
 
     std::uint8_t kScalar[32];
     reduceScalarModL(kScalar, hDigest);
 
-    Point baseB;
-    set25519(baseB.x, BX);
-    set25519(baseB.y, BY);
-    set25519(baseB.z, GF1);
-    M(baseB.t, baseB.x, baseB.y);
+    set25519(ws->baseB.x, BX);
+    set25519(ws->baseB.y, BY);
+    set25519(ws->baseB.z, GF1);
+    M(ws->baseB.t, ws->baseB.x, ws->baseB.y);
 
-    Point lhs, kA, rhs;
-    scalarMult(lhs, baseB, signature + 32);
-    scalarMult(kA, A_pt, kScalar);
-    pointAdd(rhs, R_pt, kA);
+    scalarMult(ws->lhs, ws->baseB, signature + 32, ws->acc, ws->cur, ws->tmp);
+    scalarMult(ws->kA, ws->aPt, kScalar, ws->acc, ws->cur, ws->tmp);
+    pointAdd(ws->rhs, ws->rPt, ws->kA);
 
     std::uint8_t encLhs[32], encRhs[32];
-    encodePoint(encLhs, lhs);
-    encodePoint(encRhs, rhs);
+    encodePoint(encLhs, ws->lhs);
+    encodePoint(encRhs, ws->rhs);
     return std::memcmp(encLhs, encRhs, 32) == 0;
 }
 

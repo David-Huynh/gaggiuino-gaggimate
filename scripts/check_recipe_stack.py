@@ -75,7 +75,7 @@ def main():
         print(f"PASS CommunityUploadQueue::readItemUnlocked: {q_sz} bytes (budget 512)")
 
     # On-board EspressoRL live 4 Hz MPC runs on Arduino loopTask (8 KB stack) and between-shot CPBO
-    # runs on the 16 KB Core-1 worker. Enforce tight per-frame and combined live-brew stack ceilings.
+    # runs on the 10 KB Core-1 worker. Enforce tight per-frame and combined live-brew stack ceilings.
     build_root = ROOT / f".pio/build/{args.environment}"
     mpc_objs = list(build_root.glob("lib*/EspressoRLCore/CemGpMpc.cpp.o"))
     if mpc_objs:
@@ -93,6 +93,8 @@ def main():
              "EspressoRL::FixedBasisVfeNystromGP::predictMean", 128),
             (core_dir / "EmbeddedCpbo.cpp.o",
              "EspressoRL::conditionalJndProbsBivariateTruncated", 1536),
+            (core_dir / "Ed25519Verify.cpp.o",
+             "EspressoRL::ed25519Verify", 1024),
         ]
         onboard_frames = {}
         out_cache = {}
