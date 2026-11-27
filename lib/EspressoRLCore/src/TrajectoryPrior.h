@@ -1,6 +1,7 @@
 #ifndef ESPRESSORL_CORE_TRAJECTORY_PRIOR_H
 #define ESPRESSORL_CORE_TRAJECTORY_PRIOR_H
 
+#include "Ed25519Verify.h"
 #include "HydraulicControl.h"
 #include "HydraulicWorldModel.h"
 
@@ -13,7 +14,9 @@ namespace EspressoRL {
 
 constexpr std::uint32_t ETP1_MAGIC = 0x31505445u; // "ETP1"
 constexpr std::uint16_t ETP1_VERSION = 1u;
+constexpr std::uint16_t ETP1_FLAG_SIGNED = 0x0001u;
 constexpr std::size_t ETP1_HEADER_SIZE = 16;
+constexpr std::size_t ETP1_SIGNATURE_SIZE = ED25519_SIGNATURE_BYTES;
 constexpr std::size_t ETP1_MAX_BYTES = 4096;
 constexpr std::size_t ETP1_MAX_GOAL_BUCKETS = 8;
 constexpr std::size_t TRAJECTORY_FEATURE_DIM = 14;
@@ -57,6 +60,7 @@ struct GoalPriorBucket {
 struct TrajectoryTastePrior {
     bool valid = false;
     bool approved = false;
+    bool signatureVerified = false;
     std::int64_t createdAt = 0;
     float decayComparisons = 4.0f;
     TrajectoryFeatureVec featureMean{};
@@ -77,8 +81,10 @@ std::uint64_t hashTasteGoalFingerprint(const char *fingerprint, std::size_t len,
 /// IEEE-802.3 CRC32 used by ETP1 binary codec.
 std::uint32_t etp1Crc32(const std::uint8_t *data, std::size_t len);
 
-/// Zero-trust decode of an ETP1 binary buffer (validates magic, version, CRC32, finiteness, and weight bounds).
-bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior &outPrior);
+/// Zero-trust decode of an ETP1 binary buffer (validates magic, version, CRC32, optional Ed25519
+/// signature over header+payload, finiteness, and weight bounds).
+bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior &outPrior,
+                const std::uint8_t *trustedPublicKey = nullptr, bool requireSignature = false);
 
 /// Extract canonical 14D trajectory features from recorded or simulated shot samples (matches Python bit-for-bit).
 bool extractTrajectoryFeatures(const TrajectorySamplePoint *samples, std::size_t count, float doseG,

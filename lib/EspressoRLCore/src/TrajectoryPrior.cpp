@@ -55,7 +55,8 @@ std::uint32_t etp1Crc32(const std::uint8_t *data, std::size_t len) {
     return ~crc;
 }
 
-bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior &outPrior) {
+bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior &outPrior,
+                const std::uint8_t *trustedPublicKey, bool requireSignature) {
     outPrior = TrajectoryTastePrior{};
     if (data == nullptr || size < ETP1_HEADER_SIZE || size > ETP1_MAX_BYTES) {
         return false;
@@ -64,27 +65,48 @@ bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior
     std::size_t pos = 0;
     std::uint32_t magic = 0;
     std::uint16_t version = 0;
-    std::uint16_t reserved = 0;
+    std::uint16_t flags = 0;
     std::uint32_t payloadLen = 0;
     std::uint32_t expectedCrc = 0;
     if (!readPod(data, size, pos, magic) || !readPod(data, size, pos, version) ||
-        !readPod(data, size, pos, reserved) || !readPod(data, size, pos, payloadLen) ||
+        !readPod(data, size, pos, flags) || !readPod(data, size, pos, payloadLen) ||
         !readPod(data, size, pos, expectedCrc)) {
         return false;
     }
-    if (magic != ETP1_MAGIC || version != ETP1_VERSION || payloadLen != (size - ETP1_HEADER_SIZE)) {
+    if (magic != ETP1_MAGIC || version != ETP1_VERSION || (flags & ~ETP1_FLAG_SIGNED) != 0u) {
+        return false;
+    }
+
+    const bool isSigned = (flags & ETP1_FLAG_SIGNED) != 0u;
+    if (requireSignature && (!isSigned || trustedPublicKey == nullptr)) {
+        return false;
+    }
+    const std::size_t sigBytes = isSigned ? ETP1_SIGNATURE_SIZE : 0u;
+    if (static_cast<std::size_t>(payloadLen) > size - ETP1_HEADER_SIZE) {
+        return false;
+    }
+    const std::size_t bodyEnd = ETP1_HEADER_SIZE + static_cast<std::size_t>(payloadLen);
+    if (bodyEnd + sigBytes != size) {
         return false;
     }
     if (etp1Crc32(data + ETP1_HEADER_SIZE, payloadLen) != expectedCrc) {
         return false;
     }
 
+    bool sigVerified = false;
+    if (isSigned && trustedPublicKey != nullptr) {
+        if (!ed25519Verify(trustedPublicKey, data, bodyEnd, data + bodyEnd)) {
+            return false;
+        }
+        sigVerified = true;
+    }
+
     std::int64_t createdAt = 0;
     std::uint8_t approvedByte = 0;
     float decayComp = 4.0f;
     std::uint8_t bucketCount = 0;
-    if (!readPod(data, size, pos, createdAt) || !readPod(data, size, pos, approvedByte) ||
-        !readPod(data, size, pos, decayComp) || !readPod(data, size, pos, bucketCount)) {
+    if (!readPod(data, bodyEnd, pos, createdAt) || !readPod(data, bodyEnd, pos, approvedByte) ||
+        !readPod(data, bodyEnd, pos, decayComp) || !readPod(data, bodyEnd, pos, bucketCount)) {
         return false;
     }
     if ((approvedByte != 0u && approvedByte != 1u) || !std::isfinite(decayComp) || decayComp < 0.5f ||
@@ -95,16 +117,17 @@ bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior
     TrajectoryTastePrior tmp;
     tmp.createdAt = createdAt;
     tmp.approved = (approvedByte == 1u);
+    tmp.signatureVerified = sigVerified;
     tmp.decayComparisons = decayComp;
     tmp.bucketCount = bucketCount;
 
     for (std::size_t i = 0; i < TRAJECTORY_FEATURE_DIM; ++i) {
-        if (!readPod(data, size, pos, tmp.featureMean[i]) || !std::isfinite(tmp.featureMean[i])) {
+        if (!readPod(data, bodyEnd, pos, tmp.featureMean[i]) || !std::isfinite(tmp.featureMean[i])) {
             return false;
         }
     }
     for (std::size_t i = 0; i < TRAJECTORY_FEATURE_DIM; ++i) {
-        if (!readPod(data, size, pos, tmp.featureScale[i]) || !std::isfinite(tmp.featureScale[i]) ||
+        if (!readPod(data, bodyEnd, pos, tmp.featureScale[i]) || !std::isfinite(tmp.featureScale[i]) ||
             tmp.featureScale[i] < 1e-4f) {
             return false;
         }
@@ -112,9 +135,9 @@ bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior
 
     for (std::size_t b = 0; b < bucketCount; ++b) {
         GoalPriorBucket &bk = tmp.buckets[b];
-        if (!readPod(data, size, pos, bk.goalHash) || !readPod(data, size, pos, bk.priorScale) ||
-            !readPod(data, size, pos, bk.confidence) || !readPod(data, size, pos, bk.comparisonCount) ||
-            !readPod(data, size, pos, bk.installCount)) {
+        if (!readPod(data, bodyEnd, pos, bk.goalHash) || !readPod(data, bodyEnd, pos, bk.priorScale) ||
+            !readPod(data, bodyEnd, pos, bk.confidence) || !readPod(data, bodyEnd, pos, bk.comparisonCount) ||
+            !readPod(data, bodyEnd, pos, bk.installCount)) {
             return false;
         }
         if (!std::isfinite(bk.priorScale) || bk.priorScale < 0.0f || bk.priorScale > ETP1_MAX_PRIOR_SCALE + 1e-5f ||
@@ -122,20 +145,20 @@ bool decodeEtp1(const std::uint8_t *data, std::size_t size, TrajectoryTastePrior
             return false;
         }
         for (std::size_t i = 0; i < TRAJECTORY_FEATURE_DIM; ++i) {
-            if (!readPod(data, size, pos, bk.linearWeights[i]) || !std::isfinite(bk.linearWeights[i]) ||
+            if (!readPod(data, bodyEnd, pos, bk.linearWeights[i]) || !std::isfinite(bk.linearWeights[i]) ||
                 std::fabs(bk.linearWeights[i]) > ETP1_MAX_ABS_LINEAR_WEIGHT + 1e-5f) {
                 return false;
             }
         }
         for (std::size_t i = 0; i < TRAJECTORY_FEATURE_DIM; ++i) {
-            if (!readPod(data, size, pos, bk.quadWeights[i]) || !std::isfinite(bk.quadWeights[i]) ||
+            if (!readPod(data, bodyEnd, pos, bk.quadWeights[i]) || !std::isfinite(bk.quadWeights[i]) ||
                 std::fabs(bk.quadWeights[i]) > ETP1_MAX_ABS_QUAD_WEIGHT + 1e-5f) {
                 return false;
             }
         }
     }
 
-    if (pos != size) {
+    if (pos != bodyEnd) {
         return false;
     }
 

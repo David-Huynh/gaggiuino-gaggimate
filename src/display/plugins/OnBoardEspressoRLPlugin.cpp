@@ -1438,11 +1438,37 @@ void OnBoardEspressoRLPlugin::loadCommunityPrior() {
         return;
     }
     EspressoRL::TrajectoryTastePrior decoded;
+#if defined(GAGGIMATE_ESPRESSORL_PRIOR_PUBKEY_HEX)
+    std::uint8_t pinnedPubKey[EspressoRL::ED25519_PUBLIC_KEY_BYTES]{};
+    const char *hexPub = GAGGIMATE_ESPRESSORL_PRIOR_PUBKEY_HEX;
+    bool pubOk = (std::strlen(hexPub) == 64);
+    for (std::size_t i = 0; pubOk && i < EspressoRL::ED25519_PUBLIC_KEY_BYTES; ++i) {
+        auto hexVal = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            return -1;
+        };
+        const int hi = hexVal(hexPub[2 * i]);
+        const int lo = hexVal(hexPub[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            pubOk = false;
+        } else {
+            pinnedPubKey[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+        }
+    }
+    if (!pubOk || !EspressoRL::decodeEtp1(raw.data(), raw.size(), decoded, pinnedPubKey, true) || !decoded.approved) {
+        ESP_LOGW(LOG_TAG, "Ignoring /rll/prior.bin: failed ETP1 Ed25519 signature/CRC/approval gate");
+        priorLoaded_.store(false, std::memory_order_release);
+        return;
+    }
+#else
     if (!EspressoRL::decodeEtp1(raw.data(), raw.size(), decoded) || !decoded.approved) {
         ESP_LOGW(LOG_TAG, "Ignoring /rll/prior.bin: failed ETP1 CRC/schema/approval gate");
         priorLoaded_.store(false, std::memory_order_release);
         return;
     }
+#endif
     {
         std::lock_guard<std::mutex> lock(workspaceMutex_);
         workspace_->communityPrior = decoded;

@@ -19,6 +19,7 @@
 
 // Direct-include EspressoRLCore pure-STL TUs (standard PlatformIO native Unity pattern).
 #include "CemGpMpc.cpp"
+#include "Ed25519Verify.cpp"
 #include "EmbeddedCpbo.cpp"
 #include "HydraulicWorldModel.cpp"
 #include "TrajectoryPrior.cpp"
@@ -1210,6 +1211,96 @@ void test_trajectory_prior_golden_etp1_parity_and_local_override(void) {
     TEST_ASSERT_TRUE(pm[1] > pm[0]); // Local user preferences beat the community prior!
 }
 
+static bool hexDecodeBytes(const char *hex, std::uint8_t *out, std::size_t outLen) {
+    auto val = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+        if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+        return -1;
+    };
+    for (std::size_t i = 0; i < outLen; ++i) {
+        const int hi = val(hex[2 * i]);
+        const int lo = val(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void test_ed25519_rfc8032_and_signed_etp1_verification() {
+    // 1. Official RFC 8032 Section 7.1 Test Vectors 1, 2, 3.
+    std::uint8_t pub1[32], sig1[64], pub2[32], sig2[64], pub3[32], sig3[64];
+    TEST_ASSERT_TRUE(hexDecodeBytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", pub1, 32));
+    TEST_ASSERT_TRUE(hexDecodeBytes(
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+        "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+        sig1, 64));
+    TEST_ASSERT_TRUE(ed25519Verify(pub1, nullptr, 0, sig1));
+
+    // Reject single-bit tamper in signature and non-canonical S >= L malleability.
+    std::uint8_t badSig1[64];
+    std::memcpy(badSig1, sig1, 64);
+    badSig1[0] ^= 0x01u;
+    TEST_ASSERT_FALSE(ed25519Verify(pub1, nullptr, 0, badSig1));
+    std::memcpy(badSig1, sig1, 64);
+    badSig1[63] |= 0x20u; // forces S >= L
+    TEST_ASSERT_FALSE(ed25519Verify(pub1, nullptr, 0, badSig1));
+
+    TEST_ASSERT_TRUE(hexDecodeBytes("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", pub2, 32));
+    TEST_ASSERT_TRUE(hexDecodeBytes(
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+        "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+        sig2, 64));
+    const std::uint8_t msg2[1] = {0x72u};
+    const std::uint8_t badMsg2[1] = {0x73u};
+    TEST_ASSERT_TRUE(ed25519Verify(pub2, msg2, 1, sig2));
+    TEST_ASSERT_FALSE(ed25519Verify(pub2, badMsg2, 1, sig2));
+
+    TEST_ASSERT_TRUE(hexDecodeBytes("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", pub3, 32));
+    TEST_ASSERT_TRUE(hexDecodeBytes(
+        "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+        "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+        sig3, 64));
+    const std::uint8_t msg3[2] = {0xafu, 0x82u};
+    TEST_ASSERT_TRUE(ed25519Verify(pub3, msg3, 2, sig3));
+    TEST_ASSERT_FALSE(ed25519Verify(pub1, msg3, 2, sig3)); // Wrong public key
+
+    // 2. Python-signed 470-byte ETP1 artifact verified by C++ decodeEtp1(..., pub, true).
+    const char *kSignedEtp1B64 =
+        "RVRQMQEAAQCGAQAAGUNfw2DY8moAAAAAAQAAgEACtIgHQAAAkEHrhd1BaVKIQP5d1D92w9k/GT3XP13tzT/HPbO9qh3yQMBhz0Asku4/JIPhPg"
+        "AAukLEvBE/AACAPwGGSkF3Qvk/LjJNPxZLSj8NV0w/yy5SP8j6vT770Jo/vnCkP2OLqT8viJ4+AACAPwAAAAAAAAAAmpkZPwAAgD88AAUAFLQl"
+        "vgAAAAC/OOy8vzjsvB/1P75iYC6+mz43vlzDS76VBJ+99RsxO2O1p7zpR+Q8UUEdvwAAAABUeNm+AAAAAJB2rb2Qdq29P5TvvQqyOb6CeBG+gz"
+        "93vXbzU73ccho9dtkKO9ujg70jH1q+AAAAAGZzdeY/4EKMewCRPnir8T4SAAMA9K0ivgAAAAA5YSC8OWEgvAmTPL6wzAq+0bEqvkM1Yb5gyEq+"
+        "ZUQSvQ9PIr6wy0U+MyCavgAAAAABBLw7AAAAANckEr7XJBK+SLNevdFeRb05Ol69c7pUvcXzAj58Zg49FG2nPGlOpL16GiW+AAAAAHb53SyvNy"
+        "gDvwpH38GI5P7Rjgku7YXMAJeYcj9v0JGAotwWIMAJs4f4kSJ6eapmiQLk5c3OOOZQUPP7ZnFs4gQ=";
+    const std::vector<std::uint8_t> signedRaw = decodeBase64Helper(kSignedEtp1B64);
+    TEST_ASSERT_EQUAL_UINT32(470u, static_cast<std::uint32_t>(signedRaw.size()));
+
+    std::uint8_t priorPub[32];
+    TEST_ASSERT_TRUE(hexDecodeBytes("2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12", priorPub, 32));
+
+    TrajectoryTastePrior verifiedPrior;
+    TEST_ASSERT_TRUE(decodeEtp1(signedRaw.data(), signedRaw.size(), verifiedPrior, priorPub, true));
+    TEST_ASSERT_TRUE(verifiedPrior.valid);
+    TEST_ASSERT_TRUE(verifiedPrior.approved);
+    TEST_ASSERT_TRUE(verifiedPrior.signatureVerified);
+    TEST_ASSERT_EQUAL_UINT32(2u, static_cast<std::uint32_t>(verifiedPrior.bucketCount));
+
+    // Wrong key MUST fail verification.
+    TrajectoryTastePrior rejected;
+    TEST_ASSERT_FALSE(decodeEtp1(signedRaw.data(), signedRaw.size(), rejected, pub1, true));
+    // Bit flip in signature MUST fail verification.
+    std::vector<std::uint8_t> tamperedSig = signedRaw;
+    tamperedSig.back() ^= 0x01u;
+    TEST_ASSERT_FALSE(decodeEtp1(tamperedSig.data(), tamperedSig.size(), rejected, priorPub, true));
+    // Unsigned ETP1 MUST fail when requireSignature == true.
+    std::vector<std::uint8_t> unsignedBlob(signedRaw.begin(), signedRaw.begin() + 406);
+    unsignedBlob[6] = 0; // clear ETP1_FLAG_SIGNED
+    TEST_ASSERT_FALSE(decodeEtp1(unsignedBlob.data(), unsignedBlob.size(), rejected, priorPub, true));
+    TEST_ASSERT_TRUE(decodeEtp1(unsignedBlob.data(), unsignedBlob.size(), rejected, nullptr, false));
+    TEST_ASSERT_FALSE(rejected.signatureVerified);
+}
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -1239,7 +1330,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_mes_quadrature_and_robert_gibbs_far_tail);
     RUN_TEST(test_cpbo_cooperative_yield_cancellation_and_invalid_inputs);
     RUN_TEST(test_level1_trust_region_6d_dynamics);
-    // Group D — Community J_taste Trajectory Prior (ETP1 Parity + Local Override)
+    // Group D — Community J_taste Trajectory Prior (ETP1 Parity + Ed25519 + Local Override)
     RUN_TEST(test_trajectory_prior_golden_etp1_parity_and_local_override);
+    RUN_TEST(test_ed25519_rfc8032_and_signed_etp1_verification);
     return UNITY_END();
 }
