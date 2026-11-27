@@ -423,6 +423,7 @@ class Settings {
     String getRLAutoTuningProviderMode() const { return rlAutoTuningProviderMode.get(); }
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
     bool isRLOnBoardShadowOnly() const { return rlOnBoardShadowOnly.get(); }
+    String getRLOnBoardControlMode() const { return rlOnBoardControlMode.get(); }
 #endif
     String getRLBeanContextId() const { return rlBeanContextId.get(); }
     String getRLBeanContextName() const { return rlBeanContextName.get(); }
@@ -554,6 +555,7 @@ class Settings {
     void setRLAutoTuningProviderMode(const String &providerMode);
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
     void setRLOnBoardShadowOnly(bool shadowOnly);
+    void setRLOnBoardControlMode(const String &controlMode);
 #endif
     void setRLBeanContextId(const String &contextId);
     void setRLBeanContextName(const String &contextName);
@@ -754,6 +756,7 @@ class Settings {
     Property<String> rlAutoTuningProviderMode{registry, "rl_provider", "disabled"};
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
     Property<bool> rlOnBoardShadowOnly{registry, "rl_ob_shad", true};
+    Property<String> rlOnBoardControlMode{registry, "rl_ob_mode", "recipe_only"};
 #endif
     Property<String> rlBeanContextId{registry, "rl_ctx_id", ""};
     Property<String> rlBeanContextName{registry, "rl_ctx_nm", ""};

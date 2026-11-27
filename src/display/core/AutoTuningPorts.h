@@ -2,7 +2,9 @@
 #define AUTOTUNINGPORTS_H
 
 #include "AutoTuningModels.h"
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace AutoTuning {
@@ -62,8 +64,12 @@ class LocalOptimizationStorePort {
 struct OnBoardRuntimeTelemetry {
     bool ready = false;
     bool shadowModeOnly = true;
+    std::uint8_t controlMode = 0; // 0=recipe_only, 1=spline_only, 2=joint_6d
     bool persistedStateLoaded = false;
     bool persistenceAvailable = false;
+    std::array<float, 3> activeSplineDelta{0.0f, 0.0f, 0.0f};
+    bool hasPendingSplineDelta = false;
+    std::array<float, 3> pendingSplineDelta{0.0f, 0.0f, 0.0f};
     std::size_t vfeSampleCount = 0;
     std::size_t cpboPointCount = 0;
     std::size_t cpboComparisonCount = 0;
@@ -90,6 +96,9 @@ class OnBoardOptimizerPort {
     virtual bool ready() const = 0;
     virtual bool shadowModeOnly() const = 0;
     virtual void setShadowModeOnly(bool shadowOnly) = 0;
+    virtual std::uint8_t controlMode() const { return 0; }
+    virtual bool setControlMode(std::uint8_t) { return false; }
+    virtual bool resetActiveSplineDelta() { return false; }
     virtual OnBoardRuntimeTelemetry runtimeTelemetry() const { return OnBoardRuntimeTelemetry{}; }
     virtual ShotSubmissionResult submitShot(ShotRecord const &shot, ShotDeliveryAttempt const &attempt) = 0;
     virtual bool onLiveShotStarted(LiveShotStarted const &event) = 0;

@@ -181,6 +181,14 @@ class WebUIPlugin : public Plugin {
     int rlLocalShotCount = 0;
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
     bool rlOnBoardShadowOnly = true;
+    String rlOnBoardControlMode = "recipe_only";
+    float rlOnBoardSplineEarly = 0.0f;
+    float rlOnBoardSplineMid = 0.0f;
+    float rlOnBoardSplineLate = 0.0f;
+    bool rlOnBoardHasPendingSpline = false;
+    float rlOnBoardPendingSplineEarly = 0.0f;
+    float rlOnBoardPendingSplineMid = 0.0f;
+    float rlOnBoardPendingSplineLate = 0.0f;
     int rlOnBoardVfeSamples = 0;
     int rlOnBoardCpboPoints = 0;
     int rlOnBoardCpboComparisons = 0;

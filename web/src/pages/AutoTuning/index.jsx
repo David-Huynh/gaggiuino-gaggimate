@@ -248,6 +248,19 @@ function signedNumber(value) {
   return number === undefined ? '-' : `${number >= 0 ? '+' : ''}${number.toFixed(1)}`;
 }
 
+function formatSplineWarp(knots) {
+  if (!Array.isArray(knots) || knots.length < 3) {
+    return '0.00 / 0.00 / 0.00 g/s';
+  }
+  return `${knots
+    .slice(0, 3)
+    .map(v => {
+      const n = Number(v || 0);
+      return `${n >= 0 ? '+' : ''}${n.toFixed(2)}`;
+    })
+    .join(' / ')} g/s`;
+}
+
 function recipeDomainForm(value = DEFAULT_RECIPE_DOMAIN) {
   return Object.fromEntries(
     Object.entries(DEFAULT_RECIPE_DOMAIN).map(([key, fallback]) => [
@@ -1286,15 +1299,24 @@ export function AutoTuning() {
           </div>
           {recommendation ? (
             <div className='grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_auto]'>
-              <div className='grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4'>
-                <StatCard
-                  label='Grind'
-                  value={recommendationGrind(recommendation)}
-                  tone='primary'
-                />
-                <StatCard label='Dose' value={formatNumber(recommendation.nextDoseG, 1, 'g')} />
-                <StatCard label='Yield' value={formatNumber(recommendation.targetYieldG, 1, 'g')} />
-                <StatCard label='Ratio' value={formatNumber(recommendation.targetRatio, 2)} />
+              <div className='space-y-3'>
+                <div className='grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+                  <StatCard
+                    label='Grind'
+                    value={recommendationGrind(recommendation)}
+                    tone='primary'
+                  />
+                  <StatCard label='Dose' value={formatNumber(recommendation.nextDoseG, 1, 'g')} />
+                  <StatCard label='Yield' value={formatNumber(recommendation.targetYieldG, 1, 'g')} />
+                  <StatCard label='Ratio' value={formatNumber(recommendation.targetRatio, 2)} />
+                </div>
+                {settings.rlProviderMode === 'on_board' && settings.rlOnBoardHasPendingSpline && (
+                  <StatCard
+                    label='Proposed profile warp (early / mid / late)'
+                    value={formatSplineWarp(settings.rlOnBoardPendingSpline)}
+                    tone='primary'
+                  />
+                )}
               </div>
               <div className='flex min-w-0 flex-col justify-end gap-2 lg:w-56'>
                 <button
@@ -1338,11 +1360,95 @@ export function AutoTuning() {
           }
         >
           <div className='space-y-4'>
+            <div className='space-y-2'>
+              <div className='text-base-content/60 text-xs tracking-wide uppercase'>
+                Optimization target
+              </div>
+              <div
+                className='join join-vertical sm:join-horizontal w-full'
+                role='radiogroup'
+                aria-label='On-board optimization target'
+              >
+                {[
+                  ['recipe_only', 'Grind / Dose / Yield'],
+                  ['spline_only', 'Profile Warping'],
+                  ['joint_6d', 'Both (6D)'],
+                ].map(([value, label]) => {
+                  const activeMode = settings.rlOnBoardControlMode || 'recipe_only';
+                  const selected = activeMode === value;
+                  return (
+                    <button
+                      key={value}
+                      type='button'
+                      role='radio'
+                      aria-checked={selected}
+                      disabled={busy}
+                      className={`join-item btn btn-sm min-h-10 w-full min-w-0 whitespace-normal sm:flex-1 ${
+                        selected ? 'btn-primary' : 'btn-outline'
+                      }`}
+                      onClick={() => {
+                        if (selected) return;
+                        if (
+                          (settings.rlOnBoardCpboComparisons ?? 0) > 0 &&
+                          !window.confirm(
+                            `Switch optimization target to ${label}? This starts a fresh CPBO run for the new search space while keeping your hydraulic world model.`,
+                          )
+                        ) {
+                          return;
+                        }
+                        run('req:rl:onboard:mode', { control_mode: value });
+                      }}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+              {(settings.rlOnBoardControlMode === 'spline_only' ||
+                settings.rlOnBoardControlMode === 'joint_6d') &&
+                settings.rlOnBoardShadowOnly !== false && (
+                  <div className='alert alert-warning py-2 text-xs'>
+                    Shadow Mode is active — arm Live Mode so the pump applies profile warping during
+                    extraction.
+                  </div>
+                )}
+            </div>
+
+            {(settings.rlOnBoardControlMode === 'spline_only' ||
+              settings.rlOnBoardControlMode === 'joint_6d' ||
+              (Array.isArray(settings.rlOnBoardActiveSpline) &&
+                settings.rlOnBoardActiveSpline.some(v => Math.abs(Number(v || 0)) > 0.001))) && (
+              <div className='bg-base-200/60 flex flex-col gap-2 rounded-md p-3 sm:flex-row sm:items-center sm:justify-between'>
+                <div className='min-w-0 space-y-0.5 text-sm'>
+                  <div className='text-base-content/60 text-xs tracking-wide uppercase'>
+                    Active profile warp (early / mid / late)
+                  </div>
+                  <div className='font-semibold'>
+                    {formatSplineWarp(settings.rlOnBoardActiveSpline)}
+                  </div>
+                  {settings.rlOnBoardHasPendingSpline && (
+                    <div className='text-xs opacity-75'>
+                      Next proposed: {formatSplineWarp(settings.rlOnBoardPendingSpline)} (click
+                      Apply above)
+                    </div>
+                  )}
+                </div>
+                <button
+                  type='button'
+                  className='btn btn-outline btn-xs shrink-0'
+                  disabled={busy}
+                  onClick={() => run('req:rl:onboard:mode', { reset_spline: true })}
+                >
+                  Reset Warp
+                </button>
+              </div>
+            )}
+
             <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
               <p className='max-w-xl text-sm opacity-80'>
                 {settings.rlOnBoardShadowOnly === false
                   ? 'Live Actuation is ARMED: CEM GP-MPC may adjust pump targets inside the ±2.5 bar / ±1.2 ml/s corridor with a 500 ms deadman lease.'
-                  : 'Shadow Mode evaluates and logs GP-MPC proposals at 4 Hz without actuating pump setpoints. Run 3–5 shots in Shadow Mode before arming Live.'}
+                  : 'Shadow Mode evaluates and logs GP-MPC proposals at 4 Hz without actuating pump setpoints.'}
               </p>
               <button
                 type='button'

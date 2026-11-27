@@ -534,6 +534,14 @@ void Settings::setRLAutoTuningProviderMode(const String &providerMode) {
 
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
 void Settings::setRLOnBoardShadowOnly(const bool shadowOnly) { rlOnBoardShadowOnly.set(shadowOnly); }
+
+void Settings::setRLOnBoardControlMode(const String &controlMode) {
+    if (controlMode == "spline_only" || controlMode == "joint_6d") {
+        rlOnBoardControlMode.set(controlMode);
+    } else {
+        rlOnBoardControlMode.set("recipe_only");
+    }
+}
 #endif
 
 void Settings::setRLBeanContextId(const String &contextId) { rlBeanContextId.set(contextId); }

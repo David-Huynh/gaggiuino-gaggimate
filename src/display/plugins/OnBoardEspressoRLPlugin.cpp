@@ -11,9 +11,11 @@
 #include <display/core/AutoTuning.h>
 #include <display/core/Controller.h>
 #include <display/core/EpochTime.h>
+#include <display/core/OnBoardOptimizationMode.h>
 #include <display/core/OnBoardStateCodec.h>
 #include <display/core/PluginManager.h>
 #include <display/core/ProfileHorizonSampler.h>
+#include <display/core/RecommendationContext.h>
 #include <display/core/StorageCoordinator.h>
 #include <display/core/process/BrewProcess.h>
 #include <display/models/shot_log_format.h>
@@ -236,15 +238,23 @@ struct OnBoardEspressoRLPlugin::Workspace {
         double doseG = 18.0;
         double targetYieldG = 36.0;
         double beverageOutG = 0.0;
-        std::array<double, 3> normX{0.5, 0.5, 0.5};
+        std::array<float, 3> splineDelta{0.0f, 0.0f, 0.0f};
+        std::uint8_t normDim = 3;
+        std::array<double, 6> normX{0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
         std::array<double, EspressoRL::PHYSICS_PROXY_DIM> phi0{};
     };
 
+    OnBoardOpt::ControlMode controlMode = OnBoardOpt::ControlMode::RecipeOnly;
     std::vector<CpboPoint> points;
     std::vector<EspressoRL::ComparisonPair> comparisons;
     EspressoRL::Level1TrustRegionState trustRegion;
     EspressoRL::EmbeddedPreferenceGPModel lastModel;
     std::array<float, 3> activeSplineDelta{0.0f, 0.0f, 0.0f}; // Level 1 Assist default (0, 0, 0)
+    bool hasPendingSplineDelta = false;
+    std::array<float, 3> pendingSplineDelta{0.0f, 0.0f, 0.0f};
+    std::string pendingSplineRecId;
+    bool hasLatestRecommendation = false;
+    AutoTuning::Recommendation latestRecommendation;
     EspressoRL::NominalBaselinePolicy baselinePolicy;
     bool hasLastShotRecipe = false;
     float lastShotHydraulicGrindSteps = 0.0f;
@@ -283,11 +293,34 @@ struct OnBoardEspressoRLPlugin::Workspace {
         return cfg;
     }
 
+    void resetCpboRunOnly(OnBoardOpt::ControlMode mode) {
+        controlMode = mode;
+        const std::string runKey = activeContextKey.empty()
+                                       ? ""
+                                       : (activeContextKey + "|" + OnBoardOpt::controlModeKey(mode));
+        optimizationRunId = runKey.empty() ? "" : makeRunId(runKey);
+        points.clear();
+        comparisons.clear();
+        trustRegion = EspressoRL::Level1TrustRegionState{};
+        trustRegion.center.assign(OnBoardOpt::rawDimForMode(mode), 0.5);
+        trustRegion.length = 0.20;
+        lastModel = EspressoRL::EmbeddedPreferenceGPModel{};
+        activeSplineDelta = {0.0f, 0.0f, 0.0f};
+        hasPendingSplineDelta = false;
+        pendingSplineDelta = {0.0f, 0.0f, 0.0f};
+        pendingSplineRecId.clear();
+        hasLatestRecommendation = false;
+        latestRecommendation = AutoTuning::Recommendation{};
+        bestPointIndex = 0;
+        hasBestPoint = false;
+        localShotCount = 0;
+    }
+
     void resetContext(const std::string &ctxKey, const std::string &beanId, const std::string &grinderId,
                       const std::string &profileId, const std::string &profileLabel, const std::string &rawHash,
-                      const AutoTuning::TasteGoal &goal) {
+                      const AutoTuning::TasteGoal &goal,
+                      OnBoardOpt::ControlMode mode = OnBoardOpt::ControlMode::RecipeOnly) {
         activeContextKey = ctxKey;
-        optimizationRunId = ctxKey.empty() ? "" : makeRunId(ctxKey);
         activeBeanContextId = beanId;
         activeGrinderContextId = grinderId;
         activeProfileId = profileId;
@@ -297,20 +330,11 @@ struct OnBoardEspressoRLPlugin::Workspace {
         predictor.resetAll();
         histZ.clear();
         histY.clear();
-        points.clear();
-        comparisons.clear();
-        trustRegion = EspressoRL::Level1TrustRegionState{};
-        trustRegion.center = {0.5, 0.5, 0.5};
-        trustRegion.length = 0.20;
-        lastModel = EspressoRL::EmbeddedPreferenceGPModel{};
-        activeSplineDelta = {0.0f, 0.0f, 0.0f};
         baselinePolicy.resetShot(false, false, true, true);
         hasLastShotRecipe = false;
         lastShotHydraulicGrindSteps = 0.0f;
         lastShotDoseG = 18.0f;
-        bestPointIndex = 0;
-        hasBestPoint = false;
-        localShotCount = 0;
+        resetCpboRunOnly(mode);
     }
 
     int findPointByShotId(const std::string &shotId) const {
@@ -333,10 +357,17 @@ void OnBoardEspressoRLPlugin::setup(Controller *ctrl, PluginManager *pm) {
     pluginManager_ = pm;
 
     if (controller_ != nullptr) {
-        shadowModeOnly_.store(controller_->getSettings().isRLOnBoardShadowOnly(), std::memory_order_release);
+        const Settings &s = controller_->getSettings();
+        shadowModeOnly_.store(s.isRLOnBoardShadowOnly(), std::memory_order_release);
+        OnBoardOpt::ControlMode parsedMode = OnBoardOpt::ControlMode::RecipeOnly;
+        OnBoardOpt::parseControlModeKey(s.getRLOnBoardControlMode().c_str(), parsedMode);
+        controlMode_.store(static_cast<std::uint8_t>(parsedMode), std::memory_order_release);
     }
 
     workspace_ = makePsramUnique<Workspace>();
+    if (workspace_) {
+        workspace_->resetCpboRunOnly(OnBoardOpt::controlModeFromByte(controlMode_.load(std::memory_order_acquire)));
+    }
     workspaceReady_.store(workspace_ != nullptr, std::memory_order_release);
 
     if (controller_ != nullptr) {
@@ -386,6 +417,26 @@ void OnBoardEspressoRLPlugin::setup(Controller *ctrl, PluginManager *pm) {
         work.kind = WorkKind::ProcessPreference;
         work.preference = *pref;
         event.setInt("decision_persisted", enqueueWork(std::move(work)) ? 1 : 0);
+    });
+
+    pm->on("rl:recommendation:apply", [this](Event &event) {
+        if (!isOnBoardSelected()) {
+            return;
+        }
+        const String recId = event.getString("recommendation_id");
+        if (!recId.isEmpty()) {
+            event.setInt("decision_persisted", applyLatestRecommendation(recId.c_str()) ? 1 : 0);
+        }
+    });
+
+    pm->on("rl:recommendation:ignore", [this](Event &event) {
+        if (!isOnBoardSelected()) {
+            return;
+        }
+        const String recId = event.getString("recommendation_id");
+        if (!recId.isEmpty()) {
+            event.setInt("decision_persisted", ignoreLatestRecommendation(recId.c_str()) ? 1 : 0);
+        }
     });
 
     pm->on("rl:local:reset", [this](Event const &) {
@@ -500,13 +551,39 @@ void OnBoardEspressoRLPlugin::drainMainThreadEvents() {
     }
 }
 
-bool OnBoardEspressoRLPlugin::onLiveShotStarted(AutoTuning::LiveShotStarted const &) {
+bool OnBoardEspressoRLPlugin::setControlMode(std::uint8_t mode) {
+    if (mode > static_cast<std::uint8_t>(OnBoardOpt::ControlMode::Joint6D)) {
+        return false;
+    }
+    if (brewActive_.load(std::memory_order_acquire) || (controller_ != nullptr && controller_->isActive())) {
+        return false;
+    }
+    controlMode_.store(mode, std::memory_order_release);
+    WorkItem work;
+    work.kind = WorkKind::SwitchControlMode;
+    work.targetControlMode = mode;
+    return enqueueWork(std::move(work));
+}
+
+bool OnBoardEspressoRLPlugin::resetActiveSplineDelta() {
+    if (brewActive_.load(std::memory_order_acquire) || (controller_ != nullptr && controller_->isActive())) {
+        return false;
+    }
+    WorkItem work;
+    work.kind = WorkKind::ResetSpline;
+    return enqueueWork(std::move(work));
+}
+
+bool OnBoardEspressoRLPlugin::onLiveShotStarted(AutoTuning::LiveShotStarted const &event) {
     if (!isOnBoardSelected() || !workspace_) {
         return false;
     }
     brewActive_.store(true, std::memory_order_release);
     liveSampleCount_ = 0;
     maxLiveWeightG_ = 0.0f;
+    currentLiveShotId_ = event.shotId;
+    shotAppliedSplineDelta_ = {0.0f, 0.0f, 0.0f};
+    shotHadLiveActuation_ = false;
 
     bool grindConfirmedPreShot = false;
     if (controller_ != nullptr) {
@@ -539,6 +616,11 @@ bool OnBoardEspressoRLPlugin::onLiveShotStarted(AutoTuning::LiveShotStarted cons
     if (lock.owns_lock()) {
         workspace_->predictor.resetShot();
         workspace_->mpc.resetShot();
+        const OnBoardOpt::ControlMode mode = OnBoardOpt::controlModeFromByte(controlMode_.load(std::memory_order_acquire));
+        if (!OnBoardOpt::modeTunesSpline(mode) || !OnBoardOpt::isValidSplineDelta(workspace_->activeSplineDelta)) {
+            workspace_->activeSplineDelta = {0.0f, 0.0f, 0.0f};
+        }
+        shotAppliedSplineDelta_ = workspace_->activeSplineDelta;
         const bool hasCrossShotHistory = workspace_->histZ.size() >= 12;
         const bool recipeChanged =
             !workspace_->hasLastShotRecipe ||
@@ -795,6 +877,11 @@ bool OnBoardEspressoRLPlugin::onLiveShotEnded(AutoTuning::LiveShotEnded const &)
             }
         }
     }
+    // Zero-trust follow-through: only record the non-zero spline warp if LiveBrewLease actually actuated the pump.
+    shotHadLiveActuation_ = (leaseDiag.appliedCount > 0u);
+    lastLiveShotId_ = currentLiveShotId_;
+    lastLiveRealizedSpline_ = shotHadLiveActuation_ ? shotAppliedSplineDelta_ : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+
     AutoTuning::OnBoardRuntimeTelemetry tele = runtimeTelemetry();
     tele.lastLiveActive = false;
     tele.leaseEvaluatedCount = leaseDiag.evaluatedCount;
@@ -834,6 +921,9 @@ AutoTuning::ShotSubmissionResult OnBoardEspressoRLPlugin::submitShot(AutoTuning:
     workShot->targetYieldG = shot.recipe.targetYieldG.value_or(36.0f);
     workShot->beverageOutG = shot.beverageOutG;
     workShot->shotTimeS = shot.shotTimeS;
+    workShot->realizedSplineDelta =
+        (!lastLiveShotId_.empty() && shot.shotId == lastLiveShotId_) ? lastLiveRealizedSpline_
+                                                                     : std::array<float, 3>{0.0f, 0.0f, 0.0f};
     workShot->hasUsableDose = shot.hasUsableDose();
     workShot->excludeFromOptimization = shot.excludeFromLocalOptimization || shot.utility;
     workShot->samples.assign(shot.samples.begin(), shot.samples.end());
@@ -885,11 +975,22 @@ void OnBoardEspressoRLPlugin::processWorkItem(WorkItem &item) {
             handleProcessPreference(*item.preference);
         }
         break;
+    case WorkKind::SwitchControlMode:
+        handleSwitchControlMode(item.targetControlMode);
+        break;
+    case WorkKind::ResetSpline:
+        handleResetSpline();
+        break;
+    case WorkKind::PersistState:
+        savePersistedState();
+        publishStatusEvent();
+        break;
     case WorkKind::ResetContext: {
         {
             std::lock_guard<std::mutex> lock(workspaceMutex_);
             if (workspace_) {
-                workspace_->resetContext(activeContextKey(), "", "", "", "", "", AutoTuning::TasteGoal::balanced());
+                workspace_->resetContext(activeContextKey(), "", "", "", "", "", AutoTuning::TasteGoal::balanced(),
+                                         OnBoardOpt::controlModeFromByte(controlMode_.load(std::memory_order_acquire)));
             }
         }
         clearPersistedState();
@@ -910,10 +1011,14 @@ AutoTuning::OnBoardRuntimeTelemetry OnBoardEspressoRLPlugin::runtimeTelemetry() 
     }
     tele.ready = workspaceReady_.load(std::memory_order_acquire);
     tele.shadowModeOnly = shadowModeOnly_.load(std::memory_order_acquire);
+    tele.controlMode = controlMode_.load(std::memory_order_acquire);
     tele.persistedStateLoaded = persistedStateLoaded_.load(std::memory_order_acquire);
     tele.persistenceAvailable = persistenceAvailable_.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> wLock(workspaceMutex_, std::try_to_lock);
     if (wLock.owns_lock() && workspace_) {
+        tele.activeSplineDelta = workspace_->activeSplineDelta;
+        tele.hasPendingSplineDelta = workspace_->hasPendingSplineDelta;
+        tele.pendingSplineDelta = workspace_->pendingSplineDelta;
         tele.vfeSampleCount = workspace_->histZ.size();
         tele.cpboPointCount = workspace_->points.size();
         tele.cpboComparisonCount = workspace_->comparisons.size();
@@ -921,6 +1026,176 @@ AutoTuning::OnBoardRuntimeTelemetry OnBoardEspressoRLPlugin::runtimeTelemetry() 
         tele.lastCpboFitMs = workspace_->lastCpboFitMs;
     }
     return tele;
+}
+
+void OnBoardEspressoRLPlugin::handleSwitchControlMode(std::uint8_t modeByte) {
+    if (!workspace_) {
+        return;
+    }
+    const OnBoardOpt::ControlMode newMode = OnBoardOpt::controlModeFromByte(modeByte);
+    controlMode_.store(static_cast<std::uint8_t>(newMode), std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        if (workspace_->controlMode != newMode) {
+            // Preserve the taste-agnostic hydraulic VFE Nyström world model while isolating CPBO runs per mode.
+            workspace_->resetCpboRunOnly(newMode);
+        } else if (!OnBoardOpt::modeTunesSpline(newMode)) {
+            workspace_->activeSplineDelta = {0.0f, 0.0f, 0.0f};
+            workspace_->hasPendingSplineDelta = false;
+            workspace_->pendingSplineDelta = {0.0f, 0.0f, 0.0f};
+        }
+    }
+    Event cleared;
+    cleared.id = "rl:recommendation:cleared";
+    queueMainThreadEvent(std::move(cleared));
+    savePersistedState();
+    publishStatusEvent();
+}
+
+void OnBoardEspressoRLPlugin::handleResetSpline() {
+    if (!workspace_) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        workspace_->activeSplineDelta = {0.0f, 0.0f, 0.0f};
+    }
+    savePersistedState();
+    publishStatusEvent();
+}
+
+bool OnBoardEspressoRLPlugin::applyLatestRecommendation(const std::string &recommendationId) {
+    if (!workspace_ || controller_ == nullptr || !isOnBoardSelected() || recommendationId.empty() ||
+        controller_->isActive()) {
+        return false;
+    }
+
+    AutoTuning::Recommendation rec;
+    OnBoardOpt::ControlMode mode = OnBoardOpt::ControlMode::RecipeOnly;
+    bool applySpline = false;
+    std::array<float, 3> proposedSpline{0.0f, 0.0f, 0.0f};
+    {
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        if (!workspace_->hasLatestRecommendation ||
+            workspace_->latestRecommendation.recommendationId != recommendationId) {
+            return false;
+        }
+        rec = workspace_->latestRecommendation;
+        mode = workspace_->controlMode;
+        applySpline = OnBoardOpt::modeTunesSpline(mode) && workspace_->hasPendingSplineDelta &&
+                      workspace_->pendingSplineRecId == recommendationId;
+        proposedSpline = workspace_->pendingSplineDelta;
+    }
+
+    if (rec.status != AutoTuning::RecommendationStatus::Pending &&
+        rec.status != AutoTuning::RecommendationStatus::Shown) {
+        return false;
+    }
+
+    const Settings &settings = controller_->getSettings();
+    AutoTuning::TasteGoal goal;
+    auto *profiles = controller_->getProfileManager();
+    if (!profiles || !AutoTuning::activeTasteGoal(settings, goal) ||
+        !AutoTuning::recommendationContextMatches(rec, machineId(), settings.getRLBeanContextId().c_str(),
+                                                   settings.getRLGrinderContextId().c_str(),
+                                                   profiles->getSelectedProfile().id.c_str(), goal)) {
+        ESP_LOGW(LOG_TAG, "Refused on-board recommendation apply: active context changed");
+        return false;
+    }
+
+    if (applySpline && !OnBoardOpt::isValidSplineDelta(proposedSpline)) {
+        ESP_LOGW(LOG_TAG, "Refused on-board recommendation apply: spline warp outside safety bounds");
+        return false;
+    }
+
+    if (OnBoardOpt::modeTunesRecipe(mode)) {
+        AutoTuning::RecommendationTargets check;
+        check.nextDoseG = rec.nextDoseG;
+        check.targetYieldG = rec.targetYieldG;
+        check.targetRatio = rec.targetRatio;
+        check.grindDeltaStepsFromCurrent = rec.grindDeltaStepsFromCurrent;
+        std::string rejectReason;
+        if (!AutoTuning::validateRecommendationTargets(check, settings.getRLRecipeDomain(), rejectReason)) {
+            ESP_LOGW(LOG_TAG, "Refused on-board recommendation apply: %s", rejectReason.c_str());
+            return false;
+        }
+        Profile profile = profiles->getSelectedProfile();
+        if (profile.id.c_str() != rec.profileId) {
+            return false;
+        }
+        if (rec.nextDoseG > 0.0f) {
+            controller_->setTargetGrindVolume(rec.nextDoseG);
+        }
+        if (rec.targetYieldG > 0.0f) {
+            if (!profile.setFinalVolumetricTarget(rec.targetYieldG) || !profiles->saveProfile(profile)) {
+                ESP_LOGW(LOG_TAG, "Failed to update profile target yield on recommendation apply");
+                return false;
+            }
+        }
+        auto &mutableSettings = controller_->getSettings();
+        mutableSettings.setRLRecipeChangedAt(EpochTime::now());
+        mutableSettings.save(true);
+        if (pluginManager_ != nullptr) {
+            pluginManager_->trigger("rl:recipe:changed");
+        }
+    }
+
+    rec.status = AutoTuning::RecommendationStatus::Accepted;
+    rec.updatedAt = std::max<AutoTuning::Timestamp>(EpochTime::now(), EpochTime::MIN_VALID);
+    {
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        if (workspace_) {
+            workspace_->latestRecommendation = rec;
+            if (applySpline) {
+                workspace_->activeSplineDelta = OnBoardOpt::quantizeSplineDelta(proposedSpline);
+            } else if (!OnBoardOpt::modeTunesSpline(mode)) {
+                workspace_->activeSplineDelta = {0.0f, 0.0f, 0.0f};
+            }
+            workspace_->hasPendingSplineDelta = false;
+            workspace_->pendingSplineDelta = {0.0f, 0.0f, 0.0f};
+            workspace_->pendingSplineRecId.clear();
+        }
+    }
+
+    if (pluginManager_ != nullptr) {
+        Event accepted;
+        accepted.id = "rl:recommendation:received";
+        accepted.setPayload(rec);
+        pluginManager_->trigger(accepted);
+    }
+    WorkItem persistWork;
+    persistWork.kind = WorkKind::PersistState;
+    enqueueWork(std::move(persistWork));
+    return true;
+}
+
+bool OnBoardEspressoRLPlugin::ignoreLatestRecommendation(const std::string &recommendationId) {
+    if (!workspace_ || !isOnBoardSelected() || recommendationId.empty()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        if (!workspace_->hasLatestRecommendation ||
+            workspace_->latestRecommendation.recommendationId != recommendationId) {
+            return false;
+        }
+        workspace_->latestRecommendation.status = AutoTuning::RecommendationStatus::Ignored;
+        workspace_->hasLatestRecommendation = false;
+        if (workspace_->pendingSplineRecId == recommendationId) {
+            workspace_->hasPendingSplineDelta = false;
+            workspace_->pendingSplineDelta = {0.0f, 0.0f, 0.0f};
+            workspace_->pendingSplineRecId.clear();
+        }
+    }
+    if (pluginManager_ != nullptr) {
+        Event cleared;
+        cleared.id = "rl:recommendation:cleared";
+        pluginManager_->trigger(cleared);
+    }
+    WorkItem persistWork;
+    persistWork.kind = WorkKind::PersistState;
+    enqueueWork(std::move(persistWork));
+    return true;
 }
 
 void OnBoardEspressoRLPlugin::loadPersistedState() {
@@ -977,8 +1252,11 @@ void OnBoardEspressoRLPlugin::loadPersistedState() {
 
     {
         std::lock_guard<std::mutex> lock(workspaceMutex_);
+        const OnBoardOpt::ControlMode configuredMode =
+            OnBoardOpt::controlModeFromByte(controlMode_.load(std::memory_order_acquire));
+        const OnBoardOpt::ControlMode persistedMode = OnBoardOpt::controlModeFromByte(st.controlMode);
+
         workspace_->activeContextKey = st.activeContextKey;
-        workspace_->optimizationRunId = st.optimizationRunId;
         workspace_->activeBeanContextId = st.activeBeanContextId;
         workspace_->activeGrinderContextId = st.activeGrinderContextId;
         workspace_->activeProfileId = st.activeProfileId;
@@ -997,46 +1275,72 @@ void OnBoardEspressoRLPlugin::loadPersistedState() {
         workspace_->hasLastShotRecipe = st.hasLastShotRecipe;
         workspace_->lastShotHydraulicGrindSteps = st.lastShotHydraulicGrindSteps;
         workspace_->lastShotDoseG = st.lastShotDoseG;
-        workspace_->activeSplineDelta = st.activeSplineDelta;
-
-        workspace_->trustRegion.center = {st.trustCenter[0], st.trustCenter[1], st.trustCenter[2]};
-        workspace_->trustRegion.length = st.trustLength;
-        workspace_->trustRegion.successCount = st.trustSuccesses;
-        workspace_->trustRegion.failureCount = st.trustFailures;
-        workspace_->trustRegion.locallyConverged = st.trustConverged;
-        workspace_->trustRegion.lastAction = static_cast<EspressoRL::TrustRegionAction>(st.trustLastAction);
-
-        workspace_->hasBestPoint = st.hasBestPoint;
-        workspace_->bestPointIndex = st.bestPointIndex;
-        workspace_->localShotCount = st.localShotCount;
-        workspace_->lastShotId = st.lastShotId;
-        workspace_->lastShotAt = st.lastShotAt;
-        workspace_->lastShotTimeS = st.lastShotTimeS;
-        workspace_->lastShotBeverageOutG = st.lastShotBeverageOutG;
-        workspace_->lastShotTargetYieldG = st.lastShotTargetYieldG;
-        workspace_->lastRecommendationId = st.lastRecommendationId;
-        workspace_->lastRecommendationAt = st.lastRecommendationAt;
-
         workspace_->histZ.assign(st.histZ.begin(), st.histZ.end());
         workspace_->histY.assign(st.histY.begin(), st.histY.end());
-        workspace_->points.clear();
-        workspace_->points.reserve(st.points.size());
-        for (const auto &sp : st.points) {
-            Workspace::CpboPoint pt;
-            pt.shotId = sp.shotId;
-            pt.grindSteps = sp.grindSteps;
-            pt.doseG = sp.doseG;
-            pt.targetYieldG = sp.targetYieldG;
-            pt.beverageOutG = sp.beverageOutG;
-            pt.normX = sp.normX;
-            pt.phi0 = sp.phi0;
-            workspace_->points.push_back(std::move(pt));
-        }
-        workspace_->comparisons.clear();
-        workspace_->comparisons.reserve(st.comparisons.size());
-        for (const auto &sc : st.comparisons) {
-            workspace_->comparisons.push_back(EspressoRL::ComparisonPair{
-                sc.newIndex, sc.anchorIndex, static_cast<EspressoRL::PreferenceLabel>(sc.label)});
+
+        if (persistedMode == configuredMode) {
+            workspace_->controlMode = configuredMode;
+            workspace_->optimizationRunId = st.optimizationRunId;
+            workspace_->activeSplineDelta =
+                OnBoardOpt::modeTunesSpline(configuredMode) && OnBoardOpt::isValidSplineDelta(st.activeSplineDelta)
+                    ? st.activeSplineDelta
+                    : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+            workspace_->hasPendingSplineDelta = OnBoardOpt::modeTunesSpline(configuredMode) &&
+                                                st.hasPendingSplineDelta &&
+                                                OnBoardOpt::isValidSplineDelta(st.pendingSplineDelta);
+            workspace_->pendingSplineDelta = workspace_->hasPendingSplineDelta
+                                                 ? st.pendingSplineDelta
+                                                 : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+            workspace_->pendingSplineRecId = workspace_->hasPendingSplineDelta ? st.pendingSplineRecId : "";
+
+            const std::size_t rawDim = OnBoardOpt::rawDimForMode(configuredMode);
+            workspace_->trustRegion.center.assign(rawDim, 0.5);
+            if (st.trustDim == rawDim) {
+                for (std::size_t d = 0; d < rawDim; ++d) {
+                    workspace_->trustRegion.center[d] = st.trustCenter[d];
+                }
+            }
+            workspace_->trustRegion.length = st.trustLength;
+            workspace_->trustRegion.successCount = st.trustSuccesses;
+            workspace_->trustRegion.failureCount = st.trustFailures;
+            workspace_->trustRegion.locallyConverged = st.trustConverged;
+            workspace_->trustRegion.lastAction = static_cast<EspressoRL::TrustRegionAction>(st.trustLastAction);
+
+            workspace_->hasBestPoint = st.hasBestPoint;
+            workspace_->bestPointIndex = st.bestPointIndex;
+            workspace_->localShotCount = st.localShotCount;
+            workspace_->lastShotId = st.lastShotId;
+            workspace_->lastShotAt = st.lastShotAt;
+            workspace_->lastShotTimeS = st.lastShotTimeS;
+            workspace_->lastShotBeverageOutG = st.lastShotBeverageOutG;
+            workspace_->lastShotTargetYieldG = st.lastShotTargetYieldG;
+            workspace_->lastRecommendationId = st.lastRecommendationId;
+            workspace_->lastRecommendationAt = st.lastRecommendationAt;
+
+            workspace_->points.clear();
+            workspace_->points.reserve(st.points.size());
+            for (const auto &sp : st.points) {
+                Workspace::CpboPoint pt;
+                pt.shotId = sp.shotId;
+                pt.grindSteps = sp.grindSteps;
+                pt.doseG = sp.doseG;
+                pt.targetYieldG = sp.targetYieldG;
+                pt.beverageOutG = sp.beverageOutG;
+                pt.splineDelta = sp.splineDelta;
+                pt.normDim = sp.normDim;
+                pt.normX = sp.normX;
+                pt.phi0 = sp.phi0;
+                workspace_->points.push_back(std::move(pt));
+            }
+            workspace_->comparisons.clear();
+            workspace_->comparisons.reserve(st.comparisons.size());
+            for (const auto &sc : st.comparisons) {
+                workspace_->comparisons.push_back(EspressoRL::ComparisonPair{
+                    sc.newIndex, sc.anchorIndex, static_cast<EspressoRL::PreferenceLabel>(sc.label)});
+            }
+        } else {
+            // Mode changed between boots: keep hydraulic world model, start a clean CPBO run for the new mode.
+            workspace_->resetCpboRunOnly(configuredMode);
         }
 
         if (!workspace_->histZ.empty()) {
@@ -1068,6 +1372,7 @@ bool OnBoardEspressoRLPlugin::savePersistedState() {
         st.activeProfileLabel = workspace_->activeProfileLabel;
         st.activeRawProfileHash = workspace_->activeRawProfileHash;
 
+        st.controlMode = static_cast<std::uint8_t>(workspace_->controlMode);
         st.tasteGoalMode = (workspace_->activeTasteGoal.mode == AutoTuning::TasteGoalMode::Custom) ? 1u : 0u;
         for (std::size_t i = 0; i < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++i) {
             st.tasteGoalTargets[i] = static_cast<std::uint8_t>(workspace_->activeTasteGoal.targets[i]);
@@ -1078,10 +1383,15 @@ bool OnBoardEspressoRLPlugin::savePersistedState() {
         st.lastShotHydraulicGrindSteps = workspace_->lastShotHydraulicGrindSteps;
         st.lastShotDoseG = workspace_->lastShotDoseG;
         st.activeSplineDelta = workspace_->activeSplineDelta;
+        st.hasPendingSplineDelta = workspace_->hasPendingSplineDelta;
+        st.pendingSplineDelta = workspace_->pendingSplineDelta;
+        st.pendingSplineRecId = workspace_->pendingSplineRecId;
 
-        if (workspace_->trustRegion.center.size() >= 3) {
-            st.trustCenter = {workspace_->trustRegion.center[0], workspace_->trustRegion.center[1],
-                              workspace_->trustRegion.center[2]};
+        const std::size_t rawDim = OnBoardOpt::rawDimForMode(workspace_->controlMode);
+        st.trustDim = static_cast<std::uint8_t>(rawDim);
+        st.trustCenter.fill(0.5);
+        for (std::size_t d = 0; d < std::min(rawDim, workspace_->trustRegion.center.size()); ++d) {
+            st.trustCenter[d] = workspace_->trustRegion.center[d];
         }
         st.trustLength = workspace_->trustRegion.length;
         st.trustSuccesses = workspace_->trustRegion.successCount;
@@ -1110,6 +1420,8 @@ bool OnBoardEspressoRLPlugin::savePersistedState() {
             sp.doseG = pt.doseG;
             sp.targetYieldG = pt.targetYieldG;
             sp.beverageOutG = pt.beverageOutG;
+            sp.splineDelta = pt.splineDelta;
+            sp.normDim = pt.normDim;
             sp.normX = pt.normX;
             sp.phi0 = pt.phi0;
             st.points.push_back(std::move(sp));
@@ -1197,12 +1509,17 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
         return;
     }
     std::optional<AutoTuning::PreferenceRequest> prefReq;
+    std::optional<AutoTuning::Recommendation> initialSplineRec;
+    const OnBoardOpt::ControlMode currentMode =
+        OnBoardOpt::controlModeFromByte(controlMode_.load(std::memory_order_acquire));
 
     {
         std::lock_guard<std::mutex> lock(workspaceMutex_);
         if (workspace_->activeContextKey != shot.contextKey) {
             workspace_->resetContext(shot.contextKey, shot.beanContextId, shot.grinderContextId, shot.profileId,
-                                     shot.profileLabel, shot.rawProfileHash, shot.tasteGoal);
+                                     shot.profileLabel, shot.rawProfileHash, shot.tasteGoal, currentMode);
+        } else if (workspace_->controlMode != currentMode) {
+            workspace_->resetCpboRunOnly(currentMode);
         }
 
         workspace_->lastShotId = shot.shotId;
@@ -1257,7 +1574,7 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
             }
         }
 
-        // 2. Register recipe point for CPBO and construct a pairwise preference prompt against incumbent anchor.
+        // 2. Register recipe / spline point for CPBO and construct a pairwise preference prompt against incumbent anchor.
         if (!shot.excludeFromOptimization && shot.hasUsableDose && workspace_->findPointByShotId(shot.shotId) < 0) {
             const AutoTuning::RecipeDomain domain = controller_->getSettings().getRLRecipeDomain();
             const double fineness = std::clamp(
@@ -1273,13 +1590,28 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
                     std::max<double>(static_cast<double>(domain.targetOutputMaxG - domain.targetOutputMinG), 1e-6),
                 0.0, 1.0);
 
+            const std::array<float, 3> realizedSpline = OnBoardOpt::modeTunesSpline(currentMode)
+                                                            ? OnBoardOpt::quantizeSplineDelta(shot.realizedSplineDelta)
+                                                            : std::array<float, 3>{0.0f, 0.0f, 0.0f};
+            const double s0 = OnBoardOpt::splineKnotToNorm(realizedSpline[0]);
+            const double s1 = OnBoardOpt::splineKnotToNorm(realizedSpline[1]);
+            const double s2 = OnBoardOpt::splineKnotToNorm(realizedSpline[2]);
+
             Workspace::CpboPoint pt;
             pt.shotId = shot.shotId;
             pt.grindSteps = shot.relativeGrindSteps;
             pt.doseG = shot.doseG;
             pt.targetYieldG = shot.targetYieldG;
             pt.beverageOutG = shot.beverageOutG;
-            pt.normX = {fineness, doseNorm, yieldNorm};
+            pt.splineDelta = realizedSpline;
+            pt.normDim = static_cast<std::uint8_t>(OnBoardOpt::rawDimForMode(currentMode));
+            if (currentMode == OnBoardOpt::ControlMode::SplineOnly) {
+                pt.normX = {s0, s1, s2, 0.5, 0.5, 0.5};
+            } else if (currentMode == OnBoardOpt::ControlMode::Joint6D) {
+                pt.normX = {fineness, doseNorm, yieldNorm, s0, s1, s2};
+            } else {
+                pt.normX = {fineness, doseNorm, yieldNorm, 0.5, 0.5, 0.5};
+            }
             pt.phi0 = EspressoRL::computePhi0(fineness, shot.doseG, shot.targetYieldG);
 
             if (workspace_->points.size() >= MAX_CPBO_POINTS) {
@@ -1287,6 +1619,14 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
                 if (workspace_->bestPointIndex > 0) {
                     --workspace_->bestPointIndex;
                 }
+                std::vector<EspressoRL::ComparisonPair> shifted;
+                shifted.reserve(workspace_->comparisons.size());
+                for (const auto &c : workspace_->comparisons) {
+                    if (c.newIdx > 0 && c.anchorIdx > 0) {
+                        shifted.push_back({c.newIdx - 1, c.anchorIdx - 1, c.label});
+                    }
+                }
+                workspace_->comparisons.swap(shifted);
             }
             const std::size_t newIdx = workspace_->points.size();
             workspace_->points.push_back(pt);
@@ -1295,7 +1635,49 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
             if (!workspace_->hasBestPoint) {
                 workspace_->bestPointIndex = newIdx;
                 workspace_->hasBestPoint = true;
-                workspace_->trustRegion.center = {fineness, doseNorm, yieldNorm};
+                workspace_->trustRegion.center.assign(pt.normX.begin(), pt.normX.begin() + pt.normDim);
+
+                // In spline-tuning modes, propose a gentle initial warp after Shot #1 so Shot #2 contrasts cleanly.
+                if (OnBoardOpt::modeTunesSpline(currentMode)) {
+                    const AutoTuning::Timestamp nowSec =
+                        std::max<AutoTuning::Timestamp>(EpochTime::now(), EpochTime::MIN_VALID);
+                    AutoTuning::Recommendation rec;
+                    rec.recommendationId = makeRecommendationId();
+                    rec.sourceShotId = shot.shotId;
+                    rec.installId = "on_board_esp32s3";
+                    rec.machineId = shot.machineId.empty() ? machineId() : shot.machineId;
+                    rec.beanContextId = shot.beanContextId;
+                    rec.grinderContextId = shot.grinderContextId;
+                    rec.profileId = shot.profileId;
+                    rec.rawProfileHash = shot.rawProfileHash;
+                    rec.tasteGoal = shot.tasteGoal;
+                    rec.createdAt = nowSec;
+                    rec.updatedAt = nowSec;
+                    rec.mode = AutoTuning::RecommendationMode::CpboBestIncumbent;
+                    rec.status = AutoTuning::RecommendationStatus::Pending;
+                    rec.reason = (currentMode == OnBoardOpt::ControlMode::SplineOnly)
+                                     ? "on_board_spline_only_initial_probe"
+                                     : "on_board_joint6d_initial_probe";
+                    rec.optimizationRunId = workspace_->optimizationRunId;
+                    rec.comparisonAnchorShotId = shot.shotId;
+                    rec.comparisonMode = AutoTuning::ComparisonMode::BestIncumbent;
+                    rec.preferenceFeedbackRequired = true;
+                    rec.grindDeltaStepsFromCurrent = 0.0f;
+                    rec.projectedRelativeStepFromReference = static_cast<float>(pt.grindSteps);
+                    rec.nextDoseG = static_cast<float>(pt.doseG);
+                    rec.targetYieldG = static_cast<float>(pt.targetYieldG);
+                    rec.targetRatio = static_cast<float>(pt.targetYieldG / std::max(pt.doseG, 0.1));
+                    rec.confidence = 0.5f;
+
+                    workspace_->latestRecommendation = rec;
+                    workspace_->hasLatestRecommendation = true;
+                    workspace_->lastRecommendationId = rec.recommendationId;
+                    workspace_->lastRecommendationAt = nowSec;
+                    workspace_->hasPendingSplineDelta = true;
+                    workspace_->pendingSplineDelta = OnBoardOpt::INITIAL_EXPLORATION_SPLINE_GS;
+                    workspace_->pendingSplineRecId = rec.recommendationId;
+                    initialSplineRec = std::move(rec);
+                }
             } else if (workspace_->bestPointIndex < workspace_->points.size() && workspace_->bestPointIndex != newIdx) {
                 const auto &anchor = workspace_->points[workspace_->bestPointIndex];
                 AutoTuning::PreferenceRequest req;
@@ -1340,6 +1722,17 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
     ackEv.setInt64("timestamp", ack.timestamp);
     ackEv.setPayload(std::move(ack));
     queueMainThreadEvent(std::move(ackEv));
+
+    if (initialSplineRec.has_value()) {
+        if (auto *store = controller_->getAutoTuningRecordStore()) {
+            store->storeRecommendation(*initialSplineRec);
+        }
+        Event recEv;
+        recEv.id = "rl:recommendation:received";
+        recEv.setPayload(std::move(*initialSplineRec));
+        queueMainThreadEvent(std::move(recEv));
+    }
+
     savePersistedState();
     publishStatusEvent();
 }
@@ -1351,6 +1744,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
 
     // Snapshot domain & copy CPBO data under lock, then run heavy float64 math cooperatively on Core 1.
     const AutoTuning::RecipeDomain domain = controller_->getSettings().getRLRecipeDomain();
+    OnBoardOpt::ControlMode mode = OnBoardOpt::ControlMode::RecipeOnly;
     std::vector<Workspace::CpboPoint> pointsCopy;
     std::vector<EspressoRL::ComparisonPair> compsCopy;
     EspressoRL::Level1TrustRegionState trState;
@@ -1366,6 +1760,8 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
             ESP_LOGW(LOG_TAG, "Skipping preference comparison: shot not found in active on-board run");
             return;
         }
+        mode = workspace_->controlMode;
+        const std::size_t rawDim = OnBoardOpt::rawDimForMode(mode);
         const EspressoRL::PreferenceLabel lbl = mapPreferenceLabel(feedback.label);
         if (workspace_->comparisons.size() >= MAX_CPBO_COMPARISONS) {
             workspace_->comparisons.erase(workspace_->comparisons.begin());
@@ -1381,8 +1777,11 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         const EspressoRL::TrustRegionConfig trCfg;
         EspressoRL::Level1TrustRegionState nextTr;
         const auto &newPt = workspace_->points[static_cast<std::size_t>(newIdx)];
-        if (EspressoRL::updateLevel1TrustRegion(workspace_->trustRegion, lbl,
-                                                {newPt.normX[0], newPt.normX[1], newPt.normX[2]}, trCfg, nextTr)) {
+        std::vector<double> newCenter(newPt.normX.begin(), newPt.normX.begin() + rawDim);
+        if (workspace_->trustRegion.center.size() != rawDim) {
+            workspace_->trustRegion.center.assign(rawDim, 0.5);
+        }
+        if (EspressoRL::updateLevel1TrustRegion(workspace_->trustRegion, lbl, newCenter, trCfg, nextTr)) {
             workspace_->trustRegion = nextTr;
         }
 
@@ -1399,42 +1798,64 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         goal = workspace_->activeTasteGoal;
     }
 
-    if (pointsCopy.size() < 2 || compsCopy.empty()) {
+    if (pointsCopy.size() < 2 || compsCopy.empty() || anchorIdx >= pointsCopy.size()) {
         return;
     }
 
-    // Build robust physics scaler over evaluated points + deterministic 3x3x3 domain grid.
-    std::vector<double> phiGrid;
-    phiGrid.reserve((pointsCopy.size() + 27) * EspressoRL::PHYSICS_PROXY_DIM);
-    for (const auto &pt : pointsCopy) {
-        phiGrid.insert(phiGrid.end(), pt.phi0.begin(), pt.phi0.end());
-    }
-    for (double f : {0.0, 0.5, 1.0}) {
-        for (double d : {0.0, 0.5, 1.0}) {
-            for (double o : {0.0, 0.5, 1.0}) {
-                const double dose = domain.doseMinG + d * (domain.doseMaxG - domain.doseMinG);
-                const double yield = domain.targetOutputMinG + o * (domain.targetOutputMaxG - domain.targetOutputMinG);
-                const auto p0 = EspressoRL::computePhi0(f, dose, yield);
-                phiGrid.insert(phiGrid.end(), p0.begin(), p0.end());
+    const std::size_t rawDim = OnBoardOpt::rawDimForMode(mode);
+    const std::size_t physDim =
+        (mode == OnBoardOpt::ControlMode::SplineOnly) ? 3u : EspressoRL::PHYSICS_PROXY_DIM;
+    const std::size_t stride = rawDim + physDim;
+
+    // Fit robust physics scaler over evaluated points + deterministic 3x3x3 domain scaffold.
+    std::vector<double> physGrid;
+    physGrid.reserve((pointsCopy.size() + 27) * physDim);
+    if (mode == OnBoardOpt::ControlMode::SplineOnly) {
+        for (const auto &pt : pointsCopy) {
+            const auto sf = OnBoardOpt::computeSplineShapeFeatures(pt.splineDelta);
+            physGrid.insert(physGrid.end(), sf.begin(), sf.end());
+        }
+        for (float d0 : {-1.0f, 0.0f, 1.0f}) {
+            for (float d1 : {-1.0f, 0.0f, 1.0f}) {
+                for (float d2 : {-1.0f, 0.0f, 1.0f}) {
+                    const auto sf = OnBoardOpt::computeSplineShapeFeatures({d0, d1, d2});
+                    physGrid.insert(physGrid.end(), sf.begin(), sf.end());
+                }
+            }
+        }
+    } else {
+        for (const auto &pt : pointsCopy) {
+            physGrid.insert(physGrid.end(), pt.phi0.begin(), pt.phi0.end());
+        }
+        for (double f : {0.0, 0.5, 1.0}) {
+            for (double d : {0.0, 0.5, 1.0}) {
+                for (double o : {0.0, 0.5, 1.0}) {
+                    const double dose = domain.doseMinG + d * (domain.doseMaxG - domain.doseMinG);
+                    const double yield = domain.targetOutputMinG + o * (domain.targetOutputMaxG - domain.targetOutputMinG);
+                    const auto p0 = EspressoRL::computePhi0(f, dose, yield);
+                    physGrid.insert(physGrid.end(), p0.begin(), p0.end());
+                }
             }
         }
     }
+
     EspressoRL::EmbeddedRobustScaler scaler;
-    if (!scaler.fit(phiGrid.data(), phiGrid.size() / EspressoRL::PHYSICS_PROXY_DIM, EspressoRL::PHYSICS_PROXY_DIM)) {
+    if (!scaler.fit(physGrid.data(), physGrid.size() / physDim, physDim)) {
         return;
     }
-
-    constexpr std::size_t rawDim = 3;
-    constexpr std::size_t physDim = EspressoRL::PHYSICS_PROXY_DIM;
-    constexpr std::size_t stride = rawDim + physDim;
 
     std::vector<double> trainInputs(pointsCopy.size() * stride, 0.0);
     for (std::size_t i = 0; i < pointsCopy.size(); ++i) {
         double *row = trainInputs.data() + i * stride;
-        row[0] = pointsCopy[i].normX[0];
-        row[1] = pointsCopy[i].normX[1];
-        row[2] = pointsCopy[i].normX[2];
-        scaler.transformRow(pointsCopy[i].phi0.data(), row + rawDim);
+        for (std::size_t d = 0; d < rawDim; ++d) {
+            row[d] = pointsCopy[i].normX[d];
+        }
+        if (mode == OnBoardOpt::ControlMode::SplineOnly) {
+            const auto sf = OnBoardOpt::computeSplineShapeFeatures(pointsCopy[i].splineDelta);
+            scaler.transformRow(sf.data(), row + rawDim);
+        } else {
+            scaler.transformRow(pointsCopy[i].phi0.data(), row + rawDim);
+        }
     }
 
     YieldContext yCtx;
@@ -1445,6 +1866,10 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
 
     EspressoRL::PreferenceGPConfig gpCfg;
     gpCfg.maxOuterIters = 35;
+    if (mode == OnBoardOpt::ControlMode::SplineOnly) {
+        gpCfg.initialRawKernelWeight = 0.75;
+        gpCfg.initialPhysicsKernelWeight = 0.25;
+    }
     EspressoRL::EmbeddedPreferenceGPModel model;
     const bool fitOk = EspressoRL::fitEmbeddedPreferenceGP(trainInputs.data(), pointsCopy.size(), rawDim, physDim, 0,
                                                            compsCopy.data(), compsCopy.size(), gpCfg, model,
@@ -1459,40 +1884,42 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         return;
     }
 
-    // Compute lengthscale-shaped trust-region bounds & deterministic candidate discretization (64 points + anchor).
-    std::vector<double> lo(3, 0.0), hi(3, 1.0);
+    // Compute lengthscale-shaped trust-region bounds & deterministic 64-candidate discretization (+ anchor at index 0).
+    std::vector<double> lo(rawDim, 0.0), hi(rawDim, 1.0);
     if (!trState.locallyConverged) {
         const EspressoRL::TrustRegionConfig trCfg;
         EspressoRL::computeLevel1TrustRegionBounds(trState, model.hyperparams.rawLengthscales(), trCfg, lo, hi);
     }
 
-    std::vector<std::array<double, 3>> cands;
-    cands.reserve(65);
-    cands.push_back(pointsCopy[anchorIdx].normX); // index 0 = anchor
-    for (int i0 = 0; i0 < 4; ++i0) {
-        for (int i1 = 0; i1 < 4; ++i1) {
-            for (int i2 = 0; i2 < 4; ++i2) {
-                const double u0 = lo[0] + (static_cast<double>(i0) + 0.5) * 0.25 * (hi[0] - lo[0]);
-                const double u1 = lo[1] + (static_cast<double>(i1) + 0.5) * 0.25 * (hi[1] - lo[1]);
-                const double u2 = lo[2] + (static_cast<double>(i2) + 0.5) * 0.25 * (hi[2] - lo[2]);
-                cands.push_back({u0, u1, u2});
-            }
-        }
+    std::vector<double> anchorNorm(pointsCopy[anchorIdx].normX.begin(), pointsCopy[anchorIdx].normX.begin() + rawDim);
+    std::vector<std::array<double, 6>> cands;
+    if (!OnBoardOpt::generateTrustRegionCandidates(mode, anchorNorm, lo, hi, cands) || cands.size() < 2) {
+        return;
     }
 
     std::vector<double> queryInputs(cands.size() * stride, 0.0);
     for (std::size_t i = 0; i < cands.size(); ++i) {
         double *row = queryInputs.data() + i * stride;
-        const double dose = quantizeStep(domain.doseMinG + cands[i][1] * (domain.doseMaxG - domain.doseMinG),
-                                         domain.doseMinG, domain.doseMaxG, 0.1);
-        const double yield =
-            quantizeStep(domain.targetOutputMinG + cands[i][2] * (domain.targetOutputMaxG - domain.targetOutputMinG),
-                         domain.targetOutputMinG, domain.targetOutputMaxG, 0.5);
-        const auto p0 = EspressoRL::computePhi0(cands[i][0], dose, yield);
-        row[0] = cands[i][0];
-        row[1] = cands[i][1];
-        row[2] = cands[i][2];
-        scaler.transformRow(p0.data(), row + rawDim);
+        for (std::size_t d = 0; d < rawDim; ++d) {
+            row[d] = cands[i][d];
+        }
+        if (mode == OnBoardOpt::ControlMode::SplineOnly) {
+            const std::array<float, 3> candSpline = {
+                OnBoardOpt::normToSplineKnot(cands[i][0]),
+                OnBoardOpt::normToSplineKnot(cands[i][1]),
+                OnBoardOpt::normToSplineKnot(cands[i][2]),
+            };
+            const auto sf = OnBoardOpt::computeSplineShapeFeatures(candSpline);
+            scaler.transformRow(sf.data(), row + rawDim);
+        } else {
+            const double dose = quantizeStep(domain.doseMinG + cands[i][1] * (domain.doseMaxG - domain.doseMinG),
+                                             domain.doseMinG, domain.doseMaxG, 0.1);
+            const double yield =
+                quantizeStep(domain.targetOutputMinG + cands[i][2] * (domain.targetOutputMaxG - domain.targetOutputMinG),
+                             domain.targetOutputMinG, domain.targetOutputMaxG, 0.5);
+            const auto p0 = EspressoRL::computePhi0(cands[i][0], dose, yield);
+            scaler.transformRow(p0.data(), row + rawDim);
+        }
     }
 
     std::vector<double> postMean, postCov;
@@ -1528,20 +1955,48 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
     const auto &chosen = cands[mes.candidateIndex];
     const auto &anchorPt = pointsCopy[anchorIdx];
 
-    const double nextGrindRel =
-        quantizeStep(-domain.grindRadiusSteps + chosen[0] * (2.0 * domain.grindRadiusSteps), -domain.grindRadiusSteps,
-                     domain.grindRadiusSteps, 0.5);
-    const double nextDoseG = quantizeStep(domain.doseMinG + chosen[1] * (domain.doseMaxG - domain.doseMinG),
-                                          domain.doseMinG, domain.doseMaxG, 0.1);
-    const double nextYieldG =
-        quantizeStep(domain.targetOutputMinG + chosen[2] * (domain.targetOutputMaxG - domain.targetOutputMinG),
-                     domain.targetOutputMinG, domain.targetOutputMaxG, 0.5);
+    double nextGrindRel = anchorPt.grindSteps;
+    double nextDoseG = anchorPt.doseG;
+    double nextYieldG = anchorPt.targetYieldG;
+    std::array<float, 3> nextSpline{0.0f, 0.0f, 0.0f};
+    bool hasPendingSpline = false;
+
+    if (OnBoardOpt::modeTunesRecipe(mode)) {
+        nextGrindRel =
+            quantizeStep(-domain.grindRadiusSteps + chosen[0] * (2.0 * domain.grindRadiusSteps), -domain.grindRadiusSteps,
+                         domain.grindRadiusSteps, 0.5);
+        nextDoseG = quantizeStep(domain.doseMinG + chosen[1] * (domain.doseMaxG - domain.doseMinG), domain.doseMinG,
+                                 domain.doseMaxG, 0.1);
+        nextYieldG = quantizeStep(domain.targetOutputMinG + chosen[2] * (domain.targetOutputMaxG - domain.targetOutputMinG),
+                                  domain.targetOutputMinG, domain.targetOutputMaxG, 0.5);
+    }
+    if (mode == OnBoardOpt::ControlMode::SplineOnly) {
+        nextSpline = {
+            OnBoardOpt::normToSplineKnot(chosen[0]),
+            OnBoardOpt::normToSplineKnot(chosen[1]),
+            OnBoardOpt::normToSplineKnot(chosen[2]),
+        };
+        hasPendingSpline = true;
+    } else if (mode == OnBoardOpt::ControlMode::Joint6D) {
+        nextSpline = {
+            OnBoardOpt::normToSplineKnot(chosen[3]),
+            OnBoardOpt::normToSplineKnot(chosen[4]),
+            OnBoardOpt::normToSplineKnot(chosen[5]),
+        };
+        hasPendingSpline = true;
+    }
+
+    if (hasPendingSpline && !OnBoardOpt::isValidSplineDelta(nextSpline)) {
+        ESP_LOGW(LOG_TAG, "On-board CPBO spline warp rejected by safety validator");
+        return;
+    }
 
     AutoTuning::RecommendationTargets targetCheck;
     targetCheck.nextDoseG = static_cast<float>(nextDoseG);
     targetCheck.targetYieldG = static_cast<float>(nextYieldG);
     targetCheck.targetRatio = static_cast<float>(nextYieldG / std::max(nextDoseG, 0.1));
-    targetCheck.grindDeltaStepsFromCurrent = static_cast<float>(nextGrindRel - anchorPt.grindSteps);
+    targetCheck.grindDeltaStepsFromCurrent =
+        OnBoardOpt::modeTunesRecipe(mode) ? static_cast<float>(nextGrindRel - anchorPt.grindSteps) : 0.0f;
     std::string rejectReason;
     if (!AutoTuning::validateRecommendationTargets(targetCheck, domain, rejectReason)) {
         ESP_LOGW(LOG_TAG, "On-board CPBO recommendation rejected by safety validator: %s", rejectReason.c_str());
@@ -1563,7 +2018,8 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
     rec.updatedAt = nowSec;
     rec.mode = AutoTuning::RecommendationMode::CpboBestIncumbent;
     rec.status = AutoTuning::RecommendationStatus::Pending;
-    rec.reason = shadowModeOnly_.load() ? "on_board_cpbo_ghvi_shadow" : "on_board_cpbo_ghvi_live";
+    rec.reason = std::string("on_board_") + OnBoardOpt::controlModeKey(mode) +
+                 (shadowModeOnly_.load() ? "_shadow" : "_live");
     rec.optimizationRunId = runId;
     rec.comparisonAnchorShotId = anchorPt.shotId;
     rec.comparisonMode = AutoTuning::ComparisonMode::BestIncumbent;
@@ -1579,16 +2035,24 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         std::lock_guard<std::mutex> lock(workspaceMutex_);
         if (workspace_) {
             workspace_->lastModel = std::move(model);
+            workspace_->latestRecommendation = rec;
+            workspace_->hasLatestRecommendation = true;
             workspace_->lastRecommendationId = rec.recommendationId;
             workspace_->lastRecommendationAt = nowSec;
+            workspace_->hasPendingSplineDelta = hasPendingSpline;
+            workspace_->pendingSplineDelta = nextSpline;
+            workspace_->pendingSplineRecId = hasPendingSpline ? rec.recommendationId : "";
             workspace_->lastCpboFitMs = fitMs;
             workspace_->lastCpboCancelled = false;
         }
     }
 
-    ESP_LOGI(LOG_TAG, "On-board CPBO fit+MES completed in %lu ms (ELBO=%.3f, IG=%.4f, dGrind=%.2f, dose=%.1f, yield=%.1f)",
-             static_cast<unsigned long>(fitMs), workspace_->lastModel.elbo, mes.acquisitionValue,
-             rec.grindDeltaStepsFromCurrent, rec.nextDoseG, rec.targetYieldG);
+    ESP_LOGI(LOG_TAG,
+             "On-board CPBO (%s) completed in %lu ms (ELBO=%.3f, IG=%.4f, dGrind=%.2f, dose=%.1f, yield=%.1f, "
+             "spline=[%+.2f,%+.2f,%+.2f])",
+             OnBoardOpt::controlModeKey(mode), static_cast<unsigned long>(fitMs), workspace_->lastModel.elbo,
+             mes.acquisitionValue, rec.grindDeltaStepsFromCurrent, rec.nextDoseG, rec.targetYieldG, nextSpline[0],
+             nextSpline[1], nextSpline[2]);
 
     if (auto *store = controller_->getAutoTuningRecordStore()) {
         store->storeRecommendation(rec);
@@ -1653,6 +2117,14 @@ void OnBoardEspressoRLPlugin::publishStatusEvent() {
         ev.setInt("runtime_health_storage_available", persisted ? 1 : 0);
         ev.setInt("onboard_present", 1);
         ev.setInt("onboard_shadow_only", shadow ? 1 : 0);
+        ev.setString("onboard_control_mode", OnBoardOpt::controlModeKey(workspace_->controlMode));
+        ev.setFloat("onboard_spline_early", workspace_->activeSplineDelta[0]);
+        ev.setFloat("onboard_spline_mid", workspace_->activeSplineDelta[1]);
+        ev.setFloat("onboard_spline_late", workspace_->activeSplineDelta[2]);
+        ev.setInt("onboard_has_pending_spline", workspace_->hasPendingSplineDelta ? 1 : 0);
+        ev.setFloat("onboard_pending_spline_early", workspace_->pendingSplineDelta[0]);
+        ev.setFloat("onboard_pending_spline_mid", workspace_->pendingSplineDelta[1]);
+        ev.setFloat("onboard_pending_spline_late", workspace_->pendingSplineDelta[2]);
         ev.setInt("onboard_vfe_samples", static_cast<int>(workspace_->histZ.size()));
         ev.setInt("onboard_cpbo_points", static_cast<int>(workspace_->points.size()));
         ev.setInt("onboard_cpbo_comparisons", static_cast<int>(workspace_->comparisons.size()));

@@ -15,8 +15,10 @@
 
 #include "display/core/AutoTuning.cpp"
 #include "display/core/LiveBrewLease.h"
+#include "display/core/OnBoardOptimizationMode.h"
 #include "display/core/OnBoardStateCodec.h"
 #include "display/core/ProfileHorizonSampler.h"
+#include "EmbeddedCpbo.cpp"
 
 namespace {
 
@@ -377,7 +379,12 @@ static void test_onboard_state_codec_roundtrip_and_zero_trust_corruption() {
     src.lastShotHydraulicGrindSteps = -2.5f;
     src.lastShotDoseG = 16.5f;
     src.activeSplineDelta = {0.15f, -0.05f, -0.20f};
-    src.trustCenter = {0.42, 0.58, 0.65};
+    src.controlMode = static_cast<std::uint8_t>(OnBoardOpt::ControlMode::Joint6D);
+    src.hasPendingSplineDelta = true;
+    src.pendingSplineDelta = {-0.20f, 0.15f, -0.35f};
+    src.pendingSplineRecId = "obrec_002";
+    src.trustDim = 6u;
+    src.trustCenter = {0.42, 0.58, 0.65, 0.40, 0.55, 0.35};
     src.trustLength = 0.16;
     src.trustSuccesses = 2;
     src.trustFailures = 1;
@@ -405,7 +412,9 @@ static void test_onboard_state_codec_roundtrip_and_zero_trust_corruption() {
         pt.doseG = 16.5;
         pt.targetYieldG = 36.0;
         pt.beverageOutG = 35.5 + 0.2 * p;
-        pt.normX = {0.4 + 0.1 * p, 0.5, 0.6};
+        pt.splineDelta = {-0.10f * p, 0.05f * p, -0.15f * p};
+        pt.normDim = 6u;
+        pt.normX = {0.4 + 0.1 * p, 0.5, 0.6, 0.5 - 0.05 * p, 0.5 + 0.025 * p, 0.5 - 0.075 * p};
         for (std::size_t k = 0; k < OnBoardStateCodec::PHI0_DIM; ++k) {
             pt.phi0[k] = 0.1 * static_cast<double>(k + p);
         }
@@ -422,6 +431,12 @@ static void test_onboard_state_codec_roundtrip_and_zero_trust_corruption() {
     TEST_ASSERT_TRUE(OnBoardStateCodec::decode(bytes.data(), bytes.size(), dst));
     TEST_ASSERT_EQUAL_STRING(src.activeContextKey.c_str(), dst.activeContextKey.c_str());
     TEST_ASSERT_EQUAL_STRING(src.activeProfileLabel.c_str(), dst.activeProfileLabel.c_str());
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(OnBoardOpt::ControlMode::Joint6D), dst.controlMode);
+    TEST_ASSERT_TRUE(dst.hasPendingSplineDelta);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, -0.35f, dst.pendingSplineDelta[2]);
+    TEST_ASSERT_EQUAL_STRING("obrec_002", dst.pendingSplineRecId.c_str());
+    TEST_ASSERT_EQUAL_UINT8(6u, dst.trustDim);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.35, dst.trustCenter[5]);
     TEST_ASSERT_EQUAL_UINT8(1u, dst.tasteGoalMode);
     TEST_ASSERT_EQUAL_UINT8(3u, dst.tasteGoalTargets[0]);
     TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.84f, dst.bevToPumpRatio);
@@ -429,6 +444,8 @@ static void test_onboard_state_codec_roundtrip_and_zero_trust_corruption() {
     TEST_ASSERT_FLOAT_WITHIN(1e-5f, -0.20f, dst.activeSplineDelta[2]);
     TEST_ASSERT_EQUAL_UINT32(60u, static_cast<uint32_t>(dst.histZ.size()));
     TEST_ASSERT_EQUAL_UINT32(3u, static_cast<uint32_t>(dst.points.size()));
+    TEST_ASSERT_EQUAL_UINT8(6u, dst.points[2].normDim);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, -0.30f, dst.points[2].splineDelta[2]);
     TEST_ASSERT_EQUAL_UINT32(2u, static_cast<uint32_t>(dst.comparisons.size()));
     TEST_ASSERT_EQUAL_UINT16(1u, dst.bestPointIndex);
     TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.16, dst.trustLength);
@@ -447,10 +464,16 @@ static void test_onboard_state_codec_roundtrip_and_zero_trust_corruption() {
     badMagic[0] ^= 0xFFu;
     TEST_ASSERT_FALSE(OnBoardStateCodec::decode(badMagic.data(), badMagic.size(), dst));
 
-    // 4. Out-of-bounds bestPointIndex / comparison index / NaN rejected at encode time too.
+    // 4. Out-of-bounds bestPointIndex / comparison index / mode / dim / NaN rejected at encode time too.
     OnBoardStateCodec::PersistedState badState = src;
     badState.bestPointIndex = 99u;
     std::vector<std::uint8_t> tmp;
+    TEST_ASSERT_FALSE(OnBoardStateCodec::encode(badState, tmp));
+    badState = src;
+    badState.controlMode = 9u;
+    TEST_ASSERT_FALSE(OnBoardStateCodec::encode(badState, tmp));
+    badState = src;
+    badState.trustDim = 5u;
     TEST_ASSERT_FALSE(OnBoardStateCodec::encode(badState, tmp));
     badState = src;
     badState.bevToPumpRatio = std::numeric_limits<float>::quiet_NaN();
@@ -458,6 +481,267 @@ static void test_onboard_state_codec_roundtrip_and_zero_trust_corruption() {
     badState = src;
     badState.comparisons.push_back({0u, 0u, 0u}); // self-comparison invalid
     TEST_ASSERT_FALSE(OnBoardStateCodec::encode(badState, tmp));
+}
+
+// ---------------------------------------------------------------------------
+// Group E: 3-Mode On-Board Optimization (RecipeOnly, SplineOnly, Joint6D)
+// ---------------------------------------------------------------------------
+
+void test_onboard_optimization_modes_and_spline_6d_cpbo_end_to_end(void) {
+    // 1. Mode parsing & invalid-input rejection.
+    OnBoardOpt::ControlMode parsed = OnBoardOpt::ControlMode::Joint6D;
+    TEST_ASSERT_TRUE(OnBoardOpt::parseControlModeKey("recipe_only", parsed));
+    TEST_ASSERT_EQUAL_UINT8(0u, static_cast<uint8_t>(parsed));
+    TEST_ASSERT_TRUE(OnBoardOpt::parseControlModeKey("spline_only", parsed));
+    TEST_ASSERT_EQUAL_UINT8(1u, static_cast<uint8_t>(parsed));
+    TEST_ASSERT_TRUE(OnBoardOpt::parseControlModeKey("joint_6d", parsed));
+    TEST_ASSERT_EQUAL_UINT8(2u, static_cast<uint8_t>(parsed));
+    TEST_ASSERT_FALSE(OnBoardOpt::parseControlModeKey("unknown_mode", parsed));
+    TEST_ASSERT_FALSE(OnBoardOpt::parseControlModeKey("", parsed));
+
+    // 2. Spline quantization, bounds, and NaN safety.
+    TEST_ASSERT_TRUE(OnBoardOpt::isValidSplineDelta({-1.0f, 0.0f, 1.0f}));
+    TEST_ASSERT_FALSE(OnBoardOpt::isValidSplineDelta({-1.5f, 0.0f, 0.0f}));
+    TEST_ASSERT_FALSE(OnBoardOpt::isValidSplineDelta({std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, -0.15f, OnBoardOpt::quantizeSplineKnot(-0.14f));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, OnBoardOpt::quantizeSplineKnot(0.01f));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, 0.5, OnBoardOpt::splineKnotToNorm(0.0f));
+    TEST_ASSERT_FLOAT_WITHIN(1e-5f, 0.0f, OnBoardOpt::normToSplineKnot(0.5));
+
+    // 3. Spline shape invariants: lever decline (-0.2, 0.1, -0.6) -> negative slope, positive arch.
+    const auto inv = OnBoardOpt::computeSplineShapeFeatures({-0.2f, 0.1f, -0.6f});
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, -0.15, inv[0]); // mean = (-0.2 + 0.2 - 0.6)/4 = -0.15
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, -0.40, inv[1]); // slope = -0.6 - (-0.2) = -0.40
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, 0.50, inv[2]);  // arch = 0.1 - (-0.4) = +0.50
+
+    // 3b. End-to-end 3D RecipeOnly CPBO fit + MES (rawDim=3 [grind,dose,yield], physDim=9 phi0).
+    {
+        std::vector<double> phiGrid;
+        for (double f : {0.0, 0.5, 1.0}) {
+            for (double d : {0.0, 0.5, 1.0}) {
+                for (double o : {0.0, 0.5, 1.0}) {
+                    const auto p0 = EspressoRL::computePhi0(f, 16.0 + 4.0 * d, 30.0 + 20.0 * o);
+                    phiGrid.insert(phiGrid.end(), p0.begin(), p0.end());
+                }
+            }
+        }
+        EspressoRL::EmbeddedRobustScaler scaler;
+        TEST_ASSERT_TRUE(scaler.fit(phiGrid.data(), phiGrid.size() / EspressoRL::PHYSICS_PROXY_DIM,
+                                    EspressoRL::PHYSICS_PROXY_DIM));
+
+        const std::array<std::array<double, 3>, 4> pts = {{
+            {0.50, 0.50, 0.50},
+            {0.58, 0.50, 0.52},
+            {0.40, 0.45, 0.60},
+            {0.62, 0.52, 0.48},
+        }};
+        constexpr std::size_t stride = 3 + EspressoRL::PHYSICS_PROXY_DIM;
+        std::vector<double> trainX(4 * stride, 0.0);
+        for (std::size_t i = 0; i < 4; ++i) {
+            double *row = trainX.data() + i * stride;
+            row[0] = pts[i][0];
+            row[1] = pts[i][1];
+            row[2] = pts[i][2];
+            const auto p0 = EspressoRL::computePhi0(pts[i][0], 16.0 + 4.0 * pts[i][1], 30.0 + 20.0 * pts[i][2]);
+            scaler.transformRow(p0.data(), row + 3);
+        }
+        const std::array<EspressoRL::ComparisonPair, 3> comps = {{
+            {1u, 0u, EspressoRL::PreferenceLabel::NEW_BETTER},
+            {2u, 1u, EspressoRL::PreferenceLabel::ANCHOR_BETTER},
+            {3u, 1u, EspressoRL::PreferenceLabel::NEW_BETTER},
+        }};
+        EspressoRL::PreferenceGPConfig gpCfg;
+        gpCfg.maxOuterIters = 25;
+        EspressoRL::EmbeddedPreferenceGPModel model;
+        TEST_ASSERT_TRUE(EspressoRL::fitEmbeddedPreferenceGP(trainX.data(), 4, 3, EspressoRL::PHYSICS_PROXY_DIM, 0,
+                                                             comps.data(), comps.size(), gpCfg, model));
+        TEST_ASSERT_TRUE(model.valid && std::isfinite(model.elbo));
+
+        std::vector<double> anc(pts[3].begin(), pts[3].end());
+        std::vector<double> lo(3, 0.15), hi(3, 0.85);
+        std::vector<std::array<double, 6>> cands;
+        TEST_ASSERT_TRUE(OnBoardOpt::generateTrustRegionCandidates(OnBoardOpt::ControlMode::RecipeOnly, anc, lo, hi,
+                                                                   cands));
+        TEST_ASSERT_EQUAL_UINT32(65u, static_cast<uint32_t>(cands.size()));
+        std::vector<double> qIn(cands.size() * stride, 0.0);
+        for (std::size_t i = 0; i < cands.size(); ++i) {
+            double *row = qIn.data() + i * stride;
+            row[0] = cands[i][0];
+            row[1] = cands[i][1];
+            row[2] = cands[i][2];
+            const auto p0 = EspressoRL::computePhi0(cands[i][0], 16.0 + 4.0 * cands[i][1], 30.0 + 20.0 * cands[i][2]);
+            scaler.transformRow(p0.data(), row + 3);
+        }
+        std::vector<double> pm, pc;
+        TEST_ASSERT_TRUE(model.predict(qIn.data(), cands.size(), pm, pc));
+        std::vector<std::size_t> candIdx(cands.size() - 1);
+        for (std::size_t i = 1; i < cands.size(); ++i) candIdx[i - 1] = i;
+        EspressoRL::MESConfig mesCfg;
+        mesCfg.posteriorMaxFunctionSamples = 128;
+        mesCfg.gumbelMaximumSamples = 500;
+        EspressoRL::EmbeddedMESResult mes;
+        TEST_ASSERT_TRUE(EspressoRL::evaluateEmbeddedCpboMes(pm.data(), pc.data(), cands.size(), candIdx.data(),
+                                                             candIdx.size(), nullptr, 0, 0, model.gamma,
+                                                             model.sigmaPref, mesCfg, 17u, mes));
+        TEST_ASSERT_TRUE(mes.candidateIndex >= 1u && mes.candidateIndex < cands.size());
+    }
+
+    // 4. End-to-end 3D SplineOnly CPBO fit + MES (rawDim=3, physDim=3).
+    {
+        const std::array<std::array<float, 3>, 4> knots = {{
+            {0.0f, 0.0f, 0.0f},
+            {-0.15f, 0.15f, -0.25f},
+            {0.25f, 0.20f, 0.10f},
+            {-0.25f, 0.10f, -0.45f},
+        }};
+        std::vector<double> physGrid;
+        for (float d0 : {-1.0f, 0.0f, 1.0f}) {
+            for (float d1 : {-1.0f, 0.0f, 1.0f}) {
+                for (float d2 : {-1.0f, 0.0f, 1.0f}) {
+                    const auto sf = OnBoardOpt::computeSplineShapeFeatures({d0, d1, d2});
+                    physGrid.insert(physGrid.end(), sf.begin(), sf.end());
+                }
+            }
+        }
+        EspressoRL::EmbeddedRobustScaler scaler;
+        TEST_ASSERT_TRUE(scaler.fit(physGrid.data(), physGrid.size() / 3u, 3u));
+
+        std::vector<double> trainX(4 * 6, 0.0);
+        for (std::size_t i = 0; i < 4; ++i) {
+            double *row = trainX.data() + i * 6;
+            row[0] = OnBoardOpt::splineKnotToNorm(knots[i][0]);
+            row[1] = OnBoardOpt::splineKnotToNorm(knots[i][1]);
+            row[2] = OnBoardOpt::splineKnotToNorm(knots[i][2]);
+            const auto sf = OnBoardOpt::computeSplineShapeFeatures(knots[i]);
+            scaler.transformRow(sf.data(), row + 3);
+        }
+        const std::array<EspressoRL::ComparisonPair, 3> comps = {{
+            {1u, 0u, EspressoRL::PreferenceLabel::NEW_BETTER},
+            {2u, 1u, EspressoRL::PreferenceLabel::ANCHOR_BETTER},
+            {3u, 1u, EspressoRL::PreferenceLabel::NEW_BETTER},
+        }};
+        EspressoRL::PreferenceGPConfig gpCfg;
+        gpCfg.maxOuterIters = 25;
+        gpCfg.initialRawKernelWeight = 0.75;
+        gpCfg.initialPhysicsKernelWeight = 0.25;
+        EspressoRL::EmbeddedPreferenceGPModel model;
+        TEST_ASSERT_TRUE(EspressoRL::fitEmbeddedPreferenceGP(trainX.data(), 4, 3, 3, 0, comps.data(), comps.size(),
+                                                             gpCfg, model));
+        TEST_ASSERT_TRUE(model.valid && std::isfinite(model.elbo));
+
+        std::vector<double> anchorNorm = {OnBoardOpt::splineKnotToNorm(knots[3][0]),
+                                          OnBoardOpt::splineKnotToNorm(knots[3][1]),
+                                          OnBoardOpt::splineKnotToNorm(knots[3][2])};
+        std::vector<double> lo = {0.1, 0.1, 0.1};
+        std::vector<double> hi = {0.9, 0.9, 0.9};
+        std::vector<std::array<double, 6>> cands;
+        TEST_ASSERT_TRUE(OnBoardOpt::generateTrustRegionCandidates(OnBoardOpt::ControlMode::SplineOnly, anchorNorm, lo,
+                                                                   hi, cands));
+        TEST_ASSERT_EQUAL_UINT32(65u, static_cast<uint32_t>(cands.size()));
+
+        std::vector<double> qIn(cands.size() * 6, 0.0);
+        for (std::size_t i = 0; i < cands.size(); ++i) {
+            double *row = qIn.data() + i * 6;
+            row[0] = cands[i][0];
+            row[1] = cands[i][1];
+            row[2] = cands[i][2];
+            const std::array<float, 3> sp = {OnBoardOpt::normToSplineKnot(cands[i][0]),
+                                             OnBoardOpt::normToSplineKnot(cands[i][1]),
+                                             OnBoardOpt::normToSplineKnot(cands[i][2])};
+            const auto sf = OnBoardOpt::computeSplineShapeFeatures(sp);
+            scaler.transformRow(sf.data(), row + 3);
+        }
+        std::vector<double> pm, pc;
+        TEST_ASSERT_TRUE(model.predict(qIn.data(), cands.size(), pm, pc));
+        std::vector<std::size_t> candIdx(cands.size() - 1);
+        for (std::size_t i = 1; i < cands.size(); ++i) candIdx[i - 1] = i;
+        EspressoRL::MESConfig mesCfg;
+        mesCfg.posteriorMaxFunctionSamples = 128;
+        mesCfg.gumbelMaximumSamples = 500;
+        EspressoRL::EmbeddedMESResult mes;
+        TEST_ASSERT_TRUE(EspressoRL::evaluateEmbeddedCpboMes(pm.data(), pc.data(), cands.size(), candIdx.data(),
+                                                             candIdx.size(), nullptr, 0, 0, model.gamma,
+                                                             model.sigmaPref, mesCfg, 42u, mes));
+        TEST_ASSERT_TRUE(mes.candidateIndex >= 1u && mes.candidateIndex < cands.size());
+        const auto &win = cands[mes.candidateIndex];
+        const std::array<float, 3> winSpline = {OnBoardOpt::normToSplineKnot(win[0]),
+                                                OnBoardOpt::normToSplineKnot(win[1]),
+                                                OnBoardOpt::normToSplineKnot(win[2])};
+        TEST_ASSERT_TRUE(OnBoardOpt::isValidSplineDelta(winSpline));
+    }
+
+    // 5. End-to-end 6D Joint6D CPBO fit + MES (rawDim=6, physDim=9, 64 R6+axis candidates).
+    {
+        std::vector<double> phiGrid;
+        for (double f : {0.0, 0.5, 1.0}) {
+            for (double d : {0.0, 0.5, 1.0}) {
+                for (double o : {0.0, 0.5, 1.0}) {
+                    const auto p0 = EspressoRL::computePhi0(f, 16.0 + 4.0 * d, 30.0 + 20.0 * o);
+                    phiGrid.insert(phiGrid.end(), p0.begin(), p0.end());
+                }
+            }
+        }
+        EspressoRL::EmbeddedRobustScaler scaler;
+        TEST_ASSERT_TRUE(scaler.fit(phiGrid.data(), phiGrid.size() / EspressoRL::PHYSICS_PROXY_DIM,
+                                    EspressoRL::PHYSICS_PROXY_DIM));
+
+        const std::array<std::array<double, 6>, 4> pts = {{
+            {0.50, 0.50, 0.50, 0.50, 0.50, 0.50},
+            {0.55, 0.50, 0.50, 0.42, 0.57, 0.37},
+            {0.40, 0.45, 0.60, 0.65, 0.55, 0.60},
+            {0.58, 0.52, 0.48, 0.38, 0.55, 0.30},
+        }};
+        constexpr std::size_t stride = 6 + EspressoRL::PHYSICS_PROXY_DIM;
+        std::vector<double> trainX(4 * stride, 0.0);
+        for (std::size_t i = 0; i < 4; ++i) {
+            double *row = trainX.data() + i * stride;
+            for (std::size_t d = 0; d < 6; ++d) row[d] = pts[i][d];
+            const auto p0 = EspressoRL::computePhi0(pts[i][0], 16.0 + 4.0 * pts[i][1], 30.0 + 20.0 * pts[i][2]);
+            scaler.transformRow(p0.data(), row + 6);
+        }
+        const std::array<EspressoRL::ComparisonPair, 3> comps = {{
+            {1u, 0u, EspressoRL::PreferenceLabel::NEW_BETTER},
+            {2u, 1u, EspressoRL::PreferenceLabel::ANCHOR_BETTER},
+            {3u, 1u, EspressoRL::PreferenceLabel::NEW_BETTER},
+        }};
+        EspressoRL::PreferenceGPConfig gpCfg;
+        gpCfg.maxOuterIters = 25;
+        EspressoRL::EmbeddedPreferenceGPModel model;
+        TEST_ASSERT_TRUE(EspressoRL::fitEmbeddedPreferenceGP(trainX.data(), 4, 6, EspressoRL::PHYSICS_PROXY_DIM, 0,
+                                                             comps.data(), comps.size(), gpCfg, model));
+        TEST_ASSERT_TRUE(model.valid && std::isfinite(model.elbo));
+
+        std::vector<double> anc(pts[3].begin(), pts[3].end());
+        std::vector<double> lo(6, 0.15), hi(6, 0.85);
+        std::vector<std::array<double, 6>> cands;
+        TEST_ASSERT_TRUE(OnBoardOpt::generateTrustRegionCandidates(OnBoardOpt::ControlMode::Joint6D, anc, lo, hi,
+                                                                   cands));
+        TEST_ASSERT_EQUAL_UINT32(65u, static_cast<uint32_t>(cands.size()));
+        for (std::size_t i = 1; i < cands.size(); ++i) {
+            for (std::size_t d = 0; d < 6; ++d) {
+                TEST_ASSERT_TRUE(cands[i][d] >= lo[d] - 1e-9 && cands[i][d] <= hi[d] + 1e-9);
+            }
+        }
+        std::vector<double> qIn(cands.size() * stride, 0.0);
+        for (std::size_t i = 0; i < cands.size(); ++i) {
+            double *row = qIn.data() + i * stride;
+            for (std::size_t d = 0; d < 6; ++d) row[d] = cands[i][d];
+            const auto p0 = EspressoRL::computePhi0(cands[i][0], 16.0 + 4.0 * cands[i][1], 30.0 + 20.0 * cands[i][2]);
+            scaler.transformRow(p0.data(), row + 6);
+        }
+        std::vector<double> pm, pc;
+        TEST_ASSERT_TRUE(model.predict(qIn.data(), cands.size(), pm, pc));
+        std::vector<std::size_t> candIdx(cands.size() - 1);
+        for (std::size_t i = 1; i < cands.size(); ++i) candIdx[i - 1] = i;
+        EspressoRL::MESConfig mesCfg;
+        mesCfg.posteriorMaxFunctionSamples = 128;
+        mesCfg.gumbelMaximumSamples = 500;
+        EspressoRL::EmbeddedMESResult mes;
+        TEST_ASSERT_TRUE(EspressoRL::evaluateEmbeddedCpboMes(pm.data(), pc.data(), cands.size(), candIdx.data(),
+                                                             candIdx.size(), nullptr, 0, 0, model.gamma,
+                                                             model.sigmaPref, mesCfg, 99u, mes));
+        TEST_ASSERT_TRUE(mes.candidateIndex >= 1u && mes.candidateIndex < cands.size());
+    }
 }
 
 void setUp(void) {}
@@ -474,5 +758,6 @@ int main(int argc, char **argv) {
     RUN_TEST(test_universal_schema_matrix_cremina_direct_lever_lh_and_standard);
     RUN_TEST(test_router_onboard_and_offboard_isolation);
     RUN_TEST(test_onboard_state_codec_roundtrip_and_zero_trust_corruption);
+    RUN_TEST(test_onboard_optimization_modes_and_spline_6d_cpbo_end_to_end);
     return UNITY_END();
 }

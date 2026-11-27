@@ -10,6 +10,9 @@
 #include <cmath>
 #include <cstdint>
 #include <display/core/AutoTuning.h>
+#if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
+#include <display/core/OnBoardOptimizationMode.h>
+#endif
 #include <display/core/Controller.h>
 #include <display/core/MachineProfileStore.h>
 #include <display/core/MachineProfiles.h>
@@ -997,6 +1000,17 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
         if (event.getInt("onboard_present") > 0) {
             rlOnBoardShadowOnly = event.getInt("onboard_shadow_only") > 0;
+            const String obMode = event.getString("onboard_control_mode");
+            if (!obMode.isEmpty()) {
+                rlOnBoardControlMode = obMode;
+            }
+            rlOnBoardSplineEarly = event.getFloat("onboard_spline_early");
+            rlOnBoardSplineMid = event.getFloat("onboard_spline_mid");
+            rlOnBoardSplineLate = event.getFloat("onboard_spline_late");
+            rlOnBoardHasPendingSpline = event.getInt("onboard_has_pending_spline") > 0;
+            rlOnBoardPendingSplineEarly = event.getFloat("onboard_pending_spline_early");
+            rlOnBoardPendingSplineMid = event.getFloat("onboard_pending_spline_mid");
+            rlOnBoardPendingSplineLate = event.getFloat("onboard_pending_spline_late");
             rlOnBoardVfeSamples = event.getInt("onboard_vfe_samples");
             rlOnBoardCpboPoints = event.getInt("onboard_cpbo_points");
             rlOnBoardCpboComparisons = event.getInt("onboard_cpbo_comparisons");
@@ -1100,6 +1114,16 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlLocalShotCount"] = rlLocalShotCount;
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
         doc["rlOnBoardShadowOnly"] = settings.isRLOnBoardShadowOnly();
+        doc["rlOnBoardControlMode"] = settings.getRLOnBoardControlMode();
+        JsonArray activeSpl = doc["rlOnBoardActiveSpline"].to<JsonArray>();
+        activeSpl.add(rlOnBoardSplineEarly);
+        activeSpl.add(rlOnBoardSplineMid);
+        activeSpl.add(rlOnBoardSplineLate);
+        doc["rlOnBoardHasPendingSpline"] = rlOnBoardHasPendingSpline;
+        JsonArray pendSpl = doc["rlOnBoardPendingSpline"].to<JsonArray>();
+        pendSpl.add(rlOnBoardPendingSplineEarly);
+        pendSpl.add(rlOnBoardPendingSplineMid);
+        pendSpl.add(rlOnBoardPendingSplineLate);
         doc["rlOnBoardVfeSamples"] = rlOnBoardVfeSamples;
         doc["rlOnBoardCpboPoints"] = rlOnBoardCpboPoints;
         doc["rlOnBoardCpboComparisons"] = rlOnBoardCpboComparisons;
@@ -2956,21 +2980,66 @@ void WebUIPlugin::handleRLRequest(uint32_t clientId, JsonDocument &request) {
             else changed = true;
 #if defined(GAGGIMATE_ENABLE_ONBOARD_ESPRESSORL)
         } else if (type == "req:rl:onboard:mode") {
-            if (!request["shadow_only"].is<bool>()) {
-                response["error"] = F("shadow_only boolean is required");
+            const bool hasShadow = request["shadow_only"].is<bool>();
+            const bool hasControlMode = request["control_mode"].is<const char *>();
+            const bool hasResetSpline = request["reset_spline"].is<bool>() && request["reset_spline"].as<bool>();
+            AutoTuning::OnBoardOptimizerPort *onBoard = controller->getOnBoardOptimizer();
+            if (!hasShadow && !hasControlMode && !hasResetSpline) {
+                response["error"] = F("shadow_only, control_mode, or reset_spline is required");
+            } else if (onBoard == nullptr || !onBoard->ready()) {
+                response["error"] = F("On-board EspressoRL optimizer is not available in this build");
             } else {
-                const bool shadowOnly = request["shadow_only"].as<bool>();
-                AutoTuning::OnBoardOptimizerPort *onBoard = controller->getOnBoardOptimizer();
-                if (onBoard == nullptr || !onBoard->ready()) {
-                    response["error"] = F("On-board EspressoRL optimizer is not available in this build");
-                } else if (!shadowOnly && controller->isActive()) {
-                    response["error"] = F("Stop brewing before arming live on-board actuation");
-                } else {
-                    settings.setRLOnBoardShadowOnly(shadowOnly);
+                bool ok = true;
+                if (hasShadow) {
+                    const bool shadowOnly = request["shadow_only"].as<bool>();
+                    if (!shadowOnly && controller->isActive()) {
+                        response["error"] = F("Stop brewing before arming live on-board actuation");
+                        ok = false;
+                    } else {
+                        settings.setRLOnBoardShadowOnly(shadowOnly);
+                        onBoard->setShadowModeOnly(shadowOnly);
+                        rlOnBoardShadowOnly = shadowOnly;
+                        response["onboard_shadow_only"] = shadowOnly;
+                    }
+                }
+                if (ok && hasControlMode) {
+                    const String modeStr = request["control_mode"].as<String>();
+                    OnBoardOpt::ControlMode parsedMode = OnBoardOpt::ControlMode::RecipeOnly;
+                    if (!OnBoardOpt::parseControlModeKey(modeStr.c_str(), parsedMode)) {
+                        response["error"] = F("control_mode must be recipe_only, spline_only, or joint_6d");
+                        ok = false;
+                    } else if (controller->isActive()) {
+                        response["error"] = F("Stop brewing before changing on-board optimization mode");
+                        ok = false;
+                    } else if (!onBoard->setControlMode(static_cast<std::uint8_t>(parsedMode))) {
+                        response["error"] = F("Could not switch on-board optimization mode");
+                        ok = false;
+                    } else {
+                        settings.setRLOnBoardControlMode(OnBoardOpt::controlModeKey(parsedMode));
+                        rlOnBoardControlMode = OnBoardOpt::controlModeKey(parsedMode);
+                        rlOnBoardSplineEarly = 0.0f;
+                        rlOnBoardSplineMid = 0.0f;
+                        rlOnBoardSplineLate = 0.0f;
+                        rlOnBoardHasPendingSpline = false;
+                        response["onboard_control_mode"] = rlOnBoardControlMode;
+                    }
+                }
+                if (ok && hasResetSpline) {
+                    if (controller->isActive()) {
+                        response["error"] = F("Stop brewing before resetting active profile warp");
+                        ok = false;
+                    } else if (!onBoard->resetActiveSplineDelta()) {
+                        response["error"] = F("Could not reset active profile warp");
+                        ok = false;
+                    } else {
+                        rlOnBoardSplineEarly = 0.0f;
+                        rlOnBoardSplineMid = 0.0f;
+                        rlOnBoardSplineLate = 0.0f;
+                        response["onboard_spline_reset"] = true;
+                    }
+                }
+                if (ok) {
                     settings.save(true);
-                    onBoard->setShadowModeOnly(shadowOnly);
-                    rlOnBoardShadowOnly = shadowOnly;
-                    response["onboard_shadow_only"] = shadowOnly;
                     changed = true;
                 }
             }
@@ -3672,6 +3741,13 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             obTele = onBoard->runtimeTelemetry();
         } else {
             obTele.shadowModeOnly = settings.isRLOnBoardShadowOnly();
+            OnBoardOpt::ControlMode parsedMode = OnBoardOpt::ControlMode::RecipeOnly;
+            OnBoardOpt::parseControlModeKey(settings.getRLOnBoardControlMode().c_str(), parsedMode);
+            obTele.controlMode = static_cast<std::uint8_t>(parsedMode);
+            obTele.activeSplineDelta = {rlOnBoardSplineEarly, rlOnBoardSplineMid, rlOnBoardSplineLate};
+            obTele.hasPendingSplineDelta = rlOnBoardHasPendingSpline;
+            obTele.pendingSplineDelta = {rlOnBoardPendingSplineEarly, rlOnBoardPendingSplineMid,
+                                         rlOnBoardPendingSplineLate};
             obTele.vfeSampleCount = static_cast<std::size_t>(std::max(rlOnBoardVfeSamples, 0));
             obTele.cpboPointCount = static_cast<std::size_t>(std::max(rlOnBoardCpboPoints, 0));
             obTele.cpboComparisonCount = static_cast<std::size_t>(std::max(rlOnBoardCpboComparisons, 0));
@@ -3680,6 +3756,16 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             obTele.persistedStateLoaded = rlOnBoardPersisted;
         }
         doc["rlOnBoardShadowOnly"] = obTele.shadowModeOnly;
+        doc["rlOnBoardControlMode"] = OnBoardOpt::controlModeKey(OnBoardOpt::controlModeFromByte(obTele.controlMode));
+        JsonArray activeSpl = doc["rlOnBoardActiveSpline"].to<JsonArray>();
+        activeSpl.add(obTele.activeSplineDelta[0]);
+        activeSpl.add(obTele.activeSplineDelta[1]);
+        activeSpl.add(obTele.activeSplineDelta[2]);
+        doc["rlOnBoardHasPendingSpline"] = obTele.hasPendingSplineDelta;
+        JsonArray pendSpl = doc["rlOnBoardPendingSpline"].to<JsonArray>();
+        pendSpl.add(obTele.pendingSplineDelta[0]);
+        pendSpl.add(obTele.pendingSplineDelta[1]);
+        pendSpl.add(obTele.pendingSplineDelta[2]);
         doc["rlOnBoardVfeSamples"] = static_cast<int>(obTele.vfeSampleCount);
         doc["rlOnBoardCpboPoints"] = static_cast<int>(obTele.cpboPointCount);
         doc["rlOnBoardCpboComparisons"] = static_cast<int>(obTele.cpboComparisonCount);

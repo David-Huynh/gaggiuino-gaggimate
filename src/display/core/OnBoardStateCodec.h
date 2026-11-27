@@ -13,7 +13,8 @@
 namespace OnBoardStateCodec {
 
 constexpr std::uint32_t MAGIC = 0x314C5245u; // "ERL1"
-constexpr std::uint16_t FORMAT_VERSION = 1u;
+constexpr std::uint16_t FORMAT_VERSION_V1 = 1u;
+constexpr std::uint16_t FORMAT_VERSION = 2u;
 constexpr std::size_t HEADER_SIZE = 16;
 constexpr std::size_t MAX_ENCODED_BYTES = 64u * 1024u;
 constexpr std::size_t MAX_HISTORY = 480;
@@ -22,6 +23,7 @@ constexpr std::size_t MAX_COMPARISONS = 48;
 constexpr std::size_t MAX_STRING_LEN = 256;
 constexpr std::size_t TASTE_TARGET_COUNT = 14;
 constexpr std::size_t PHI0_DIM = 9;
+constexpr std::size_t MAX_RAW_DIM = 6;
 
 struct PersistedPoint {
     std::string shotId;
@@ -29,7 +31,9 @@ struct PersistedPoint {
     double doseG = 18.0;
     double targetYieldG = 36.0;
     double beverageOutG = 0.0;
-    std::array<double, 3> normX{0.5, 0.5, 0.5};
+    std::array<float, 3> splineDelta{0.0f, 0.0f, 0.0f};
+    std::uint8_t normDim = 3;
+    std::array<double, MAX_RAW_DIM> normX{0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
     std::array<double, PHI0_DIM> phi0{};
 };
 
@@ -48,6 +52,7 @@ struct PersistedState {
     std::string activeProfileLabel;
     std::string activeRawProfileHash;
 
+    std::uint8_t controlMode = 0; // 0=recipe_only, 1=spline_only, 2=joint_6d
     std::uint8_t tasteGoalMode = 0; // 0=Balanced, 1=Custom
     std::array<std::uint8_t, TASTE_TARGET_COUNT> tasteGoalTargets{};
 
@@ -56,8 +61,12 @@ struct PersistedState {
     float lastShotHydraulicGrindSteps = 0.0f;
     float lastShotDoseG = 18.0f;
     std::array<float, 3> activeSplineDelta{0.0f, 0.0f, 0.0f};
+    bool hasPendingSplineDelta = false;
+    std::array<float, 3> pendingSplineDelta{0.0f, 0.0f, 0.0f};
+    std::string pendingSplineRecId;
 
-    std::array<double, 3> trustCenter{0.5, 0.5, 0.5};
+    std::uint8_t trustDim = 3;
+    std::array<double, MAX_RAW_DIM> trustCenter{0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
     double trustLength = 0.20;
     std::int32_t trustSuccesses = 0;
     std::int32_t trustFailures = 0;
@@ -145,7 +154,10 @@ inline bool validateState(const PersistedState &st) {
         st.comparisons.size() > MAX_COMPARISONS) {
         return false;
     }
-    if (st.tasteGoalMode > 1u) {
+    if (st.controlMode > 2u || st.tasteGoalMode > 1u) {
+        return false;
+    }
+    if (st.trustDim != 3u && st.trustDim != 6u) {
         return false;
     }
     for (std::uint8_t t : st.tasteGoalTargets) {
@@ -165,7 +177,16 @@ inline bool validateState(const PersistedState &st) {
             return false;
         }
     }
-    for (double c : st.trustCenter) {
+    for (float d : st.pendingSplineDelta) {
+        if (!std::isfinite(d) || d < -1.5f || d > 1.5f) {
+            return false;
+        }
+    }
+    if (st.pendingSplineRecId.size() > MAX_STRING_LEN) {
+        return false;
+    }
+    for (std::size_t i = 0; i < st.trustDim; ++i) {
+        const double c = st.trustCenter[i];
         if (!std::isfinite(c) || c < 0.0 || c > 1.0) {
             return false;
         }
@@ -195,10 +216,16 @@ inline bool validateState(const PersistedState &st) {
     for (const auto &pt : st.points) {
         if (pt.shotId.empty() || pt.shotId.size() > MAX_STRING_LEN || !std::isfinite(pt.grindSteps) ||
             !std::isfinite(pt.doseG) || pt.doseG <= 0.0 || !std::isfinite(pt.targetYieldG) || pt.targetYieldG <= 0.0 ||
-            !std::isfinite(pt.beverageOutG) || pt.beverageOutG < 0.0) {
+            !std::isfinite(pt.beverageOutG) || pt.beverageOutG < 0.0 || (pt.normDim != 3u && pt.normDim != 6u)) {
             return false;
         }
-        for (double x : pt.normX) {
+        for (float d : pt.splineDelta) {
+            if (!std::isfinite(d) || d < -1.5f || d > 1.5f) {
+                return false;
+            }
+        }
+        for (std::size_t k = 0; k < pt.normDim; ++k) {
+            const double x = pt.normX[k];
             if (!std::isfinite(x) || x < 0.0 || x > 1.0) {
                 return false;
             }
@@ -238,6 +265,7 @@ inline bool encode(const PersistedState &st, std::vector<std::uint8_t> &outBytes
         return false;
     }
 
+    detail::appendPod<std::uint8_t>(outBytes, st.controlMode);
     detail::appendPod<std::uint8_t>(outBytes, st.tasteGoalMode);
     for (std::uint8_t t : st.tasteGoalTargets) {
         detail::appendPod<std::uint8_t>(outBytes, t);
@@ -250,9 +278,18 @@ inline bool encode(const PersistedState &st, std::vector<std::uint8_t> &outBytes
     for (float d : st.activeSplineDelta) {
         detail::appendPod<float>(outBytes, d);
     }
+    detail::appendPod<std::uint8_t>(outBytes, st.hasPendingSplineDelta ? 1u : 0u);
+    for (float d : st.pendingSplineDelta) {
+        detail::appendPod<float>(outBytes, d);
+    }
+    if (!detail::appendString(outBytes, st.pendingSplineRecId)) {
+        outBytes.clear();
+        return false;
+    }
 
-    for (double c : st.trustCenter) {
-        detail::appendPod<double>(outBytes, c);
+    detail::appendPod<std::uint8_t>(outBytes, st.trustDim);
+    for (std::size_t i = 0; i < st.trustDim; ++i) {
+        detail::appendPod<double>(outBytes, st.trustCenter[i]);
     }
     detail::appendPod<double>(outBytes, st.trustLength);
     detail::appendPod<std::int32_t>(outBytes, st.trustSuccesses);
@@ -295,8 +332,12 @@ inline bool encode(const PersistedState &st, std::vector<std::uint8_t> &outBytes
         detail::appendPod<double>(outBytes, pt.doseG);
         detail::appendPod<double>(outBytes, pt.targetYieldG);
         detail::appendPod<double>(outBytes, pt.beverageOutG);
-        for (double x : pt.normX) {
-            detail::appendPod<double>(outBytes, x);
+        for (float d : pt.splineDelta) {
+            detail::appendPod<float>(outBytes, d);
+        }
+        detail::appendPod<std::uint8_t>(outBytes, pt.normDim);
+        for (std::size_t k = 0; k < pt.normDim; ++k) {
+            detail::appendPod<double>(outBytes, pt.normX[k]);
         }
         for (double p : pt.phi0) {
             detail::appendPod<double>(outBytes, p);
@@ -342,19 +383,28 @@ inline bool decode(const std::uint8_t *data, std::size_t size, PersistedState &o
         !r.readPod(expectedCrc)) {
         return false;
     }
-    if (magic != MAGIC || version != FORMAT_VERSION || payloadLen != (size - HEADER_SIZE)) {
+    if (magic != MAGIC || (version != FORMAT_VERSION_V1 && version != FORMAT_VERSION) ||
+        payloadLen != (size - HEADER_SIZE)) {
         return false;
     }
     if (crc32(data + HEADER_SIZE, payloadLen) != expectedCrc) {
         return false;
     }
 
+    const bool isV2 = (version == FORMAT_VERSION);
     PersistedState st;
     if (!r.readString(st.activeContextKey) || !r.readString(st.optimizationRunId) ||
         !r.readString(st.activeBeanContextId) || !r.readString(st.activeGrinderContextId) ||
         !r.readString(st.activeProfileId) || !r.readString(st.activeProfileLabel) ||
         !r.readString(st.activeRawProfileHash)) {
         return false;
+    }
+    if (isV2) {
+        if (!r.readPod(st.controlMode)) {
+            return false;
+        }
+    } else {
+        st.controlMode = 0u;
     }
     if (!r.readPod(st.tasteGoalMode)) {
         return false;
@@ -376,9 +426,31 @@ inline bool decode(const std::uint8_t *data, std::size_t size, PersistedState &o
             return false;
         }
     }
+    if (isV2) {
+        std::uint8_t hasPendingByte = 0;
+        if (!r.readPod(hasPendingByte)) {
+            return false;
+        }
+        st.hasPendingSplineDelta = (hasPendingByte != 0u);
+        for (float &d : st.pendingSplineDelta) {
+            if (!r.readPod(d)) {
+                return false;
+            }
+        }
+        if (!r.readString(st.pendingSplineRecId) || !r.readPod(st.trustDim) ||
+            (st.trustDim != 3u && st.trustDim != 6u)) {
+            return false;
+        }
+    } else {
+        st.hasPendingSplineDelta = false;
+        st.pendingSplineDelta = {0.0f, 0.0f, 0.0f};
+        st.pendingSplineRecId.clear();
+        st.trustDim = 3u;
+    }
 
-    for (double &c : st.trustCenter) {
-        if (!r.readPod(c)) {
+    st.trustCenter.fill(0.5);
+    for (std::size_t i = 0; i < st.trustDim; ++i) {
+        if (!r.readPod(st.trustCenter[i])) {
             return false;
         }
     }
@@ -426,8 +498,22 @@ inline bool decode(const std::uint8_t *data, std::size_t size, PersistedState &o
             !r.readPod(pt.targetYieldG) || !r.readPod(pt.beverageOutG)) {
             return false;
         }
-        for (double &x : pt.normX) {
-            if (!r.readPod(x)) {
+        if (isV2) {
+            for (float &d : pt.splineDelta) {
+                if (!r.readPod(d)) {
+                    return false;
+                }
+            }
+            if (!r.readPod(pt.normDim) || (pt.normDim != 3u && pt.normDim != 6u)) {
+                return false;
+            }
+        } else {
+            pt.splineDelta = {0.0f, 0.0f, 0.0f};
+            pt.normDim = 3u;
+        }
+        pt.normX.fill(0.5);
+        for (std::size_t k = 0; k < pt.normDim; ++k) {
+            if (!r.readPod(pt.normX[k])) {
                 return false;
             }
         }
