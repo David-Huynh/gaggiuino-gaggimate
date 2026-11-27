@@ -67,6 +67,8 @@ struct OnBoardRuntimeTelemetry {
     std::uint8_t controlMode = 0; // 0=recipe_only, 1=spline_only, 2=joint_6d
     bool persistedStateLoaded = false;
     bool persistenceAvailable = false;
+    bool priorLoaded = false;
+    float priorConfidence = 0.0f;
     std::array<float, 3> activeSplineDelta{0.0f, 0.0f, 0.0f};
     bool hasPendingSplineDelta = false;
     std::array<float, 3> pendingSplineDelta{0.0f, 0.0f, 0.0f};

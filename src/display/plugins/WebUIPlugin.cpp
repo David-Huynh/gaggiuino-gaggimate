@@ -1017,6 +1017,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
             rlOnBoardLastMpcUs = event.getInt("onboard_last_mpc_us");
             rlOnBoardLastCpboMs = event.getInt("onboard_last_cpbo_ms");
             rlOnBoardPersisted = event.getInt("onboard_persisted") > 0;
+            rlOnBoardPriorLoaded = event.getInt("onboard_prior_loaded") > 0;
         }
 #endif
         rlRuntimeHealthStatus = event.getString("runtime_health_status");
@@ -1130,6 +1131,7 @@ void WebUIPlugin::setup(Controller *_controller, PluginManager *_pluginManager) 
         doc["rlOnBoardLastMpcUs"] = rlOnBoardLastMpcUs;
         doc["rlOnBoardLastCpboMs"] = rlOnBoardLastCpboMs;
         doc["rlOnBoardPersisted"] = rlOnBoardPersisted;
+        doc["rlOnBoardPriorLoaded"] = rlOnBoardPriorLoaded;
 #endif
         doc["rlRuntimeHealthStatus"] = rlRuntimeHealthStatus;
         doc["rlRuntimeHealthSummary"] = rlRuntimeHealthSummary;
@@ -3754,6 +3756,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
             obTele.lastMpcFitUs = static_cast<std::uint32_t>(std::max(rlOnBoardLastMpcUs, 0));
             obTele.lastCpboFitMs = static_cast<std::uint32_t>(std::max(rlOnBoardLastCpboMs, 0));
             obTele.persistedStateLoaded = rlOnBoardPersisted;
+            obTele.priorLoaded = rlOnBoardPriorLoaded;
         }
         doc["rlOnBoardShadowOnly"] = obTele.shadowModeOnly;
         doc["rlOnBoardControlMode"] = OnBoardOpt::controlModeKey(OnBoardOpt::controlModeFromByte(obTele.controlMode));
@@ -3772,6 +3775,7 @@ void WebUIPlugin::handleSettings(AsyncWebServerRequest *request) const {
         doc["rlOnBoardLastMpcUs"] = static_cast<int>(obTele.lastMpcFitUs);
         doc["rlOnBoardLastCpboMs"] = static_cast<int>(obTele.lastCpboFitMs);
         doc["rlOnBoardPersisted"] = obTele.persistedStateLoaded;
+        doc["rlOnBoardPriorLoaded"] = obTele.priorLoaded;
     }
 #endif
     doc["rlCommunityUploadEnabled"] = settings.isRLCommunityUploadEnabled();

@@ -26,12 +26,14 @@
 #include <display/util/LittleFSUtil.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <mbedtls/sha256.h>
 
 namespace {
 
 constexpr const char *LOG_TAG = "OnBoardEspressoRL";
 constexpr const char *PERSIST_DIR = "/rll";
 constexpr const char *PERSIST_STATE_PATH = "/rll/ob_state.bin";
+constexpr const char *PRIOR_ARTIFACT_PATH = "/rll/prior.bin";
 constexpr std::size_t MAX_HYDRAULIC_HISTORY = 480; // ~6-8 shots at 4 Hz in PSRAM
 constexpr std::size_t MAX_CPBO_POINTS = 40;
 constexpr std::size_t MAX_CPBO_COMPARISONS = 48;
@@ -212,6 +214,55 @@ double quantizeStep(double val, double minVal, double maxVal, double resolution)
     return std::clamp(minVal + steps * resolution, minVal, maxVal);
 }
 
+std::uint64_t computeTasteGoalBucketHash(AutoTuning::TasteGoal const &goal) {
+    if (goal.mode == AutoTuning::TasteGoalMode::Balanced) {
+        return 0ULL;
+    }
+    // Canonical sorted JSON matching Python TasteGoal.fingerprint:
+    // {"mode":"custom","schema_version":1,"targets":{"<sorted_key>":"<level>",...}}
+    std::vector<std::pair<std::string, const char *>> entries;
+    for (std::size_t i = 0; i < AutoTuning::TASTE_GOAL_ATTRIBUTE_COUNT; ++i) {
+        const AutoTuning::TasteLevel lvl = goal.targets[i];
+        if (lvl == AutoTuning::TasteLevel::Unspecified) {
+            continue;
+        }
+        const char *key = AutoTuning::tasteGoalAttributeKey(i);
+        const char *val = (lvl == AutoTuning::TasteLevel::Low)
+                              ? "low"
+                              : (lvl == AutoTuning::TasteLevel::Medium ? "medium" : "high");
+        if (key != nullptr) {
+            entries.emplace_back(key, val);
+        }
+    }
+    if (entries.empty()) {
+        return 0ULL;
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::string canonical = "{\"mode\":\"custom\",\"schema_version\":1,\"targets\":{";
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (i > 0) {
+            canonical.push_back(',');
+        }
+        canonical.push_back('"');
+        canonical += entries[i].first;
+        canonical += "\":\"";
+        canonical += entries[i].second;
+        canonical.push_back('"');
+    }
+    canonical += "}}";
+
+    std::uint8_t digest[32]{};
+    mbedtls_sha256(reinterpret_cast<const unsigned char *>(canonical.data()), canonical.size(), digest, 0);
+    static constexpr char kHex[] = "0123456789abcdef";
+    char hexFp[64];
+    for (std::size_t i = 0; i < 32; ++i) {
+        hexFp[2 * i] = kHex[(digest[i] >> 4) & 0x0Fu];
+        hexFp[2 * i + 1] = kHex[digest[i] & 0x0Fu];
+    }
+    return EspressoRL::hashTasteGoalFingerprint(hexFp, sizeof(hexFp), false);
+}
+
 } // namespace
 
 struct OnBoardEspressoRLPlugin::Workspace {
@@ -242,9 +293,12 @@ struct OnBoardEspressoRLPlugin::Workspace {
         std::uint8_t normDim = 3;
         std::array<double, 6> normX{0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
         std::array<double, EspressoRL::PHYSICS_PROXY_DIM> phi0{};
+        bool hasTrajectoryFeatures = false;
+        EspressoRL::TrajectoryFeatureVec trajFeatures{};
     };
 
     OnBoardOpt::ControlMode controlMode = OnBoardOpt::ControlMode::RecipeOnly;
+    EspressoRL::TrajectoryTastePrior communityPrior;
     std::vector<CpboPoint> points;
     std::vector<EspressoRL::ComparisonPair> comparisons;
     EspressoRL::Level1TrustRegionState trustRegion;
@@ -963,6 +1017,7 @@ void OnBoardEspressoRLPlugin::processWorkItem(WorkItem &item) {
     switch (item.kind) {
     case WorkKind::LoadPersistedState:
         loadPersistedState();
+        loadCommunityPrior();
         publishStatusEvent();
         break;
     case WorkKind::IngestShot:
@@ -1014,8 +1069,10 @@ AutoTuning::OnBoardRuntimeTelemetry OnBoardEspressoRLPlugin::runtimeTelemetry() 
     tele.controlMode = controlMode_.load(std::memory_order_acquire);
     tele.persistedStateLoaded = persistedStateLoaded_.load(std::memory_order_acquire);
     tele.persistenceAvailable = persistenceAvailable_.load(std::memory_order_acquire);
+    tele.priorLoaded = priorLoaded_.load(std::memory_order_acquire);
     std::unique_lock<std::mutex> wLock(workspaceMutex_, std::try_to_lock);
     if (wLock.owns_lock() && workspace_) {
+        tele.priorConfidence = workspace_->communityPrior.primaryConfidence();
         tele.activeSplineDelta = workspace_->activeSplineDelta;
         tele.hasPendingSplineDelta = workspace_->hasPendingSplineDelta;
         tele.pendingSplineDelta = workspace_->pendingSplineDelta;
@@ -1356,6 +1413,45 @@ void OnBoardEspressoRLPlugin::loadPersistedState() {
              static_cast<unsigned>(st.comparisons.size()));
 }
 
+void OnBoardEspressoRLPlugin::loadCommunityPrior() {
+    if (!workspace_) {
+        return;
+    }
+    std::vector<std::uint8_t> raw;
+    bool found = false;
+    {
+        auto flashLease = StorageCoordinator::instance().acquireFlash();
+        if (LittleFSUtil::existsQuietly(PRIOR_ARTIFACT_PATH)) {
+            File f = LittleFS.open(PRIOR_ARTIFACT_PATH, FILE_READ);
+            if (f) {
+                const size_t sz = f.size();
+                if (sz >= EspressoRL::ETP1_HEADER_SIZE && sz <= EspressoRL::ETP1_MAX_BYTES) {
+                    raw.resize(sz);
+                    found = (f.read(raw.data(), sz) == sz);
+                }
+                f.close();
+            }
+        }
+    }
+    if (!found || raw.empty()) {
+        priorLoaded_.store(false, std::memory_order_release);
+        return;
+    }
+    EspressoRL::TrajectoryTastePrior decoded;
+    if (!EspressoRL::decodeEtp1(raw.data(), raw.size(), decoded) || !decoded.approved) {
+        ESP_LOGW(LOG_TAG, "Ignoring /rll/prior.bin: failed ETP1 CRC/schema/approval gate");
+        priorLoaded_.store(false, std::memory_order_release);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        workspace_->communityPrior = decoded;
+    }
+    priorLoaded_.store(true, std::memory_order_release);
+    ESP_LOGI(LOG_TAG, "Loaded optional community J_taste prior (%u buckets, conf=%.2f)",
+             static_cast<unsigned>(decoded.bucketCount), decoded.primaryConfidence());
+}
+
 bool OnBoardEspressoRLPlugin::savePersistedState() {
     if (!workspace_ || brewActive_.load(std::memory_order_acquire) || otaActive_.load(std::memory_order_acquire)) {
         return false;
@@ -1613,6 +1709,22 @@ void OnBoardEspressoRLPlugin::handleIngestShot(PendingShotWork const &shot) {
                 pt.normX = {fineness, doseNorm, yieldNorm, 0.5, 0.5, 0.5};
             }
             pt.phi0 = EspressoRL::computePhi0(fineness, shot.doseG, shot.targetYieldG);
+            if (shot.samples.size() >= 2) {
+                std::vector<EspressoRL::TrajectorySamplePoint, PsramStlAllocator<EspressoRL::TrajectorySamplePoint>>
+                    tPts(shot.samples.size());
+                for (std::size_t i = 0; i < shot.samples.size(); ++i) {
+                    const auto &s = shot.samples[i];
+                    tPts[i].elapsedS = static_cast<float>(s.elapsedMs) / 1000.0f;
+                    tPts[i].pressureBar = s.pressure;
+                    tPts[i].beverageFlowGS = selectBeverageFlowGS(s);
+                    tPts[i].weightG = s.weight;
+                    tPts[i].temperatureC = s.temperature;
+                    tPts[i].valveOpen = s.valveOpen;
+                    tPts[i].systemInfo = static_cast<std::uint8_t>(s.systemInfo & 0xFFu);
+                }
+                pt.hasTrajectoryFeatures = EspressoRL::extractTrajectoryFeatures(
+                    tPts.data(), tPts.size(), shot.doseG, shot.beverageOutG, shot.shotTimeS, pt.trajFeatures);
+            }
 
             if (workspace_->points.size() >= MAX_CPBO_POINTS) {
                 workspace_->points.erase(workspace_->points.begin());
@@ -1751,6 +1863,29 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
     std::size_t anchorIdx = 0;
     std::string runId, beanId, grinderId, profileId, rawHash, sourceShotId;
     AutoTuning::TasteGoal goal;
+    EspressoRL::TrajectoryTastePrior priorCopy;
+    float basePeakP = 8.5f;
+    float baseTailP = 5.5f;
+    float baseTempC = 93.0f;
+    if (auto *pm = controller_->getProfileManager()) {
+        const Profile &sel = pm->getSelectedProfile();
+        if (std::isfinite(sel.temperature) && sel.temperature >= 60.0f && sel.temperature <= 110.0f) {
+            baseTempC = sel.temperature;
+        }
+        float maxP = 0.0f;
+        float lastP = 0.0f;
+        for (const auto &ph : sel.phases) {
+            if (!ph.pumpIsSimple && ph.pumpAdvanced.target == PumpTarget::PUMP_TARGET_PRESSURE &&
+                ph.pumpAdvanced.pressure > 0.5f) {
+                maxP = std::max(maxP, ph.pumpAdvanced.pressure);
+                lastP = ph.pumpAdvanced.pressure;
+            }
+        }
+        if (maxP >= 2.0f) {
+            basePeakP = maxP;
+            baseTailP = (lastP >= 1.5f) ? lastP : maxP;
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(workspaceMutex_);
@@ -1761,6 +1896,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
             return;
         }
         mode = workspace_->controlMode;
+        priorCopy = workspace_->communityPrior;
         const std::size_t rawDim = OnBoardOpt::rawDimForMode(mode);
         const EspressoRL::PreferenceLabel lbl = mapPreferenceLabel(feedback.label);
         if (workspace_->comparisons.size() >= MAX_CPBO_COMPARISONS) {
@@ -1864,6 +2000,19 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
     yCtx.startedAtMs = millis();
     yCtx.lastYieldMs = yCtx.startedAtMs;
 
+    const bool usePrior = priorCopy.valid && priorCopy.approved;
+    const std::uint64_t goalHash = usePrior ? computeTasteGoalBucketHash(goal) : 0ULL;
+    std::vector<double> trainPriorMean;
+    if (usePrior) {
+        trainPriorMean.assign(pointsCopy.size(), 0.0);
+        for (std::size_t i = 0; i < pointsCopy.size(); ++i) {
+            if (pointsCopy[i].hasTrajectoryFeatures) {
+                trainPriorMean[i] =
+                    static_cast<double>(priorCopy.evaluate(pointsCopy[i].trajFeatures, goalHash, compsCopy.size()));
+            }
+        }
+    }
+
     EspressoRL::PreferenceGPConfig gpCfg;
     gpCfg.maxOuterIters = 35;
     if (mode == OnBoardOpt::ControlMode::SplineOnly) {
@@ -1871,9 +2020,9 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         gpCfg.initialPhysicsKernelWeight = 0.25;
     }
     EspressoRL::EmbeddedPreferenceGPModel model;
-    const bool fitOk = EspressoRL::fitEmbeddedPreferenceGP(trainInputs.data(), pointsCopy.size(), rawDim, physDim, 0,
-                                                           compsCopy.data(), compsCopy.size(), gpCfg, model,
-                                                           cooperativeYieldCallback, &yCtx);
+    const bool fitOk = EspressoRL::fitEmbeddedPreferenceGP(
+        trainInputs.data(), pointsCopy.size(), rawDim, physDim, 0, compsCopy.data(), compsCopy.size(), gpCfg, model,
+        cooperativeYieldCallback, &yCtx, usePrior ? trainPriorMean.data() : nullptr);
     if (!fitOk || model.cancelled) {
         std::lock_guard<std::mutex> lock(workspaceMutex_);
         if (workspace_) {
@@ -1922,8 +2071,46 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         }
     }
 
+    std::vector<double> queryPriorMean;
+    if (usePrior) {
+        queryPriorMean.assign(cands.size(), 0.0);
+        const auto &anchorRef = pointsCopy[anchorIdx];
+        std::lock_guard<std::mutex> lock(workspaceMutex_);
+        if (workspace_ && !brewActive_.load(std::memory_order_acquire)) {
+            for (std::size_t i = 0; i < cands.size(); ++i) {
+                if (brewActive_.load(std::memory_order_acquire)) {
+                    break;
+                }
+                double cGrind = anchorRef.grindSteps;
+                double cDose = anchorRef.doseG;
+                double cYield = anchorRef.targetYieldG;
+                std::array<float, 3> cSpline{0.0f, 0.0f, 0.0f};
+                if (OnBoardOpt::modeTunesRecipe(mode)) {
+                    cGrind = -domain.grindRadiusSteps + cands[i][0] * (2.0 * domain.grindRadiusSteps);
+                    cDose = domain.doseMinG + cands[i][1] * (domain.doseMaxG - domain.doseMinG);
+                    cYield = domain.targetOutputMinG + cands[i][2] * (domain.targetOutputMaxG - domain.targetOutputMinG);
+                }
+                if (mode == OnBoardOpt::ControlMode::SplineOnly) {
+                    cSpline = {OnBoardOpt::normToSplineKnot(cands[i][0]), OnBoardOpt::normToSplineKnot(cands[i][1]),
+                               OnBoardOpt::normToSplineKnot(cands[i][2])};
+                } else if (mode == OnBoardOpt::ControlMode::Joint6D) {
+                    cSpline = {OnBoardOpt::normToSplineKnot(cands[i][3]), OnBoardOpt::normToSplineKnot(cands[i][4]),
+                               OnBoardOpt::normToSplineKnot(cands[i][5])};
+                }
+                EspressoRL::TrajectoryFeatureVec candFeat{};
+                if (EspressoRL::predictCandidateTrajectoryFeatures(
+                        workspace_->predictor, static_cast<float>(cGrind), static_cast<float>(cDose),
+                        static_cast<float>(cYield), cSpline, basePeakP, baseTailP, baseTempC, candFeat)) {
+                    queryPriorMean[i] =
+                        static_cast<double>(priorCopy.evaluate(candFeat, goalHash, compsCopy.size()));
+                }
+            }
+        }
+    }
+
     std::vector<double> postMean, postCov;
-    if (!model.predict(queryInputs.data(), cands.size(), postMean, postCov)) {
+    if (!model.predict(queryInputs.data(), cands.size(), postMean, postCov,
+                       usePrior ? queryPriorMean.data() : nullptr)) {
         return;
     }
 
@@ -2131,6 +2318,7 @@ void OnBoardEspressoRLPlugin::publishStatusEvent() {
         ev.setInt("onboard_last_mpc_us", static_cast<int>(workspace_->lastMpcFitUs));
         ev.setInt("onboard_last_cpbo_ms", static_cast<int>(workspace_->lastCpboFitMs));
         ev.setInt("onboard_persisted", persistedStateLoaded_.load(std::memory_order_acquire) ? 1 : 0);
+        ev.setInt("onboard_prior_loaded", priorLoaded_.load(std::memory_order_acquire) ? 1 : 0);
     }
     queueMainThreadEvent(std::move(ev));
 }

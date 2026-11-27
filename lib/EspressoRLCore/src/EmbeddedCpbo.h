@@ -163,8 +163,9 @@ struct EmbeddedPreferenceGPModel {
     std::vector<double> dualLambda;   // [C]
 
     /// Exact GP posterior prediction using triangular solves on L_K and L_B (never forms K^{-1}).
+    /// Optional queryPriorMean [queryCount] adds a fixed non-zero prior mean m_0(x_*).
     bool predict(const double *queryInputs, std::size_t queryCount, std::vector<double> &outMean,
-                 std::vector<double> &outCov) const;
+                 std::vector<double> &outCov, const double *queryPriorMean = nullptr) const;
 };
 
 /// Evaluate exact inner-converged ELBO and Envelope-Theorem gradient w.r.t. packed theta vector:
@@ -176,11 +177,12 @@ bool evaluatePreferenceGpObjectiveAndGrad(const double *trainInputs, std::size_t
                                           double &outNegElbo, std::vector<double> &outGrad);
 
 /// Fit full-fidelity 20-pt Gauss-Hermite VI Preference GP in pure float64 STL C++17.
+/// Optional trainPriorMean [trainCount] specifies a fixed prior mean m_0(x_i) so f(x) = m_0(x) + g(x).
 bool fitEmbeddedPreferenceGP(const double *trainInputs, std::size_t trainCount, std::size_t rawDim,
                              std::size_t physicsDim, std::size_t traceDim, const ComparisonPair *comparisons,
                              std::size_t comparisonCount, const PreferenceGPConfig &cfg,
                              EmbeddedPreferenceGPModel &outModel, YieldCallback onYield = nullptr,
-                             void *yieldCtx = nullptr);
+                             void *yieldCtx = nullptr, const double *trainPriorMean = nullptr);
 
 // ---------------------------------------------------------------------------
 // Conditional-Coordinate Gauss-Legendre MES + Robert-Gibbs Far-Tail Fallback

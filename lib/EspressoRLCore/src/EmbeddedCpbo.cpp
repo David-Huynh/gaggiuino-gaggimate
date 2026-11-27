@@ -556,7 +556,8 @@ InnerViResult solveInnerOpperArchambeau(const std::vector<double> &cholK, std::s
                                         const ComparisonPair *comparisons, std::size_t compCount, double gamma,
                                         double sigmaPref, double epsilon, const std::vector<double> *initMBar,
                                         const std::vector<double> *initLam, int maxIters, double tol,
-                                        YieldCallback onYield, void *yieldCtx) {
+                                        YieldCallback onYield, void *yieldCtx,
+                                        const double *trainPriorMean = nullptr) {
     InnerViResult res;
     if (compCount == 0) {
         res.ok = true;
@@ -639,7 +640,9 @@ InnerViResult solveInnerOpperArchambeau(const std::vector<double> &cholK, std::s
 
         for (std::size_t c = 0; c < compCount; ++c) {
             const double *wRow = wMat.data() + c * n;
-            double m = 0.0;
+            double m = (trainPriorMean != nullptr)
+                           ? (trainPriorMean[comparisons[c].newIdx] - trainPriorMean[comparisons[c].anchorIdx])
+                           : 0.0;
             for (std::size_t i = 0; i < n; ++i) {
                 m += wRow[i] * mVec[i];
             }
@@ -801,7 +804,7 @@ bool evalEnvelopeObjective(const double *trainInputs, std::size_t trainCount, st
                            std::size_t comparisonCount, const PreferenceGPConfig &cfg, double initRawGamma,
                            const std::vector<double> &vec, std::vector<double> &cacheMBar, std::vector<double> &cacheLam,
                            int maxInnerIters, YieldCallback onYield, void *yieldCtx, double &outNegElbo,
-                           std::vector<double> &outGrad, bool &outCancelled) {
+                           std::vector<double> &outGrad, bool &outCancelled, const double *trainPriorMean = nullptr) {
     outCancelled = false;
     EmbeddedKernelHyperparams hp;
     double rawG = initRawGamma;
@@ -821,7 +824,8 @@ bool evalEnvelopeObjective(const double *trainInputs, std::size_t trainCount, st
     const std::vector<double> *lInit = (cacheLam.size() == comparisonCount) ? &cacheLam : nullptr;
     InnerViResult inner =
         solveInnerOpperArchambeau(cholK, trainCount, comparisons, comparisonCount, gamma, cfg.sigmaPref,
-                                  cfg.probabilityEpsilon, mInit, lInit, maxInnerIters, 1e-9, onYield, yieldCtx);
+                                  cfg.probabilityEpsilon, mInit, lInit, maxInnerIters, 1e-9, onYield, yieldCtx,
+                                  trainPriorMean);
     if (inner.cancelled) {
         outCancelled = true;
         return false;
@@ -1289,13 +1293,20 @@ std::vector<double> EmbeddedKernelHyperparams::traceLengthscales() const {
 std::vector<double> EmbeddedKernelHyperparams::mixtureWeights() const { return softmaxVec(weightLogits); }
 
 bool EmbeddedPreferenceGPModel::predict(const double *queryInputs, std::size_t queryCount, std::vector<double> &outMean,
-                                        std::vector<double> &outCov) const {
+                                        std::vector<double> &outCov, const double *queryPriorMean) const {
     if (!valid || queryInputs == nullptr || queryCount == 0 || trainCount == 0) {
         return false;
     }
     for (std::size_t i = 0; i < queryCount * featureStride; ++i) {
         if (!std::isfinite(queryInputs[i])) {
             return false;
+        }
+    }
+    if (queryPriorMean != nullptr) {
+        for (std::size_t j = 0; j < queryCount; ++j) {
+            if (!std::isfinite(queryPriorMean[j])) {
+                return false;
+            }
         }
     }
 
@@ -1313,7 +1324,7 @@ bool EmbeddedPreferenceGPModel::predict(const double *queryInputs, std::size_t q
 
     outMean.assign(queryCount, 0.0);
     for (std::size_t j = 0; j < queryCount; ++j) {
-        double m = 0.0;
+        double m = (queryPriorMean != nullptr) ? queryPriorMean[j] : 0.0;
         for (std::size_t i = 0; i < trainCount; ++i) {
             m += vStar[i * queryCount + j] * whitenedMean[i];
         }
@@ -1367,13 +1378,21 @@ bool evaluatePreferenceGpObjectiveAndGrad(const double *trainInputs, std::size_t
 bool fitEmbeddedPreferenceGP(const double *trainInputs, std::size_t trainCount, std::size_t rawDim,
                              std::size_t physicsDim, std::size_t traceDim, const ComparisonPair *comparisons,
                              std::size_t comparisonCount, const PreferenceGPConfig &cfg,
-                             EmbeddedPreferenceGPModel &outModel, YieldCallback onYield, void *yieldCtx) {
+                             EmbeddedPreferenceGPModel &outModel, YieldCallback onYield, void *yieldCtx,
+                             const double *trainPriorMean) {
     outModel = EmbeddedPreferenceGPModel{};
 
     if (trainInputs == nullptr || trainCount == 0 || rawDim == 0 || physicsDim == 0 || !std::isfinite(cfg.sigmaPref) ||
         cfg.sigmaPref <= 0.0 || !std::isfinite(cfg.initialGamma) || cfg.initialGamma < 0.0 ||
         !std::isfinite(cfg.covarianceJitter) || cfg.covarianceJitter <= 0.0) {
         return false;
+    }
+    if (trainPriorMean != nullptr) {
+        for (std::size_t i = 0; i < trainCount; ++i) {
+            if (!std::isfinite(trainPriorMean[i])) {
+                return false;
+            }
+        }
     }
     const std::size_t stride = computeFeatureStride(rawDim, physicsDim, traceDim);
     for (std::size_t i = 0; i < trainCount * stride; ++i) {
@@ -1472,7 +1491,7 @@ bool fitEmbeddedPreferenceGP(const double *trainInputs, std::size_t trainCount, 
     bool cancelled = false;
     if (!evalEnvelopeObjective(trainInputs, trainCount, rawDim, physicsDim, traceDim, comparisons, comparisonCount, cfg,
                                initRawGamma, x, cacheMBar, cacheLam, cfg.maxInnerIters, onYield, yieldCtx, fVal, gVal,
-                               cancelled)) {
+                               cancelled, trainPriorMean)) {
         outModel.cancelled = cancelled;
         return false;
     }
@@ -1627,7 +1646,8 @@ bool fitEmbeddedPreferenceGP(const double *trainInputs, std::size_t trainCount, 
                     bool lsCancelled = false;
                     if (evalEnvelopeObjective(trainInputs, trainCount, rawDim, physicsDim, traceDim, comparisons,
                                               comparisonCount, cfg, initRawGamma, xTrial, cacheMBar, cacheLam,
-                                              cfg.maxInnerIters, onYield, yieldCtx, fCand, gTrial, lsCancelled)) {
+                                              cfg.maxInnerIters, onYield, yieldCtx, fCand, gTrial, lsCancelled,
+                                              trainPriorMean)) {
                         if (fCand <= fVal + 1e-4 * slope) {
                             outFNew = fCand;
                             return true;
@@ -1716,7 +1736,8 @@ bool fitEmbeddedPreferenceGP(const double *trainInputs, std::size_t trainCount, 
     const std::vector<double> *lInit = (cacheLam.size() == comparisonCount) ? &cacheLam : nullptr;
     InnerViResult finalInner =
         solveInnerOpperArchambeau(cholK, trainCount, comparisons, comparisonCount, optGamma, cfg.sigmaPref,
-                                  cfg.probabilityEpsilon, mInit, lInit, cfg.finalInnerIters, 1e-10, onYield, yieldCtx);
+                                  cfg.probabilityEpsilon, mInit, lInit, cfg.finalInnerIters, 1e-10, onYield, yieldCtx,
+                                  trainPriorMean);
     if (finalInner.cancelled) {
         outModel.cancelled = true;
         return false;

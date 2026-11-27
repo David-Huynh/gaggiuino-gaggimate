@@ -195,6 +195,7 @@ class WebUIPlugin : public Plugin {
     int rlOnBoardLastMpcUs = 0;
     int rlOnBoardLastCpboMs = 0;
     bool rlOnBoardPersisted = false;
+    bool rlOnBoardPriorLoaded = false;
 #endif
     String rlRuntimeHealthStatus = "";
     String rlRuntimeHealthSummary = "";

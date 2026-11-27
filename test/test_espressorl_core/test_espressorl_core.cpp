@@ -21,6 +21,7 @@
 #include "CemGpMpc.cpp"
 #include "EmbeddedCpbo.cpp"
 #include "HydraulicWorldModel.cpp"
+#include "TrajectoryPrior.cpp"
 
 using namespace EspressoRL;
 
@@ -1062,6 +1063,153 @@ static void test_level1_trust_region_6d_dynamics() {
     TEST_ASSERT_FALSE(updateLevel1TrustRegion(conv, PreferenceLabel::NEW_BETTER, nextCenter, cfg, rejected));
 }
 
+// ---------------------------------------------------------------------------
+// Group D: Community J_taste Trajectory Prior (ETP1 Parity + Local Override)
+// ---------------------------------------------------------------------------
+
+static std::vector<std::uint8_t> decodeBase64Helper(const char *b64) {
+    static const int8_t kTable[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    };
+    std::vector<std::uint8_t> out;
+    int val = 0, valb = -8;
+    for (const unsigned char *p = reinterpret_cast<const unsigned char *>(b64); *p; ++p) {
+        if (*p == '=') break;
+        const int d = kTable[*p];
+        if (d < 0) continue;
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<std::uint8_t>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+void test_trajectory_prior_golden_etp1_parity_and_local_override(void) {
+    // Exact 406-byte ETP1 artifact from espressorl/tests/fixtures/trajectory_prior_golden_v1.json.
+    static constexpr const char *kGoldenEtp1B64 =
+        "RVRQMQEAAACGAQAAGUNfw2DY8moAAAAAAQAAgEACtIgHQAAAkEHrhd1BaVKIQP5d1D92w9k/GT3XP13tzT/HPbO9qh3yQMBhz0Asku4/"
+        "JIPhPgAAukLEvBE/AACAPwGGSkF3Qvk/LjJNPxZLSj8NV0w/yy5SP8j6vT770Jo/vnCkP2OLqT8viJ4+AACAPwAAAAAAAAAAmpkZPwAAgD"
+        "88AAUAFLQlvgAAAAC/OOy8vzjsvB/1P75iYC6+mz43vlzDS76VBJ+99RsxO2O1p7zpR+Q8UUEdvwAAAABUeNm+AAAAAJB2rb2Qdq29P5Tvv"
+        "QqyOb6CeBG+gz93vXbzU73ccho9dtkKO9ujg70jH1q+AAAAAGZzdeY/4EKMewCRPnir8T4SAAMA9K0ivgAAAAA5YSC8OWEgvAmTPL6wzAq"
+        "+0bEqvkM1Yb5gyEq+ZUQSvQ9PIr6wy0U+MyCavgAAAAABBLw7AAAAANckEr7XJBK+SLNevdFeRb05Ol69c7pUvcXzAj58Zg49FG2nPGlOp"
+        "L16GiW+AAAAAA==";
+    const std::vector<std::uint8_t> raw = decodeBase64Helper(kGoldenEtp1B64);
+    TEST_ASSERT_EQUAL_UINT32(406u, static_cast<uint32_t>(raw.size()));
+
+    TrajectoryTastePrior prior;
+    TEST_ASSERT_TRUE(decodeEtp1(raw.data(), raw.size(), prior));
+    TEST_ASSERT_TRUE(prior.valid && prior.approved);
+    TEST_ASSERT_EQUAL_UINT32(2u, static_cast<uint32_t>(prior.bucketCount));
+    TEST_ASSERT_EQUAL_UINT64(0ULL, prior.buckets[0].goalHash);
+    static constexpr const char *kCustomFp = "e1d83790ccc80adb03492a656ca28239f3a1a75c98eaf25e53f58ecd96797711";
+    const std::uint64_t customHash = hashTasteGoalFingerprint(kCustomFp, 64, false);
+    TEST_ASSERT_EQUAL_UINT64(10106887078826832742ULL, customHash);
+    TEST_ASSERT_EQUAL_UINT64(customHash, prior.buckets[1].goalHash);
+
+    // 1. Exact 14D extraction + ETP1 evaluation parity on lever_sweet_spot and channeled_fast.
+    std::vector<TrajectorySamplePoint> lever(41);
+    float accW = 0.0f;
+    for (int i = 0; i < 41; ++i) {
+        const float q = (i < 6) ? 0.0f : std::max(0.9f, 1.8f - 0.02f * static_cast<float>(i - 6));
+        accW += q * 0.25f;
+        lever[i] = {0.25f * static_cast<float>(i),
+                    (i < 6) ? 1.5f : std::max(4.0f, 9.0f - 0.14f * static_cast<float>(i - 6)), q, accW, 93.0f, true,
+                    0u};
+    }
+    TrajectoryFeatureVec fLever{};
+    TEST_ASSERT_TRUE(extractTrajectoryFeatures(lever.data(), lever.size(), 18.0f, lever.back().weightG,
+                                               lever.back().elapsedS, fLever));
+    const std::array<float, 14> expLever = {0.7097222f, 18.0f, 10.0f, 1.75f, 1.46f, 1.72f, 1.51f,
+                                            1.25f,      -0.47f, 9.0f, 6.62f, 4.06f, 0.02f, 93.0f};
+    for (std::size_t k = 0; k < 14; ++k) {
+        TEST_ASSERT_FLOAT_WITHIN(1e-3f, expLever[k], fLever[k]);
+    }
+    const float sLeverBal0 = prior.evaluate(fLever, 0ULL, 0);
+    const float sLeverBal4 = prior.evaluate(fLever, 0ULL, 4);
+    const float sLeverCust0 = prior.evaluate(fLever, customHash, 0);
+    TEST_ASSERT_FLOAT_WITHIN(1e-3f, -0.5734425f, sLeverBal0);
+    TEST_ASSERT_FLOAT_WITHIN(1e-3f, -0.2867213f, sLeverBal4);
+    TEST_ASSERT_FLOAT_WITHIN(1e-3f, 0.1595707f, sLeverCust0);
+
+    std::vector<TrajectorySamplePoint> chan(25);
+    accW = 0.0f;
+    for (int i = 0; i < 25; ++i) {
+        const float q = (i < 4) ? 0.0f : ((i < 12) ? 1.4f : (3.6f + ((i % 2 == 0) ? 0.5f : -0.5f)));
+        accW += q * 0.25f;
+        chan[i] = {0.25f * static_cast<float>(i), (i < 4) ? 2.0f : 9.0f, q, accW, 93.5f, true, 0u};
+    }
+    TrajectoryFeatureVec fChan{};
+    TEST_ASSERT_TRUE(extractTrajectoryFeatures(chan.data(), chan.size(), 18.0f, chan.back().weightG,
+                                               chan.back().elapsedS, fChan));
+    const float sChanBal0 = prior.evaluate(fChan, 0ULL, 0);
+    const float sChanCust0 = prior.evaluate(fChan, customHash, 0);
+    TEST_ASSERT_FLOAT_WITHIN(1e-3f, -0.600000f, sChanBal0);
+    TEST_ASSERT_FLOAT_WITHIN(1e-3f, -0.280924f, sChanCust0);
+    TEST_ASSERT_TRUE(sLeverBal0 > sChanBal0);
+    TEST_ASSERT_TRUE(sLeverCust0 > sChanCust0);
+
+    // 2. Zero-trust corruption rejection (bit flip, truncation, bad magic).
+    auto badCrc = raw;
+    badCrc[ETP1_HEADER_SIZE + 5] ^= 0x01u;
+    TrajectoryTastePrior badPrior;
+    TEST_ASSERT_FALSE(decodeEtp1(badCrc.data(), badCrc.size(), badPrior));
+    TEST_ASSERT_FALSE(decodeEtp1(raw.data(), raw.size() - 4, badPrior));
+    auto badMagic = raw;
+    badMagic[0] ^= 0xFFu;
+    TEST_ASSERT_FALSE(decodeEtp1(badMagic.data(), badMagic.size(), badPrior));
+
+    // 3. Forward hydraulic rollout produces physically ordered trajectories.
+    CombinedHydraulicPredictor pred;
+    TrajectoryFeatureVec fFine{}, fCoarse{};
+    TEST_ASSERT_TRUE(predictCandidateTrajectoryFeatures(pred, +4.0f, 18.0f, 36.0f, {0.0f, 0.0f, 0.0f}, 9.0f, 5.5f,
+                                                        93.0f, fFine));
+    TEST_ASSERT_TRUE(predictCandidateTrajectoryFeatures(pred, -4.0f, 18.0f, 36.0f, {0.0f, 0.0f, 0.0f}, 9.0f, 5.5f,
+                                                        93.0f, fCoarse));
+    TEST_ASSERT_TRUE(fFine[4] < fCoarse[4]); // Finer grind -> slower mean flow
+    TEST_ASSERT_TRUE(fFine[2] > fCoarse[2]); // Finer grind -> longer total shot time
+
+    // 4. Local-always-overrides: strong community prior favors point 0 (+0.55 vs -0.55),
+    //    but 4 local user comparisons prefer point 1 -> posterior flips to prefer point 1!
+    const std::array<std::array<double, 3>, 2> x2 = {{{0.2, 0.5, 0.5}, {0.8, 0.5, 0.5}}};
+    constexpr std::size_t stride = 3 + PHYSICS_PROXY_DIM;
+    std::vector<double> trainIn(2 * stride, 0.0);
+    for (std::size_t i = 0; i < 2; ++i) {
+        trainIn[i * stride + 0] = x2[i][0];
+        trainIn[i * stride + 1] = x2[i][1];
+        trainIn[i * stride + 2] = x2[i][2];
+        const auto p0 = computePhi0(x2[i][0], 18.0, 36.0);
+        for (std::size_t k = 0; k < PHYSICS_PROXY_DIM; ++k) {
+            trainIn[i * stride + 3 + k] = p0[k] * 0.01;
+        }
+    }
+    const std::array<double, 2> strongWrongPrior = {+0.55, -0.55};
+    const std::array<ComparisonPair, 4> localOverrides = {{
+        {1u, 0u, PreferenceLabel::NEW_BETTER},
+        {1u, 0u, PreferenceLabel::NEW_BETTER},
+        {1u, 0u, PreferenceLabel::NEW_BETTER},
+        {1u, 0u, PreferenceLabel::NEW_BETTER},
+    }};
+    PreferenceGPConfig gpCfg;
+    gpCfg.maxOuterIters = 25;
+    EmbeddedPreferenceGPModel gp;
+    TEST_ASSERT_TRUE(fitEmbeddedPreferenceGP(trainIn.data(), 2, 3, PHYSICS_PROXY_DIM, 0, localOverrides.data(),
+                                             localOverrides.size(), gpCfg, gp, nullptr, nullptr,
+                                             strongWrongPrior.data()));
+    std::vector<double> pm, pc;
+    TEST_ASSERT_TRUE(gp.predict(trainIn.data(), 2, pm, pc, strongWrongPrior.data()));
+    TEST_ASSERT_TRUE(pm[1] > pm[0]); // Local user preferences beat the community prior!
+}
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -1091,5 +1239,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_mes_quadrature_and_robert_gibbs_far_tail);
     RUN_TEST(test_cpbo_cooperative_yield_cancellation_and_invalid_inputs);
     RUN_TEST(test_level1_trust_region_6d_dynamics);
+    // Group D — Community J_taste Trajectory Prior (ETP1 Parity + Local Override)
+    RUN_TEST(test_trajectory_prior_golden_etp1_parity_and_local_override);
     return UNITY_END();
 }

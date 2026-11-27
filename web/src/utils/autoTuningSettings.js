@@ -37,6 +37,7 @@ const AUTO_TUNING_RUNTIME_FIELDS = [
   'rlOnBoardLastMpcUs',
   'rlOnBoardLastCpboMs',
   'rlOnBoardPersisted',
+  'rlOnBoardPriorLoaded',
 ];
 
 export function mergeAutoTuningRuntimeStatus(formData, status) {

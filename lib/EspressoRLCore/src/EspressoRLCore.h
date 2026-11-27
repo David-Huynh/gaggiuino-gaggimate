@@ -5,5 +5,6 @@
 #include "EmbeddedCpbo.h"
 #include "HydraulicControl.h"
 #include "HydraulicWorldModel.h"
+#include "TrajectoryPrior.h"
 
 #endif // ESPRESSORL_CORE_H

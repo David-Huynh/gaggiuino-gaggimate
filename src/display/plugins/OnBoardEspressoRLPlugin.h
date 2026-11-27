@@ -111,6 +111,7 @@ class OnBoardEspressoRLPlugin : public Plugin, public AutoTuning::OnBoardOptimiz
     bool applyLatestRecommendation(const std::string &recommendationId);
     bool ignoreLatestRecommendation(const std::string &recommendationId);
     void loadPersistedState();
+    void loadCommunityPrior();
     bool savePersistedState();
     void clearPersistedState();
     void publishLiveTelemetryEvent(const AutoTuning::OnBoardRuntimeTelemetry &t);
@@ -142,6 +143,7 @@ class OnBoardEspressoRLPlugin : public Plugin, public AutoTuning::OnBoardOptimiz
     std::atomic<std::uint8_t> controlMode_{0}; // 0=recipe_only, 1=spline_only, 2=joint_6d
     std::atomic<bool> persistenceAvailable_{false};
     std::atomic<bool> persistedStateLoaded_{false};
+    std::atomic<bool> priorLoaded_{false};
 
     // Active live-shot parameters captured at brew start & realized live actuation tracking.
     float liveGrindSteps_ = 0.0f; // Canonical sign: positive = finer / higher resistance

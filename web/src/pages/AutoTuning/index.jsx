@@ -1489,8 +1489,8 @@ export function AutoTuning() {
                 value={`${settings.rlOnBoardLastMpcUs ?? 0} µs / ${settings.rlOnBoardLastCpboMs ?? 0} ms`}
               />
               <StatCard
-                label='Persistence'
-                value={settings.rlOnBoardPersisted ? 'LittleFS Saved' : 'Ready (Empty)'}
+                label='Persistence / Prior'
+                value={`${settings.rlOnBoardPersisted ? 'Saved' : 'Empty'} · ${settings.rlOnBoardPriorLoaded ? 'Prior On' : 'Local'}`}
                 tone={settings.rlOnBoardPersisted ? 'success' : 'neutral'}
               />
             </div>
