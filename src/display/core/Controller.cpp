@@ -292,7 +292,7 @@ void Controller::setup() {
     this->onScreenReady();
 
     updateLastAction();
-    xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", configMINIMAL_STACK_SIZE * 6, this, 3, &logicTaskHandle, 0);
+    xTaskCreatePinnedToCore(loopLogicTask, "Controller::loopLogic", 8192, this, 3, &logicTaskHandle, 0);
     esp_task_wdt_add(logicTaskHandle);
 }
 

@@ -77,6 +77,9 @@ class SquareRootBayesianLinearF32 {
     /// Re-solve R * mu_w = rhs after a batch of updateRow calls.
     void solveWeights();
 
+    /// Read-only access to the solved posterior mean weights mu_w (length MAX_NYSTROM_BASIS).
+    const float *weights() const { return muW_.data(); }
+
     /// Predict (mean, phi^T Sigma_w phi) in float32 via forward triangular solve on R^T.
     void predict(const float *phi, float &outMean, float &outVar) const;
 
@@ -103,6 +106,8 @@ class FixedBasisVfeNystromGP {
     std::uint32_t choleskyFallbackCount() const { return choleskyFallbacks_; }
 
     void predict(const FeatureVec4 &z, float &outMean, float &outVar) const;
+    /// Fast exact O(M) posterior mean prediction using precomputed L_MM^{-T} * mu_w (zero stack buffers).
+    float predictMean(const FeatureVec4 &z) const;
     float novelty(const FeatureVec4 &z) const;
 
     /// Fast float32 QR update from one completed shot (keeps existing anchors).
@@ -117,10 +122,12 @@ class FixedBasisVfeNystromGP {
     std::uint32_t choleskyFallbacks_ = 0;
     std::array<FeatureVec4, MAX_NYSTROM_BASIS> anchors_{};
     std::array<float, MAX_NYSTROM_BASIS * MAX_NYSTROM_BASIS> lMmInv_{};
+    std::array<float, MAX_NYSTROM_BASIS> alphaW_{};
     SquareRootBayesianLinearF32 core_{};
 
     void buildScaffold(float grindCenter, float doseCenter, std::vector<FeatureVec4> &out) const;
     void factorAnchorsFloat64();
+    void rebuildMeanWeights();
     void computeFeatures(const FeatureVec4 &z, float *outPsi) const;
     float rbfKernelF32(const FeatureVec4 &a, const FeatureVec4 &b) const;
     double rbfKernelF64(const FeatureVec4 &a, const FeatureVec4 &b) const;
@@ -166,6 +173,19 @@ struct RolloutOutput {
     std::array<float, MAX_MPC_HORIZON> weightStdG{};
 };
 
+/// Optional caller-owned scratch workspace for CombinedHydraulicPredictor::rollout
+/// so real-time embedded callers keep large trajectory arrays off task stacks.
+struct RolloutScratch {
+    std::array<float, MAX_MPC_HORIZON> liveOffsets{};
+    std::array<float, MAX_MPC_HORIZON> liveStds{};
+    std::array<float, MAX_MPC_HORIZON> pHi{};
+    std::array<float, MAX_MPC_HORIZON> qHi{};
+    std::array<float, MAX_MPC_HORIZON> wHi{};
+    std::array<float, MAX_MPC_HORIZON> pLo{};
+    std::array<float, MAX_MPC_HORIZON> qLo{};
+    std::array<float, MAX_MPC_HORIZON> wLo{};
+};
+
 /// Unified gray-box predictor combining f_phys + VFE Nyström g_past + Matérn-3/2 delta_live.
 class CombinedHydraulicPredictor {
   public:
@@ -185,6 +205,12 @@ class CombinedHydraulicPredictor {
     void rollout(const HydraulicState &state, const PumpMode *modes, const float *pressureTargets,
                  const float *flowTargets, std::size_t horizonSteps, float relativeGrindSteps, float doseInG,
                  bool propagateUncertainty, RolloutOutput &out) const;
+
+    /// Stack-free rollout variant using caller-owned scratch workspace (zero large stack frames).
+    void rolloutWithScratch(const HydraulicState &state, const PumpMode *modes, const float *pressureTargets,
+                            const float *flowTargets, std::size_t horizonSteps, float relativeGrindSteps,
+                            float doseInG, bool propagateUncertainty, RolloutOutput &out,
+                            RolloutScratch &scratch) const;
 
     /// Compute the profile's own physics-induced nominal beverage-flow trajectory by rolling out
     /// the unmodified base profile with zero dynamic disturbance (liveRate = 0, liveOffset = baselineOffset).

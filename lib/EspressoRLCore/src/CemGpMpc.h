@@ -63,6 +63,23 @@ class CemGpMpcController {
     std::array<float, MAX_CEM_KNOTS> lastPressureKnots_{};
     std::array<float, MAX_CEM_KNOTS> lastFlowKnots_{};
 
+    // Member-owned CEM scratch workspace (~7.5 KB) kept inside the controller instance
+    // (which resides in PSRAM on ESP32-S3) so computeCommand() never bloats task stacks
+    // and never performs dynamic heap allocations during live 4 Hz brew control.
+    struct Scratch {
+        std::array<float, MAX_MPC_HORIZON> targetQCurve{};
+        std::array<float, MAX_MPC_HORIZON> bestPlan{};
+        std::array<std::array<float, MAX_MPC_HORIZON>, MAX_CEM_CANDIDATES> clampedPlans{};
+        std::array<double, MAX_CEM_CANDIDATES> costs{};
+        std::array<std::size_t, MAX_CEM_CANDIDATES> order{};
+        std::array<float, MAX_MPC_HORIZON> rawPlan{};
+        std::array<float, MAX_MPC_HORIZON> pPlanBuf{};
+        std::array<float, MAX_MPC_HORIZON> qPlanBuf{};
+        RolloutOutput pred{};
+        RolloutScratch rolloutWs{};
+    };
+    Scratch scratch_{};
+
     float nextNormalF32();
     void expandKnots(const float *knots, float *outPlan) const;
     void sampleKnotsFromPlan(const float *plan, float *outKnots) const;

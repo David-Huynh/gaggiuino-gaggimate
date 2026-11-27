@@ -180,6 +180,7 @@ void FixedBasisVfeNystromGP::reset() {
     }
     factorAnchorsFloat64();
     core_.reset(anchorCount_);
+    rebuildMeanWeights();
 }
 
 void FixedBasisVfeNystromGP::buildScaffold(float grindCenter, float doseCenter, std::vector<FeatureVec4> &out) const {
@@ -291,6 +292,23 @@ void FixedBasisVfeNystromGP::factorAnchorsFloat64() {
     }
 }
 
+void FixedBasisVfeNystromGP::rebuildMeanWeights() {
+    alphaW_.fill(0.0f);
+    const std::size_t m = anchorCount_;
+    if (m == 0) {
+        return;
+    }
+    const float *muW = core_.weights();
+    // alphaW = L_MM^{-T} * muW so psi^T muW == kVec^T alphaW exactly.
+    for (std::size_t j = 0; j < m; ++j) {
+        float sum = 0.0f;
+        for (std::size_t i = j; i < m; ++i) {
+            sum += lMmInv_[i * MAX_NYSTROM_BASIS + j] * muW[i];
+        }
+        alphaW_[j] = std::isfinite(sum) ? sum : 0.0f;
+    }
+}
+
 void FixedBasisVfeNystromGP::computeFeatures(const FeatureVec4 &z, float *outPsi) const {
     std::array<float, MAX_NYSTROM_BASIS> kVec{};
     for (std::size_t j = 0; j < anchorCount_; ++j) {
@@ -305,6 +323,17 @@ void FixedBasisVfeNystromGP::computeFeatures(const FeatureVec4 &z, float *outPsi
         }
         outPsi[i] = sum;
     }
+}
+
+float FixedBasisVfeNystromGP::predictMean(const FeatureVec4 &z) const {
+    if (anchorCount_ == 0) {
+        return 0.0f;
+    }
+    float mean = 0.0f;
+    for (std::size_t j = 0; j < anchorCount_; ++j) {
+        mean += alphaW_[j] * rbfKernelF32(z, anchors_[j]);
+    }
+    return std::isfinite(mean) ? mean : 0.0f;
 }
 
 void FixedBasisVfeNystromGP::predict(const FeatureVec4 &z, float &outMean, float &outVar) const {
@@ -353,6 +382,7 @@ void FixedBasisVfeNystromGP::updateFromShot(const FeatureVec4 *zRows, const floa
         core_.updateRow(psi.data(), yValues[i], invNoiseStd);
     }
     core_.solveWeights();
+    rebuildMeanWeights();
 }
 
 void FixedBasisVfeNystromGP::refreshFromHistory(const FeatureVec4 *zRows, const float *yValues, std::size_t count,
@@ -431,6 +461,7 @@ void FixedBasisVfeNystromGP::refreshFromHistory(const FeatureVec4 *zRows, const 
         core_.updateRow(psi.data(), yValues[i], invNoiseStd);
     }
     core_.solveWeights();
+    rebuildMeanWeights();
 }
 
 // ---------------------------------------------------------------------------
@@ -639,9 +670,13 @@ void CombinedHydraulicPredictor::rolloutSinglePath(const HydraulicState &state, 
         const FeatureVec4 z = buildHydraulicFeature(vIn, p, relativeGrindSteps, doseInG);
         float gMean = 0.0f;
         float gVar = 0.0f;
-        residualGP_.predict(z, gMean, gVar);
-        const float liveVar = (liveStds != nullptr) ? (liveStds[step] * liveStds[step]) : 0.0f;
-        const float ellStd = std::sqrt(std::max(gVar + liveVar, 0.0f));
+        if (sigmaShift == 0.0f) {
+            gMean = residualGP_.predictMean(z);
+        } else {
+            residualGP_.predict(z, gMean, gVar);
+        }
+        const float liveVar = (liveStds != nullptr && sigmaShift != 0.0f) ? (liveStds[step] * liveStds[step]) : 0.0f;
+        const float ellStd = (sigmaShift != 0.0f) ? std::sqrt(std::max(gVar + liveVar, 0.0f)) : 0.0f;
         const float ell = std::clamp(mPhys + gMean + liveOffsets[step] + sigmaShift * ellStd,
                                      physics_.logConductanceMin, physics_.logConductanceMax);
         const float kBev = std::exp(ell);
@@ -689,37 +724,46 @@ void CombinedHydraulicPredictor::rollout(const HydraulicState &state, const Pump
                                          const float *pressureTargets, const float *flowTargets,
                                          std::size_t horizonSteps, float relativeGrindSteps, float doseInG,
                                          bool propagateUncertainty, RolloutOutput &out) const {
+    RolloutScratch localScratch;
+    rolloutWithScratch(state, modes, pressureTargets, flowTargets, horizonSteps, relativeGrindSteps, doseInG,
+                       propagateUncertainty, out, localScratch);
+}
+
+void CombinedHydraulicPredictor::rolloutWithScratch(const HydraulicState &state, const PumpMode *modes,
+                                                    const float *pressureTargets, const float *flowTargets,
+                                                    std::size_t horizonSteps, float relativeGrindSteps, float doseInG,
+                                                    bool propagateUncertainty, RolloutOutput &out,
+                                                    RolloutScratch &ws) const {
     const std::size_t h = std::min(horizonSteps, MAX_MPC_HORIZON);
     out.steps = h;
     if (h == 0) {
         return;
     }
 
-    std::array<float, MAX_MPC_HORIZON> liveOffsets{};
-    std::array<float, MAX_MPC_HORIZON> liveVars{};
-    std::array<float, MAX_MPC_HORIZON> liveStds{};
     liveFilter_.forecast(state.liveOffset, state.liveRate, state.liveCov00, state.liveCov01, state.liveCov11, h,
-                         physics_.dtS, liveOffsets.data(), liveVars.data());
+                         physics_.dtS, ws.liveOffsets.data(), ws.liveStds.data());
     for (std::size_t i = 0; i < h; ++i) {
-        liveStds[i] = std::sqrt(std::max(liveVars[i], 0.0f));
+        ws.liveStds[i] = std::sqrt(std::max(ws.liveStds[i], 0.0f));
     }
 
-    rolloutSinglePath(state, modes, pressureTargets, flowTargets, h, relativeGrindSteps, doseInG, liveOffsets.data(),
-                      liveStds.data(), 0.0f, out.pressureBar.data(), out.beverageFlowGS.data(), out.weightG.data());
+    rolloutSinglePath(state, modes, pressureTargets, flowTargets, h, relativeGrindSteps, doseInG,
+                      ws.liveOffsets.data(), ws.liveStds.data(), 0.0f, out.pressureBar.data(),
+                      out.beverageFlowGS.data(), out.weightG.data());
 
     if (propagateUncertainty) {
-        std::array<float, MAX_MPC_HORIZON> pHi{}, qHi{}, wHi{}, pLo{}, qLo{}, wLo{};
         rolloutSinglePath(state, modes, pressureTargets, flowTargets, h, relativeGrindSteps, doseInG,
-                          liveOffsets.data(), liveStds.data(), 1.0f, pHi.data(), qHi.data(), wHi.data());
+                          ws.liveOffsets.data(), ws.liveStds.data(), 1.0f, ws.pHi.data(), ws.qHi.data(),
+                          ws.wHi.data());
         rolloutSinglePath(state, modes, pressureTargets, flowTargets, h, relativeGrindSteps, doseInG,
-                          liveOffsets.data(), liveStds.data(), -1.0f, pLo.data(), qLo.data(), wLo.data());
+                          ws.liveOffsets.data(), ws.liveStds.data(), -1.0f, ws.pLo.data(), ws.qLo.data(),
+                          ws.wLo.data());
         const float pObsVar = physics_.obsPressureNoiseStdBar * physics_.obsPressureNoiseStdBar;
         const float qObsVar = physics_.obsFlowNoiseStdGS * physics_.obsFlowNoiseStdGS;
         const float wStepVar = (physics_.obsFlowNoiseStdGS * physics_.dtS) * (physics_.obsFlowNoiseStdGS * physics_.dtS);
         for (std::size_t i = 0; i < h; ++i) {
-            const float pe = 0.5f * std::fabs(pHi[i] - pLo[i]);
-            const float qe = 0.5f * std::fabs(qHi[i] - qLo[i]);
-            const float we = 0.5f * std::fabs(wHi[i] - wLo[i]);
+            const float pe = 0.5f * std::fabs(ws.pHi[i] - ws.pLo[i]);
+            const float qe = 0.5f * std::fabs(ws.qHi[i] - ws.qLo[i]);
+            const float we = 0.5f * std::fabs(ws.wHi[i] - ws.wLo[i]);
             out.pressureStdBar[i] = std::sqrt(pe * pe + pObsVar);
             out.beverageFlowStdGS[i] = std::sqrt(qe * qe + qObsVar);
             out.weightStdG[i] = std::sqrt(we * we + static_cast<float>(i + 1) * wStepVar);

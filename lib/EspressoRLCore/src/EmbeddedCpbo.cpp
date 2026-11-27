@@ -1831,25 +1831,23 @@ bool conditionalJndProbsBivariateTruncated(double meanX, double meanA, double co
         return true;
     }
 
-    // Two-pass log-sum-exp over 24 x 20 = 480 nodes (zero heap allocations).
-    std::array<double, 24 * 20> logJoint{};
-    std::array<double, 24 * 20> diffs{};
-    double maxLog = -std::numeric_limits<double>::infinity();
+    // Streaming two-pass log-sum-exp over 24 x 20 = 480 nodes (zero heap, minimal stack).
+    std::array<double, 20> logGl20Weights{};
+    for (std::size_t ix = 0; ix < 20; ++ix) {
+        logGl20Weights[ix] = std::log(kGl20Weights[ix]);
+    }
 
+    double maxLog = -std::numeric_limits<double>::infinity();
     for (std::size_t ia = 0; ia < 24; ++ia) {
         const double aXc = alphaXCondArr[ia];
         const double xHi = std::min(aXc, 5.5);
         const double xLo = (aXc >= 0.0) ? -5.5 : (xHi - 5.0);
         const double halfX = 0.5 * (xHi - xLo);
         const double midX = 0.5 * (xHi + xLo);
+        const double baseLog = logWaArr[ia] + std::log(halfX);
         for (std::size_t ix = 0; ix < 20; ++ix) {
-            const std::size_t idx = ia * 20 + ix;
             const double zX = midX + halfX * kGl20Nodes[ix];
-            const double fX = mXCondArr[ia] + sXCond * zX;
-            const double logWx = std::log(halfX * kGl20Weights[ix]) - 0.5 * zX * zX;
-            const double lj = logWaArr[ia] + logWx;
-            logJoint[idx] = lj;
-            diffs[idx] = fX - fAArr[ia];
+            const double lj = baseLog + logGl20Weights[ix] - 0.5 * zX * zX;
             if (lj > maxLog) {
                 maxLog = lj;
             }
@@ -1858,13 +1856,24 @@ bool conditionalJndProbsBivariateTruncated(double meanX, double meanA, double co
 
     double wSum = 0.0;
     std::array<double, 3> probs{0.0, 0.0, 0.0};
-    for (std::size_t idx = 0; idx < 24 * 20; ++idx) {
-        const double w = std::exp(logJoint[idx] - maxLog);
-        wSum += w;
-        const auto p = jndProbabilities(diffs[idx], gamma, sigmaPref);
-        probs[0] += w * p[0];
-        probs[1] += w * p[1];
-        probs[2] += w * p[2];
+    for (std::size_t ia = 0; ia < 24; ++ia) {
+        const double aXc = alphaXCondArr[ia];
+        const double xHi = std::min(aXc, 5.5);
+        const double xLo = (aXc >= 0.0) ? -5.5 : (xHi - 5.0);
+        const double halfX = 0.5 * (xHi - xLo);
+        const double midX = 0.5 * (xHi + xLo);
+        const double baseLog = logWaArr[ia] + std::log(halfX);
+        for (std::size_t ix = 0; ix < 20; ++ix) {
+            const double zX = midX + halfX * kGl20Nodes[ix];
+            const double lj = baseLog + logGl20Weights[ix] - 0.5 * zX * zX;
+            const double w = std::exp(lj - maxLog);
+            wSum += w;
+            const double fX = mXCondArr[ia] + sXCond * zX;
+            const auto p = jndProbabilities(fX - fAArr[ia], gamma, sigmaPref);
+            probs[0] += w * p[0];
+            probs[1] += w * p[1];
+            probs[2] += w * p[2];
+        }
     }
 
     const double norm = std::max(wSum, 1e-300);

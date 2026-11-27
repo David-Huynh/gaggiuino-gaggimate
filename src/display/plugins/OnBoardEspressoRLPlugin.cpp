@@ -328,6 +328,13 @@ struct OnBoardEspressoRLPlugin::Workspace {
     uint32_t lastCpboFitMs = 0;
     bool lastCpboCancelled = false;
 
+    // PSRAM-backed scratch buffers for 4 Hz onLiveShotSample() so loopTask's 8 KB stack
+    // never carries multi-kilobyte phase/horizon arrays. Guarded by workspaceMutex_.
+    std::array<ProfileHorizon::PhaseSpec, MAX_PHASE_WINDOW> livePhaseSpecs{};
+    ProfileHorizon::HorizonSample liveHorizon{};
+    std::array<EspressoRL::PumpMode, EspressoRL::MAX_MPC_HORIZON> liveModes{};
+    std::array<float, EspressoRL::MAX_MPC_HORIZON> liveNominalRefFlow{};
+
     Workspace()
         : predictor(),
           mpc(predictor, EspressoRL::HydraulicControlEnvelope{}, EspressoRL::SplineTrajectoryBasis{3, 1.0f},
@@ -429,7 +436,7 @@ void OnBoardEspressoRLPlugin::setup(Controller *ctrl, PluginManager *pm) {
     }
 
     // Spawn dedicated Core-1 background worker for between-shot GP/CPBO optimization & flash persistence.
-    if (xTaskCreatePinnedToCore(workerTaskEntry, "OnBoardEspressoRL", 12288, this, 1, &workerTaskHandle_, 1) !=
+    if (xTaskCreatePinnedToCore(workerTaskEntry, "OnBoardEspressoRL", 16384, this, 1, &workerTaskHandle_, 1) !=
         pdPASS) {
         workerTaskHandle_ = nullptr;
         workspaceReady_.store(false, std::memory_order_release);
@@ -719,8 +726,8 @@ bool OnBoardEspressoRLPlugin::onLiveShotSample(AutoTuning::LiveShotSample const 
 
     workspace_->predictor.observeTick(smp.pressure, bevFlow, waterPumped, liveGrindSteps_, liveDoseG_, activeEst);
 
-    // Snapshot a sliding phase window starting at currentPhaseIdx without holding processMutex during CEM rollouts.
-    std::array<ProfileHorizon::PhaseSpec, MAX_PHASE_WINDOW> phaseSpecs{};
+    // Snapshot a sliding phase window into PSRAM scratch without holding processMutex during CEM rollouts.
+    auto &phaseSpecs = workspace_->livePhaseSpecs;
     std::size_t windowCount = 0;
     float currentPhaseElapsedS = 0.0f;
     float phaseStartP = smp.pressure;
@@ -765,6 +772,7 @@ bool OnBoardEspressoRLPlugin::onLiveShotSample(AutoTuning::LiveShotSample const 
                 for (std::size_t wi = 0; wi < windowCount; ++wi) {
                     const Phase &ph = bp->profile.phases[startIdx + wi];
                     ProfileHorizon::PhaseSpec &sp = phaseSpecs[wi];
+                    sp = ProfileHorizon::PhaseSpec{};
                     sp.isBrewPhase = (ph.phase == PhaseType::PHASE_TYPE_BREW);
                     sp.valveOpen = (ph.valve > 0);
                     sp.isStandardProfile = isStandard;
@@ -805,7 +813,8 @@ bool OnBoardEspressoRLPlugin::onLiveShotSample(AutoTuning::LiveShotSample const 
     }
 
     const float fallbackRefFlow = std::clamp(liveTargetYieldG_ / 22.0f, 0.8f, 3.5f);
-    ProfileHorizon::HorizonSample horizon{};
+    auto &horizon = workspace_->liveHorizon;
+    horizon = ProfileHorizon::HorizonSample{};
     if (!ProfileHorizon::sampleHorizon(phaseSpecs.data(), windowCount, 0, currentPhaseElapsedS, phaseStartP,
                                        phaseStartQ, smp.pressure, smp.pumpFlow, fallbackRefFlow,
                                        workspace_->predictor.bevToPumpRatio(), workspace_->predictor.physics().dtS, 16,
@@ -814,7 +823,7 @@ bool OnBoardEspressoRLPlugin::onLiveShotSample(AutoTuning::LiveShotSample const 
         return true;
     }
 
-    std::array<EspressoRL::PumpMode, EspressoRL::MAX_MPC_HORIZON> modes{};
+    auto &modes = workspace_->liveModes;
     for (std::size_t i = 0; i < horizon.steps; ++i) {
         modes[i] = mapHorizonMode(horizon.modes[i]);
     }
@@ -842,7 +851,8 @@ bool OnBoardEspressoRLPlugin::onLiveShotSample(AutoTuning::LiveShotSample const 
     // rescuing mid-shot channeling surges & flow runaways.
     const float baselineOffset = workspace_->baselinePolicy.updateAndResolve(readyForMpc, st.liveOffset);
 
-    std::array<float, EspressoRL::MAX_MPC_HORIZON> nominalRefFlow{};
+    auto &nominalRefFlow = workspace_->liveNominalRefFlow;
+    nominalRefFlow.fill(0.0f);
     workspace_->predictor.predictNominalReferenceFlow(st, modes.data(), horizon.basePressureBar.data(),
                                                       horizon.baseFlowMlS.data(), horizon.steps, liveGrindSteps_,
                                                       liveDoseG_, baselineOffset, nominalRefFlow.data());
@@ -1437,7 +1447,7 @@ void OnBoardEspressoRLPlugin::loadCommunityPrior() {
         priorLoaded_.store(false, std::memory_order_release);
         return;
     }
-    EspressoRL::TrajectoryTastePrior decoded;
+    auto decoded = makePsramUnique<EspressoRL::TrajectoryTastePrior>();
 #if defined(GAGGIMATE_ESPRESSORL_PRIOR_PUBKEY_HEX)
     std::uint8_t pinnedPubKey[EspressoRL::ED25519_PUBLIC_KEY_BYTES]{};
     const char *hexPub = GAGGIMATE_ESPRESSORL_PRIOR_PUBKEY_HEX;
@@ -1457,13 +1467,13 @@ void OnBoardEspressoRLPlugin::loadCommunityPrior() {
             pinnedPubKey[i] = static_cast<std::uint8_t>((hi << 4) | lo);
         }
     }
-    if (!pubOk || !EspressoRL::decodeEtp1(raw.data(), raw.size(), decoded, pinnedPubKey, true) || !decoded.approved) {
+    if (!pubOk || !EspressoRL::decodeEtp1(raw.data(), raw.size(), *decoded, pinnedPubKey, true) || !decoded->approved) {
         ESP_LOGW(LOG_TAG, "Ignoring /rll/prior.bin: failed ETP1 Ed25519 signature/CRC/approval gate");
         priorLoaded_.store(false, std::memory_order_release);
         return;
     }
 #else
-    if (!EspressoRL::decodeEtp1(raw.data(), raw.size(), decoded) || !decoded.approved) {
+    if (!EspressoRL::decodeEtp1(raw.data(), raw.size(), *decoded) || !decoded->approved) {
         ESP_LOGW(LOG_TAG, "Ignoring /rll/prior.bin: failed ETP1 CRC/schema/approval gate");
         priorLoaded_.store(false, std::memory_order_release);
         return;
@@ -1471,11 +1481,11 @@ void OnBoardEspressoRLPlugin::loadCommunityPrior() {
 #endif
     {
         std::lock_guard<std::mutex> lock(workspaceMutex_);
-        workspace_->communityPrior = decoded;
+        workspace_->communityPrior = *decoded;
     }
     priorLoaded_.store(true, std::memory_order_release);
     ESP_LOGI(LOG_TAG, "Loaded optional community J_taste prior (%u buckets, conf=%.2f)",
-             static_cast<unsigned>(decoded.bucketCount), decoded.primaryConfidence());
+             static_cast<unsigned>(decoded->bucketCount), decoded->primaryConfidence());
 }
 
 bool OnBoardEspressoRLPlugin::savePersistedState() {
@@ -1889,7 +1899,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
     std::size_t anchorIdx = 0;
     std::string runId, beanId, grinderId, profileId, rawHash, sourceShotId;
     AutoTuning::TasteGoal goal;
-    EspressoRL::TrajectoryTastePrior priorCopy;
+    auto priorCopy = makePsramUnique<EspressoRL::TrajectoryTastePrior>();
     float basePeakP = 8.5f;
     float baseTailP = 5.5f;
     float baseTempC = 93.0f;
@@ -1922,7 +1932,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
             return;
         }
         mode = workspace_->controlMode;
-        priorCopy = workspace_->communityPrior;
+        *priorCopy = workspace_->communityPrior;
         const std::size_t rawDim = OnBoardOpt::rawDimForMode(mode);
         const EspressoRL::PreferenceLabel lbl = mapPreferenceLabel(feedback.label);
         if (workspace_->comparisons.size() >= MAX_CPBO_COMPARISONS) {
@@ -2026,7 +2036,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
     yCtx.startedAtMs = millis();
     yCtx.lastYieldMs = yCtx.startedAtMs;
 
-    const bool usePrior = priorCopy.valid && priorCopy.approved;
+    const bool usePrior = priorCopy->valid && priorCopy->approved;
     const std::uint64_t goalHash = usePrior ? computeTasteGoalBucketHash(goal) : 0ULL;
     std::vector<double> trainPriorMean;
     if (usePrior) {
@@ -2034,7 +2044,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
         for (std::size_t i = 0; i < pointsCopy.size(); ++i) {
             if (pointsCopy[i].hasTrajectoryFeatures) {
                 trainPriorMean[i] =
-                    static_cast<double>(priorCopy.evaluate(pointsCopy[i].trajFeatures, goalHash, compsCopy.size()));
+                    static_cast<double>(priorCopy->evaluate(pointsCopy[i].trajFeatures, goalHash, compsCopy.size()));
             }
         }
     }
@@ -2128,7 +2138,7 @@ void OnBoardEspressoRLPlugin::handleProcessPreference(AutoTuning::PreferenceFeed
                         workspace_->predictor, static_cast<float>(cGrind), static_cast<float>(cDose),
                         static_cast<float>(cYield), cSpline, basePeakP, baseTailP, baseTempC, candFeat)) {
                     queryPriorMean[i] =
-                        static_cast<double>(priorCopy.evaluate(candFeat, goalHash, compsCopy.size()));
+                        static_cast<double>(priorCopy->evaluate(candFeat, goalHash, compsCopy.size()));
                 }
             }
         }

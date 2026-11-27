@@ -154,7 +154,7 @@ ControlCommand CemGpMpcController::computeCommand(const HydraulicState &state, c
     }
 
     // Build Level 1 spline-warped beverage-flow reference over shot progress s in [0, 1].
-    std::array<float, MAX_MPC_HORIZON> targetQCurve{};
+    auto &targetQCurve = scratch_.targetQCurve;
     float estWeight = state.weightG;
     for (std::size_t i = 0; i < h; ++i) {
         estWeight = std::clamp(estWeight + std::max(referenceBeverageFlow[i], 0.0f) * dtS, 0.0f, yieldStop);
@@ -191,18 +191,20 @@ ControlCommand CemGpMpcController::computeCommand(const HydraulicState &state, c
     stdKnots.fill(isPressure ? cfg_.initialPressureStdBar : cfg_.initialFlowStdMlS);
 
     double bestCost = std::numeric_limits<double>::infinity();
-    std::array<float, MAX_MPC_HORIZON> bestPlan{};
+    auto &bestPlan = scratch_.bestPlan;
     for (std::size_t i = 0; i < h; ++i) {
         bestPlan[i] = activeBase[i];
     }
     std::array<float, MAX_CEM_KNOTS> bestKnots = baseKnots;
 
-    std::array<std::array<float, MAX_MPC_HORIZON>, MAX_CEM_CANDIDATES> clampedPlans{};
-    std::array<double, MAX_CEM_CANDIDATES> costs{};
-    std::array<std::size_t, MAX_CEM_CANDIDATES> order{};
+    auto &clampedPlans = scratch_.clampedPlans;
+    auto &costs = scratch_.costs;
+    auto &order = scratch_.order;
     std::array<float, MAX_CEM_KNOTS> candKnots{};
-    std::array<float, MAX_MPC_HORIZON> rawPlan{};
-    RolloutOutput pred{};
+    auto &rawPlan = scratch_.rawPlan;
+    auto &pPlanBuf = scratch_.pPlanBuf;
+    auto &qPlanBuf = scratch_.qPlanBuf;
+    auto &pred = scratch_.pred;
 
     for (std::size_t iter = 0; iter < cfg_.cemIterations; ++iter) {
         bool anyFinite = false;
@@ -231,8 +233,6 @@ ControlCommand CemGpMpcController::computeCommand(const HydraulicState &state, c
 
             // Mode-scoped horizon rollout: only mutate steps matching activeMode; preserve exact base setpoints
             // and secondary soft caps on any future phase that switches mode or uses SIMPLE / valve-closed.
-            std::array<float, MAX_MPC_HORIZON> pPlanBuf{};
-            std::array<float, MAX_MPC_HORIZON> qPlanBuf{};
             for (std::size_t i = 0; i < h; ++i) {
                 if (baseModes[i] == activeMode) {
                     pPlanBuf[i] = isPressure ? clampedPlans[c][i] : basePressureTargets[i];
@@ -242,8 +242,8 @@ ControlCommand CemGpMpcController::computeCommand(const HydraulicState &state, c
                     qPlanBuf[i] = baseFlowTargets[i];
                 }
             }
-            predictor_.rollout(state, baseModes, pPlanBuf.data(), qPlanBuf.data(), h, relativeGrindSteps, doseInG, true,
-                               pred);
+            predictor_.rolloutWithScratch(state, baseModes, pPlanBuf.data(), qPlanBuf.data(), h, relativeGrindSteps,
+                                          doseInG, true, pred, scratch_.rolloutWs);
 
             bool ok = true;
             double trackSum = 0.0;

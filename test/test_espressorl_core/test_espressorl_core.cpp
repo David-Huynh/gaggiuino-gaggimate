@@ -1301,6 +1301,91 @@ static void test_ed25519_rfc8032_and_signed_etp1_verification() {
     TEST_ASSERT_FALSE(rejected.signatureVerified);
 }
 
+static void test_vfe_predict_mean_and_rollout_scratch_parity() {
+    CombinedHydraulicPredictor pred;
+    std::vector<FeatureVec4> zRows;
+    std::vector<float> yVals;
+    for (int i = 0; i < 40; ++i) {
+        const float v = 8.0f + 0.9f * static_cast<float>(i);
+        const float p = 3.0f + 0.15f * static_cast<float>(i % 20);
+        const float g = -1.0f + 0.1f * static_cast<float>(i % 10);
+        zRows.push_back(buildHydraulicFeature(v, p, g, 18.5f));
+        yVals.push_back(0.25f * std::sin(0.15f * static_cast<float>(i)) - 0.05f);
+    }
+    pred.residualGP().refreshFromHistory(zRows.data(), yVals.data(), zRows.size(), 0.25f);
+
+    // 1. Fast O(M) predictMean(z) must match full predict(z, mean, var) across in-domain and OOD points.
+    const std::array<FeatureVec4, 4> probes = {{
+        buildHydraulicFeature(12.0f, 6.0f, 0.0f, 18.5f),
+        buildHydraulicFeature(35.0f, 9.0f, -0.5f, 18.0f),
+        buildHydraulicFeature(2.0f, 1.5f, +4.0f, 21.0f),
+        buildHydraulicFeature(80.0f, 12.0f, -5.0f, 15.0f),
+    }};
+    for (const auto &z : probes) {
+        float fullMean = 0.0f;
+        float fullVar = 0.0f;
+        pred.residualGP().predict(z, fullMean, fullVar);
+        const float fastMean = pred.residualGP().predictMean(z);
+        TEST_ASSERT_FLOAT_WITHIN(1e-4f, fullMean, fastMean);
+    }
+
+    // 2. Also verify updateFromShot keeps alphaW_ synchronized with core_.weights().
+    pred.residualGP().updateFromShot(zRows.data(), yVals.data(), 10, 0.25f);
+    for (const auto &z : probes) {
+        float fullMean = 0.0f;
+        float fullVar = 0.0f;
+        pred.residualGP().predict(z, fullMean, fullVar);
+        const float fastMean = pred.residualGP().predictMean(z);
+        TEST_ASSERT_FLOAT_WITHIN(1e-4f, fullMean, fastMean);
+    }
+
+    // 3. rolloutWithScratch must produce bit-identical predictions to default rollout.
+    HydraulicState st;
+    st.elapsedS = 4.0f;
+    st.pressureBar = 8.2f;
+    st.pumpFlowMlS = 2.1f;
+    st.beverageFlowGS = 1.6f;
+    st.waterPumpedMl = 18.0f;
+    st.weightG = 5.5f;
+    st.pumpMode = PumpMode::PRESSURE;
+    st.liveOffset = 0.15f;
+    st.liveRate = 0.02f;
+    st.liveCov00 = 0.04f;
+    st.liveCov01 = 0.002f;
+    st.liveCov11 = 0.01f;
+
+    std::array<PumpMode, 16> modes;
+    modes.fill(PumpMode::PRESSURE);
+    std::array<float, 16> pTgt, qTgt;
+    for (std::size_t i = 0; i < 16; ++i) {
+        pTgt[i] = 9.0f - 0.15f * static_cast<float>(i);
+        qTgt[i] = 0.0f;
+    }
+
+    RolloutOutput refOut{}, scratchOut{};
+    RolloutScratch ws{};
+    pred.rollout(st, modes.data(), pTgt.data(), qTgt.data(), 16, 0.0f, 18.5f, true, refOut);
+    pred.rolloutWithScratch(st, modes.data(), pTgt.data(), qTgt.data(), 16, 0.0f, 18.5f, true, scratchOut, ws);
+    TEST_ASSERT_EQUAL_UINT32(refOut.steps, scratchOut.steps);
+    for (std::size_t i = 0; i < 16; ++i) {
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, refOut.pressureBar[i], scratchOut.pressureBar[i]);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, refOut.pressureStdBar[i], scratchOut.pressureStdBar[i]);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, refOut.beverageFlowGS[i], scratchOut.beverageFlowGS[i]);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, refOut.beverageFlowStdGS[i], scratchOut.beverageFlowStdGS[i]);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, refOut.weightG[i], scratchOut.weightG[i]);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, refOut.weightStdG[i], scratchOut.weightStdG[i]);
+    }
+
+    // 4. Streaming two-pass bivariate quadrature preserves exact symmetry & normalization.
+    std::array<double, 3> symProbs{};
+    bool usedGibbs = true;
+    TEST_ASSERT_TRUE(conditionalJndProbsBivariateTruncated(0.1, 0.1, 0.8, 0.35, 0.8, 1.2, 1.2, 0.12, 0.20, 7ULL, 256,
+                                                           64, 2, symProbs, usedGibbs));
+    TEST_ASSERT_FALSE(usedGibbs);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-12, 1.0, symProbs[0] + symProbs[1] + symProbs[2]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, symProbs[0], symProbs[2]);
+}
+
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -1333,5 +1418,6 @@ int main(int argc, char **argv) {
     // Group D — Community J_taste Trajectory Prior (ETP1 Parity + Ed25519 + Local Override)
     RUN_TEST(test_trajectory_prior_golden_etp1_parity_and_local_override);
     RUN_TEST(test_ed25519_rfc8032_and_signed_etp1_verification);
+    RUN_TEST(test_vfe_predict_mean_and_rollout_scratch_parity);
     return UNITY_END();
 }

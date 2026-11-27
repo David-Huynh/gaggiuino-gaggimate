@@ -12,6 +12,7 @@
 #include <display/core/AutoTuningModels.h>
 #include <display/core/EpochTime.h>
 #include <display/util/PsramAllocator.h>
+#include <display/util/PsramStlAllocator.h>
 #include <vector>
 
 namespace {
@@ -258,9 +259,8 @@ bool CommunityUploadQueue::readItemUnlocked(
         }
         payloadJson->remove(0);
         payloadJson->reserve(payloadBytes);
-        std::array<std::uint8_t,
-                   StorageCoordinator::MAX_FLASH_QUANTUM_BYTES>
-            buffer{};
+        auto bufferStorage = makePsramUnique<std::array<std::uint8_t, StorageCoordinator::MAX_FLASH_QUANTUM_BYTES>>();
+        auto &buffer = *bufferStorage;
         size_t remaining = payloadBytes;
         while (remaining > 0) {
             const size_t requested = std::min(buffer.size(), remaining);

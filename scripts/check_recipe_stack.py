@@ -65,6 +65,55 @@ def main():
         raise SystemExit(f"Combined recovery/projection frames exceed 1536 bytes: {recovery_frames}")
     print(f"PASS combined recovery/projection frames: {recovery_frames} bytes (budget 1536)")
 
+    # CommunityUploadQueue runs on the 6 KB CloudHandoff task; keep the 4 KB flash chunk off the stack.
+    queue_obj = ROOT / f".pio/build/{args.environment}/src/display/plugins/community/CommunityUploadQueue.cpp.o"
+    if queue_obj.exists():
+        q_out = subprocess.check_output([str(objdump), "-d", "-C", str(queue_obj)], text=True)
+        q_sz = frame_size(q_out, "CommunityUploadQueue::readItemUnlocked")
+        if q_sz > 512:
+            raise SystemExit(f"CommunityUploadQueue::readItemUnlocked: {q_sz} bytes exceeds 512-byte frame budget")
+        print(f"PASS CommunityUploadQueue::readItemUnlocked: {q_sz} bytes (budget 512)")
+
+    # On-board EspressoRL live 4 Hz MPC runs on Arduino loopTask (8 KB stack) and between-shot CPBO
+    # runs on the 16 KB Core-1 worker. Enforce tight per-frame and combined live-brew stack ceilings.
+    build_root = ROOT / f".pio/build/{args.environment}"
+    mpc_objs = list(build_root.glob("lib*/EspressoRLCore/CemGpMpc.cpp.o"))
+    if mpc_objs:
+        core_dir = mpc_objs[0].parent
+        onboard_checks = [
+            (build_root / "src/display/plugins/OnBoardEspressoRLPlugin.cpp.o",
+             "OnBoardEspressoRLPlugin::onLiveShotSample", 768),
+            (build_root / "src/display/plugins/OnBoardEspressoRLPlugin.cpp.o",
+             "OnBoardEspressoRLPlugin::loadCommunityPrior", 512),
+            (core_dir / "CemGpMpc.cpp.o",
+             "EspressoRL::CemGpMpcController::computeCommand", 768),
+            (core_dir / "HydraulicWorldModel.cpp.o",
+             "EspressoRL::CombinedHydraulicPredictor::rolloutWithScratch", 256),
+            (core_dir / "HydraulicWorldModel.cpp.o",
+             "EspressoRL::FixedBasisVfeNystromGP::predictMean", 128),
+            (core_dir / "EmbeddedCpbo.cpp.o",
+             "EspressoRL::conditionalJndProbsBivariateTruncated", 1536),
+        ]
+        onboard_frames = {}
+        out_cache = {}
+        for obj_path, symbol, budget in onboard_checks:
+            key = str(obj_path)
+            if key not in out_cache:
+                out_cache[key] = subprocess.check_output([str(objdump), "-d", "-C", key], text=True)
+            size = frame_size(out_cache[key], symbol)
+            onboard_frames[symbol] = size
+            if size > budget:
+                raise SystemExit(f"{symbol}: {size} bytes exceeds {budget}-byte frame budget")
+            print(f"PASS {symbol}: {size} bytes (budget {budget})")
+        live_brew_frames = (
+            onboard_frames["OnBoardEspressoRLPlugin::onLiveShotSample"] +
+            onboard_frames["EspressoRL::CemGpMpcController::computeCommand"] +
+            onboard_frames["EspressoRL::CombinedHydraulicPredictor::rolloutWithScratch"]
+        )
+        if live_brew_frames > 1536:
+            raise SystemExit(f"Combined live-brew MPC frames exceed 1536 bytes: {live_brew_frames}")
+        print(f"PASS combined live-brew MPC frames: {live_brew_frames} bytes (budget 1536)")
+
 
 if __name__ == "__main__":
     main()
